@@ -6,8 +6,6 @@ ColumnLimit: 100
 AllowShortIfStatementsOnASingleLine: false
 AllowShortFunctionsOnASingleLine: false
 SortIncludes: true
-AlignConsecutiveAssignments: true
-AlignConsecutiveDeclarations: true
 PointerAlignment: Right
 ReferenceAlignment: Right
 Standard: c++17
