@@ -1,355 +1,533 @@
 #pragma once
 
-#include <iostream>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <list>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ir {
 
-class Type;
-class Value;
-class User;
-class Instruction;
-class BasicBlock;
-class Function;
-class Module;
-
-// ============================================================================
-// 1. 类型系统 (Type System) - 解决之前弱类型、无法校验的问题
-// ============================================================================
 class Type {
   public:
-    enum TypeID {
-        VoidTyID,    // void
-        LabelTyID,   // Basic Block
-        IntegerTyID, // i1, i32
-        FloatTyID,   // float
-        PointerTyID, // ptr
-        ArrayTyID,   // array
-        FunctionTyID // function
+    enum class TypeID {
+        Void,
+        Label,
+        Integer,
+        Float,
+        Pointer,
+        Array,
+        Function,
     };
-    explicit Type(TypeID id) : id_(id) {
-    }
+
+    explicit Type(TypeID id);
     virtual ~Type() = default;
-    TypeID get_id() const {
-        return id_;
-    }
+
+    TypeID id() const;
+
+    bool is_void() const;
+    bool is_label() const;
+    bool is_integer() const;
+    bool is_float() const;
+    bool is_pointer() const;
+    bool is_array() const;
+    bool is_function() const;
 
     virtual std::string print() const = 0;
 
-  protected:
+  private:
     TypeID id_;
 };
 
-// ============================================================================
-// 2. 基石：Value 与 User (彻底抛弃基于 std::string 的名字查找)
-// ============================================================================
+class VoidType final : public Type {
+  public:
+    VoidType();
+    std::string print() const override;
+};
 
-// Value 是所有可以作为操作数的东西（变量、常量、指令的结果）
+class LabelType final : public Type {
+  public:
+    LabelType();
+    std::string print() const override;
+};
+
+class IntegerType final : public Type {
+  public:
+    explicit IntegerType(std::size_t bit_width);
+
+    std::size_t bit_width() const;
+    std::string print() const override;
+
+  private:
+    std::size_t bit_width_;
+};
+
+class FloatType final : public Type {
+  public:
+    FloatType();
+    std::string print() const override;
+};
+
+class PointerType final : public Type {
+  public:
+    explicit PointerType(Type *element_type);
+
+    Type *element_type() const;
+    std::string print() const override;
+
+  private:
+    Type *element_type_;
+};
+
+class ArrayType final : public Type {
+  public:
+    ArrayType(Type *element_type, std::size_t element_count);
+
+    Type *element_type() const;
+    std::size_t element_count() const;
+    std::string print() const override;
+
+  private:
+    Type *element_type_;
+    std::size_t element_count_;
+};
+
+class FunctionType final : public Type {
+  public:
+    FunctionType(Type *return_type, std::vector<Type *> param_types);
+
+    Type *return_type() const;
+    const std::vector<Type *> &param_types() const;
+    std::string print() const override;
+
+  private:
+    Type *return_type_;
+    std::vector<Type *> param_types_;
+};
+
+class TypeContext {
+  public:
+    TypeContext();
+
+    VoidType *void_ty() const;
+    LabelType *label_ty() const;
+    IntegerType *int1_ty() const;
+    IntegerType *int32_ty() const;
+    FloatType *float_ty() const;
+
+    PointerType *ptr_ty(Type *element_type);
+    ArrayType *array_ty(Type *element_type, std::size_t element_count);
+    FunctionType *func_ty(Type *return_type, const std::vector<Type *> &param_types);
+
+  private:
+    std::unique_ptr<VoidType> void_ty_;
+    std::unique_ptr<LabelType> label_ty_;
+    std::unique_ptr<IntegerType> int1_ty_;
+    std::unique_ptr<IntegerType> int32_ty_;
+    std::unique_ptr<FloatType> float_ty_;
+    std::vector<std::unique_ptr<Type>> owned_composite_types_;
+};
+
 class Value {
   public:
-    explicit Value(Type *type, const std::string &name = "") : type_(type), name_(name) {
-    }
+    Value(Type *type, const std::string &name = "");
     virtual ~Value() = default;
 
-    Type *get_type() const {
-        return type_;
-    }
-    std::string get_name() const {
-        return name_;
-    }
-    void set_name(const std::string &name) {
-        name_ = name;
-    }
-
-    // 未来优化：这里可以记录谁使用了我（Use-Def 链），做 DCE 和常量传播非常简单
-    // std::list<Use*> use_list_;
+    Type *type() const;
+    const std::string &name() const;
+    void set_name(const std::string &name);
 
     virtual std::string print() const = 0;
 
-  protected:
+  private:
     Type *type_;
     std::string name_;
 };
 
-// User 是会使用 Value 的东西（也就是 Instruction）
+class ConstantInt final : public Value {
+  public:
+    ConstantInt(Type *type, std::int64_t value);
+
+    std::int64_t value() const;
+    std::string print() const override;
+
+  private:
+    std::int64_t value_;
+};
+
+class ConstantFloat final : public Value {
+  public:
+    ConstantFloat(Type *type, float value);
+
+    float value() const;
+    std::string print() const override;
+
+  private:
+    float value_;
+};
+
+class UndefValue final : public Value {
+  public:
+    explicit UndefValue(Type *type);
+    std::string print() const override;
+};
+
 class User : public Value {
   public:
-    User(Type *type, const std::string &name = "") : Value(type, name) {
-    }
+    User(Type *type, const std::string &name = "");
 
-    void add_operand(Value *val) {
-        operands_.push_back(val);
-    }
-    Value *get_operand(size_t i) const {
-        return operands_[i];
-    }
-    size_t get_num_operands() const {
-        return operands_.size();
-    }
+    void add_operand(Value *value);
+    Value *operand(std::size_t index) const;
+    std::size_t operand_count() const;
+    const std::vector<Value *> &operands() const;
 
   protected:
-    std::vector<Value *> operands_; // 核心：这里存的是真实的内存指针，而不是名字字符串！
+    std::vector<Value *> operands_;
 };
 
-// ============================================================================
-// 3. 常量（Constant），它们本身也是一种 Value
-// ============================================================================
-class ConstantInt : public Value {
-  public:
-    int value_;
-    ConstantInt(Type *ty, int val) : Value(ty, std::to_string(val)), value_(val) {
-    }
-    std::string print() const override {
-        return std::to_string(value_);
-    }
-};
+class BasicBlock;
+class Function;
+class Module;
 
-class ConstantFloat : public Value {
-  public:
-    float value_;
-    ConstantFloat(Type *ty, float val) : Value(ty, std::to_string(val)), value_(val) {
-    }
-    std::string print() const override {
-        return std::to_string(value_);
-    }
-};
-
-// ============================================================================
-// 4. 指令集 (Instructions)
-// ============================================================================
 class Instruction : public User {
   public:
-    enum OpID {
+    enum class OpID {
         Ret,
-        Br, // Terminator
+        Br,
         Add,
         Sub,
         Mul,
-        Div,
-        Mod, // Binary
+        SDiv,
+        SRem,
         FAdd,
         FSub,
         FMul,
-        FDiv, // Float Binary
+        FDiv,
+        ICmp,
+        FCmp,
         Alloca,
         Load,
         Store,
-        GetElementPtr, // Memory
+        GetElementPtr,
         Call,
-        Zext,
-        Phi // Other & SSA
+        ZExt,
+        SIToFP,
+        FPToSI,
+        Phi,
     };
 
-    Instruction(Type *ty, OpID op, BasicBlock *parent, const std::string &name = "")
-        : User(ty, name), op_id_(op), parent_(parent) {
-    }
+    Instruction(Type *type, OpID op, BasicBlock *parent, const std::string &name = "");
+    ~Instruction() override = default;
 
-    OpID get_op() const {
-        return op_id_;
-    }
-    BasicBlock *get_parent() const {
-        return parent_;
-    }
+    OpID op() const;
+    BasicBlock *parent() const;
+    void set_parent(BasicBlock *parent);
+    bool is_terminator() const;
 
-  protected:
-    OpID op_id_;
+  private:
+    OpID op_;
     BasicBlock *parent_;
 };
 
-// 二元运算
-class BinaryInst : public Instruction {
+class BinaryInst final : public Instruction {
   public:
-    BinaryInst(Type *ty, OpID op, Value *lhs, Value *rhs, BasicBlock *parent,
-               const std::string &name = "")
-        : Instruction(ty, op, parent, name) {
-        add_operand(lhs);
-        add_operand(rhs);
-    }
-    std::string print() const override {
-        return name_ + " = binary_op " + operands_[0]->get_name() + ", " + operands_[1]->get_name();
-    }
+    BinaryInst(Type *type, OpID op, Value *lhs, Value *rhs, BasicBlock *parent,
+               const std::string &name = "");
+
+    Value *lhs() const;
+    Value *rhs() const;
+    std::string print() const override;
 };
 
-// 内存分配 (Alloca 应该返回 PointerType)
-class AllocaInst : public Instruction {
+enum class CmpPred { EQ, NE, LT, LE, GT, GE };
+
+class CmpInst final : public Instruction {
   public:
+    CmpInst(Type *result_type, OpID op, CmpPred pred, Value *lhs, Value *rhs, BasicBlock *parent,
+            const std::string &name = "");
+
+    CmpPred pred() const;
+    Value *lhs() const;
+    Value *rhs() const;
+    std::string print() const override;
+
+  private:
+    CmpPred pred_;
+};
+
+class CastInst final : public Instruction {
+  public:
+    CastInst(Type *dst_type, OpID op, Value *src, BasicBlock *parent, const std::string &name = "");
+
+    Value *src() const;
+    std::string print() const override;
+};
+
+class AllocaInst final : public Instruction {
+  public:
+    AllocaInst(Type *ptr_type, Type *allocated_type, BasicBlock *parent,
+               const std::string &name = "");
+
+    Type *allocated_type() const;
+    std::string print() const override;
+
+  private:
     Type *allocated_type_;
-    AllocaInst(Type *ptr_ty, Type *alloc_ty, BasicBlock *parent, const std::string &name = "")
-        : Instruction(ptr_ty, Alloca, parent, name), allocated_type_(alloc_ty) {
-    }
-    std::string print() const override {
-        return name_ + " = alloca " + allocated_type_->print();
-    }
 };
 
-// 寻址 (GEP)
-class GetElementPtrInst : public Instruction {
+class GetElementPtrInst final : public Instruction {
   public:
-    GetElementPtrInst(Type *ptr_ty, Value *ptr, Value *idx, BasicBlock *parent,
-                      const std::string &name = "")
-        : Instruction(ptr_ty, GetElementPtr, parent, name) {
-        add_operand(ptr);
-        add_operand(idx);
-    }
-    std::string print() const override {
-        return name_ + " = gep " + operands_[0]->get_name() + "[" + operands_[1]->get_name() + "]";
-    }
+    GetElementPtrInst(Type *ptr_type, Value *base_ptr, const std::vector<Value *> &indices,
+                      BasicBlock *parent, const std::string &name = "");
+
+    Value *base_ptr() const;
+    std::vector<Value *> indices() const;
+    std::string print() const override;
 };
 
-// 内存读写
-class LoadInst : public Instruction {
+class LoadInst final : public Instruction {
   public:
-    LoadInst(Type *ty, Value *ptr, BasicBlock *parent, const std::string &name = "")
-        : Instruction(ty, Load, parent, name) {
-        add_operand(ptr);
-    }
-    std::string print() const override {
-        return name_ + " = load " + operands_[0]->get_name();
-    }
+    LoadInst(Type *loaded_type, Value *ptr, BasicBlock *parent, const std::string &name = "");
+
+    Value *ptr() const;
+    std::string print() const override;
 };
 
-class StoreInst : public Instruction {
+class StoreInst final : public Instruction {
   public:
-    StoreInst(Value *val, Value *ptr, BasicBlock *parent)
-        : Instruction(nullptr /* void */, Store, parent, "") {
-        add_operand(val);
-        add_operand(ptr);
-    }
-    std::string print() const override {
-        return "store " + operands_[0]->get_name() + " -> " + operands_[1]->get_name();
-    }
+    StoreInst(Type *void_type, Value *value, Value *ptr, BasicBlock *parent);
+
+    Value *value() const;
+    Value *ptr() const;
+    std::string print() const override;
 };
 
-// 函数调用
-class CallInst : public Instruction {
+class CallInst final : public Instruction {
   public:
-    CallInst(Type *ret_ty, Function *func, std::vector<Value *> args, BasicBlock *parent,
-             const std::string &name = "")
-        : Instruction(ret_ty, Call, parent, name) {
-        add_operand((Value *)func); // operand[0] 是函数本身
-        for (auto arg : args)
-            add_operand(arg);
-    }
-    std::string print() const override {
-        return name_ + " = call " + operands_[0]->get_name();
-    }
+    CallInst(Type *return_type, Value *callee, const std::vector<Value *> &args, BasicBlock *parent,
+             const std::string &name = "");
+
+    Value *callee() const;
+    std::vector<Value *> args() const;
+    std::string print() const override;
 };
 
-// 返回指令
-class ReturnInst : public Instruction {
+class ReturnInst final : public Instruction {
   public:
-    ReturnInst(Value *val, BasicBlock *parent) : Instruction(nullptr, Ret, parent, "") {
-        if (val)
-            add_operand(val);
-    }
-    std::string print() const override {
-        return "ret " + (operands_.empty() ? "void" : operands_[0]->get_name());
-    }
+    ReturnInst(Type *void_type, Value *value, BasicBlock *parent);
+
+    bool has_value() const;
+    Value *value() const;
+    std::string print() const override;
 };
 
-// 分支跳转指令
-class BranchInst : public Instruction {
+class BranchInst final : public Instruction {
   public:
-    // 条件分支
-    BranchInst(Value *cond, BasicBlock *true_bb, BasicBlock *false_bb, BasicBlock *parent)
-        : Instruction(nullptr, Br, parent, "") {
-        add_operand(cond);
-        add_operand((Value *)true_bb);
-        add_operand((Value *)false_bb);
-    }
-    // 无条件跳转
-    BranchInst(BasicBlock *bb, BasicBlock *parent) : Instruction(nullptr, Br, parent, "") {
-        add_operand((Value *)bb);
-    }
-    std::string print() const override {
-        return "br ...";
-    }
+    BranchInst(Type *void_type, BasicBlock *target, BasicBlock *parent);
+    BranchInst(Type *void_type, Value *cond, BasicBlock *true_bb, BasicBlock *false_bb,
+               BasicBlock *parent);
+
+    bool is_conditional() const;
+    Value *cond() const;
+    BasicBlock *true_bb() const;
+    BasicBlock *false_bb() const;
+    BasicBlock *target_bb() const;
+    std::string print() const override;
 };
 
-// SSA 极度关键指令：Phi 节点 (用于合并不同控制流分支的值)
-class PhiInst : public Instruction {
+class PhiInst final : public Instruction {
   public:
-    PhiInst(Type *ty, BasicBlock *parent, const std::string &name = "")
-        : Instruction(ty, Phi, parent, name) {
-    }
+    PhiInst(Type *type, BasicBlock *parent, const std::string &name = "");
 
-    void add_incoming(Value *val, BasicBlock *bb) {
-        add_operand(val);
-        add_operand((Value *)bb);
-    }
-    std::string print() const override {
-        return name_ + " = phi ...";
-    }
+    void add_incoming(Value *value, BasicBlock *from);
+    const std::vector<std::pair<Value *, BasicBlock *>> &incoming() const;
+    std::string print() const override;
+
+  private:
+    std::vector<std::pair<Value *, BasicBlock *>> incoming_;
 };
 
-// ============================================================================
-// 5. 结构化容器: BasicBlock, Function, Module
-// ============================================================================
-class BasicBlock : public Value {
+class Argument final : public Value {
   public:
-    BasicBlock(const std::string &name, Function *parent)
-        : Value(nullptr /* LabelTy */, name), parent_(parent) {
-    }
+    Argument(Type *type, const std::string &name, Function *parent, std::size_t index);
 
-    // 基本块拥有（独占管理）指令的生命周期，但外界引用指令用普通指针
-    std::list<std::unique_ptr<Instruction>> insts_;
+    Function *parent() const;
+    std::size_t index() const;
+    std::string print() const override;
+
+  private:
     Function *parent_;
-
-    std::string print() const override {
-        return name_ + ":";
-    }
+    std::size_t index_;
 };
 
-class Argument : public Value {
+class BasicBlock final : public Value {
   public:
+    BasicBlock(Type *label_type, const std::string &name, Function *parent);
+
+    Instruction *append_instruction(std::unique_ptr<Instruction> inst);
+    bool has_terminator() const;
+    Instruction *terminator() const;
+
+    void add_predecessor(BasicBlock *pred);
+    void add_successor(BasicBlock *succ);
+    const std::vector<BasicBlock *> &predecessors() const;
+    const std::vector<BasicBlock *> &successors() const;
+
+    std::list<std::unique_ptr<Instruction>> &instructions();
+    const std::list<std::unique_ptr<Instruction>> &instructions() const;
+
+    Function *parent() const;
+    std::string print() const override;
+
+  private:
     Function *parent_;
-    Argument(Type *ty, const std::string &name, Function *parent)
-        : Value(ty, name), parent_(parent) {
-    }
-    std::string print() const override {
-        return type_->print() + " " + name_;
-    }
+    std::list<std::unique_ptr<Instruction>> instructions_;
+    std::vector<BasicBlock *> predecessors_;
+    std::vector<BasicBlock *> successors_;
 };
 
-class Function : public Value {
+class Function final : public Value {
   public:
-    Function(Type *func_ty, const std::string &name, Module *parent)
-        : Value(func_ty, name), parent_(parent) {
-    }
+    Function(FunctionType *type, const std::string &name, Module *parent, bool is_external = false);
 
+    FunctionType *function_type() const;
+    Type *return_type() const;
+    Module *parent() const;
+    bool is_external() const;
+    void set_external(bool is_external);
+
+    Argument *add_argument(Type *type, const std::string &name);
+    BasicBlock *create_block(const std::string &name = "");
+    BasicBlock *entry_block() const;
+
+    std::vector<std::unique_ptr<Argument>> &args();
+    const std::vector<std::unique_ptr<Argument>> &args() const;
+    std::list<std::unique_ptr<BasicBlock>> &blocks();
+    const std::list<std::unique_ptr<BasicBlock>> &blocks() const;
+
+    std::string print() const override;
+
+  private:
+    Module *parent_;
+    bool is_external_;
+    std::size_t next_block_id_;
     std::vector<std::unique_ptr<Argument>> args_;
     std::list<std::unique_ptr<BasicBlock>> blocks_;
-    Module *parent_;
-
-    std::string print() const override {
-        return "define " + name_ + "()";
-    }
 };
 
-// 全局变量也是一种用裸指针寻址的 Value
-class GlobalVariable : public Value {
+class GlobalVariable final : public Value {
   public:
+    GlobalVariable(Type *ptr_type, Type *value_type, const std::string &name, bool is_const,
+                   Value *init_value);
+
+    Type *value_type() const;
+    bool is_const() const;
+    Value *init_value() const;
+    std::string print() const override;
+
+  private:
+    Type *value_type_;
     bool is_const_;
-    Value *init_val_;
-    GlobalVariable(Type *ty, const std::string &name, bool is_const, Value *init_val)
-        : Value(ty /* 其实应该是 PointerTy */, name), is_const_(is_const), init_val_(init_val) {
-    }
-    std::string print() const override {
-        return name_ + " = global ...";
-    }
+    Value *init_value_;
 };
 
-class Module {
+class Module final {
   public:
-    std::string module_name_;
-    std::vector<std::unique_ptr<GlobalVariable>> global_vars_;
-    std::vector<std::unique_ptr<Function>> functions_;
+    explicit Module(const std::string &name);
 
-    explicit Module(const std::string &name) : module_name_(name) {
+    const std::string &name() const;
+    TypeContext &types();
+    const TypeContext &types() const;
+
+    Function *create_function(const std::string &name, FunctionType *type,
+                              bool is_external = false);
+    Function *get_function(const std::string &name) const;
+
+    GlobalVariable *create_global(const std::string &name, Type *value_type, bool is_const,
+                                  Value *init_value = nullptr);
+    GlobalVariable *get_global(const std::string &name) const;
+
+    ConstantInt *create_i1(bool value);
+    ConstantInt *create_i32(std::int64_t value);
+    ConstantFloat *create_f32(float value);
+    UndefValue *create_undef(Type *type);
+
+    std::vector<std::unique_ptr<GlobalVariable>> &globals();
+    const std::vector<std::unique_ptr<GlobalVariable>> &globals() const;
+    std::vector<std::unique_ptr<Function>> &functions();
+    const std::vector<std::unique_ptr<Function>> &functions() const;
+
+    std::string print() const;
+    bool verify(std::string *message = nullptr) const;
+
+  private:
+    std::string name_;
+    TypeContext types_;
+    std::vector<std::unique_ptr<GlobalVariable>> globals_;
+    std::vector<std::unique_ptr<Function>> functions_;
+    std::vector<std::unique_ptr<Value>> owned_constants_;
+    std::unordered_map<std::string, Function *> function_table_;
+    std::unordered_map<std::string, GlobalVariable *> global_table_;
+};
+
+class IRBuilder final {
+  public:
+    explicit IRBuilder(Module *module);
+
+    Module *module() const;
+    BasicBlock *insert_block() const;
+    void set_insert_point(BasicBlock *block);
+    void clear_insert_point();
+
+    ConstantInt *i1(bool value) const;
+    ConstantInt *i32(std::int64_t value) const;
+    ConstantFloat *f32(float value) const;
+    UndefValue *undef(Type *type) const;
+
+    BinaryInst *create_binary(Instruction::OpID op, Value *lhs, Value *rhs,
+                              const std::string &name = "");
+    CmpInst *create_icmp(CmpPred pred, Value *lhs, Value *rhs, const std::string &name = "");
+    CmpInst *create_fcmp(CmpPred pred, Value *lhs, Value *rhs, const std::string &name = "");
+    CastInst *create_zext(Value *src, Type *dst_type, const std::string &name = "");
+    CastInst *create_sitofp(Value *src, Type *dst_type, const std::string &name = "");
+    CastInst *create_fptosi(Value *src, Type *dst_type, const std::string &name = "");
+
+    AllocaInst *create_alloca(Type *allocated_type, const std::string &name = "");
+    LoadInst *create_load(Value *ptr, Type *loaded_type, const std::string &name = "");
+    StoreInst *create_store(Value *value, Value *ptr);
+    GetElementPtrInst *create_gep(Value *base_ptr, Type *result_ptr_type,
+                                  const std::vector<Value *> &indices,
+                                  const std::string &name = "");
+
+    CallInst *create_call(Value *callee, Type *return_type, const std::vector<Value *> &args,
+                          const std::string &name = "");
+    ReturnInst *create_ret(Value *value = nullptr);
+    BranchInst *create_br(BasicBlock *target);
+    BranchInst *create_cond_br(Value *cond, BasicBlock *true_bb, BasicBlock *false_bb);
+    PhiInst *create_phi(Type *type, const std::string &name = "");
+
+  private:
+    template <typename T> T *append(std::unique_ptr<T> inst) {
+        assert(insert_block_ != nullptr && "insert point is not set");
+        return static_cast<T *>(insert_block_->append_instruction(std::move(inst)));
     }
+
+    Module *module_;
+    BasicBlock *insert_block_;
+};
+
+struct VerifyResult {
+    bool ok;
+    std::string message;
+};
+
+class Verifier final {
+  public:
+    static VerifyResult verify_module(const Module &module);
 };
 
 } // namespace ir

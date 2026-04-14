@@ -30,3 +30,7 @@ xmake
 ```
 
 即可构建
+
+## 设计文档
+
+- SSA IR 设计与 AST->SSA IR 说明：`docs/ssa_ir_design.md`
