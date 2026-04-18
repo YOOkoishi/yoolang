@@ -1,29 +1,61 @@
-#include "../../include/IR/SSA_IR.h"
+#include "../../include/IRGen/IRGen.h"
 #include "../../include/include.h"
 
+#include <iostream>
+
 int main(int argc, char **argv) {
-    std::cout << "compiler starting..." << std::endl;
+    // 简单 smoke test: 手工构造 AST 做 lowering 验证
+    // int add(int a, int b) { return a + b; }
+    // int main() { return add(3, 4); }
+    using namespace irgen;
 
-    ir::Module module("ssa_smoke");
-    auto *i32 = module.types().int32_ty();
-    auto *fn_ty = module.types().func_ty(i32, {});
-    auto *fn = module.create_function("smoke_main", fn_ty, false);
-    auto *entry = fn->create_block("entry");
+    CompUnit unit;
 
-    ir::IRBuilder builder(&module);
-    builder.set_insert_point(entry);
+    {
+        auto func = std::make_unique<FuncDef>(BuiltinType::Int, "add");
+        func->params.push_back({BuiltinType::Int, "a", {}});
+        func->params.push_back({BuiltinType::Int, "b", {}});
 
-    auto *sum =
-        builder.create_binary(ir::Instruction::OpID::Add, builder.i32(1), builder.i32(2), "sum");
-    builder.create_ret(sum);
+        auto lhs = std::make_unique<LValExpr>("a");
+        auto rhs = std::make_unique<LValExpr>("b");
+        auto add_expr = std::make_unique<BinaryExpr>(BinaryOp::Add, std::move(lhs), std::move(rhs));
+        auto ret_stmt = std::make_unique<ReturnStmt>(std::move(add_expr));
 
-    std::string verify_message;
-    if (!module.verify(&verify_message)) {
-        std::cerr << "SSA verify failed: " << verify_message << std::endl;
+        auto body = std::make_unique<BlockStmt>();
+        body->stmts.push_back(std::move(ret_stmt));
+        func->body = std::move(body);
+
+        unit.functions.push_back(std::move(func));
+    }
+
+    {
+        auto func = std::make_unique<FuncDef>(BuiltinType::Int, "main");
+
+        std::vector<std::unique_ptr<Expr>> call_args;
+        call_args.push_back(std::make_unique<IntLiteral>(3));
+        call_args.push_back(std::make_unique<IntLiteral>(4));
+        auto call_expr = std::make_unique<CallExpr>("add");
+        call_expr->args = std::move(call_args);
+
+        auto ret_stmt = std::make_unique<ReturnStmt>(std::move(call_expr));
+        auto body = std::make_unique<BlockStmt>();
+        body->stmts.push_back(std::move(ret_stmt));
+        func->body = std::move(body);
+
+        unit.functions.push_back(std::move(func));
+    }
+
+    ASTToIRLowering lowering;
+    auto module = lowering.lower(unit, "smoke_test");
+
+    std::string verify_msg;
+    if (!module->verify(&verify_msg)) {
+        std::cerr << "SSA verify FAILED: " << verify_msg << std::endl;
         return 1;
     }
 
-    std::cout << module.print() << std::endl;
+    std::cout << "SSA verify OK" << std::endl;
+    std::cout << module->print() << std::endl;
 
     return 0;
 }
