@@ -1,7 +1,6 @@
 #include "../../include/parser/parser.h"
 
-int yylex();
-void yyerror(std::unique_ptr<CompUnit> &ast, const char *s);
+int nextToken();
 
 namespace {
 
@@ -19,8 +18,8 @@ class Parser {
 
     std::unique_ptr<CompUnit> parseCompUnit() {
         auto unit = std::make_unique<CompUnit>();
-        while (!check(0)) {
-            if (check(CONST)) {
+        while (!check(TOK_EOF)) {
+            if (check(TOK_CONST)) {
                 auto decl = parseDeclStmt();
                 if (!decl) {
                     return nullptr;
@@ -70,29 +69,30 @@ class Parser {
     std::unique_ptr<CompUnit> &ast_;
     std::vector<Token> tokens_;
     std::size_t position_ = 0;
+    bool has_error_ = false;
 
     static bool isTypeToken(int kind) {
-        return kind == INT || kind == FLOAT || kind == VOID;
+        return kind == TOK_INT || kind == TOK_FLOAT || kind == TOK_VOID;
     }
 
     void syntaxError(const std::string &message) {
-        yyerror(ast_, message.c_str());
+        std::cerr << "error: " << message << std::endl;
+        has_error_ = true;
     }
 
     void ensure(std::size_t index) {
         while (tokens_.size() <= index) {
             Token token;
-            token.kind = yylex();
-            if (token.kind == IDENT) {
-                token.text = *yylval.str_val;
-                delete yylval.str_val;
-            } else if (token.kind == INT_CONST) {
-                token.int_val = yylval.int_val;
-            } else if (token.kind == FLOAT_CONST) {
-                token.float_val = yylval.float_val;
+            token.kind = nextToken();
+            if (token.kind == TOK_IDENT) {
+                token.text = token_value.str_val;
+            } else if (token.kind == TOK_INT_CONST) {
+                token.int_val = token_value.int_val;
+            } else if (token.kind == TOK_FLOAT_CONST) {
+                token.float_val = token_value.float_val;
             }
             tokens_.push_back(std::move(token));
-            if (tokens_.back().kind == 0) {
+            if (tokens_.back().kind == TOK_EOF) {
                 break;
             }
         }
@@ -125,7 +125,7 @@ class Parser {
     }
 
     bool consumeIdentifier(std::string &name) {
-        if (!check(IDENT)) {
+        if (!check(TOK_IDENT)) {
             syntaxError("expected identifier");
             return false;
         }
@@ -144,13 +144,13 @@ class Parser {
     }
 
     BuiltinType parseBType() {
-        if (match(INT)) {
+        if (match(TOK_INT)) {
             return BuiltinType::Int;
         }
-        if (match(FLOAT)) {
+        if (match(TOK_FLOAT)) {
             return BuiltinType::Float;
         }
-        if (match(VOID)) {
+        if (match(TOK_VOID)) {
             return BuiltinType::Void;
         }
         syntaxError("expected type");
@@ -159,7 +159,7 @@ class Parser {
 
     std::unique_ptr<DeclStmt> parseDeclStmt() {
         bool is_const = false;
-        if (match(CONST)) {
+        if (match(TOK_CONST)) {
             is_const = true;
         }
 
@@ -276,7 +276,7 @@ class Parser {
 
         auto block = std::make_unique<BlockStmt>();
         while (!check('}')) {
-            if (check(0)) {
+            if (check(TOK_EOF)) {
                 syntaxError("expected '}'");
                 return nullptr;
             }
@@ -298,11 +298,11 @@ class Parser {
             return parseBlockStmt();
         }
 
-        if (check(CONST) || isTypeToken(current().kind)) {
+        if (check(TOK_CONST) || isTypeToken(current().kind)) {
             return parseDeclStmt();
         }
 
-        if (match(IF)) {
+        if (match(TOK_IF)) {
             if (!expect('(', "'('")) {
                 return nullptr;
             }
@@ -315,7 +315,7 @@ class Parser {
                 return nullptr;
             }
             std::unique_ptr<Stmt> else_stmt;
-            if (match(ELSE)) {
+            if (match(TOK_ELSE)) {
                 else_stmt = parseStmt();
                 if (!else_stmt) {
                     return nullptr;
@@ -324,7 +324,7 @@ class Parser {
             return std::make_unique<IfStmt>(std::move(cond), std::move(then_stmt), std::move(else_stmt));
         }
 
-        if (match(WHILE)) {
+        if (match(TOK_WHILE)) {
             if (!expect('(', "'('")) {
                 return nullptr;
             }
@@ -339,7 +339,7 @@ class Parser {
             return std::make_unique<WhileStmt>(std::move(cond), std::move(body));
         }
 
-        if (match(RETURN)) {
+        if (match(TOK_RETURN)) {
             if (match(';')) {
                 return std::make_unique<ReturnStmt>();
             }
@@ -350,14 +350,14 @@ class Parser {
             return std::make_unique<ReturnStmt>(std::move(expr));
         }
 
-        if (match(BREAK)) {
+        if (match(TOK_BREAK)) {
             if (!expect(';', "';'")) {
                 return nullptr;
             }
             return std::make_unique<BreakStmt>();
         }
 
-        if (match(CONTINUE)) {
+        if (match(TOK_CONTINUE)) {
             if (!expect(';', "';'")) {
                 return nullptr;
             }
@@ -369,7 +369,7 @@ class Parser {
         }
 
         std::size_t mark = position_;
-        if (check(IDENT)) {
+        if (check(TOK_IDENT)) {
             std::string name = current().text;
             ++position_;
             auto lval = parseLValTail(std::move(name));
@@ -468,7 +468,7 @@ class Parser {
         if (!expr) {
             return nullptr;
         }
-        while (match(LOR)) {
+        while (match(TOK_LOR)) {
             auto rhs = parseLAndExp();
             if (!rhs) {
                 return nullptr;
@@ -483,7 +483,7 @@ class Parser {
         if (!expr) {
             return nullptr;
         }
-        while (match(LAND)) {
+        while (match(TOK_LAND)) {
             auto rhs = parseEqExp();
             if (!rhs) {
                 return nullptr;
@@ -498,14 +498,14 @@ class Parser {
         if (!expr) {
             return nullptr;
         }
-        while (check(EQ) || check(NE)) {
+        while (check(TOK_EQ) || check(TOK_NE)) {
             int op = current().kind;
             ++position_;
             auto rhs = parseRelExp();
             if (!rhs) {
                 return nullptr;
             }
-            expr = std::make_unique<BinaryExpr>(op == EQ ? BinaryOp::Eq : BinaryOp::Ne,
+            expr = std::make_unique<BinaryExpr>(op == TOK_EQ ? BinaryOp::Eq : BinaryOp::Ne,
                                                 std::move(expr), std::move(rhs));
         }
         return expr;
@@ -516,7 +516,7 @@ class Parser {
         if (!expr) {
             return nullptr;
         }
-        while (check('<') || check('>') || check(LE) || check(GE)) {
+        while (check('<') || check('>') || check(TOK_LE) || check(TOK_GE)) {
             int op = current().kind;
             ++position_;
             auto rhs = parseAddExp();
@@ -528,7 +528,7 @@ class Parser {
                 binary_op = BinaryOp::Lt;
             } else if (op == '>') {
                 binary_op = BinaryOp::Gt;
-            } else if (op == LE) {
+            } else if (op == TOK_LE) {
                 binary_op = BinaryOp::Le;
             } else {
                 binary_op = BinaryOp::Ge;
@@ -612,19 +612,19 @@ class Parser {
             return expr;
         }
 
-        if (check(INT_CONST)) {
+        if (check(TOK_INT_CONST)) {
             int value = current().int_val;
             ++position_;
             return std::make_unique<IntLiteral>(value);
         }
 
-        if (check(FLOAT_CONST)) {
+        if (check(TOK_FLOAT_CONST)) {
             float value = current().float_val;
             ++position_;
             return std::make_unique<FloatLiteral>(value);
         }
 
-        if (check(IDENT)) {
+        if (check(TOK_IDENT)) {
             std::string name = current().text;
             ++position_;
             if (match('(')) {
@@ -651,9 +651,7 @@ class Parser {
 
 } // namespace
 
-YYSTYPE yylval;
-
-int yyparse(std::unique_ptr<CompUnit> &ast) {
+int parse(std::unique_ptr<CompUnit> &ast) {
     Parser parser(ast);
     auto result = parser.parseCompUnit();
     if (!result) {
@@ -661,9 +659,4 @@ int yyparse(std::unique_ptr<CompUnit> &ast) {
     }
     ast = std::move(result);
     return 0;
-}
-
-void yyerror(std::unique_ptr<CompUnit> &ast, const char *s) {
-    (void)ast;
-    std::cerr << "error: " << s << std::endl;
 }

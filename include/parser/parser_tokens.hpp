@@ -1,73 +1,47 @@
 #pragma once
 
 #include <string>
+#include <variant>
 #include <vector>
 
-enum yytokentype {
-    INT = 258,
-    FLOAT = 259,
-    VOID = 260,
-    RETURN = 261,
-    CONST = 262,
-    IF = 263,
-    ELSE = 264,
-    WHILE = 265,
-    BREAK = 266,
-    CONTINUE = 267,
-    LE = 268,
-    GE = 269,
-    EQ = 270,
-    NE = 271,
-    LOR = 272,
-    LAND = 273,
-    IDENT = 274,
-    INT_CONST = 275,
-    FLOAT_CONST = 276,
-    UNOT = 277,
-    UMINUS = 278,
-    UPLUS = 279
+// Token 类型枚举（从 258 开始以避免与 ASCII 字符冲突）
+enum TokenKind {
+    TOK_EOF = 0,
+
+    // 关键字
+    TOK_INT = 258,
+    TOK_FLOAT = 259,
+    TOK_VOID = 260,
+    TOK_RETURN = 261,
+    TOK_CONST = 262,
+    TOK_IF = 263,
+    TOK_ELSE = 264,
+    TOK_WHILE = 265,
+    TOK_BREAK = 266,
+    TOK_CONTINUE = 267,
+
+    // 运算符
+    TOK_LE = 268,
+    TOK_GE = 269,
+    TOK_EQ = 270,
+    TOK_NE = 271,
+    TOK_LOR = 272,
+    TOK_LAND = 273,
+
+    // 字面量 / 标识符
+    TOK_IDENT = 274,
+    TOK_INT_CONST = 275,
+    TOK_FLOAT_CONST = 276,
+
+    // 错误
+    TOK_ERROR = 277,
 };
 
-#define INT 258
-#define FLOAT 259
-#define VOID 260
-#define RETURN 261
-#define CONST 262
-#define IF 263
-#define ELSE 264
-#define WHILE 265
-#define BREAK 266
-#define CONTINUE 267
-#define LE 268
-#define GE 269
-#define EQ 270
-#define NE 271
-#define LOR 272
-#define LAND 273
-#define IDENT 274
-#define INT_CONST 275
-#define FLOAT_CONST 276
-#define UNOT 277
-#define UMINUS 278
-#define UPLUS 279
+// Lexer 产生的语义值
+struct TokenValue {
+    std::string str_val;
+    int int_val = 0;
+    float float_val = 0.0f;
+};
 
-typedef union YYSTYPE {
-    std::string *str_val;
-    int int_val;
-    float float_val;
-    void *expr;
-    void *stmt;
-    void *decl_stmt;
-    void *var_decl;
-    void *func_def;
-    void *comp_unit;
-    void *init_val;
-    void *param_val;
-    std::vector<void *> *expr_vec;
-    std::vector<void *> *stmt_vec;
-    std::vector<void *> *var_decl_vec;
-    std::vector<void *> *init_val_vec;
-    std::vector<void *> *param_vec;
-} YYSTYPE;
-
-extern YYSTYPE yylval;
+extern TokenValue token_value;

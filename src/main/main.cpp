@@ -1,8 +1,8 @@
 #include "../../include/include.h"
 #include "../../include/ast/ast.h"
 
-extern FILE *yyin;
-int yyparse(std::unique_ptr<CompUnit> &ast);
+extern FILE *lexer_input;
+int parse(std::unique_ptr<CompUnit> &ast);
 
 namespace {
 
@@ -287,9 +287,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    yyin = input;
+    lexer_input = input;
     std::unique_ptr<CompUnit> ast;
-    if (yyparse(ast) != 0 || !ast) {
+    if (parse(ast) != 0 || !ast) {
         std::cerr << "parse failed\n";
         fclose(input);
         return 1;

@@ -8,8 +8,9 @@
 
 using namespace std;
 
-FILE *yyin = nullptr;
-FILE *yyout = nullptr;
+FILE *lexer_input = nullptr;
+
+TokenValue token_value;
 
 namespace {
 
@@ -23,7 +24,7 @@ void loadInput() {
     }
 
     loaded = true;
-    FILE *stream = yyin != nullptr ? yyin : stdin;
+    FILE *stream = lexer_input != nullptr ? lexer_input : stdin;
     int ch = 0;
     while ((ch = std::fgetc(stream)) != EOF) {
         input.push_back(static_cast<char>(ch));
@@ -102,38 +103,38 @@ int scanKeywordOrIdent() {
 
     std::string name = input.substr(start, loc - start);
     if (name == "int") {
-        return INT;
+        return TOK_INT;
     }
     if (name == "float") {
-        return FLOAT;
+        return TOK_FLOAT;
     }
     if (name == "void") {
-        return VOID;
+        return TOK_VOID;
     }
     if (name == "return") {
-        return RETURN;
+        return TOK_RETURN;
     }
     if (name == "const") {
-        return CONST;
+        return TOK_CONST;
     }
     if (name == "if") {
-        return IF;
+        return TOK_IF;
     }
     if (name == "else") {
-        return ELSE;
+        return TOK_ELSE;
     }
     if (name == "while") {
-        return WHILE;
+        return TOK_WHILE;
     }
     if (name == "break") {
-        return BREAK;
+        return TOK_BREAK;
     }
     if (name == "continue") {
-        return CONTINUE;
+        return TOK_CONTINUE;
     }
 
-    yylval.str_val = new std::string(name);
-    return IDENT;
+    token_value.str_val = name;
+    return TOK_IDENT;
 }
 
 int scanNumber() {
@@ -183,12 +184,12 @@ int scanNumber() {
 
     std::string raw = input.substr(start, loc - start);
     if (isFloat) {
-        yylval.float_val = strtof(raw.c_str(), nullptr);
-        return FLOAT_CONST;
+        token_value.float_val = strtof(raw.c_str(), nullptr);
+        return TOK_FLOAT_CONST;
     }
 
-    yylval.int_val = static_cast<int>(strtol(raw.c_str(), nullptr, 0));
-    return INT_CONST;
+    token_value.int_val = static_cast<int>(strtol(raw.c_str(), nullptr, 0));
+    return TOK_INT_CONST;
 }
 
 int scanPunctuation() {
@@ -196,27 +197,27 @@ int scanPunctuation() {
 
     if (startsWith("<=")) {
         advance(2);
-        return LE;
+        return TOK_LE;
     }
     if (startsWith(">=")) {
         advance(2);
-        return GE;
+        return TOK_GE;
     }
     if (startsWith("==")) {
         advance(2);
-        return EQ;
+        return TOK_EQ;
     }
     if (startsWith("!=")) {
         advance(2);
-        return NE;
+        return TOK_NE;
     }
     if (startsWith("||")) {
         advance(2);
-        return LOR;
+        return TOK_LOR;
     }
     if (startsWith("&&")) {
         advance(2);
-        return LAND;
+        return TOK_LAND;
     }
 
     advance();
@@ -225,12 +226,12 @@ int scanPunctuation() {
 
 } // namespace
 
-int yylex() {
+int nextToken() {
     loadInput();
     skipWhitespaceAndComments();
 
     if (atEnd()) {
-        return 0;
+        return TOK_EOF;
     }
 
     char c = peek();
@@ -238,7 +239,8 @@ int yylex() {
         return scanKeywordOrIdent();
     }
 
-    if (std::isdigit(static_cast<unsigned char>(c)) || (c == '.' && std::isdigit(static_cast<unsigned char>(peek(1))))) {
+    if (std::isdigit(static_cast<unsigned char>(c)) ||
+        (c == '.' && std::isdigit(static_cast<unsigned char>(peek(1))))) {
         return scanNumber();
     }
 
@@ -264,8 +266,8 @@ int yylex() {
     case '|':
         return scanPunctuation();
     default:
-        std::cerr << "Lexical error: " << c << std::endl;
+        std::cerr << "Lexical error: unexpected character '" << c << "'" << std::endl;
         advance();
-        return static_cast<unsigned char>(c);
+        return TOK_ERROR;
     }
 }
