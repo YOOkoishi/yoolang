@@ -42,3 +42,5 @@ test/**.in
 test/**.out
 
 参考/*
+
+!runtime/*
