@@ -180,12 +180,12 @@ ir::Type *map_builtin_type_local(ir::TypeContext &types, BuiltinType type);
 class FunctionLowering {
   public:
     FunctionLowering(ir::Module *module, ir::Function *func)
-        : module_(module), func_(func), builder_(module) {
+        : module_(module), func_(func), builder_(module), entry_block_(nullptr), unique_id_(0) {
     }
 
     void run(FuncDef &ast_func) {
-        auto *entry = func_->create_block("entry");
-        builder_.set_insert_point(entry);
+        entry_block_ = func_->create_block("entry");
+        builder_.set_insert_point(entry_block_);
 
         // 参数 alloca + store
         const auto n = std::min(func_->args().size(), ast_func.params.size());
@@ -196,7 +196,7 @@ class FunctionLowering {
 
             // 如果参数是指针类型（数组参数），alloca 一个 T* 槽；否则 alloca 标量
             ir::Type *alloca_ty = arg_ty;
-            auto *alloca = builder_.create_alloca(alloca_ty, param_ast.name);
+            auto *alloca = emit_alloca(alloca_ty, param_ast.name);
             builder_.create_store(arg, alloca);
             push_scope();
             symbol_table_[param_ast.name] = alloca;
@@ -222,12 +222,31 @@ class FunctionLowering {
     ir::Module *module_;
     ir::Function *func_;
     ir::IRBuilder builder_;
+    ir::BasicBlock *entry_block_; // entry 块指针，alloca 始终插入此处
+    int unique_id_;               // 唯一 ID 计数器
     std::vector<std::unordered_map<std::string, ir::Value *>> scopes_;
     std::unordered_map<std::string, ir::Value *> symbol_table_;
 
     // break/continue 的跳转目标栈
     std::vector<ir::BasicBlock *> break_stack_;
     std::vector<ir::BasicBlock *> continue_stack_;
+
+    // ---- 唯一名称生成 ----
+
+    std::string unique_name(const std::string &base) {
+        return base + "." + std::to_string(unique_id_++);
+    }
+
+    // ---- 在 entry 块插入 alloca ----
+
+    ir::AllocaInst *emit_alloca(ir::Type *ty, const std::string &name_hint) {
+        // 始终在 entry 块的插入点创建 alloca（标准 SSA 做法）
+        auto *saved_bb = builder_.insert_block();
+        builder_.set_insert_point(entry_block_);
+        auto *inst = builder_.create_alloca(ty, unique_name(name_hint));
+        builder_.set_insert_point(saved_bb);
+        return inst;
+    }
 
     // ---- 作用域管理 ----
 
@@ -318,6 +337,12 @@ class FunctionLowering {
             builder_.create_store(val, ptr);
         } else {
             // 数组元素赋值：计算 GEP 然后 store
+            // 如果 ptr 是 alloca 且指向指针类型（数组参数的 alloca 槽），先 load 获取真正的数组基址
+            if (auto *pt = dynamic_cast<ir::PointerType *>(ptr->type())) {
+                if (pt->element_type()->is_pointer()) {
+                    ptr = builder_.create_load(ptr, pt->element_type(), target.name + ".ptr");
+                }
+            }
             auto *gep = compute_array_gep(ptr, target.indices);
             val = unify_type_for_store(val, gep);
             builder_.create_store(val, gep);
@@ -438,7 +463,7 @@ class FunctionLowering {
     void lower_local_var_decl(VarDecl &decl) {
         ir::Type *base = map_builtin_type_local(types(), decl.base_type);
         ir::Type *value_type = build_decl_type(types(), base, decl.dimensions);
-        auto *alloca = builder_.create_alloca(value_type, decl.name);
+        auto *alloca = emit_alloca(value_type, decl.name);
         define(decl.name, alloca);
 
         // 初始化
@@ -495,6 +520,12 @@ class FunctionLowering {
             return builder_.create_load(ptr, loaded_type(ptr), e.name);
         } else {
             // 数组元素：GEP + load
+            // 如果 ptr 是 alloca 且指向指针类型（数组参数的 alloca 槽），先 load 获取真正的数组基址
+            if (auto *pt = dynamic_cast<ir::PointerType *>(ptr->type())) {
+                if (pt->element_type()->is_pointer()) {
+                    ptr = builder_.create_load(ptr, pt->element_type(), e.name + ".ptr");
+                }
+            }
             auto *gep = compute_array_gep(ptr, e.indices);
             return builder_.create_load(gep, loaded_type(gep), e.name);
         }

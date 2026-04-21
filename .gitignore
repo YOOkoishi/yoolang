@@ -41,6 +41,6 @@ $RECYCLE.BIN/
 test/**.in
 test/**.out
 
-参考/*
+参考/**
 
 !runtime/*

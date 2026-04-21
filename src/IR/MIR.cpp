@@ -306,18 +306,24 @@ void MachineInst::emit() const {
     case Op::CALL:
         os << "  call " << symbol_ << "\n";
         break;
-    case Op::RET:
+    case Op::RET: {
+        // Epilogue: 恢复 ra 和 s0，恢复 sp
+        // 需要获取 frame size，但 MachineInst 不直接持有 MachineFunction
+        // 所以我们在 MachineFunction::emit 中为入口块前置 prologue，为含 RET 的块追加 epilogue
+        // 这里只生成返回值搬运 + jr ra
         if (!operands_.empty())
             os << "  mv a0, " << rn(operands_[0].reg()) << "\n";
         os << "  ret\n";
         break;
+    }
 
     // ---- 类型转换 ----
     case Op::FCVT_S_W:
         os << "  fcvt.s.w " << rn(operands_[0].reg()) << ", " << rn(operands_[1].reg()) << "\n";
         break;
     case Op::FCVT_W_S:
-        os << "  fcvt.w.s " << rn(operands_[0].reg()) << ", " << rn(operands_[1].reg()) << "\n";
+        os << "  fcvt.w.s " << rn(operands_[0].reg()) << ", " << rn(operands_[1].reg())
+           << ", rtz\n";
         break;
 
     // ---- 零扩展 ----
@@ -365,10 +371,25 @@ void MachineFunction::emit() const {
     }
 
     // ---- 基本块 ----
-    for (auto it = blocks_begin(); it != blocks_end(); ++it)
-        (*it)->emit();
+    // 生成 epilogue 的辅助 lambda
+    auto emit_epilogue = [&]() {
+        std::cout << "  lw ra, " << (fs - 4) << "(s0)\n";
+        std::cout << "  lw s0, " << (fs - 8) << "(s0)\n";
+        std::cout << "  addi sp, sp, " << fs << "\n";
+    };
 
-    // (Epilogue 由 RET 指令生成，或在此补充 fallthrough epilogue)
+    for (auto it = blocks_begin(); it != blocks_end(); ++it) {
+        auto *bb = it->get();
+        std::cout << "." << bb->label << ":\n";
+        for (const auto &inst : *bb) {
+            // 在 RET 之前输出 epilogue（恢复 callee-saved 寄存器和 sp）
+            if (inst->opcode() == MachineInst::Op::RET) {
+                emit_epilogue();
+            }
+            inst->emit();
+        }
+    }
+
     std::cout << "\n";
 }
 

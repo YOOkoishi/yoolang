@@ -1,4 +1,4 @@
-#include "../../include/parser/parser.h"
+#include "../../include/front/parser.h"
 
 int nextToken();
 
@@ -13,8 +13,8 @@ struct Token {
 
 class Parser {
   public:
-        explicit Parser(std::unique_ptr<CompUnit> &ast) : ast_(ast) {
-        }
+    explicit Parser(std::unique_ptr<CompUnit> &ast) : ast_(ast) {
+    }
 
     std::unique_ptr<CompUnit> parseCompUnit() {
         auto unit = std::make_unique<CompUnit>();
@@ -321,7 +321,8 @@ class Parser {
                     return nullptr;
                 }
             }
-            return std::make_unique<IfStmt>(std::move(cond), std::move(then_stmt), std::move(else_stmt));
+            return std::make_unique<IfStmt>(std::move(cond), std::move(then_stmt),
+                                            std::move(else_stmt));
         }
 
         if (match(TOK_WHILE)) {

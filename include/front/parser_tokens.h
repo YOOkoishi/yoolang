@@ -4,7 +4,6 @@
 #include <variant>
 #include <vector>
 
-// Token 类型枚举（从 258 开始以避免与 ASCII 字符冲突）
 enum TokenKind {
     TOK_EOF = 0,
 

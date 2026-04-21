@@ -1,8 +1,7 @@
 #pragma once
 
-#include "../include.h"
 #include "../ast/ast.h"
-#include "parser_tokens.hpp"
+#include "../include.h"
+#include "parser_tokens.h"
 
 int parse(std::unique_ptr<CompUnit> &ast);
-

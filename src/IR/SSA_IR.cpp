@@ -749,10 +749,9 @@ Argument *Function::add_argument(Type *type, const std::string &name) {
 }
 
 BasicBlock *Function::create_block(const std::string &name) {
-    std::string block_name = name;
-    if (block_name.empty()) {
-        block_name = "bb" + std::to_string(next_block_id_++);
-    }
+    // 始终生成唯一名：原名 + 计数器
+    std::string block_name = name.empty() ? "bb" : name;
+    block_name += "." + std::to_string(next_block_id_++);
     auto block = std::make_unique<BasicBlock>(parent_->types().label_ty(), block_name, this);
     auto *raw = block.get();
     blocks_.push_back(std::move(block));
