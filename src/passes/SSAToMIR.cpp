@@ -191,14 +191,15 @@ void SSAToMIRLowering::lower_function(Function &func, MachineModule &mm) {
     for (auto *phi : pending_phis_) {
         auto *dst = vreg_map_[phi];
         for (auto &[val, from_bb] : phi->incoming()) {
-            auto *src = get_vreg(val);
             auto *pred_mbb = bb_map_[from_bb];
+            // 临时设置 cur_mbb_ 以便 get_vreg/materialize_constant 正确插入指令
+            cur_mbb_ = pred_mbb;
+            auto *src = get_vreg(val);
             // 在前驱块的跳转指令之前插入 MV
-            // 使用 push_back：由于 SSA 的 phi 已收集完毕，
-            // 后续 emit 时 MV 会在 J/BRANCH 之前（list 中有序）
             pred_mbb->push_back(MachineInst::make_mv(dst, src, pred_mbb));
         }
     }
+    cur_mbb_ = nullptr;
 
     // ---- Phase 5: 在入口块开头插入 Alloca 地址初始化 ----
     // alloca 的地址已在 Phase 2 中通过 alloca_slots_ 记录，
