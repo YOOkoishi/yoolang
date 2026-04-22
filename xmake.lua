@@ -1,9 +1,7 @@
 add_rules("mode.debug", "mode.release")
 
--- 源文件列表（不含 main）
 local srcs = {
     "src/ast/**.cpp",
-    "src/CodeGen/**.cpp",
     "src/IR/**.cpp",
     "src/IRGen/**.cpp",
     "src/front/**.cpp",
