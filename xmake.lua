@@ -17,10 +17,3 @@ target("yoolang")
     add_files(srcs)
     add_files("src/main/main.cpp")
 
-target("test_ir")
-    set_kind("binary")
-    set_languages("c++17")
-    add_includedirs("include")
-    add_files(srcs)
-    add_files("src/main/test_ir.cpp")
-

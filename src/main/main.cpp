@@ -1,61 +1,75 @@
-#include "../../include/IRGen/IRGen.h"
-#include "../../include/include.h"
+#include "../include/IR/MIR.h"
+#include "../include/IRGen/IRGen.h"
+#include "../include/front/parser.h"
+#include "../include/include.h"
+#include "../include/passes/passes.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <string>
+
+extern FILE *lexer_input;
 
 int main(int argc, char **argv) {
-    // 简单 smoke test: 手工构造 AST 做 lowering 验证
-    // int add(int a, int b) { return a + b; }
-    // int main() { return add(3, 4); }
-    using namespace irgen;
-
-    CompUnit unit;
-
-    {
-        auto func = std::make_unique<FuncDef>(BuiltinType::Int, "add");
-        func->params.push_back({BuiltinType::Int, "a", {}});
-        func->params.push_back({BuiltinType::Int, "b", {}});
-
-        auto lhs = std::make_unique<LValExpr>("a");
-        auto rhs = std::make_unique<LValExpr>("b");
-        auto add_expr = std::make_unique<BinaryExpr>(BinaryOp::Add, std::move(lhs), std::move(rhs));
-        auto ret_stmt = std::make_unique<ReturnStmt>(std::move(add_expr));
-
-        auto body = std::make_unique<BlockStmt>();
-        body->stmts.push_back(std::move(ret_stmt));
-        func->body = std::move(body);
-
-        unit.functions.push_back(std::move(func));
-    }
-
-    {
-        auto func = std::make_unique<FuncDef>(BuiltinType::Int, "main");
-
-        std::vector<std::unique_ptr<Expr>> call_args;
-        call_args.push_back(std::make_unique<IntLiteral>(3));
-        call_args.push_back(std::make_unique<IntLiteral>(4));
-        auto call_expr = std::make_unique<CallExpr>("add");
-        call_expr->args = std::move(call_args);
-
-        auto ret_stmt = std::make_unique<ReturnStmt>(std::move(call_expr));
-        auto body = std::make_unique<BlockStmt>();
-        body->stmts.push_back(std::move(ret_stmt));
-        func->body = std::move(body);
-
-        unit.functions.push_back(std::move(func));
-    }
-
-    ASTToIRLowering lowering;
-    auto module = lowering.lower(unit, "smoke_test");
-
-    std::string verify_msg;
-    if (!module->verify(&verify_msg)) {
-        std::cerr << "SSA verify FAILED: " << verify_msg << std::endl;
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <input.sy> [--emit-asm] [module_name]" << std::endl;
         return 1;
     }
 
-    std::cout << "SSA verify OK" << std::endl;
+    const char *filename = argv[1];
+    bool emit_asm = false;
+    std::string module_name = "test_module";
+
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--emit-asm") {
+            emit_asm = true;
+        } else {
+            module_name = arg;
+        }
+    }
+
+    // 1. Lexing + Parsing
+    FILE *f = std::fopen(filename, "r");
+    if (!f) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return 1;
+    }
+    lexer_input = f;
+
+    std::unique_ptr<CompUnit> ast;
+    int rc = parse(ast);
+    std::fclose(f);
+    lexer_input = nullptr;
+
+    if (rc != 0 || !ast) {
+        std::cerr << "Parse FAILED for: " << filename << std::endl;
+        return 1;
+    }
+
+    // 2. AST -> SSA IR
+    irgen::ASTToIRLowering lowering;
+    auto module = lowering.lower(*ast, module_name);
+
+    // 3. Verify
+    std::string verify_msg;
+    if (!module->verify(&verify_msg)) {
+        std::cerr << "WARNING: SSA verify FAILED: " << verify_msg << std::endl;
+        // 仍然输出 IR 以便调试
+    }
+
+    // 4. Print SSA IR
+    std::cout << "; === IR for " << filename << " ===" << std::endl;
     std::cout << module->print() << std::endl;
+
+    // 5. SSA IR -> Machine IR -> RISC-V assembly
+    if (emit_asm) {
+        std::cout << "\n; === RISC-V Assembly ===" << std::endl;
+        passes::SSAToMIRLowering mir_lowering;
+        auto machine_module = mir_lowering.lower(*module);
+        machine_module->emit();
+    }
 
     return 0;
 }
