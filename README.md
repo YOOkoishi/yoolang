@@ -1,5 +1,7 @@
 # yoolang
 
+![yoolang](/yoolang.jpg)
+
 ## 首次拉取（Git LFS）
 
 本仓库的部分测试数据由 Git LFS 管理。首次拉取请执行：
@@ -30,3 +32,5 @@ xmake
 ```
 
 即可构建
+
+

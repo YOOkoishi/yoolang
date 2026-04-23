@@ -4,6 +4,7 @@ local srcs = {
     "src/ast/**.cpp",
     "src/IR/**.cpp",
     "src/front/**.cpp",
+    "src/pass/**.cpp",
 }
 
 target("yoolang")
