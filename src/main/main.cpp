@@ -18,13 +18,13 @@ int main(int argc, char **argv) {
     }
 
     const char *filename = argv[1];
-    bool emit_asm = false;
+    bool emit_ir = false;
     std::string module_name = "test_module";
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--emit-asm") {
-            emit_asm = true;
+        if (arg == "--emit-ir") {
+            emit_ir = true;
         } else {
             module_name = arg;
         }
@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
     std::cout << module->print() << std::endl;
 
     // 5. SSA IR -> Machine IR -> RISC-V assembly
-    if (emit_asm) {
+    if (!emit_ir) {
         std::cout << "\n; === RISC-V Assembly ===" << std::endl;
         passes::SSAToMIRLowering mir_lowering;
         auto machine_module = mir_lowering.lower(*module);
