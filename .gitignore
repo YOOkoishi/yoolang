@@ -44,3 +44,7 @@ test/**.out
 参考/**
 
 !runtime/*
+
+tmp/*
+
+.codex
