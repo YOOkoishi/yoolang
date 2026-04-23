@@ -3,9 +3,7 @@ add_rules("mode.debug", "mode.release")
 local srcs = {
     "src/ast/**.cpp",
     "src/IR/**.cpp",
-    "src/IRGen/**.cpp",
     "src/front/**.cpp",
-    "src/passes/**.cpp",
 }
 
 target("yoolang")
@@ -14,4 +12,3 @@ target("yoolang")
     add_includedirs("include")
     add_files(srcs)
     add_files("src/main/main.cpp")
-
