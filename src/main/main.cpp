@@ -13,7 +13,7 @@ extern FILE *lexer_input;
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <input.sy> [--emit-asm] [module_name]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input.sy> [--emit-ir] [module_name]" << std::endl;
         return 1;
     }
 
@@ -59,13 +59,9 @@ int main(int argc, char **argv) {
         // 仍然输出 IR 以便调试
     }
 
-    // 4. Print SSA IR
-    std::cout << "; === IR for " << filename << " ===" << std::endl;
-    std::cout << module->print() << std::endl;
-
-    // 5. SSA IR -> Machine IR -> RISC-V assembly
-    if (!emit_ir) {
-        std::cout << "\n; === RISC-V Assembly ===" << std::endl;
+    if (emit_ir) {
+        std::cout << module->print();
+    } else {
         passes::SSAToMIRLowering mir_lowering;
         auto machine_module = mir_lowering.lower(*module);
         machine_module->emit();

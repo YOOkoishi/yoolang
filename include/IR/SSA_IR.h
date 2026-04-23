@@ -369,6 +369,7 @@ class BasicBlock final : public Value {
     BasicBlock(Type *label_type, const std::string &name, Function *parent);
 
     Instruction *append_instruction(std::unique_ptr<Instruction> inst);
+    Instruction *insert_before_terminator(std::unique_ptr<Instruction> inst);
     bool has_terminator() const;
     Instruction *terminator() const;
 

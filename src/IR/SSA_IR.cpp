@@ -667,6 +667,17 @@ Instruction *BasicBlock::append_instruction(std::unique_ptr<Instruction> inst) {
     return raw;
 }
 
+Instruction *BasicBlock::insert_before_terminator(std::unique_ptr<Instruction> inst) {
+    auto *raw = inst.get();
+    raw->set_parent(this);
+    if (has_terminator()) {
+        instructions_.insert(std::prev(instructions_.end()), std::move(inst));
+    } else {
+        instructions_.push_back(std::move(inst));
+    }
+    return raw;
+}
+
 bool BasicBlock::has_terminator() const {
     if (instructions_.empty()) {
         return false;
