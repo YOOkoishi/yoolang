@@ -1,0 +1,43 @@
+module {
+  yir.global @a : array<4 x array<2 x i32>> = {{1, 2}, {3, 0}, {4, 5}, {6, 0}}
+  yir.global @largezero : array<10000 x i32> = zero
+  yir.func @main() -> i32 {
+    %b = yir.array_var : array<4 x array<2 x array<3 x i32>>>
+    yir.array_init %b : array<4 x array<2 x array<3 x i32>>> {
+      [0, 0, 0] = 1
+      [0, 0, 1] = 2
+      [0, 0, 2] = 3
+      [0, 1, 0] = 4
+      [1, 0, 0] = 5
+      default = zero
+    }
+    %v0 = yir.const.i32 1 : i32
+    %v1 = yir.const.i32 0 : i32
+    %a = yir.array_load @a, [%v0, %v1] : i32
+    %c = yir.var : i32 = %a
+    %v2 = yir.const.i32 4 : i32
+    %v3 = yir.const.i32 1 : i32
+    %v4 = yir.const.i32 0 : i32
+    yir.array_store %v2, @a, [%v3, %v4]
+    %v5 = yir.const.i32 5 : i32
+    %v6 = yir.const.i32 0 : i32
+    %v7 = yir.const.i32 0 : i32
+    %v8 = yir.const.i32 0 : i32
+    yir.array_store %v5, %b, [%v6, %v7, %v8]
+    %v9 = yir.const.i32 1 : i32
+    %v10 = yir.const.i32 0 : i32
+    %a.1 = yir.array_load @a, [%v9, %v10] : i32
+    %v11 = yir.addi %c, %a.1 : i32
+    %v12 = yir.const.i32 0 : i32
+    %v13 = yir.const.i32 0 : i32
+    %v14 = yir.const.i32 0 : i32
+    %b.1 = yir.array_load %b, [%v12, %v13, %v14] : i32
+    %v15 = yir.addi %v11, %b.1 : i32
+    %v16 = yir.const.i32 0 : i32
+    %v17 = yir.const.i32 0 : i32
+    %v18 = yir.const.i32 1 : i32
+    %b.2 = yir.array_load %b, [%v16, %v17, %v18] : i32
+    %v19 = yir.addi %v15, %b.2 : i32
+    yir.return %v19
+  }
+}

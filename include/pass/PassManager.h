@@ -3,11 +3,11 @@
 #include "../IR/SSA_IR.h"
 #include "../ast/ast.h"
 
-#include <any>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <typeinfo>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -52,7 +52,11 @@ class PassContext {
     void erase_artifact(const std::string &key);
 
     template <typename T> void set_artifact(const std::string &key, T value) {
-        artifacts_[key] = std::move(value);
+        artifacts_[key] = std::make_unique<Artifact<T>>(std::move(value));
+    }
+
+    template <typename T> void set_artifact(T value) {
+        set_artifact(default_artifact_key<T>(), std::move(value));
     }
 
     template <typename T> T *get_artifact(const std::string &key) {
@@ -60,7 +64,12 @@ class PassContext {
         if (it == artifacts_.end()) {
             return nullptr;
         }
-        return std::any_cast<T>(&it->second);
+        auto *artifact = dynamic_cast<Artifact<T> *>(it->second.get());
+        return artifact == nullptr ? nullptr : &artifact->value;
+    }
+
+    template <typename T> T *get_artifact() {
+        return get_artifact<T>(default_artifact_key<T>());
     }
 
     template <typename T> const T *get_artifact(const std::string &key) const {
@@ -68,7 +77,12 @@ class PassContext {
         if (it == artifacts_.end()) {
             return nullptr;
         }
-        return std::any_cast<T>(&it->second);
+        auto *artifact = dynamic_cast<const Artifact<T> *>(it->second.get());
+        return artifact == nullptr ? nullptr : &artifact->value;
+    }
+
+    template <typename T> const T *get_artifact() const {
+        return get_artifact<T>(default_artifact_key<T>());
     }
 
     template <typename T> T take_artifact(const std::string &key) {
@@ -76,15 +90,33 @@ class PassContext {
         if (it == artifacts_.end()) {
             throw std::runtime_error("artifact not found: " + key);
         }
-        T value = std::any_cast<T>(std::move(it->second));
+        auto *artifact = dynamic_cast<Artifact<T> *>(it->second.get());
+        if (artifact == nullptr) {
+            throw std::runtime_error("artifact has unexpected type: " + key);
+        }
+        T value = std::move(artifact->value);
         artifacts_.erase(it);
         return value;
     }
 
   private:
+    struct ArtifactBase {
+        virtual ~ArtifactBase() = default;
+    };
+
+    template <typename T> struct Artifact final : ArtifactBase {
+        explicit Artifact(T value) : value(std::move(value)) {
+        }
+        T value;
+    };
+
+    template <typename T> static std::string default_artifact_key() {
+        return typeid(T).name();
+    }
+
     std::unique_ptr<CompUnit> ast_;
     std::unique_ptr<ir::Module> ssa_module_;
-    std::unordered_map<std::string, std::any> artifacts_;
+    std::unordered_map<std::string, std::unique_ptr<ArtifactBase>> artifacts_;
 };
 
 class Pass {

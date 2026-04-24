@@ -1,6 +1,8 @@
 #include "../include/front/parser.h"
 #include "../include/pass/ASTDumpPass.h"
+#include "../include/pass/ASTToYIRPass.h"
 #include "../include/pass/PassManager.h"
+#include "../include/yir/YIRPrinter.h"
 
 #include <cstdio>
 #include <iostream>
@@ -14,6 +16,7 @@ namespace {
 struct CommandLineOptions {
     std::string input_path;
     bool emit_ast = false;
+    bool emit_yir = false;
     bool show_help = false;
 };
 
@@ -21,7 +24,8 @@ void print_help(const char *program, std::ostream &out) {
     out << "Usage: " << program << " [options] <input.sy>\n\n"
         << "Options:\n"
         << "  -h, --help    Show this help message\n"
-        << "  --emit-ast    Dump the parsed AST through the pass pipeline\n";
+        << "  --emit-ast    Dump the parsed AST through the pass pipeline\n"
+        << "  --emit-yir    Lower the parsed AST to YIR and dump it\n";
 }
 
 bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std::string &error) {
@@ -33,6 +37,10 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         }
         if (arg == "--emit-ast") {
             options.emit_ast = true;
+            continue;
+        }
+        if (arg == "--emit-yir") {
+            options.emit_yir = true;
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {
@@ -82,6 +90,9 @@ pass::PassManager build_frontend_pipeline(const CommandLineOptions &options, std
     if (options.emit_ast) {
         pm.emplace_pass<pass::ASTDumpPass>(out);
     }
+    if (options.emit_yir) {
+        pm.emplace_pass<pass::ASTToYIRPass>();
+    }
     return pm;
 }
 
@@ -129,5 +140,20 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    return run_pipeline(pm, context, std::cerr);
+    int rc = run_pipeline(pm, context, std::cerr);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (options.emit_yir) {
+        auto *module = context.get_artifact<std::unique_ptr<yir::Module>>();
+        if (module == nullptr || *module == nullptr) {
+            std::cerr << "YIR module was not produced\n";
+            return 1;
+        }
+        yir::YIRPrinter printer(std::cout);
+        printer.print(**module);
+    }
+
+    return 0;
 }
