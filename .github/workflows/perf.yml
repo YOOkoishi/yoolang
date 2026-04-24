@@ -1,0 +1,57 @@
+name: Build and Perf
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+jobs:
+  build-and-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          chmod +x scripts/setup_env.sh
+          scripts/setup_env.sh
+
+      - name: Ensure xmake in PATH
+        run: |
+          if command -v xmake >/dev/null 2>&1; then
+            echo "xmake already available: $(xmake --version | head -n 1)"
+            exit 0
+          fi
+          if [ -f "$HOME/.local/bin/xmake" ]; then
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            "$HOME/.local/bin/xmake" --version
+            exit 0
+          fi
+          echo "xmake not found after setup_env.sh"
+          exit 1
+
+      - name: Build (xmake release)
+        run: |
+          xmake f -m release
+          xmake -vD
+
+      - name: Resolve built binary path
+        run: |
+          BIN_PATH=$(find build -type f -name yoolang | grep '/release/' | head -n 1 || true)
+          if [ -z "$BIN_PATH" ]; then
+            echo "Cannot find built yoolang binary under build/*/release"
+            exit 1
+          fi
+          echo "YOO_LANG_BIN=$BIN_PATH" >> "$GITHUB_ENV"
+          echo "Resolved binary: $BIN_PATH"
+
+      - name: Run perf script
+        env:
+          PERF_MAX_CASES: "30"
+          PERF_TIMEOUT_SEC: "20"
+        run: |
+          python3 scripts/compare_perf.py
