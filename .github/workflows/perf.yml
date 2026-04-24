@@ -46,3 +46,23 @@ jobs:
           PERF_TIMEOUT_SEC: "20"
         run: |
           python3 scripts/compare_perf.py
+
+      - name: Publish perf summary
+        if: always()
+        run: |
+          if [ -f build/perf-ci/perf-report.md ]; then
+            cat build/perf-ci/perf-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# RISC-V QEMU Perf Report" >> "$GITHUB_STEP_SUMMARY"
+            echo "perf-report.md not found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: |
+            build/perf-ci/perf-report.md
+            build/perf-ci/perf-report.json
+          if-no-files-found: warn

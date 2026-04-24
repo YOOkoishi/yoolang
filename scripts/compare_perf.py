@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import sys
 import time
@@ -32,6 +33,9 @@ CLANG_BIN = os.environ.get("RISCV_CLANGXX", "clang++")
 AR_BIN = os.environ.get("RISCV_AR", "riscv64-linux-gnu-ar")
 RANLIB_BIN = os.environ.get("RISCV_RANLIB", "riscv64-linux-gnu-ranlib")
 TIMEOUT_SEC = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
+REPORT_DIR = WORKSPACE / "build" / "perf-ci"
+REPORT_MD = REPORT_DIR / "perf-report.md"
+REPORT_JSON = REPORT_DIR / "perf-report.json"
 
 
 def _resolve_yoolang_binary() -> Path:
@@ -386,6 +390,63 @@ def _print_header() -> None:
     print(f"Cases: {len(CASES)}")
     print(f"Timeout per qemu run: {TIMEOUT_SEC}s")
     print("-" * 140)
+
+
+def _md_escape(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", "<br>")
+
+
+def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    status = "PASS" if failures == 0 else "FAIL"
+    generated = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+
+    md_lines = [
+        "# RISC-V QEMU Perf Report",
+        "",
+        f"- Status: {status}",
+        f"- Generated: {generated}",
+        f"- Cases: {len(rows)}",
+        f"- Failed: {failures}",
+        f"- Total runtime (s): {total_runtime:.4f}",
+        f"- Yoolang binary: {YOOLANG_BIN}",
+        f"- Runtime lib: {RUNTIME_LIB}",
+        "",
+        "| Case | GCC | Clang++ | Yoolang | Status |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+
+    for row in rows:
+        md_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _md_escape(str(row["case"])),
+                    _md_escape(str(row["gcc"])),
+                    _md_escape(str(row["clang"])),
+                    _md_escape(str(row["yoolang"])),
+                    _md_escape(str(row["status"])),
+                ]
+            )
+            + " |"
+        )
+
+    REPORT_MD.write_text("\n".join(md_lines) + "\n")
+
+    payload = {
+        "status": status,
+        "generated_utc": generated,
+        "workspace": str(WORKSPACE),
+        "yoolang_binary": str(YOOLANG_BIN),
+        "runtime_lib": str(RUNTIME_LIB),
+        "test_dirs": [str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS],
+        "cases": len(rows),
+        "failures": failures,
+        "total_runtime_sec": total_runtime,
+        "rows": rows,
+    }
+    REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
     print(f"{'Case':<42} | {'GCC':<12} | {'Clang++':<12} | {'Yoolang':<12} | Status")
     print("-" * 140)
 
@@ -413,6 +474,7 @@ def main() -> int:
     _print_header()
     failures = 0
     total_runtime = 0.0
+    report_rows: list[dict] = []
 
     for case in CASES:
         gcc, clang, yoolang, ok, detail = _compile_and_run(case)
@@ -420,6 +482,15 @@ def main() -> int:
         rel = str(case.relative_to(WORKSPACE))
         print(
             f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(yoolang):<12} | {detail}"
+        )
+        report_rows.append(
+            {
+                "case": rel,
+                "gcc": _format_cell(gcc),
+                "clang": _format_cell(clang),
+                "yoolang": _format_cell(yoolang),
+                "status": detail,
+            }
         )
         if not ok:
             failures += 1
@@ -433,6 +504,10 @@ def main() -> int:
 
     print("-" * 140)
     print(f"Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")
+
+    _write_reports(report_rows, failures, total_runtime)
+    print(f"Report markdown: {REPORT_MD}")
+    print(f"Report json: {REPORT_JSON}")
 
     if failures > 0:
         print("[ERROR] perf compare failed.")
