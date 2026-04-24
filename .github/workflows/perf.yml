@@ -9,7 +9,7 @@ on:
 jobs:
   build-and-perf:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -39,19 +39,10 @@ jobs:
           xmake f -m release
           xmake -vD
 
-      - name: Resolve built binary path
-        run: |
-          BIN_PATH=$(find build -type f -name yoolang | grep '/release/' | head -n 1 || true)
-          if [ -z "$BIN_PATH" ]; then
-            echo "Cannot find built yoolang binary under build/*/release"
-            exit 1
-          fi
-          echo "YOO_LANG_BIN=$BIN_PATH" >> "$GITHUB_ENV"
-          echo "Resolved binary: $BIN_PATH"
-
       - name: Run perf script
         env:
-          PERF_MAX_CASES: "30"
+          PERF_TEST_DIRS: test/bsb2025-final,test/bsb2025-prel
+          PERF_MAX_CASES: "120"
           PERF_TIMEOUT_SEC: "20"
         run: |
           python3 scripts/compare_perf.py

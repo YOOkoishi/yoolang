@@ -2,122 +2,361 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
-def _find_repo_root() -> Path:
-    script_dir = Path(__file__).resolve().parent
-    return script_dir.parent
+MARKER = "; === RISC-V Assembly ==="
 
 
-def _resolve_binary(repo_root: Path) -> Path:
+@dataclass
+class RunResult:
+    compile_ok: bool
+    run_ok: bool
+    elapsed_sec: float
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: Optional[int] = None
+    detail: str = ""
+
+
+WORKSPACE = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[1])).resolve()
+RUNTIME_HEADER = WORKSPACE / "runtime" / "sylib.h"
+RUNTIME_SOURCE = WORKSPACE / "runtime" / "sylib.c"
+DEFAULT_RUNTIME_LIB = WORKSPACE / "runtime" / "libsysy_riscv.a"
+QEMU_BIN = os.environ.get("QEMU_BIN", "qemu-riscv64")
+GCC_BIN = os.environ.get("RISCV_GCC", "riscv64-linux-gnu-g++")
+CLANG_BIN = os.environ.get("RISCV_CLANGXX", "clang++")
+AR_BIN = os.environ.get("RISCV_AR", "riscv64-linux-gnu-ar")
+TIMEOUT_SEC = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
+
+
+def _resolve_yoolang_binary() -> Path:
     env_bin = os.environ.get("YOO_LANG_BIN", "").strip()
     if env_bin:
-        p = Path(env_bin)
-        return p if p.is_absolute() else (repo_root / p)
-    return repo_root / "build" / "macosx" / "arm64" / "release" / "yoolang"
+        candidate = Path(env_bin)
+        return candidate if candidate.is_absolute() else (WORKSPACE / candidate)
+
+    candidates = []
+    for path in (WORKSPACE / "build").rglob("yoolang"):
+        if path.is_file() and "release" in path.parts:
+            candidates.append(path)
+    if not candidates:
+        raise FileNotFoundError("cannot find built yoolang binary under build/**/release")
+    return sorted(candidates)[0]
 
 
-def _collect_sy_files(repo_root: Path) -> list[Path]:
-    test_root = repo_root / "test"
-    patterns = [
-        "simple_test.sy",
-        "bsb2025-final/*.sy",
-        "bsb2025-prel/*.sy",
+def _normalize_text(text: str) -> str:
+    return text.replace("\r\n", "\n").strip()
+
+
+def _collect_cases() -> list[Path]:
+    env_dirs = os.environ.get("PERF_TEST_DIRS", "").strip()
+    if env_dirs:
+        roots = [WORKSPACE / item.strip() for item in env_dirs.split(",") if item.strip()]
+    else:
+        preferred = ["test/perf_tests", "test/bsb2025-final", "test/bsb2025-prel"]
+        roots = [WORKSPACE / rel for rel in preferred if (WORKSPACE / rel).exists()]
+        if not roots:
+            roots = [WORKSPACE / "test"]
+
+    cases: list[Path] = []
+    for root in roots:
+        if root.is_file() and root.suffix == ".sy":
+            cases.append(root)
+        elif root.is_dir():
+            cases.extend(sorted(root.rglob("*.sy")))
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for case in cases:
+        if case not in seen:
+            seen.add(case)
+            ordered.append(case)
+    return ordered
+
+
+CASES = _collect_cases()
+
+
+def _ensure_runtime_lib() -> Path:
+    runtime_lib = DEFAULT_RUNTIME_LIB
+    if runtime_lib.exists():
+        return runtime_lib
+
+    if not RUNTIME_SOURCE.exists() or not RUNTIME_HEADER.exists():
+        raise FileNotFoundError(
+            "missing runtime/sylib.c or runtime/sylib.h, cannot build sysy runtime"
+        )
+
+    build_dir = WORKSPACE / "build" / "perf-ci" / "runtime"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    obj_file = build_dir / "sylib.o"
+    lib_file = build_dir / "libsysy_riscv.a"
+
+    subprocess.run(
+        [
+            "riscv64-linux-gnu-gcc",
+            "-O2",
+            "-I",
+            str(RUNTIME_HEADER.parent),
+            "-c",
+            str(RUNTIME_SOURCE),
+            "-o",
+            str(obj_file),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [AR_BIN, "rcs", str(lib_file), str(obj_file)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return lib_file
+
+
+try:
+    YOOLANG_BIN = _resolve_yoolang_binary()
+    RUNTIME_LIB = _ensure_runtime_lib()
+except Exception as exc:
+    print(f"[ERROR] {exc}")
+    sys.exit(2)
+
+
+def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
+    obj = out_dir / f"{src.stem}.gcc.o"
+    exe = out_dir / f"{src.stem}.gcc.riscv"
+    cmd = [
+        GCC_BIN,
+        "-O3",
+        "-std=gnu++17",
+        "-include",
+        str(RUNTIME_HEADER),
+        "-x",
+        "c++",
+        "-c",
+        str(src),
+        "-o",
+        str(obj),
     ]
-    files: list[Path] = []
-    for pat in patterns:
-        files.extend(sorted(test_root.glob(pat)))
-    # De-dup while preserving order.
-    seen = set()
-    result: list[Path] = []
-    for f in files:
-        if f not in seen:
-            seen.add(f)
-            result.append(f)
-    return result
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    return exe, "OK"
 
 
-def _run_one(binary: Path, src: Path, timeout_sec: int) -> tuple[bool, float, str]:
+def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
+    obj = out_dir / f"{src.stem}.clang.o"
+    exe = out_dir / f"{src.stem}.clang.riscv"
+    cmd = [
+        CLANG_BIN,
+        "-O3",
+        "-std=gnu++17",
+        "--target=riscv64-linux-gnu",
+        "--sysroot=/usr/riscv64-linux-gnu",
+        "-include",
+        str(RUNTIME_HEADER),
+        "-x",
+        "c++",
+        "-c",
+        str(src),
+        "-o",
+        str(obj),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    return exe, "OK"
+
+
+def _emit_yoolang_asm(src: Path, out_dir: Path) -> tuple[Path, str]:
+    result = subprocess.run(
+        [str(YOOLANG_BIN), str(src), "--emit-asm", src.stem],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    raw = result.stdout
+    marker_pos = raw.find(MARKER)
+    if marker_pos < 0:
+        raise RuntimeError(f"assembly marker not found in yoolang output for {src}")
+    asm_text = raw[marker_pos + len(MARKER):].lstrip("\r\n")
+    asm_file = out_dir / f"{src.stem}.yoolang.s"
+    asm_file.write_text(asm_text)
+    return asm_file, "OK"
+
+
+def _compile_yoolang(src: Path, out_dir: Path) -> tuple[Path, str]:
+    asm_file, _ = _emit_yoolang_asm(src, out_dir)
+    obj = out_dir / f"{src.stem}.yoolang.o"
+    exe = out_dir / f"{src.stem}.yoolang.riscv"
+    subprocess.run([GCC_BIN, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    return exe, "OK"
+
+
+def _run_qemu(exe: Path, input_file: Optional[Path]) -> tuple[bool, float, str, str, Optional[int], str]:
+    stdin_data = input_file.read_bytes() if input_file and input_file.exists() else None
     start = time.perf_counter()
     try:
-        ret = subprocess.run(
-            [str(binary), str(src)],
+        result = subprocess.run(
+            [QEMU_BIN, "-L", "/usr/riscv64-linux-gnu", str(exe)],
+            input=stdin_data,
             capture_output=True,
-            text=True,
-            timeout=timeout_sec,
+            text=False,
+            timeout=TIMEOUT_SEC,
             check=False,
         )
         elapsed = time.perf_counter() - start
-        if ret.returncode != 0:
-            msg = ret.stderr.strip() or ret.stdout.strip() or f"exit={ret.returncode}"
-            return False, elapsed, msg
-        return True, elapsed, "OK"
+        stdout = result.stdout.decode(errors="replace") if result.stdout else ""
+        stderr = result.stderr.decode(errors="replace") if result.stderr else ""
+        ok = result.returncode == 0
+        return ok, elapsed, stdout, stderr, result.returncode, "OK" if ok else f"exit={result.returncode}"
     except subprocess.TimeoutExpired:
         elapsed = time.perf_counter() - start
-        return False, elapsed, "TIMEOUT"
+        return False, elapsed, "", "", None, "TIMEOUT"
     except Exception as exc:  # pragma: no cover
         elapsed = time.perf_counter() - start
-        return False, elapsed, f"ERR: {exc}"
+        return False, elapsed, "", "", None, f"ERR: {exc}"
+
+
+def _expected_input(case: Path) -> Optional[Path]:
+    candidate = case.with_suffix(".in")
+    return candidate if candidate.exists() else None
+
+
+def _case_work_dir(case: Path) -> Path:
+    out_dir = WORKSPACE / "build" / "perf-ci" / case.parent.relative_to(WORKSPACE) / case.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _format_cell(result: RunResult) -> str:
+    if not result.compile_ok:
+        return "CFAIL"
+    if not result.run_ok:
+        return result.detail
+    return f"{result.elapsed_sec:.4f}s"
+
+
+def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, str]:
+    input_file = _expected_input(src)
+    case_dir = _case_work_dir(src)
+
+    results: dict[str, RunResult] = {}
+
+    compiler_specs = (
+        ("gcc", _compile_gcc),
+        ("clang++", _compile_clang),
+        ("yoolang", _compile_yoolang),
+    )
+
+    for name, compiler in compiler_specs:
+        start = time.perf_counter()
+        try:
+            exe, _ = compiler(src, case_dir)
+        except subprocess.CalledProcessError as exc:
+            elapsed = time.perf_counter() - start
+            stderr = (exc.stderr or "").strip()
+            stdout = (exc.stdout or "").strip()
+            detail = stderr or stdout or "compile error"
+            results[name] = RunResult(False, False, elapsed, detail=detail)
+            continue
+        except Exception as exc:
+            elapsed = time.perf_counter() - start
+            results[name] = RunResult(False, False, elapsed, detail=f"ERR: {exc}")
+            continue
+
+        run_ok, elapsed, stdout, stderr, exit_code, detail = _run_qemu(exe, input_file)
+        results[name] = RunResult(True, run_ok, elapsed, stdout, stderr, exit_code, detail)
+
+    gcc = results["gcc"]
+    clang = results["clang++"]
+    yoolang = results["yoolang"]
+
+    if not gcc.compile_ok or not gcc.run_ok:
+        return gcc, clang, yoolang, False, f"gcc {gcc.detail}"
+    if not clang.compile_ok or not clang.run_ok:
+        return gcc, clang, yoolang, False, f"clang++ {clang.detail}"
+    if not yoolang.compile_ok or not yoolang.run_ok:
+        return gcc, clang, yoolang, False, f"yoolang {yoolang.detail}"
+
+    baseline_stdout = _normalize_text(gcc.stdout)
+    baseline_exit = gcc.exit_code
+    clang_stdout = _normalize_text(clang.stdout)
+    yoolang_stdout = _normalize_text(yoolang.stdout)
+
+    if clang_stdout != baseline_stdout or clang.exit_code != baseline_exit:
+        return gcc, clang, yoolang, False, f"clang++ output mismatch vs gcc for {src.name}"
+    if yoolang_stdout != baseline_stdout or yoolang.exit_code != baseline_exit:
+        return gcc, clang, yoolang, False, f"yoolang output mismatch vs gcc for {src.name}"
+
+    return gcc, clang, yoolang, True, "OK"
+
+
+def _print_header() -> None:
+    print("=== RISC-V/QEMU perf compare ===")
+    print(f"Workspace: {WORKSPACE}")
+    print(f"Yoolang binary: {YOOLANG_BIN}")
+    print(f"Runtime lib: {RUNTIME_LIB}")
+    print(f"Test dirs: {', '.join(str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS)}")
+    print(f"Cases: {len(CASES)}")
+    print(f"Timeout per qemu run: {TIMEOUT_SEC}s")
+    print("-" * 140)
+    print(f"{'Case':<42} | {'GCC':<12} | {'Clang++':<12} | {'Yoolang':<12} | Status")
+    print("-" * 140)
+
+
+TEST_ROOTS = []
+env_dirs = os.environ.get("PERF_TEST_DIRS", "").strip()
+if env_dirs:
+    TEST_ROOTS = [WORKSPACE / item.strip() for item in env_dirs.split(",") if item.strip()]
+else:
+    for rel in ("test/perf_tests", "test/bsb2025-final", "test/bsb2025-prel"):
+        candidate = WORKSPACE / rel
+        if candidate.exists():
+            TEST_ROOTS.append(candidate)
+    if not TEST_ROOTS:
+        TEST_ROOTS = [WORKSPACE / "test"]
+
+
+if not CASES:
+    print("[ERROR] no .sy testcases found")
+    sys.exit(2)
+
 
 
 def main() -> int:
-    repo_root = _find_repo_root()
-    binary = _resolve_binary(repo_root)
+    _print_header()
+    failures = 0
+    total_runtime = 0.0
 
-    if not binary.exists():
-        print(f"[ERROR] yoolang binary not found: {binary}")
-        print("Hint: build first with xmake -m release")
-        return 2
+    for case in CASES:
+        gcc, clang, yoolang, ok, detail = _compile_and_run(case)
+        total_runtime += gcc.elapsed_sec + clang.elapsed_sec + yoolang.elapsed_sec
+        rel = str(case.relative_to(WORKSPACE))
+        print(
+            f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(yoolang):<12} | {detail}"
+        )
+        if not ok:
+            failures += 1
+            print(f"[FAIL] {rel}: {detail}")
+            if gcc.stderr.strip():
+                print(f"[gcc stderr] {gcc.stderr.strip()}")
+            if clang.stderr.strip():
+                print(f"[clang++ stderr] {clang.stderr.strip()}")
+            if yoolang.stderr.strip():
+                print(f"[yoolang stderr] {yoolang.stderr.strip()}")
 
-    all_cases = _collect_sy_files(repo_root)
-    if not all_cases:
-        print("[ERROR] no .sy testcases found under test/")
-        return 2
+    print("-" * 140)
+    print(f"Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")
 
-    max_cases = int(os.environ.get("PERF_MAX_CASES", "30"))
-    timeout_sec = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
-    cases = all_cases[:max_cases]
-
-    print("=== yoolang perf (compile-time) ===")
-    print(f"Repo: {repo_root}")
-    print(f"Binary: {binary}")
-    print(f"Cases: {len(cases)}/{len(all_cases)} (PERF_MAX_CASES={max_cases})")
-    print(f"Timeout per case: {timeout_sec}s")
-    print("-" * 96)
-    print(f"{'Case':<48} | {'Status':<8} | {'Time(s)':>9} | Detail")
-    print("-" * 96)
-
-    failed = 0
-    total_time = 0.0
-    times: list[float] = []
-
-    for case in cases:
-        ok, cost, detail = _run_one(binary, case, timeout_sec)
-        status = "PASS" if ok else "FAIL"
-        rel = case.relative_to(repo_root)
-        print(f"{str(rel):<48} | {status:<8} | {cost:>9.4f} | {detail}")
-        if ok:
-            times.append(cost)
-            total_time += cost
-        else:
-            failed += 1
-
-    print("-" * 96)
-    passed = len(cases) - failed
-    avg = (sum(times) / len(times)) if times else 0.0
-    fastest = min(times) if times else 0.0
-    slowest = max(times) if times else 0.0
-    print(
-        f"Summary: total={len(cases)} pass={passed} fail={failed} "
-        f"total_time={total_time:.4f}s avg={avg:.4f}s "
-        f"min={fastest:.4f}s max={slowest:.4f}s"
-    )
-
-    if failed > 0:
-        print("[ERROR] perf run has failures.")
+    if failures > 0:
+        print("[ERROR] perf compare failed.")
         return 1
-    print("[OK] perf run passed.")
+    print("[OK] perf compare passed.")
     return 0
 
 
