@@ -25,10 +25,12 @@ WORKSPACE = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().par
 RUNTIME_HEADER = WORKSPACE / "runtime" / "sylib.h"
 RUNTIME_SOURCE = WORKSPACE / "runtime" / "sylib.c"
 DEFAULT_RUNTIME_LIB = WORKSPACE / "runtime" / "libsysy_riscv.a"
+DEFAULT_RUNTIME_LIB_ALT = WORKSPACE / "runtime" / "libsysy.a"
 QEMU_BIN = os.environ.get("QEMU_BIN", "qemu-riscv64")
 GCC_BIN = os.environ.get("RISCV_GCC", "riscv64-linux-gnu-g++")
 CLANG_BIN = os.environ.get("RISCV_CLANGXX", "clang++")
 AR_BIN = os.environ.get("RISCV_AR", "riscv64-linux-gnu-ar")
+RANLIB_BIN = os.environ.get("RISCV_RANLIB", "riscv64-linux-gnu-ranlib")
 TIMEOUT_SEC = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
 
 
@@ -74,6 +76,9 @@ def _collect_cases() -> list[Path]:
         if case not in seen:
             seen.add(case)
             ordered.append(case)
+    max_cases = int(os.environ.get("PERF_MAX_CASES", "0"))
+    if max_cases > 0:
+        return ordered[:max_cases]
     return ordered
 
 
@@ -81,9 +86,17 @@ CASES = _collect_cases()
 
 
 def _ensure_runtime_lib() -> Path:
-    runtime_lib = DEFAULT_RUNTIME_LIB
-    if runtime_lib.exists():
-        return runtime_lib
+    env_lib = os.environ.get("SYSY_RUNTIME_LIB", "").strip()
+    if env_lib:
+        p = Path(env_lib)
+        runtime_lib = p if p.is_absolute() else (WORKSPACE / p)
+        if runtime_lib.exists():
+            return runtime_lib
+        raise FileNotFoundError(f"SYSY_RUNTIME_LIB was set but file does not exist: {runtime_lib}")
+
+    for runtime_lib in (DEFAULT_RUNTIME_LIB_ALT, DEFAULT_RUNTIME_LIB):
+        if runtime_lib.exists():
+            return runtime_lib
 
     if not RUNTIME_SOURCE.exists() or not RUNTIME_HEADER.exists():
         raise FileNotFoundError(
@@ -93,7 +106,42 @@ def _ensure_runtime_lib() -> Path:
     build_dir = WORKSPACE / "build" / "perf-ci" / "runtime"
     build_dir.mkdir(parents=True, exist_ok=True)
     obj_file = build_dir / "sylib.o"
-    lib_file = build_dir / "libsysy_riscv.a"
+    lib_file = build_dir / "libsysy.a"
+
+    cmake_file = WORKSPACE / "runtime" / "CMakeLists.txt"
+    if cmake_file.exists():
+        cmake_build_dir = build_dir / "cmake"
+        subprocess.run(
+            [
+                "cmake",
+                "-S",
+                str(WORKSPACE / "runtime"),
+                "-B",
+                str(cmake_build_dir),
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc",
+                f"-DCMAKE_AR={AR_BIN}",
+                f"-DCMAKE_RANLIB={RANLIB_BIN}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["cmake", "--build", str(cmake_build_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        cmake_candidates = list(cmake_build_dir.rglob("libsysy.a")) + list(cmake_build_dir.rglob("libsysy_riscv.a"))
+        if cmake_candidates:
+            picked = sorted(cmake_candidates)[0]
+            if picked != lib_file:
+                lib_file.write_bytes(picked.read_bytes())
+            return lib_file
+        raise FileNotFoundError(
+            f"runtime/CMakeLists.txt exists but no libsysy.a or libsysy_riscv.a was produced under {cmake_build_dir}"
+        )
 
     subprocess.run(
         [
@@ -116,12 +164,30 @@ def _ensure_runtime_lib() -> Path:
         capture_output=True,
         text=True,
     )
+    if not lib_file.exists():
+        raise FileNotFoundError(f"runtime library build failed, expected: {lib_file}")
     return lib_file
+
+
+def _ensure_runtime_wrapper() -> Path:
+    wrapper_dir = WORKSPACE / "build" / "perf-ci" / "runtime"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = wrapper_dir / "sylib_wrapper.hpp"
+    wrapper.write_text(
+        "#ifndef SYLIB_WRAPPER_HPP\n"
+        "#define SYLIB_WRAPPER_HPP\n"
+        "extern \"C\" {\n"
+        f"#include \"{RUNTIME_HEADER.as_posix()}\"\n"
+        "}\n"
+        "#endif\n"
+    )
+    return wrapper
 
 
 try:
     YOOLANG_BIN = _resolve_yoolang_binary()
     RUNTIME_LIB = _ensure_runtime_lib()
+    RUNTIME_WRAPPER = _ensure_runtime_wrapper()
 except Exception as exc:
     print(f"[ERROR] {exc}")
     sys.exit(2)
@@ -135,7 +201,7 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
         "-O3",
         "-std=gnu++17",
         "-include",
-        str(RUNTIME_HEADER),
+        str(RUNTIME_WRAPPER),
         "-x",
         "c++",
         "-c",
@@ -158,7 +224,7 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
         "--target=riscv64-linux-gnu",
         "--sysroot=/usr/riscv64-linux-gnu",
         "-include",
-        str(RUNTIME_HEADER),
+        str(RUNTIME_WRAPPER),
         "-x",
         "c++",
         "-c",
@@ -301,6 +367,7 @@ def _print_header() -> None:
     print(f"Workspace: {WORKSPACE}")
     print(f"Yoolang binary: {YOOLANG_BIN}")
     print(f"Runtime lib: {RUNTIME_LIB}")
+    print(f"Runtime wrapper: {RUNTIME_WRAPPER}")
     print(f"Test dirs: {', '.join(str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS)}")
     print(f"Cases: {len(CASES)}")
     print(f"Timeout per qemu run: {TIMEOUT_SEC}s")
