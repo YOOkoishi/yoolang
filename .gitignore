@@ -46,3 +46,5 @@ $RECYCLE.BIN/
 tmp/*
 
 .codex
+
+test/*

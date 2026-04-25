@@ -43,17 +43,20 @@ void AsmPrinter::print(const Module &module) {
 }
 
 void AsmPrinter::print_global_sections(const Module &module) {
-    bool printed_data_header = false;
-    bool printed_bss_header = false;
+    enum class Section { None, Data, Bss };
+    Section current_section = Section::None;
+
     for (const auto &global : module.globals()) {
-        if (global.initializer == "zero" || global.initializer.empty()) {
-            if (!printed_bss_header) {
+        const Section target_section =
+            (global.initializer == "zero" || global.initializer.empty()) ? Section::Bss
+                                                                         : Section::Data;
+        if (target_section != current_section) {
+            if (target_section == Section::Bss) {
                 out_ << "\t.bss\n";
-                printed_bss_header = true;
+            } else {
+                out_ << "\t.data\n";
             }
-        } else if (!printed_data_header) {
-            out_ << "\t.data\n";
-            printed_data_header = true;
+            current_section = target_section;
         }
         print_global(global);
     }
@@ -178,8 +181,16 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\tremw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].string_value() << "\n";
         break;
+    case Opcode::And:
+        out_ << "\tand " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
     case Opcode::SllI:
         out_ << "\tslli " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
+        break;
+    case Opcode::SrliW:
+        out_ << "\tsrliw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";
         break;
     case Opcode::Xor:
