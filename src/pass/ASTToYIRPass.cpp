@@ -40,11 +40,69 @@ std::string sanitize_name(const std::string &name) {
 }
 
 class Lowerer final : public ASTVisitor {
-    struct Binding {
+    struct ConstantValue {
+        bool valid = false;
+        BuiltinType type = BuiltinType::Int;
+        int int_value = 0;
+        float float_value = 0.0F;
+    };
+
+    struct Symbol {
+        enum class Kind {
+            Variable,
+            Function,
+        };
+
+        Kind kind = Kind::Variable;
+        std::string name;
         yir::Value *value = nullptr;
         yir::TypePtr type;
+        bool is_const = false;
         bool is_array = false;
         bool is_global = false;
+        bool is_builtin = false;
+        bool is_variadic = false;
+        yir::Function *function = nullptr;
+        yir::TypePtr return_type;
+        std::vector<yir::TypePtr> param_types;
+        ConstantValue constant;
+    };
+
+    class SymbolTable {
+      public:
+        void enter_scope() {
+            scopes_.push_back({});
+        }
+
+        void leave_scope() {
+            scopes_.pop_back();
+        }
+
+        bool empty() const {
+            return scopes_.empty();
+        }
+
+        bool define(Symbol symbol) {
+            if (scopes_.empty()) {
+                enter_scope();
+            }
+            auto &scope = scopes_.back();
+            std::string name = symbol.name;
+            return scope.emplace(std::move(name), std::move(symbol)).second;
+        }
+
+        Symbol *lookup(const std::string &name) {
+            for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+                auto found = it->find(name);
+                if (found != it->end()) {
+                    return &found->second;
+                }
+            }
+            return nullptr;
+        }
+
+      private:
+        std::vector<std::unordered_map<std::string, Symbol>> scopes_;
     };
 
   public:
@@ -66,21 +124,7 @@ class Lowerer final : public ASTVisitor {
     }
 
     void visit(LValExpr &node) override {
-        Binding *binding = lookup(node.name);
-        if (binding == nullptr) {
-            errors_.push_back("unknown variable: " + node.name);
-            last_value_ = emit<yir::ConstI32Op>(0, fresh_temp());
-            return;
-        }
-        if (node.indices.empty()) {
-            last_value_ = binding->value;
-            return;
-        }
-
-        auto indices = lower_indices(node.indices);
-        yir::TypePtr element_type = element_type_for_indexing(binding->type, indices.size());
-        last_value_ =
-            emit<yir::ArrayLoadOp>(binding->value, std::move(indices), element_type, fresh_name(node.name));
+        last_value_ = lower_lval_value(node);
     }
 
     void visit(BinaryExpr &node) override {
@@ -139,7 +183,8 @@ class Lowerer final : public ASTVisitor {
                 last_value_ = emit<yir::SubFOp>(zero, value, fresh_temp());
             } else {
                 auto *zero = emit<yir::ConstI32Op>(0, fresh_temp());
-                last_value_ = emit<yir::SubIOp>(zero, cast_to(value, yir::Type::get_i32()), fresh_temp());
+                last_value_ =
+                    emit<yir::SubIOp>(zero, cast_to(value, yir::Type::get_i32()), fresh_temp());
             }
             return;
         case UnaryOp::Not:
@@ -149,22 +194,18 @@ class Lowerer final : public ASTVisitor {
     }
 
     void visit(CallExpr &node) override {
+        Symbol *callee = lookup_function(node.func_name);
         std::vector<yir::Value *> args;
         args.reserve(node.args.size());
-        for (auto &arg : node.args) {
-            args.push_back(lower_call_arg(*arg));
-        }
-
-        auto param_it = function_params_.find(node.func_name);
-        if (param_it != function_params_.end()) {
-            const auto &param_types = param_it->second;
-            for (std::size_t i = 0; i < args.size() && i < param_types.size(); ++i) {
-                args[i] = cast_to(args[i], param_types[i]);
+        for (std::size_t i = 0; i < node.args.size(); ++i) {
+            yir::TypePtr expected_type;
+            if (callee != nullptr && !callee->is_variadic && i < callee->param_types.size()) {
+                expected_type = callee->param_types[i];
             }
+            args.push_back(lower_call_arg(*node.args[i], expected_type));
         }
 
-        auto it = function_returns_.find(node.func_name);
-        yir::TypePtr result_type = it == function_returns_.end() ? yir::Type::get_i32() : it->second;
+        yir::TypePtr result_type = callee == nullptr ? yir::Type::get_i32() : callee->return_type;
         auto *op = emit<yir::CallOp>(node.func_name, std::move(args), result_type, fresh_temp());
         last_value_ = op == nullptr ? nullptr : op;
     }
@@ -179,12 +220,16 @@ class Lowerer final : public ASTVisitor {
     }
 
     void visit(AssignStmt &node) override {
-        Binding *target = lookup(node.target->name);
+        Symbol *target = lookup_variable(node.target->name);
         yir::Value *value = lower_expr(*node.value);
         if (target == nullptr || value == nullptr) {
             if (target == nullptr) {
                 errors_.push_back("unknown variable: " + node.target->name);
             }
+            return;
+        }
+        if (target->is_const) {
+            errors_.push_back("cannot assign to const variable: " + node.target->name);
             return;
         }
         if (node.target->indices.empty()) {
@@ -193,7 +238,7 @@ class Lowerer final : public ASTVisitor {
         }
 
         auto indices = lower_indices(node.target->indices);
-        yir::TypePtr element_type = element_type_for_indexing(target->type, indices.size());
+        yir::TypePtr element_type = type_after_indices(target->type, indices.size());
         emit<yir::ArrayStoreOp>(cast_to(value, element_type), target->value, std::move(indices));
     }
 
@@ -264,9 +309,10 @@ class Lowerer final : public ASTVisitor {
 
     void visit(VarDecl &node) override {
         yir::TypePtr storage_type = type_for_var(node.base_type, node.dimensions);
+        ConstantValue constant = constant_value_for_decl(node);
         if (storage_type->is_array()) {
             auto *array = emit<yir::ArrayVarOp>(storage_type, fresh_name(node.name));
-            bind(node.name, array, storage_type, true, false);
+            define_variable(node.name, array, storage_type, node.is_const, true, false, constant);
             if (node.init) {
                 emit_array_init(array, storage_type, *node.init);
             }
@@ -279,8 +325,9 @@ class Lowerer final : public ASTVisitor {
         } else {
             initializer = emit<yir::ZeroOp>(storage_type, fresh_temp());
         }
-        auto *var = emit<yir::VarOp>(storage_type, cast_to(initializer, storage_type), fresh_name(node.name));
-        bind(node.name, var, storage_type, false, false);
+        auto *var = emit<yir::VarOp>(storage_type, cast_to(initializer, storage_type),
+                                     fresh_name(node.name));
+        define_variable(node.name, var, storage_type, node.is_const, false, false, constant);
     }
 
     void visit(DeclStmt &node) override {
@@ -290,12 +337,12 @@ class Lowerer final : public ASTVisitor {
     }
 
     void visit(FuncDef &node) override {
-        auto func_it = functions_.find(node.name);
-        if (func_it == functions_.end()) {
+        Symbol *function_symbol = lookup_function(node.name);
+        if (function_symbol == nullptr || function_symbol->function == nullptr) {
             return;
         }
 
-        current_function_ = func_it->second;
+        current_function_ = function_symbol->function;
         current_region_ = &current_function_->body();
         current_return_type_ = type_for_builtin(node.return_type);
         name_counts_.clear();
@@ -309,9 +356,9 @@ class Lowerer final : public ASTVisitor {
             if (param.dimensions.empty()) {
                 auto type = type_for_builtin(param.type);
                 auto *var = emit<yir::VarOp>(type, param_value, fresh_name(param.name));
-                bind(param.name, var, type, false, false);
+                define_variable(param.name, var, type, false, false, false, {});
             } else {
-                bind(param.name, param_value, param_type(param), true, false);
+                define_variable(param.name, param_value, param_type(param), false, true, false, {});
             }
         }
 
@@ -327,6 +374,7 @@ class Lowerer final : public ASTVisitor {
 
     void visit(CompUnit &node) override {
         enter_scope();
+        install_sysy_builtins();
         for (auto &decl : node.global_decls) {
             lower_global_decl(*decl);
         }
@@ -337,10 +385,9 @@ class Lowerer final : public ASTVisitor {
                 param_types.push_back(param_type(param));
             }
             auto return_type = type_for_builtin(func->return_type);
-            function_params_[func->name] = param_types;
-            functions_[func->name] =
-                module_->add_function(func->name, return_type, std::move(param_types));
-            function_returns_[func->name] = return_type;
+            auto *function = module_->add_function(func->name, return_type, param_types);
+            define_function(func->name, function, return_type, std::move(param_types), false,
+                            false);
         }
 
         for (auto &func : node.functions) {
@@ -380,23 +427,56 @@ class Lowerer final : public ASTVisitor {
         return last_value_;
     }
 
-    yir::Value *lower_call_arg(Expr &expr) {
-        if (auto *lval = dynamic_cast<LValExpr *>(&expr)) {
-            Binding *binding = lookup(lval->name);
-            if (binding == nullptr) {
-                errors_.push_back("unknown variable: " + lval->name);
-                return emit<yir::ConstI32Op>(0, fresh_temp());
-            }
-            if (lval->indices.empty()) {
-                return binding->value;
-            }
-
-            auto indices = lower_indices(lval->indices);
-            yir::TypePtr element_type = element_type_for_indexing(binding->type, indices.size());
-            return emit<yir::ArrayLoadOp>(binding->value, std::move(indices), element_type,
-                                          fresh_name(lval->name));
+    yir::Value *lower_lval_value(LValExpr &lval) {
+        Symbol *symbol = lookup_variable(lval.name);
+        if (symbol == nullptr) {
+            errors_.push_back("unknown variable: " + lval.name);
+            return emit<yir::ConstI32Op>(0, fresh_temp());
         }
-        return lower_expr(expr);
+        if (lval.indices.empty()) {
+            return symbol->value;
+        }
+
+        auto indices = lower_indices(lval.indices);
+        yir::TypePtr indexed_type = type_after_indices(symbol->type, indices.size());
+        if (indexed_type != nullptr && indexed_type->is_array()) {
+            return emit<yir::ElemAddrOp>(symbol->value, std::move(indices),
+                                         yir::Type::get_ptr(indexed_type),
+                                         fresh_name(lval.name + ".addr"));
+        }
+        return emit<yir::ArrayLoadOp>(symbol->value, std::move(indices), indexed_type,
+                                      fresh_name(lval.name));
+    }
+
+    yir::Value *lower_lval_pointer(LValExpr &lval, yir::TypePtr expected_type) {
+        Symbol *symbol = lookup_variable(lval.name);
+        if (symbol == nullptr) {
+            errors_.push_back("unknown variable: " + lval.name);
+            return emit<yir::ConstI32Op>(0, fresh_temp());
+        }
+        if (lval.indices.empty()) {
+            return expected_type == nullptr ? decay(symbol->value)
+                                            : cast_to(symbol->value, expected_type);
+        }
+
+        auto indices = lower_indices(lval.indices);
+        yir::TypePtr indexed_type = type_after_indices(symbol->type, indices.size());
+        auto *address = emit<yir::ElemAddrOp>(symbol->value, std::move(indices),
+                                              yir::Type::get_ptr(indexed_type),
+                                              fresh_name(lval.name + ".addr"));
+        return expected_type == nullptr ? decay(address) : cast_to(address, expected_type);
+    }
+
+    yir::Value *lower_call_arg(Expr &expr, yir::TypePtr expected_type) {
+        if (auto *lval = dynamic_cast<LValExpr *>(&expr)) {
+            if (expected_type != nullptr && expected_type->is_ptr()) {
+                return lower_lval_pointer(*lval, expected_type);
+            }
+            return expected_type == nullptr ? decay(lower_lval_value(*lval))
+                                            : cast_to(lower_lval_value(*lval), expected_type);
+        }
+        return expected_type == nullptr ? lower_expr(expr)
+                                        : cast_to(lower_expr(expr), expected_type);
     }
 
     std::vector<yir::Value *> lower_indices(const std::vector<std::unique_ptr<Expr>> &exprs) {
@@ -408,18 +488,29 @@ class Lowerer final : public ASTVisitor {
         return indices;
     }
 
-    yir::Value *decay(yir::Value *address) {
-        auto pointee = yir::pointee_type(address->type());
-        if (!pointee->is_array()) {
-            return address;
+    yir::Value *decay(yir::Value *value) {
+        if (value == nullptr || value->type() == nullptr) {
+            return value;
         }
-        return emit<yir::DecayOp>(address, yir::Type::get_ptr(pointee->element()), fresh_temp());
+        if (value->type()->is_array()) {
+            return emit<yir::DecayOp>(value, yir::Type::get_ptr(value->type()->element()),
+                                      fresh_temp());
+        }
+        if (value->type()->is_ptr()) {
+            auto pointee = value->type()->pointee();
+            if (pointee != nullptr && pointee->is_array()) {
+                return emit<yir::DecayOp>(value, yir::Type::get_ptr(pointee->element()),
+                                          fresh_temp());
+            }
+        }
+        return value;
     }
 
-    yir::TypePtr element_type_for_indexing(yir::TypePtr base_type, std::size_t index_count) {
+    yir::TypePtr type_after_indices(yir::TypePtr base_type, std::size_t index_count) {
         yir::TypePtr current = base_type;
-        if (current != nullptr && current->is_ptr()) {
+        if (current != nullptr && current->is_ptr() && index_count > 0) {
             current = current->pointee();
+            --index_count;
         }
         for (std::size_t i = 0; i < index_count; ++i) {
             if (current != nullptr && current->is_array()) {
@@ -434,8 +525,8 @@ class Lowerer final : public ASTVisitor {
             return emit<yir::AddFOp>(cast_to(lhs, yir::Type::get_f32()),
                                      cast_to(rhs, yir::Type::get_f32()), fresh_temp());
         }
-        return emit<yir::AddIOp>(cast_to(lhs, yir::Type::get_i32()), cast_to(rhs, yir::Type::get_i32()),
-                                 fresh_temp());
+        return emit<yir::AddIOp>(cast_to(lhs, yir::Type::get_i32()),
+                                 cast_to(rhs, yir::Type::get_i32()), fresh_temp());
     }
 
     yir::Value *lower_sub(yir::Value *lhs, yir::Value *rhs) {
@@ -443,8 +534,8 @@ class Lowerer final : public ASTVisitor {
             return emit<yir::SubFOp>(cast_to(lhs, yir::Type::get_f32()),
                                      cast_to(rhs, yir::Type::get_f32()), fresh_temp());
         }
-        return emit<yir::SubIOp>(cast_to(lhs, yir::Type::get_i32()), cast_to(rhs, yir::Type::get_i32()),
-                                 fresh_temp());
+        return emit<yir::SubIOp>(cast_to(lhs, yir::Type::get_i32()),
+                                 cast_to(rhs, yir::Type::get_i32()), fresh_temp());
     }
 
     yir::Value *lower_mul(yir::Value *lhs, yir::Value *rhs) {
@@ -452,8 +543,8 @@ class Lowerer final : public ASTVisitor {
             return emit<yir::MulFOp>(cast_to(lhs, yir::Type::get_f32()),
                                      cast_to(rhs, yir::Type::get_f32()), fresh_temp());
         }
-        return emit<yir::MulIOp>(cast_to(lhs, yir::Type::get_i32()), cast_to(rhs, yir::Type::get_i32()),
-                                 fresh_temp());
+        return emit<yir::MulIOp>(cast_to(lhs, yir::Type::get_i32()),
+                                 cast_to(rhs, yir::Type::get_i32()), fresh_temp());
     }
 
     yir::Value *lower_div(yir::Value *lhs, yir::Value *rhs) {
@@ -461,8 +552,8 @@ class Lowerer final : public ASTVisitor {
             return emit<yir::DivFOp>(cast_to(lhs, yir::Type::get_f32()),
                                      cast_to(rhs, yir::Type::get_f32()), fresh_temp());
         }
-        return emit<yir::DivSIOp>(cast_to(lhs, yir::Type::get_i32()), cast_to(rhs, yir::Type::get_i32()),
-                                  fresh_temp());
+        return emit<yir::DivSIOp>(cast_to(lhs, yir::Type::get_i32()),
+                                  cast_to(rhs, yir::Type::get_i32()), fresh_temp());
     }
 
     yir::Value *lower_compare(BinaryOp op, yir::Value *lhs, yir::Value *rhs) {
@@ -529,8 +620,14 @@ class Lowerer final : public ASTVisitor {
                 return emit<yir::SIToFPOp>(value, fresh_temp());
             }
         }
-        if (target->kind() == yir::Type::Kind::Ptr && value->type()->is_array()) {
-            return emit<yir::DecayOp>(value, target, fresh_temp());
+        if (target->kind() == yir::Type::Kind::Ptr) {
+            if (value->type()->is_array()) {
+                return emit<yir::DecayOp>(value, target, fresh_temp());
+            }
+            if (value->type()->is_ptr() && value->type()->pointee() != nullptr &&
+                value->type()->pointee()->is_array()) {
+                return emit<yir::DecayOp>(value, target, fresh_temp());
+            }
         }
         return value;
     }
@@ -547,6 +644,23 @@ class Lowerer final : public ASTVisitor {
             return lower_expr(*init.expr);
         }
         return emit<yir::ZeroOp>(storage_type, fresh_temp());
+    }
+
+    ConstantValue constant_value_for_decl(const VarDecl &decl) {
+        ConstantValue value;
+        if (!decl.is_const || !decl.dimensions.empty() || decl.init == nullptr) {
+            return value;
+        }
+        value.valid = true;
+        value.type = decl.base_type;
+        if (decl.base_type == BuiltinType::Float) {
+            value.float_value = eval_const_float(decl.init->expr.get());
+            value.int_value = static_cast<int>(value.float_value);
+            return value;
+        }
+        value.int_value = eval_const_int(decl.init->expr.get());
+        value.float_value = static_cast<float>(value.int_value);
+        return value;
     }
 
     void emit_array_init(yir::Value *array, yir::TypePtr storage_type, InitVal &init) {
@@ -573,7 +687,8 @@ class Lowerer final : public ASTVisitor {
         return entries;
     }
 
-    yir::TypePtr collect_array_dimensions(yir::TypePtr type, std::vector<std::uint64_t> &dimensions) {
+    yir::TypePtr collect_array_dimensions(yir::TypePtr type,
+                                          std::vector<std::uint64_t> &dimensions) {
         while (type->is_array()) {
             dimensions.push_back(type->count());
             type = type->element();
@@ -604,16 +719,18 @@ class Lowerer final : public ASTVisitor {
             }
 
             std::uint64_t sub_size = 1;
-            std::size_t sub_level = braced_subobject_level(dimensions, level, cursor, limit, sub_size);
+            std::size_t sub_level =
+                braced_subobject_level(dimensions, level, cursor, limit, sub_size);
             std::uint64_t sub_end = cursor + sub_size;
-            lower_array_init_list(element_type, dimensions, *elem, sub_level, cursor, sub_end, entries);
+            lower_array_init_list(element_type, dimensions, *elem, sub_level, cursor, sub_end,
+                                  entries);
             cursor = sub_end;
         }
     }
 
     std::size_t braced_subobject_level(const std::vector<std::uint64_t> &dimensions,
-                                       std::size_t level, std::uint64_t cursor,
-                                       std::uint64_t limit, std::uint64_t &sub_size) {
+                                       std::size_t level, std::uint64_t cursor, std::uint64_t limit,
+                                       std::uint64_t &sub_size) {
         for (std::size_t candidate = level + 1; candidate < dimensions.size(); ++candidate) {
             std::uint64_t size = suffix_element_count(dimensions, candidate);
             if (size != 0 && cursor % size == 0 && cursor + size <= limit) {
@@ -660,19 +777,22 @@ class Lowerer final : public ASTVisitor {
     void lower_global_decl(DeclStmt &decl_stmt) {
         for (auto &decl : decl_stmt.decls) {
             yir::TypePtr storage_type = type_for_var(decl->base_type, decl->dimensions);
+            ConstantValue constant = constant_value_for_decl(*decl);
             yir::Global *global = module_->add_global(decl->name, storage_type, decl->is_const);
-            bind(decl->name, global->address(), storage_type, storage_type->is_array(), true);
             if (decl->init) {
                 global->set_initializer(global_initializer(storage_type, *decl->init));
             } else {
                 global->set_initializer("zero");
             }
+            define_variable(decl->name, global->address(), storage_type, decl->is_const,
+                            storage_type->is_array(), true, constant);
         }
     }
 
     std::string global_initializer(yir::TypePtr storage_type, InitVal &init) {
         if (!storage_type->is_array()) {
-            return init.expr ? const_expr_to_string(init.expr.get(), storage_type) : zero_literal(storage_type);
+            return init.expr ? const_expr_to_string(init.expr.get(), storage_type)
+                             : zero_literal(storage_type);
         }
 
         std::vector<std::uint64_t> dimensions;
@@ -711,9 +831,11 @@ class Lowerer final : public ASTVisitor {
             }
 
             std::uint64_t sub_size = 1;
-            std::size_t sub_level = braced_subobject_level(dimensions, level, cursor, limit, sub_size);
+            std::size_t sub_level =
+                braced_subobject_level(dimensions, level, cursor, limit, sub_size);
             std::uint64_t sub_end = cursor + sub_size;
-            flatten_global_init_list(element_type, dimensions, *elem, sub_level, cursor, sub_end, values);
+            flatten_global_init_list(element_type, dimensions, *elem, sub_level, cursor, sub_end,
+                                     values);
             cursor = sub_end;
         }
     }
@@ -758,8 +880,13 @@ class Lowerer final : public ASTVisitor {
         if (expr == nullptr) {
             return true;
         }
-        if (dynamic_cast<IntLiteral *>(expr) != nullptr || dynamic_cast<FloatLiteral *>(expr) != nullptr) {
+        if (dynamic_cast<IntLiteral *>(expr) != nullptr ||
+            dynamic_cast<FloatLiteral *>(expr) != nullptr) {
             return true;
+        }
+        if (auto *lval = dynamic_cast<LValExpr *>(expr)) {
+            Symbol *symbol = lookup_variable(lval->name);
+            return lval->indices.empty() && symbol != nullptr && symbol->constant.valid;
         }
         if (auto *unary = dynamic_cast<UnaryExpr *>(expr)) {
             return is_const_expr(unary->operand.get());
@@ -795,10 +922,12 @@ class Lowerer final : public ASTVisitor {
         return yir::Type::get_i32();
     }
 
-    yir::TypePtr type_for_var(BuiltinType base_type, const std::vector<std::unique_ptr<Expr>> &dims) {
+    yir::TypePtr type_for_var(BuiltinType base_type,
+                              const std::vector<std::unique_ptr<Expr>> &dims) {
         yir::TypePtr type = type_for_builtin(base_type);
         for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
-            type = yir::Type::get_array(static_cast<std::uint64_t>(eval_const_int(it->get())), type);
+            type =
+                yir::Type::get_array(static_cast<std::uint64_t>(eval_const_int(it->get())), type);
         }
         return type;
     }
@@ -812,7 +941,8 @@ class Lowerer final : public ASTVisitor {
             if (it->get() == nullptr) {
                 continue;
             }
-            type = yir::Type::get_array(static_cast<std::uint64_t>(eval_const_int(it->get())), type);
+            type =
+                yir::Type::get_array(static_cast<std::uint64_t>(eval_const_int(it->get())), type);
         }
         return yir::Type::get_ptr(type);
     }
@@ -823,6 +953,19 @@ class Lowerer final : public ASTVisitor {
         }
         if (auto *int_lit = dynamic_cast<IntLiteral *>(expr)) {
             return int_lit->value;
+        }
+        if (auto *float_lit = dynamic_cast<FloatLiteral *>(expr)) {
+            return static_cast<int>(float_lit->value);
+        }
+        if (auto *lval = dynamic_cast<LValExpr *>(expr)) {
+            Symbol *symbol = lookup_variable(lval->name);
+            if (lval->indices.empty() && symbol != nullptr && symbol->constant.valid) {
+                return symbol->constant.type == BuiltinType::Float
+                           ? static_cast<int>(symbol->constant.float_value)
+                           : symbol->constant.int_value;
+            }
+            errors_.push_back("constant expression uses non-constant variable: " + lval->name);
+            return 0;
         }
         if (auto *unary = dynamic_cast<UnaryExpr *>(expr)) {
             int value = eval_const_int(unary->operand.get());
@@ -861,6 +1004,16 @@ class Lowerer final : public ASTVisitor {
         }
         if (auto *int_lit = dynamic_cast<IntLiteral *>(expr)) {
             return static_cast<float>(int_lit->value);
+        }
+        if (auto *lval = dynamic_cast<LValExpr *>(expr)) {
+            Symbol *symbol = lookup_variable(lval->name);
+            if (lval->indices.empty() && symbol != nullptr && symbol->constant.valid) {
+                return symbol->constant.type == BuiltinType::Float
+                           ? symbol->constant.float_value
+                           : static_cast<float>(symbol->constant.int_value);
+            }
+            errors_.push_back("constant expression uses non-constant variable: " + lval->name);
+            return 0.0F;
         }
         if (auto *unary = dynamic_cast<UnaryExpr *>(expr)) {
             float value = eval_const_float(unary->operand.get());
@@ -927,31 +1080,82 @@ class Lowerer final : public ASTVisitor {
     }
 
     void enter_scope() {
-        scopes_.push_back({});
+        symbols_.enter_scope();
     }
 
     void leave_scope() {
-        scopes_.pop_back();
+        symbols_.leave_scope();
     }
 
-    void bind(const std::string &name, yir::Value *value, yir::TypePtr type, bool is_array,
-              bool is_global) {
-        Binding binding;
-        binding.value = value;
-        binding.type = std::move(type);
-        binding.is_array = is_array;
-        binding.is_global = is_global;
-        scopes_.back()[name] = std::move(binding);
-    }
-
-    Binding *lookup(const std::string &name) {
-        for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-            auto found = it->find(name);
-            if (found != it->end()) {
-                return &found->second;
-            }
+    void define_variable(const std::string &name, yir::Value *value, yir::TypePtr type,
+                         bool is_const, bool is_array, bool is_global, ConstantValue constant) {
+        Symbol symbol;
+        symbol.kind = Symbol::Kind::Variable;
+        symbol.name = name;
+        symbol.value = value;
+        symbol.type = std::move(type);
+        symbol.is_const = is_const;
+        symbol.is_array = is_array;
+        symbol.is_global = is_global;
+        symbol.constant = constant;
+        if (!symbols_.define(std::move(symbol))) {
+            errors_.push_back("redefinition of symbol: " + name);
         }
-        return nullptr;
+    }
+
+    void define_function(const std::string &name, yir::Function *function, yir::TypePtr return_type,
+                         std::vector<yir::TypePtr> param_types, bool is_builtin, bool is_variadic) {
+        Symbol symbol;
+        symbol.kind = Symbol::Kind::Function;
+        symbol.name = name;
+        symbol.type = yir::Type::get_func(param_types, return_type);
+        symbol.function = function;
+        symbol.return_type = std::move(return_type);
+        symbol.param_types = std::move(param_types);
+        symbol.is_builtin = is_builtin;
+        symbol.is_variadic = is_variadic;
+        if (!symbols_.define(std::move(symbol))) {
+            errors_.push_back("redefinition of symbol: " + name);
+        }
+    }
+
+    Symbol *lookup_variable(const std::string &name) {
+        Symbol *symbol = symbols_.lookup(name);
+        if (symbol == nullptr || symbol->kind != Symbol::Kind::Variable) {
+            return nullptr;
+        }
+        return symbol;
+    }
+
+    Symbol *lookup_function(const std::string &name) {
+        Symbol *symbol = symbols_.lookup(name);
+        if (symbol == nullptr || symbol->kind != Symbol::Kind::Function) {
+            return nullptr;
+        }
+        return symbol;
+    }
+
+    void install_sysy_builtins() {
+        auto i32 = yir::Type::get_i32();
+        auto f32 = yir::Type::get_f32();
+        auto void_ty = yir::Type::get_void();
+        auto i32_ptr = yir::Type::get_ptr(i32);
+        auto f32_ptr = yir::Type::get_ptr(f32);
+
+        define_function("getint", nullptr, i32, {}, true, false);
+        define_function("getch", nullptr, i32, {}, true, false);
+        define_function("getfloat", nullptr, f32, {}, true, false);
+        define_function("getarray", nullptr, i32, {i32_ptr}, true, false);
+        define_function("getfarray", nullptr, i32, {f32_ptr}, true, false);
+
+        define_function("putint", nullptr, void_ty, {i32}, true, false);
+        define_function("putch", nullptr, void_ty, {i32}, true, false);
+        define_function("putarray", nullptr, void_ty, {i32, i32_ptr}, true, false);
+        define_function("putfloat", nullptr, void_ty, {f32}, true, false);
+        define_function("putfarray", nullptr, void_ty, {i32, f32_ptr}, true, false);
+        define_function("putf", nullptr, void_ty, {}, true, true);
+        define_function("starttime", nullptr, void_ty, {}, true, false);
+        define_function("stoptime", nullptr, void_ty, {}, true, false);
     }
 
     std::string fresh_temp() {
@@ -975,10 +1179,7 @@ class Lowerer final : public ASTVisitor {
     yir::Value *last_value_ = nullptr;
     int loop_depth_ = 0;
     unsigned temp_counter_ = 0;
-    std::vector<std::unordered_map<std::string, Binding>> scopes_;
-    std::unordered_map<std::string, yir::Function *> functions_;
-    std::unordered_map<std::string, yir::TypePtr> function_returns_;
-    std::unordered_map<std::string, std::vector<yir::TypePtr>> function_params_;
+    SymbolTable symbols_;
     std::unordered_map<std::string, unsigned> name_counts_;
     std::vector<std::string> errors_;
 };
@@ -1003,7 +1204,8 @@ PassResult ASTToYIRPass::run(PassContext &context) {
         auto module = lowerer.lower(*context.ast());
         auto verify = yir::verify_high_level_yir(*module);
         if (!verify.success) {
-            return PassResult::fail(verify.errors.empty() ? "YIR verification failed" : verify.errors.front());
+            return PassResult::fail(verify.errors.empty() ? "YIR verification failed"
+                                                          : verify.errors.front());
         }
         context.set_artifact<std::unique_ptr<yir::Module>>(std::move(module));
         return PassResult::ok(true);
