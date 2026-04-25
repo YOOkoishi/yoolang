@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../ast/ast.h"
+#include "../mir/MIR.h"
 #include "../oir/oir.h"
 
 #include <memory>
@@ -47,6 +48,12 @@ class PassContext {
     const oir::Module *ssa_module() const;
     void set_ssa_module(std::unique_ptr<oir::Module> module);
     std::unique_ptr<oir::Module> take_ssa_module();
+
+    bool has_machine_module() const;
+    mir::Module *machine_module();
+    const mir::Module *machine_module() const;
+    void set_machine_module(std::unique_ptr<mir::Module> module);
+    std::unique_ptr<mir::Module> take_machine_module();
 
     bool has_artifact(const std::string &key) const;
     void erase_artifact(const std::string &key);
@@ -116,6 +123,7 @@ class PassContext {
 
     std::unique_ptr<CompUnit> ast_;
     std::unique_ptr<oir::Module> ssa_module_;
+    std::unique_ptr<mir::Module> machine_module_;
     std::unordered_map<std::string, std::unique_ptr<ArtifactBase>> artifacts_;
 };
 
