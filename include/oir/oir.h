@@ -130,6 +130,9 @@ class TypeContext {
     std::unique_ptr<IntegerType> int32_ty_;
     std::unique_ptr<FloatType> float_ty_;
     std::vector<std::unique_ptr<Type>> owned_composite_types_;
+    std::unordered_map<std::string, PointerType *> pointer_types_;
+    std::unordered_map<std::string, ArrayType *> array_types_;
+    std::unordered_map<std::string, FunctionType *> function_types_;
 };
 
 class Value {
@@ -168,6 +171,12 @@ class ConstantFloat final : public Value {
 
   private:
     float value_;
+};
+
+class ConstantZero final : public Value {
+  public:
+    explicit ConstantZero(Type *type);
+    std::string print() const override;
 };
 
 class UndefValue final : public Value {
@@ -403,6 +412,7 @@ class Function final : public Value {
 
     Argument *add_argument(Type *type, const std::string &name);
     BasicBlock *create_block(const std::string &name = "");
+    void erase_block(BasicBlock *block);
     BasicBlock *entry_block() const;
 
     std::vector<std::unique_ptr<Argument>> &args();
@@ -428,12 +438,15 @@ class GlobalVariable final : public Value {
     Type *value_type() const;
     bool is_const() const;
     Value *init_value() const;
+    void set_initializer_literal(std::string literal);
+    const std::string &initializer_literal() const;
     std::string print() const override;
 
   private:
     Type *value_type_;
     bool is_const_;
     Value *init_value_;
+    std::string initializer_literal_;
 };
 
 class Module final {
@@ -455,6 +468,7 @@ class Module final {
     ConstantInt *create_i1(bool value);
     ConstantInt *create_i32(std::int64_t value);
     ConstantFloat *create_f32(float value);
+    ConstantZero *create_zero(Type *type);
     UndefValue *create_undef(Type *type);
 
     std::vector<std::unique_ptr<GlobalVariable>> &globals();
@@ -487,6 +501,7 @@ class IRBuilder final {
     ConstantInt *i1(bool value) const;
     ConstantInt *i32(std::int64_t value) const;
     ConstantFloat *f32(float value) const;
+    ConstantZero *zero(Type *type) const;
     UndefValue *undef(Type *type) const;
 
     BinaryInst *create_binary(Instruction::OpID op, Value *lhs, Value *rhs,

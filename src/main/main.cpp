@@ -2,6 +2,7 @@
 #include "../include/pass/ASTDumpPass.h"
 #include "../include/pass/ASTToYIRPass.h"
 #include "../include/pass/PassManager.h"
+#include "../include/pass/YIRToOIRPass.h"
 #include "../include/yir/YIRPrinter.h"
 
 #include <cstdio>
@@ -17,6 +18,7 @@ struct CommandLineOptions {
     std::string input_path;
     bool emit_ast = false;
     bool emit_yir = false;
+    bool emit_oir = false;
     bool show_help = false;
 };
 
@@ -25,7 +27,8 @@ void print_help(const char *program, std::ostream &out) {
         << "Options:\n"
         << "  -h, --help    Show this help message\n"
         << "  --emit-ast    Dump the parsed AST through the pass pipeline\n"
-        << "  --emit-yir    Lower the parsed AST to YIR and dump it\n";
+        << "  --emit-yir    Lower the parsed AST to YIR and dump it\n"
+        << "  --emit-oir    Lower the parsed AST to SSA OIR, verify it, and dump it\n";
 }
 
 bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std::string &error) {
@@ -41,6 +44,10 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         }
         if (arg == "--emit-yir") {
             options.emit_yir = true;
+            continue;
+        }
+        if (arg == "--emit-oir") {
+            options.emit_oir = true;
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {
@@ -90,8 +97,11 @@ pass::PassManager build_frontend_pipeline(const CommandLineOptions &options, std
     if (options.emit_ast) {
         pm.emplace_pass<pass::ASTDumpPass>(out);
     }
-    if (options.emit_yir) {
+    if (options.emit_yir || options.emit_oir) {
         pm.emplace_pass<pass::ASTToYIRPass>();
+    }
+    if (options.emit_oir) {
+        pm.emplace_pass<pass::YIRToOIRPass>();
     }
     return pm;
 }
@@ -153,6 +163,15 @@ int main(int argc, char **argv) {
         }
         yir::YIRPrinter printer(std::cout);
         printer.print(**module);
+    }
+
+    if (options.emit_oir) {
+        auto *module = context.ssa_module();
+        if (module == nullptr) {
+            std::cerr << "OIR module was not produced\n";
+            return 1;
+        }
+        std::cout << module->print();
     }
 
     return 0;
