@@ -58,19 +58,19 @@ bool PassContext::has_ssa_module() const {
     return ssa_module_ != nullptr;
 }
 
-ir::Module *PassContext::ssa_module() {
+oir::Module *PassContext::ssa_module() {
     return ssa_module_.get();
 }
 
-const ir::Module *PassContext::ssa_module() const {
+const oir::Module *PassContext::ssa_module() const {
     return ssa_module_.get();
 }
 
-void PassContext::set_ssa_module(std::unique_ptr<ir::Module> module) {
+void PassContext::set_ssa_module(std::unique_ptr<oir::Module> module) {
     ssa_module_ = std::move(module);
 }
 
-std::unique_ptr<ir::Module> PassContext::take_ssa_module() {
+std::unique_ptr<oir::Module> PassContext::take_ssa_module() {
     return std::move(ssa_module_);
 }
 

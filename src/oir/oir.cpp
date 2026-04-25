@@ -1,10 +1,10 @@
-#include "../../include/IR/SSA_IR.h"
+#include "../../include/oir/oir.h"
 
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
 
-namespace ir {
+namespace oir {
 
 namespace {
 
@@ -1242,4 +1242,4 @@ VerifyResult Verifier::verify_module(const Module &module) {
     return {true, "ok"};
 }
 
-} // namespace ir
+} // namespace oir
