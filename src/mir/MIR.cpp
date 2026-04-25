@@ -358,8 +358,12 @@ const char *opcode_name(Opcode opcode) {
         return "DIVW";
     case Opcode::RemW:
         return "REMW";
+    case Opcode::And:
+        return "AND";
     case Opcode::SllI:
         return "SLLI";
+    case Opcode::SrliW:
+        return "SRLIW";
     case Opcode::Xor:
         return "XOR";
     case Opcode::XorI:
