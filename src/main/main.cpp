@@ -1,8 +1,11 @@
 #include "../include/front/parser.h"
 #include "../include/pass/ASTDumpPass.h"
 #include "../include/pass/ASTToYIRPass.h"
+#include "../include/pass/MIRToAsmPass.h"
+#include "../include/pass/OIRToMIRPass.h"
 #include "../include/pass/PassManager.h"
 #include "../include/pass/YIRToOIRPass.h"
+#include "../include/mir/MIRPrinter.h"
 #include "../include/yir/YIRPrinter.h"
 
 #include <cstdio>
@@ -19,6 +22,8 @@ struct CommandLineOptions {
     bool emit_ast = false;
     bool emit_yir = false;
     bool emit_oir = false;
+    bool emit_mir = false;
+    bool emit_asm = false;
     bool show_help = false;
 };
 
@@ -28,7 +33,9 @@ void print_help(const char *program, std::ostream &out) {
         << "  -h, --help    Show this help message\n"
         << "  --emit-ast    Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir    Lower the parsed AST to YIR and dump it\n"
-        << "  --emit-oir    Lower the parsed AST to SSA OIR, verify it, and dump it\n";
+        << "  --emit-oir    Lower the parsed AST to SSA OIR, verify it, and dump it\n"
+        << "  --emit-mir    Lower OIR to the first RISC-V MIR and dump it\n"
+        << "  --emit-asm    Lower to RISC-V assembly (default)\n";
 }
 
 bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std::string &error) {
@@ -50,6 +57,14 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
             options.emit_oir = true;
             continue;
         }
+        if (arg == "--emit-mir") {
+            options.emit_mir = true;
+            continue;
+        }
+        if (arg == "--emit-asm") {
+            options.emit_asm = true;
+            continue;
+        }
         if (!arg.empty() && arg[0] == '-') {
             error = "unknown option: " + arg;
             return false;
@@ -64,6 +79,11 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
     if (!options.show_help && options.input_path.empty()) {
         error = "missing input file";
         return false;
+    }
+
+    if (!options.show_help && !options.emit_ast && !options.emit_yir && !options.emit_oir &&
+        !options.emit_mir && !options.emit_asm) {
+        options.emit_asm = true;
     }
 
     return true;
@@ -97,11 +117,17 @@ pass::PassManager build_frontend_pipeline(const CommandLineOptions &options, std
     if (options.emit_ast) {
         pm.emplace_pass<pass::ASTDumpPass>(out);
     }
-    if (options.emit_yir || options.emit_oir) {
+    if (options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm) {
         pm.emplace_pass<pass::ASTToYIRPass>();
     }
-    if (options.emit_oir) {
+    if (options.emit_oir || options.emit_mir || options.emit_asm) {
         pm.emplace_pass<pass::YIRToOIRPass>();
+    }
+    if (options.emit_mir || options.emit_asm) {
+        pm.emplace_pass<pass::OIRToMIRPass>();
+    }
+    if (options.emit_asm) {
+        pm.emplace_pass<pass::MIRToAsmPass>();
     }
     return pm;
 }
@@ -172,6 +198,25 @@ int main(int argc, char **argv) {
             return 1;
         }
         std::cout << module->print();
+    }
+
+    if (options.emit_mir) {
+        auto *module = context.machine_module();
+        if (module == nullptr) {
+            std::cerr << "MIR module was not produced\n";
+            return 1;
+        }
+        mir::MIRPrinter printer(std::cout);
+        printer.print(*module);
+    }
+
+    if (options.emit_asm) {
+        auto *asm_text = context.get_artifact<std::string>(pass::MIRToAsmPass::kArtifactKey);
+        if (asm_text == nullptr) {
+            std::cerr << "Assembly was not produced\n";
+            return 1;
+        }
+        std::cout << *asm_text;
     }
 
     return 0;

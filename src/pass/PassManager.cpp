@@ -74,6 +74,26 @@ std::unique_ptr<oir::Module> PassContext::take_ssa_module() {
     return std::move(ssa_module_);
 }
 
+bool PassContext::has_machine_module() const {
+    return machine_module_ != nullptr;
+}
+
+mir::Module *PassContext::machine_module() {
+    return machine_module_.get();
+}
+
+const mir::Module *PassContext::machine_module() const {
+    return machine_module_.get();
+}
+
+void PassContext::set_machine_module(std::unique_ptr<mir::Module> module) {
+    machine_module_ = std::move(module);
+}
+
+std::unique_ptr<mir::Module> PassContext::take_machine_module() {
+    return std::move(machine_module_);
+}
+
 bool PassContext::has_artifact(const std::string &key) const {
     return artifacts_.find(key) != artifacts_.end();
 }
