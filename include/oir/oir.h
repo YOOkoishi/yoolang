@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace ir {
+namespace oir {
 
 class Type {
   public:
@@ -531,4 +531,4 @@ class Verifier final {
     static VerifyResult verify_module(const Module &module);
 };
 
-} // namespace ir
+} // namespace oir
