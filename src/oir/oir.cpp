@@ -8,6 +8,10 @@ namespace oir {
 
 namespace {
 
+std::string type_key(const Type *type) {
+    return type == nullptr ? "<null>" : type->print();
+}
+
 std::string op_to_string(Instruction::OpID op) {
     switch (op) {
     case Instruction::OpID::Ret:
@@ -83,6 +87,7 @@ std::string value_ref(const Value *value) {
 
     if (dynamic_cast<const ConstantInt *>(value) != nullptr ||
         dynamic_cast<const ConstantFloat *>(value) != nullptr ||
+        dynamic_cast<const ConstantZero *>(value) != nullptr ||
         dynamic_cast<const UndefValue *>(value) != nullptr) {
         return value->print();
     }
@@ -108,6 +113,13 @@ std::string prefix_name(const Value *value) {
         return "";
     }
     return "%" + value->name() + " = ";
+}
+
+std::string typed_value_ref(const Value *value) {
+    if (value == nullptr || value->type() == nullptr) {
+        return "<null>";
+    }
+    return value->type()->print() + " " + value_ref(value);
 }
 
 } // namespace
@@ -258,23 +270,53 @@ FloatType *TypeContext::float_ty() const {
 }
 
 PointerType *TypeContext::ptr_ty(Type *element_type) {
+    std::string key = type_key(element_type) + "*";
+    auto found = pointer_types_.find(key);
+    if (found != pointer_types_.end()) {
+        return found->second;
+    }
+
     auto ptr = std::make_unique<PointerType>(element_type);
     auto *raw = ptr.get();
     owned_composite_types_.push_back(std::move(ptr));
+    pointer_types_[std::move(key)] = raw;
     return raw;
 }
 
 ArrayType *TypeContext::array_ty(Type *element_type, std::size_t element_count) {
+    std::string key = "[" + std::to_string(element_count) + " x " + type_key(element_type) + "]";
+    auto found = array_types_.find(key);
+    if (found != array_types_.end()) {
+        return found->second;
+    }
+
     auto arr = std::make_unique<ArrayType>(element_type, element_count);
     auto *raw = arr.get();
     owned_composite_types_.push_back(std::move(arr));
+    array_types_[std::move(key)] = raw;
     return raw;
 }
 
 FunctionType *TypeContext::func_ty(Type *return_type, const std::vector<Type *> &param_types) {
+    std::ostringstream key;
+    key << type_key(return_type) << "(";
+    for (std::size_t i = 0; i < param_types.size(); ++i) {
+        if (i != 0) {
+            key << ",";
+        }
+        key << type_key(param_types[i]);
+    }
+    key << ")";
+    auto key_string = key.str();
+    auto found = function_types_.find(key_string);
+    if (found != function_types_.end()) {
+        return found->second;
+    }
+
     auto fn = std::make_unique<FunctionType>(return_type, param_types);
     auto *raw = fn.get();
     owned_composite_types_.push_back(std::move(fn));
+    function_types_[std::move(key_string)] = raw;
     return raw;
 }
 
@@ -317,6 +359,13 @@ std::string ConstantFloat::print() const {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(6) << value_;
     return oss.str();
+}
+
+ConstantZero::ConstantZero(Type *type) : Value(type, "zero") {
+}
+
+std::string ConstantZero::print() const {
+    return "zero";
 }
 
 UndefValue::UndefValue(Type *type) : Value(type, "undef") {
@@ -381,7 +430,7 @@ Value *BinaryInst::rhs() const {
 }
 
 std::string BinaryInst::print() const {
-    return prefix_name(this) + op_to_string(op()) + " " + value_ref(lhs()) + ", " +
+    return prefix_name(this) + op_to_string(op()) + " " + typed_value_ref(lhs()) + ", " +
            value_ref(rhs());
 }
 
@@ -406,7 +455,7 @@ Value *CmpInst::rhs() const {
 
 std::string CmpInst::print() const {
     return prefix_name(this) + op_to_string(op()) + " " + cmp_pred_to_string(pred_) + " " +
-           value_ref(lhs()) + ", " + value_ref(rhs());
+           typed_value_ref(lhs()) + ", " + value_ref(rhs());
 }
 
 CastInst::CastInst(Type *dst_type, OpID op, Value *src, BasicBlock *parent, const std::string &name)
@@ -419,7 +468,7 @@ Value *CastInst::src() const {
 }
 
 std::string CastInst::print() const {
-    return prefix_name(this) + op_to_string(op()) + " " + value_ref(src()) + " to " +
+    return prefix_name(this) + op_to_string(op()) + " " + typed_value_ref(src()) + " to " +
            type()->print();
 }
 
@@ -460,9 +509,9 @@ std::vector<Value *> GetElementPtrInst::indices() const {
 
 std::string GetElementPtrInst::print() const {
     std::ostringstream oss;
-    oss << prefix_name(this) << "gep " << value_ref(base_ptr());
+    oss << prefix_name(this) << "gep " << typed_value_ref(base_ptr());
     for (std::size_t i = 1; i < operand_count(); ++i) {
-        oss << ", " << value_ref(operand(i));
+        oss << ", " << typed_value_ref(operand(i));
     }
     return oss.str();
 }
@@ -477,7 +526,7 @@ Value *LoadInst::ptr() const {
 }
 
 std::string LoadInst::print() const {
-    return prefix_name(this) + "load " + value_ref(ptr());
+    return prefix_name(this) + "load " + type()->print() + ", " + typed_value_ref(ptr());
 }
 
 StoreInst::StoreInst(Type *void_type, Value *value, Value *ptr, BasicBlock *parent)
@@ -495,7 +544,7 @@ Value *StoreInst::ptr() const {
 }
 
 std::string StoreInst::print() const {
-    return "store " + value_ref(value()) + ", " + value_ref(ptr());
+    return "store " + typed_value_ref(value()) + ", " + typed_value_ref(ptr());
 }
 
 CallInst::CallInst(Type *return_type, Value *callee, const std::vector<Value *> &args,
@@ -524,12 +573,12 @@ std::string CallInst::print() const {
     if (!name().empty()) {
         oss << "%" << name() << " = ";
     }
-    oss << "call " << value_ref(callee()) << "(";
+    oss << "call " << type()->print() << " " << value_ref(callee()) << "(";
     for (std::size_t i = 1; i < operand_count(); ++i) {
         if (i != 1) {
             oss << ", ";
         }
-        oss << value_ref(operand(i));
+        oss << typed_value_ref(operand(i));
     }
     oss << ")";
     return oss.str();
@@ -557,7 +606,7 @@ std::string ReturnInst::print() const {
     if (!has_value()) {
         return "ret void";
     }
-    return "ret " + value_ref(value());
+    return "ret " + typed_value_ref(value());
 }
 
 BranchInst::BranchInst(Type *void_type, BasicBlock *target, BasicBlock *parent)
@@ -607,7 +656,7 @@ BasicBlock *BranchInst::target_bb() const {
 
 std::string BranchInst::print() const {
     if (is_conditional()) {
-        return "br " + value_ref(cond()) + ", " + value_ref(true_bb()) + ", " +
+        return "br " + typed_value_ref(cond()) + ", " + value_ref(true_bb()) + ", " +
                value_ref(false_bb());
     }
     return "br " + value_ref(target_bb());
@@ -769,6 +818,15 @@ BasicBlock *Function::create_block(const std::string &name) {
     return raw;
 }
 
+void Function::erase_block(BasicBlock *block) {
+    auto it = std::find_if(
+        blocks_.begin(), blocks_.end(),
+        [block](const std::unique_ptr<BasicBlock> &candidate) { return candidate.get() == block; });
+    if (it != blocks_.end()) {
+        blocks_.erase(it);
+    }
+}
+
 BasicBlock *Function::entry_block() const {
     if (blocks_.empty()) {
         return nullptr;
@@ -822,10 +880,20 @@ Value *GlobalVariable::init_value() const {
     return init_value_;
 }
 
+void GlobalVariable::set_initializer_literal(std::string literal) {
+    initializer_literal_ = std::move(literal);
+}
+
+const std::string &GlobalVariable::initializer_literal() const {
+    return initializer_literal_;
+}
+
 std::string GlobalVariable::print() const {
     std::ostringstream oss;
     oss << "@" << name() << " = " << (is_const_ ? "constant " : "global ") << value_type_->print();
-    if (init_value_ != nullptr) {
+    if (!initializer_literal_.empty()) {
+        oss << " " << initializer_literal_;
+    } else if (init_value_ != nullptr) {
         oss << " " << value_ref(init_value_);
     }
     return oss.str();
@@ -915,6 +983,13 @@ ConstantFloat *Module::create_f32(float value) {
     auto c = std::make_unique<ConstantFloat>(types_.float_ty(), value);
     auto *raw = c.get();
     owned_constants_.push_back(std::move(c));
+    return raw;
+}
+
+ConstantZero *Module::create_zero(Type *type) {
+    auto zero = std::make_unique<ConstantZero>(type);
+    auto *raw = zero.get();
+    owned_constants_.push_back(std::move(zero));
     return raw;
 }
 
@@ -1009,6 +1084,10 @@ ConstantInt *IRBuilder::i32(std::int64_t value) const {
 
 ConstantFloat *IRBuilder::f32(float value) const {
     return module_->create_f32(value);
+}
+
+ConstantZero *IRBuilder::zero(Type *type) const {
+    return module_->create_zero(type);
 }
 
 UndefValue *IRBuilder::undef(Type *type) const {
@@ -1113,6 +1192,7 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 return {false, "block %" + block->name() + " is empty"};
             }
 
+            bool saw_non_phi = false;
             for (auto it = insts.begin(); it != insts.end(); ++it) {
                 const auto *inst = it->get();
                 const bool is_last = std::next(it) == insts.end();
@@ -1120,6 +1200,14 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 if (inst->is_terminator() && !is_last) {
                     return {false, "terminator in block %" + block->name() +
                                        " is not the last instruction"};
+                }
+                if (inst->op() == Instruction::OpID::Phi) {
+                    if (saw_non_phi) {
+                        return {false, "phi instruction in block %" + block->name() +
+                                           " appears after a non-phi instruction"};
+                    }
+                } else {
+                    saw_non_phi = true;
                 }
 
                 switch (inst->op()) {
@@ -1136,9 +1224,16 @@ VerifyResult Verifier::verify_module(const Module &module) {
                             br->false_bb() == nullptr) {
                             return {false, "conditional branch is incomplete"};
                         }
-                        if (!br->cond()->type()->is_integer()) {
-                            return {false, "conditional branch expects integer condition"};
+                        auto *cond_ty = dynamic_cast<IntegerType *>(br->cond()->type());
+                        if (cond_ty == nullptr || cond_ty->bit_width() != 1) {
+                            return {false, "conditional branch expects i1 condition"};
                         }
+                        if (br->true_bb()->parent() != function ||
+                            br->false_bb()->parent() != function) {
+                            return {false, "conditional branch target is outside the function"};
+                        }
+                    } else if (br->target_bb()->parent() != function) {
+                        return {false, "branch target is outside the function"};
                     }
                     break;
                 }
@@ -1214,6 +1309,32 @@ VerifyResult Verifier::verify_module(const Module &module) {
                     if (cmp->lhs()->type() != cmp->rhs()->type()) {
                         return {false, "compare operands must have same type"};
                     }
+                    auto *result_ty = dynamic_cast<IntegerType *>(cmp->type());
+                    if (result_ty == nullptr || result_ty->bit_width() != 1) {
+                        return {false, "compare result must be i1"};
+                    }
+                    if (inst->op() == Instruction::OpID::ICmp &&
+                        !cmp->lhs()->type()->is_integer()) {
+                        return {false, "icmp operands must be integer"};
+                    }
+                    if (inst->op() == Instruction::OpID::FCmp && !cmp->lhs()->type()->is_float()) {
+                        return {false, "fcmp operands must be float"};
+                    }
+                    break;
+                }
+                case Instruction::OpID::GetElementPtr: {
+                    const auto *gep = dynamic_cast<const GetElementPtrInst *>(inst);
+                    if (gep == nullptr) {
+                        return {false, "gep instruction type mismatch"};
+                    }
+                    if (!gep->base_ptr()->type()->is_pointer() || !gep->type()->is_pointer()) {
+                        return {false, "gep expects pointer base and pointer result"};
+                    }
+                    for (auto *index : gep->indices()) {
+                        if (!index->type()->is_integer()) {
+                            return {false, "gep index must be integer"};
+                        }
+                    }
                     break;
                 }
                 case Instruction::OpID::Phi: {
@@ -1221,9 +1342,16 @@ VerifyResult Verifier::verify_module(const Module &module) {
                     if (phi == nullptr) {
                         return {false, "phi instruction type mismatch"};
                     }
+                    if (phi->incoming().size() != block->predecessors().size()) {
+                        return {false, "phi incoming count does not match predecessor count"};
+                    }
                     for (const auto &item : phi->incoming()) {
                         if (item.first->type() != phi->type()) {
                             return {false, "phi incoming value type mismatch"};
+                        }
+                        const auto &preds = block->predecessors();
+                        if (std::find(preds.begin(), preds.end(), item.second) == preds.end()) {
+                            return {false, "phi incoming predecessor is not a CFG predecessor"};
                         }
                     }
                     break;
