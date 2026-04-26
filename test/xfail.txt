@@ -1,0 +1,17 @@
+# Known end-to-end failures from the first full qemu run.
+# Keep these narrow. XPASS is reported as a failure so fixed tests do not stay hidden.
+
+e2e test/bsb-final/2025-3F1-17.sy
+e2e test/bsb-final/2025-ALU-23.sy
+e2e test/bsb-final/2025-CNI-38.sy
+e2e test/bsb-final/2025-EQV-46.sy
+e2e test/bsb-final/2025-N3A-33.sy
+e2e test/bsb-final/2025-PDZ-59.sy
+e2e test/bsb-perl/03_sort1.sy
+e2e test/bsb-perl/crypto-1.sy
+e2e test/bsb-perl/crypto-2.sy
+e2e test/bsb-perl/crypto-3.sy
+e2e test/bsb-perl/fft0.sy
+e2e test/bsb-perl/h-9-01.sy
+e2e test/bsb-perl/h-9-02.sy
+e2e test/bsb-perl/h-9-03.sy

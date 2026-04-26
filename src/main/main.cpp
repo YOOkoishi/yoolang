@@ -1,11 +1,11 @@
 #include "../include/front/parser.h"
+#include "../include/mir/MIRPrinter.h"
 #include "../include/pass/ASTDumpPass.h"
 #include "../include/pass/ASTToYIRPass.h"
 #include "../include/pass/MIRToAsmPass.h"
 #include "../include/pass/OIRToMIRPass.h"
 #include "../include/pass/PassManager.h"
 #include "../include/pass/YIRToOIRPass.h"
-#include "../include/mir/MIRPrinter.h"
 #include "../include/yir/YIRPrinter.h"
 
 #include <cstdio>
@@ -34,7 +34,7 @@ void print_help(const char *program, std::ostream &out) {
         << "  --emit-ast    Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir    Lower the parsed AST to YIR and dump it\n"
         << "  --emit-oir    Lower the parsed AST to SSA OIR, verify it, and dump it\n"
-        << "  --emit-mir    Lower OIR to the first RISC-V MIR and dump it\n"
+        << "  --emit-mir    Lower OIR to the RISC-V MIR and dump it\n"
         << "  --emit-asm    Lower to RISC-V assembly (default)\n";
 }
 

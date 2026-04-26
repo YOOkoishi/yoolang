@@ -1,2 +1,1 @@
-test/**/*.in filter=lfs diff=lfs merge=lfs -text
-test/**/*.out filter=lfs diff=lfs merge=lfs -text
+# Test inputs/outputs are kept as normal repository files in this MVP checkout.

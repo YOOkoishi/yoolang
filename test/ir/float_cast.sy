@@ -1,0 +1,27 @@
+// RUN: %yoolang --emit-oir %s | FileCheck %s --check-prefix=OIR
+// RUN: %yoolang --emit-mir %s | FileCheck %s --check-prefix=MIR
+// RUN: %yoolang --emit-asm %s | FileCheck %s --check-prefix=ASM
+
+float f(float x, int y) {
+  return x + y;
+}
+
+int main() {
+  float z = f(1.5, 2);
+  return z;
+}
+
+// OIR-LABEL: define float @f
+// OIR: sitofp i32
+// OIR: fadd float
+// OIR: fptosi float
+
+// MIR-LABEL: func @f
+// MIR: FCVT.S.W
+// MIR: FADD.S
+// MIR: FCVT.W.S
+
+// ASM-LABEL: f:
+// ASM: fcvt.s.w
+// ASM: fadd.s
+// ASM: fcvt.w.s
