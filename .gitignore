@@ -21,6 +21,17 @@ compile_commands.json
 *.out
 *.app
 
+# Test references are source artifacts, not build outputs.
+!test/**/*.out
+!test/**/*.in
+!test/**/*.sy
+!test/**/*.yir
+!test/**/*.txt
+
+# Keep extracted tests, but do not commit bulky downloaded archives.
+test/**/*.zip
+*.zip
+
 # 编辑器与 IDE 临时文件和配置
 .vscode/*
 !.vscode/tasks.json
@@ -31,6 +42,8 @@ compile_commands.json
 *.swo
 *~
 *.bak
+__pycache__/
+*.py[cod]
 
 # 操作系统自动生成的文件
 .DS_Store
@@ -46,5 +59,3 @@ $RECYCLE.BIN/
 tmp/*
 
 .codex
-
-test/*

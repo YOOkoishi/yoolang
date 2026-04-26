@@ -1,0 +1,38 @@
+// RUN: %yoolang --emit-yir %s | FileCheck %s --check-prefix=YIR
+// RUN: %yoolang --emit-oir %s | FileCheck %s --check-prefix=OIR
+// RUN: %yoolang --emit-mir %s | FileCheck %s --check-prefix=MIR
+// RUN: %yoolang --emit-asm %s | FileCheck %s --check-prefix=ASM
+
+int main() {
+  int a = 7;
+  int count = 0;
+  while (a != 1) {
+    count = count + 1;
+    if (a % 2 == 0) {
+      a = a / 2;
+    } else {
+      a = a * 3 + 1;
+    }
+  }
+  return count;
+}
+
+// YIR-LABEL: yir.func @main() -> i32
+// YIR: yir.while
+// YIR: yir.if
+// YIR: yir.return
+
+// OIR-LABEL: define i32 @main()
+// OIR: phi
+// OIR: br i1
+// OIR: srem
+// OIR: ret i32
+
+// MIR-LABEL: func @main() -> i32
+// MIR: BNEZ
+// MIR: J %epilogue
+// MIR: edge.
+
+// ASM-LABEL: main:
+// ASM: bnez
+// ASM: ret
