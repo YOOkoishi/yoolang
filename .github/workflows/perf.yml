@@ -41,7 +41,7 @@ jobs:
 
       - name: Run perf script
         env:
-          PERF_TEST_DIRS: test/bsb2025-final,test/bsb2025-prel
+          PERF_TEST_DIRS: test/bsb-final,test/bsb-perl
           PERF_MAX_CASES: "120"
           PERF_TIMEOUT_SEC: "20"
         run: |
