@@ -257,16 +257,18 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
 
 def _emit_yoolang_asm(src: Path, out_dir: Path) -> tuple[Path, str]:
     result = subprocess.run(
-        [str(YOOLANG_BIN), str(src), "--emit-asm", src.stem],
+        [str(YOOLANG_BIN), str(src), "--emit-asm"],
         check=True,
         capture_output=True,
         text=True,
     )
     raw = result.stdout
     marker_pos = raw.find(MARKER)
-    if marker_pos < 0:
-        raise RuntimeError(f"assembly marker not found in yoolang output for {src}")
-    asm_text = raw[marker_pos + len(MARKER):].lstrip("\r\n")
+    # Newer frontend prints plain assembly directly; older builds may still emit a marker.
+    if marker_pos >= 0:
+        asm_text = raw[marker_pos + len(MARKER):].lstrip("\r\n")
+    else:
+        asm_text = raw
     asm_file = out_dir / f"{src.stem}.yoolang.s"
     asm_file.write_text(asm_text)
     return asm_file, "OK"
