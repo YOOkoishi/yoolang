@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -431,29 +430,6 @@ class Lowerer final {
 
     void lower_int_binary(const oir::BinaryInst &inst) {
         load_int_value(inst.lhs(), "t0");
-        if (inst.op() == oir::Instruction::OpID::SDiv ||
-            inst.op() == oir::Instruction::OpID::SRem) {
-            auto rhs_constant = constant_i32(inst.rhs());
-            if (rhs_constant.has_value() && rhs_constant.value() > 0 &&
-                is_power_of_two(static_cast<std::uint64_t>(rhs_constant.value()))) {
-                if (inst.op() == oir::Instruction::OpID::SDiv) {
-                    emit(mir::Opcode::SrliW,
-                         {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t0"),
-                          mir::MachineOperand::imm(log2_u64(
-                              static_cast<std::uint64_t>(rhs_constant.value())))});
-                } else {
-                    emit(mir::Opcode::LoadImm,
-                         {mir::MachineOperand::reg("t1"),
-                          mir::MachineOperand::imm(rhs_constant.value() - 1)});
-                    emit(mir::Opcode::And,
-                         {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t0"),
-                          mir::MachineOperand::reg("t1")});
-                }
-                store_reg_to_value_slot(&inst, "t2");
-                return;
-            }
-        }
-
         load_int_value(inst.rhs(), "t1");
         mir::Opcode opcode = mir::Opcode::AddW;
         switch (inst.op()) {
@@ -478,30 +454,6 @@ class Lowerer final {
         emit(opcode, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t0"),
                       mir::MachineOperand::reg("t1")});
         store_reg_to_value_slot(&inst, "t2");
-    }
-
-    std::optional<std::int64_t> constant_i32(oir::Value *value) const {
-        if (auto *constant = dynamic_cast<oir::ConstantInt *>(value)) {
-            return constant->value();
-        }
-        auto *load = dynamic_cast<oir::LoadInst *>(value);
-        if (load == nullptr) {
-            return std::nullopt;
-        }
-
-        auto *global = dynamic_cast<oir::GlobalVariable *>(load->ptr());
-        if (global == nullptr || !global->is_const()) {
-            return std::nullopt;
-        }
-        const std::string &literal = global->initializer_literal();
-        if (literal.empty() || literal == "zero") {
-            return 0;
-        }
-        try {
-            return std::stoll(literal);
-        } catch (...) {
-            return std::nullopt;
-        }
     }
 
     void lower_float_binary(const oir::BinaryInst &inst) {
