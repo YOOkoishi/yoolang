@@ -1,5 +1,2 @@
 # Known end-to-end failures.
 # Keep these narrow. XPASS is reported as a failure so fixed tests do not stay hidden.
-
-# Current input contains values outside the signed 32-bit SysY int range.
-e2e test/bsb-perl/03_sort1.sy
