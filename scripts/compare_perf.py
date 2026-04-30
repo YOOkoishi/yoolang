@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import sys
 import time
@@ -202,6 +203,36 @@ def _ensure_runtime_wrapper() -> Path:
     return wrapper
 
 
+def flatten_multidim_array_io_calls_for_baseline(src: str) -> str:
+    multidim_int_arrays: set[str] = set()
+    decl_re = re.compile(r"\bint\s+([A-Za-z_]\w*)\s*(?:\[[^\]]+\]){2,}\s*(?:=|;)")
+
+    for match in decl_re.finditer(src):
+        multidim_int_arrays.add(match.group(1))
+
+    for name in sorted(multidim_int_arrays, key=len, reverse=True):
+        ident = re.escape(name)
+        src = re.sub(
+            rf"\bgetarray\s*\(\s*{ident}\s*\)",
+            f"getarray((int*){name})",
+            src,
+        )
+        src = re.sub(
+            rf"\bputarray\s*\(\s*([^,\n]+?)\s*,\s*{ident}\s*\)",
+            rf"putarray(\1, (int*){name})",
+            src,
+        )
+
+    return src
+
+
+def _prepare_baseline_source(src: Path, out_dir: Path) -> Path:
+    baseline_src = flatten_multidim_array_io_calls_for_baseline(src.read_text())
+    baseline_file = out_dir / f"{src.stem}.baseline.cc"
+    baseline_file.write_text(baseline_src)
+    return baseline_file
+
+
 try:
     YOOLANG_BIN = _resolve_yoolang_binary()
     RUNTIME_LIB = _ensure_runtime_lib()
@@ -212,6 +243,7 @@ except Exception as exc:
 
 
 def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
+    baseline_src = _prepare_baseline_source(src, out_dir)
     obj = out_dir / f"{src.stem}.gcc.o"
     exe = out_dir / f"{src.stem}.gcc.riscv"
     cmd = [
@@ -223,7 +255,7 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
         "-x",
         "c++",
         "-c",
-        str(src),
+        str(baseline_src),
         "-o",
         str(obj),
     ]
@@ -233,6 +265,7 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
 
 
 def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
+    baseline_src = _prepare_baseline_source(src, out_dir)
     obj = out_dir / f"{src.stem}.clang.o"
     exe = out_dir / f"{src.stem}.clang.riscv"
     cmd = [
@@ -246,7 +279,7 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
         "-x",
         "c++",
         "-c",
-        str(src),
+        str(baseline_src),
         "-o",
         str(obj),
     ]
