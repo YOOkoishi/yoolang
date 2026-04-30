@@ -52,7 +52,7 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          PERF_TEST_DIRS: test/performance
+          PERF_TEST_DIRS: test/bsb-final
           PERF_TIMEOUT_SEC: "20"
           SYSY_RUNTIME_LIB: runtime/libsysy.a
         run: |
