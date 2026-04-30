@@ -1,9 +1,6 @@
-name: Build and Perf
+name: Perf (Manual)
 
 on:
-  push:
-    branches:
-      - "**"
   workflow_dispatch:
 
 jobs:

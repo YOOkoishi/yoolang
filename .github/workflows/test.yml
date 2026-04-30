@@ -1,4 +1,4 @@
-name: Build and Test
+name: Functional Tests and Perf
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-test:
+  functional-and-perf:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -34,24 +34,177 @@ jobs:
           echo "xmake not found after setup_env.sh"
           exit 1
 
-      - name: Build (xmake release)
+      - name: Run functional tests
+        id: functional_tests
+        continue-on-error: true
         run: |
-          xmake f -m release
-          xmake -vD
+          set -o pipefail
+          mkdir -p build/github-actions
+          python3 scripts/run_tests.py --build --suite all 2>&1 | tee build/github-actions/functional-tests.log
 
-      - name: Run functional and perf tests
-        run: |
-          python3 scripts/run_tests_ci.py
-
-      - name: Publish perf summary
+      - name: Run performance tests
+        id: perf_tests
         if: always()
+        continue-on-error: true
+        env:
+          PERF_TEST_DIRS: test/performance
+          PERF_TIMEOUT_SEC: "20"
         run: |
-          if [ -f build/perf-ci/perf-report.md ]; then
-            cat build/perf-ci/perf-report.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "# RISC-V QEMU Perf Report" >> "$GITHUB_STEP_SUMMARY"
-            echo "perf-report.md not found." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          set -o pipefail
+          mkdir -p build/github-actions
+          python3 scripts/compare_perf.py 2>&1 | tee build/github-actions/perf-tests.log
+
+      - name: Write summary
+        if: always()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
+          PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path.cwd()
+          functional_log = root / "build/github-actions/functional-tests.log"
+          perf_log = root / "build/github-actions/perf-tests.log"
+          perf_json = root / "build/perf-ci/perf-report.json"
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          def parse_functional_summary(text: str) -> dict[str, int] | None:
+              match = re.search(
+                  r"summary:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+(\d+) xfailed,\s+(\d+) xpassed",
+                  text,
+              )
+              if not match:
+                  return None
+              return {
+                  "passed": int(match.group(1)),
+                  "failed": int(match.group(2)),
+                  "skipped": int(match.group(3)),
+                  "xfailed": int(match.group(4)),
+                  "xpassed": int(match.group(5)),
+              }
+
+          def parse_failed_cases(text: str) -> list[str]:
+              cases: list[str] = []
+              for line in text.splitlines():
+                  match = re.match(r"^FAIL\s+\w+\s+(.+?)\s+\([0-9.]+s\)$", line)
+                  if match:
+                      cases.append(match.group(1))
+              return cases
+
+          def parse_time(cell: str) -> float | None:
+              match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)s", cell.strip())
+              if not match:
+                  return None
+              return float(match.group(1))
+
+          functional_text = functional_log.read_text(errors="replace") if functional_log.exists() else ""
+          functional = parse_functional_summary(functional_text)
+          functional_failed_cases = parse_failed_cases(functional_text)
+
+          if functional is None:
+              functional_status = "PASS" if os.environ["FUNCTIONAL_OUTCOME"] == "success" else "FAIL"
+          else:
+              functional_status = "PASS" if functional["failed"] == 0 else "FAIL"
+
+          perf_payload = None
+          if perf_json.exists():
+              perf_payload = json.loads(perf_json.read_text())
+
+          lines = [
+              "# CI Summary",
+              "",
+              "## Functional Tests",
+              "- Command: `scripts/run_tests.py --build --suite all`",
+              f"- Status: {functional_status}",
+          ]
+
+          if functional is None:
+              lines.append(f"- Result: could not parse summary, step outcome was `{os.environ['FUNCTIONAL_OUTCOME']}`")
+          else:
+              lines.append(f"- Passed: {functional['passed']}")
+              lines.append(f"- Failed: {functional['failed']}")
+              lines.append(f"- Skipped: {functional['skipped']}")
+              lines.append(f"- XFailed: {functional['xfailed']}")
+              lines.append(f"- XPassed: {functional['xpassed']}")
+
+          if functional_failed_cases:
+              lines.extend(
+                  [
+                      "",
+                      "<details><summary>Functional test failures</summary>",
+                      "",
+                  ]
+              )
+              lines.extend(f"- `{case}`" for case in functional_failed_cases[:20])
+              if len(functional_failed_cases) > 20:
+                  lines.append(f"- ... and {len(functional_failed_cases) - 20} more")
+              lines.extend(["", "</details>"])
+
+          lines.extend(["", "## Performance Tests"])
+
+          if perf_payload is None:
+              lines.append(f"- Status: {os.environ['PERF_OUTCOME'].upper()}")
+              lines.append("- Result: perf report was not generated")
+              if perf_log.exists():
+                  tail = "\n".join(perf_log.read_text(errors="replace").splitlines()[-20:])
+                  if tail:
+                      lines.extend(["", "<details><summary>Perf log tail</summary>", "", "```text", tail, "```", "", "</details>"])
+          else:
+              rows = perf_payload.get("rows", [])
+              gcc_total = 0.0
+              clang_total = 0.0
+              yoolang_total = 0.0
+              comparable_cases = 0
+              gcc_compile_fail = 0
+              clang_compile_fail = 0
+              yoolang_compile_fail = 0
+
+              for row in rows:
+                  gcc_cell = str(row.get("gcc", ""))
+                  clang_cell = str(row.get("clang", ""))
+                  yoolang_cell = str(row.get("yoolang", ""))
+
+                  if gcc_cell == "CFAIL":
+                      gcc_compile_fail += 1
+                  if clang_cell == "CFAIL":
+                      clang_compile_fail += 1
+                  if yoolang_cell == "CFAIL":
+                      yoolang_compile_fail += 1
+
+                  gcc_time = parse_time(gcc_cell)
+                  clang_time = parse_time(clang_cell)
+                  yoolang_time = parse_time(yoolang_cell)
+                  if gcc_time is None or clang_time is None or yoolang_time is None:
+                      continue
+                  gcc_total += gcc_time
+                  clang_total += clang_time
+                  yoolang_total += yoolang_time
+                  comparable_cases += 1
+
+              lines.append(f"- Status: {perf_payload.get('status', os.environ['PERF_OUTCOME'].upper())}")
+              lines.append(f"- Cases: {perf_payload.get('cases', len(rows))}")
+              lines.append(f"- Failed: {perf_payload.get('failures', 'unknown')}")
+              lines.append(f"- Total runtime: {perf_payload.get('total_runtime_sec', 0.0):.4f}s")
+              lines.append(f"- Comparable cases: {comparable_cases}")
+              lines.append(f"- GCC compile failures: {gcc_compile_fail}")
+              lines.append(f"- Clang compile failures: {clang_compile_fail}")
+              lines.append(f"- Yoolang compile failures: {yoolang_compile_fail}")
+
+              if comparable_cases > 0 and gcc_total > 0 and clang_total > 0:
+                  delta_vs_gcc = (yoolang_total - gcc_total) / gcc_total * 100.0
+                  delta_vs_clang = (yoolang_total - clang_total) / clang_total * 100.0
+                  lines.append(f"- Yoolang total on comparable cases: {yoolang_total:.4f}s")
+                  lines.append(f"- GCC baseline total: {gcc_total:.4f}s ({delta_vs_gcc:+.2f}% vs yoolang)")
+                  lines.append(f"- Clang baseline total: {clang_total:.4f}s ({delta_vs_clang:+.2f}% vs yoolang)")
+              else:
+                  lines.append("- Baseline comparison: not enough successful gcc/clang/yoolang runs to compare")
+
+          summary_path.write_text("\n".join(lines) + "\n")
+          PY
 
       - name: Upload perf artifacts
         if: always()
@@ -59,6 +212,40 @@ jobs:
         with:
           name: perf-report
           path: |
+            build/github-actions/functional-tests.log
+            build/github-actions/perf-tests.log
             build/perf-ci/perf-report.md
             build/perf-ci/perf-report.json
           if-no-files-found: warn
+
+      - name: Fail job if functional tests failed
+        if: always()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          log_path = Path("build/github-actions/functional-tests.log")
+          if log_path.exists():
+              text = log_path.read_text(errors="replace")
+              match = re.search(
+                  r"summary:\s+\d+ passed,\s+(\d+) failed,\s+\d+ skipped,\s+\d+ xfailed,\s+\d+ xpassed",
+                  text,
+              )
+              if match:
+                  failed = int(match.group(1))
+                  if failed > 0:
+                      print(f"Functional tests failed: {failed}")
+                      sys.exit(1)
+                  print("Functional tests passed.")
+                  sys.exit(0)
+
+          if os.environ["FUNCTIONAL_OUTCOME"] != "success":
+              print("Functional tests did not complete successfully.")
+              sys.exit(1)
+          print("Functional tests passed.")
+          PY
