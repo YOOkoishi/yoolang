@@ -34,13 +34,18 @@ jobs:
           echo "xmake not found after setup_env.sh"
           exit 1
 
+      - name: Build (xmake release)
+        run: |
+          xmake f -m release
+          xmake -vD
+
       - name: Run functional tests
         id: functional_tests
         continue-on-error: true
         run: |
           set -o pipefail
           mkdir -p build/github-actions
-          python3 scripts/run_tests.py --build --suite all 2>&1 | tee build/github-actions/functional-tests.log
+          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy.a 2>&1 | tee build/github-actions/functional-tests.log
 
       - name: Run performance tests
         id: perf_tests
@@ -49,6 +54,7 @@ jobs:
         env:
           PERF_TEST_DIRS: test/performance
           PERF_TIMEOUT_SEC: "20"
+          SYSY_RUNTIME_LIB: runtime/libsysy.a
         run: |
           set -o pipefail
           mkdir -p build/github-actions
@@ -118,7 +124,7 @@ jobs:
               "# CI Summary",
               "",
               "## Functional Tests",
-              "- Command: `scripts/run_tests.py --build --suite all`",
+              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy.a`",
               f"- Status: {functional_status}",
           ]
 
@@ -193,6 +199,18 @@ jobs:
               lines.append(f"- GCC compile failures: {gcc_compile_fail}")
               lines.append(f"- Clang compile failures: {clang_compile_fail}")
               lines.append(f"- Yoolang compile failures: {yoolang_compile_fail}")
+
+              failed_rows = [row for row in rows if str(row.get("status", "")) != "OK"]
+              if failed_rows:
+                  lines.extend(["", "<details><summary>Perf failure details</summary>", ""])
+                  for row in failed_rows[:20]:
+                      lines.append(f"- `{row.get('case', 'unknown')}`: {row.get('status', '')}")
+                      detail = str(row.get("detail", "")).strip()
+                      if detail and detail != str(row.get("status", "")).strip():
+                          lines.extend(["", "```text", detail[:2000], "```", ""])
+                  if len(failed_rows) > 20:
+                      lines.append(f"- ... and {len(failed_rows) - 20} more")
+                  lines.extend(["", "</details>"])
 
               if comparable_cases > 0 and gcc_total > 0 and clang_total > 0:
                   delta_vs_gcc = (yoolang_total - gcc_total) / gcc_total * 100.0

@@ -228,7 +228,7 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
         str(obj),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -251,7 +251,7 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
         str(obj),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -279,7 +279,7 @@ def _compile_yoolang(src: Path, out_dir: Path) -> tuple[Path, str]:
     obj = out_dir / f"{src.stem}.yoolang.o"
     exe = out_dir / f"{src.stem}.yoolang.riscv"
     subprocess.run([GCC_BIN, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -325,6 +325,21 @@ def _format_cell(result: RunResult) -> str:
     if not result.run_ok:
         return result.detail
     return f"{result.elapsed_sec:.4f}s"
+
+
+def _format_detail(label: str, result: RunResult) -> str:
+    parts: list[str] = []
+    if not result.compile_ok:
+        parts.append(f"{label} compile failed: {result.detail}")
+    elif not result.run_ok:
+        parts.append(f"{label} run failed: {result.detail}")
+    if result.exit_code is not None:
+        parts.append(f"{label} exit code: {result.exit_code}")
+    if result.stdout.strip():
+        parts.append(f"{label} stdout:\n{result.stdout.strip()}")
+    if result.stderr.strip():
+        parts.append(f"{label} stderr:\n{result.stderr.strip()}")
+    return "\n\n".join(parts)
 
 
 def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, str]:
@@ -420,6 +435,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
     ]
 
     for row in rows:
+        detail = str(row.get("detail", "")).strip()
         md_lines.append(
             "| "
             + " | ".join(
@@ -433,6 +449,20 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
             )
             + " |"
         )
+        if detail:
+            md_lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        "",
+                        "",
+                        "",
+                        "",
+                        _md_escape(detail),
+                    ]
+                )
+                + " |"
+            )
 
     REPORT_MD.write_text("\n".join(md_lines) + "\n")
 
@@ -482,6 +512,17 @@ def main() -> int:
         gcc, clang, yoolang, ok, detail = _compile_and_run(case)
         total_runtime += gcc.elapsed_sec + clang.elapsed_sec + yoolang.elapsed_sec
         rel = str(case.relative_to(WORKSPACE))
+        error_detail = ""
+        if not ok:
+            error_detail = "\n\n".join(
+                item
+                for item in (
+                    _format_detail("gcc", gcc),
+                    _format_detail("clang++", clang),
+                    _format_detail("yoolang", yoolang),
+                )
+                if item
+            )
         print(
             f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(yoolang):<12} | {detail}"
         )
@@ -492,17 +533,14 @@ def main() -> int:
                 "clang": _format_cell(clang),
                 "yoolang": _format_cell(yoolang),
                 "status": detail,
+                "detail": error_detail,
             }
         )
         if not ok:
             failures += 1
             print(f"[FAIL] {rel}: {detail}")
-            if gcc.stderr.strip():
-                print(f"[gcc stderr] {gcc.stderr.strip()}")
-            if clang.stderr.strip():
-                print(f"[clang++ stderr] {clang.stderr.strip()}")
-            if yoolang.stderr.strip():
-                print(f"[yoolang stderr] {yoolang.stderr.strip()}")
+            if error_detail:
+                print(error_detail)
 
     print("-" * 140)
     print(f"Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")
