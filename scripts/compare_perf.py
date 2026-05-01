@@ -37,6 +37,7 @@ TIMEOUT_SEC = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
 REPORT_DIR = WORKSPACE / "build" / "perf-ci"
 REPORT_MD = REPORT_DIR / "perf-report.md"
 REPORT_JSON = REPORT_DIR / "perf-report.json"
+MAX_STATUS_CELL_CHARS = 4000
 
 
 def _resolve_yoolang_binary() -> Path:
@@ -446,6 +447,12 @@ def _md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
 
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... <truncated, {len(text) - limit} chars omitted> ..."
+
+
 def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -467,8 +474,13 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         "| --- | --- | --- | --- | --- |",
     ]
 
-    for row in rows:
+    display_rows = sorted(rows, key=lambda row: str(row.get("status", "")) == "OK")
+    for row in display_rows:
         detail = str(row.get("detail", "")).strip()
+        status_cell = str(row["status"])
+        if detail:
+            status_cell = f"{status_cell}\n\n{detail}"
+        status_cell = _truncate_text(status_cell, MAX_STATUS_CELL_CHARS)
         md_lines.append(
             "| "
             + " | ".join(
@@ -477,25 +489,11 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
                     _md_escape(str(row["gcc"])),
                     _md_escape(str(row["clang"])),
                     _md_escape(str(row["yoolang"])),
-                    _md_escape(str(row["status"])),
+                    _md_escape(status_cell),
                 ]
             )
             + " |"
         )
-        if detail:
-            md_lines.append(
-                "| "
-                + " | ".join(
-                    [
-                        "",
-                        "",
-                        "",
-                        "",
-                        _md_escape(detail),
-                    ]
-                )
-                + " |"
-            )
 
     REPORT_MD.write_text("\n".join(md_lines) + "\n")
 

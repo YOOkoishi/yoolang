@@ -6,6 +6,10 @@ on:
       - "**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   functional-and-perf:
     runs-on: ubuntu-latest
@@ -60,6 +64,77 @@ jobs:
           mkdir -p build/github-actions
           python3 scripts/compare_perf.py 2>&1 | tee build/github-actions/perf-tests.log
 
+      - name: Compare perf against main baseline
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set +e
+          mkdir -p build/perf-ci build/perf-baseline
+          current_json="build/perf-ci/perf-report.json"
+          delta_md="build/perf-ci/perf-delta.md"
+          delta_json="build/perf-ci/perf-delta.json"
+          baseline_label="${BASELINE_BRANCH} latest successful run"
+
+          if [ ! -f "$current_json" ]; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: current perf report unavailable"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"current perf report unavailable"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          run_id="$(gh run list --workflow test.yml --branch "$BASELINE_BRANCH" --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null)"
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: No baseline found"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"No baseline found"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          if ! gh run download "$run_id" --name perf-report --dir build/perf-baseline >/dev/null 2>&1; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: baseline artifact download failed"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"baseline artifact download failed"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          baseline_json="$(find build/perf-baseline -name perf-report.json -type f | head -n 1)"
+          if [ -z "$baseline_json" ]; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: baseline perf-report.json not found"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"baseline perf-report.json not found"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          python3 scripts/compare_perf_baseline.py \
+            --current "$current_json" \
+            --baseline "$baseline_json" \
+            --out-md "$delta_md" \
+            --out-json "$delta_json" \
+            --baseline-label "$baseline_label" || true
+
       - name: Write summary
         if: always()
         env:
@@ -76,6 +151,7 @@ jobs:
           functional_log = root / "build/github-actions/functional-tests.log"
           perf_log = root / "build/github-actions/perf-tests.log"
           perf_json = root / "build/perf-ci/perf-report.json"
+          perf_delta_md = root / "build/perf-ci/perf-delta.md"
           summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
 
           def parse_functional_summary(text: str) -> dict[str, int] | None:
@@ -93,19 +169,43 @@ jobs:
                   "xpassed": int(match.group(5)),
               }
 
-          def parse_failed_cases(text: str) -> list[str]:
-              cases: list[str] = []
+          def truncate_text(text: str, limit: int = 4000) -> str:
+              if len(text) <= limit:
+                  return text
+              return text[:limit] + f"\n... <truncated, {len(text) - limit} chars omitted> ..."
+
+          def md_escape(text: str) -> str:
+              return text.replace("|", "\\|").replace("\n", "<br>")
+
+          def parse_failed_cases(text: str) -> list[dict[str, str]]:
+              cases: list[dict[str, str]] = []
+              current: dict[str, object] | None = None
+
+              def flush_current() -> None:
+                  nonlocal current
+                  if current is None:
+                      return
+                  detail_lines = current.get("detail_lines", [])
+                  detail = "\n".join(str(line) for line in detail_lines).strip()
+                  cases.append({"case": str(current["case"]), "detail": detail})
+                  current = None
+
               for line in text.splitlines():
                   match = re.match(r"^FAIL\s+\w+\s+(.+?)\s+\([0-9.]+s\)$", line)
                   if match:
-                      cases.append(match.group(1))
+                      flush_current()
+                      current = {"case": match.group(1), "detail_lines": []}
+                      continue
+                  if re.match(r"^(PASS|FAIL|SKIP|XFAIL|XPASS)\s+", line) or line.startswith("summary:"):
+                      flush_current()
+                      continue
+                  if current is not None:
+                      if line.startswith("    "):
+                          current["detail_lines"].append(line[4:])
+                      elif line.strip():
+                          current["detail_lines"].append(line)
+              flush_current()
               return cases
-
-          def parse_time(cell: str) -> float | None:
-              match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)s", cell.strip())
-              if not match:
-                  return None
-              return float(match.group(1))
 
           functional_text = functional_log.read_text(errors="replace") if functional_log.exists() else ""
           functional = parse_functional_summary(functional_text)
@@ -120,8 +220,21 @@ jobs:
           if perf_json.exists():
               perf_payload = json.loads(perf_json.read_text())
 
+          if perf_payload is None:
+              perf_status = "PASS" if os.environ["PERF_OUTCOME"] == "success" else "FAIL"
+          else:
+              perf_status = str(perf_payload.get("status", os.environ["PERF_OUTCOME"].upper()))
+          overall_status = "PASS" if functional_status == "PASS" and perf_status == "PASS" else "FAIL"
+
           lines = [
               "# CI Summary",
+              "",
+              "## Overall",
+              f"- Status: {overall_status}",
+              f"- Functional: {functional_status}",
+              f"- Perf: {perf_status}",
+              f"- Branch: `{os.environ.get('GITHUB_REF_NAME', 'unknown')}`",
+              f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
               "",
               "## Functional Tests",
               "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy.a`",
@@ -145,7 +258,11 @@ jobs:
                       "",
                   ]
               )
-              lines.extend(f"- `{case}`" for case in functional_failed_cases[:20])
+              for failure in functional_failed_cases[:20]:
+                  lines.append(f"### `{failure['case']}`")
+                  detail = failure.get("detail", "").strip()
+                  if detail:
+                      lines.extend(["", "```text", truncate_text(detail, 4000), "```", ""])
               if len(functional_failed_cases) > 20:
                   lines.append(f"- ... and {len(functional_failed_cases) - 20} more")
               lines.extend(["", "</details>"])
@@ -161,65 +278,36 @@ jobs:
                       lines.extend(["", "<details><summary>Perf log tail</summary>", "", "```text", tail, "```", "", "</details>"])
           else:
               rows = perf_payload.get("rows", [])
-              gcc_total = 0.0
-              clang_total = 0.0
-              yoolang_total = 0.0
-              comparable_cases = 0
-              gcc_compile_fail = 0
-              clang_compile_fail = 0
-              yoolang_compile_fail = 0
-
-              for row in rows:
-                  gcc_cell = str(row.get("gcc", ""))
-                  clang_cell = str(row.get("clang", ""))
-                  yoolang_cell = str(row.get("yoolang", ""))
-
-                  if gcc_cell == "CFAIL":
-                      gcc_compile_fail += 1
-                  if clang_cell == "CFAIL":
-                      clang_compile_fail += 1
-                  if yoolang_cell == "CFAIL":
-                      yoolang_compile_fail += 1
-
-                  gcc_time = parse_time(gcc_cell)
-                  clang_time = parse_time(clang_cell)
-                  yoolang_time = parse_time(yoolang_cell)
-                  if gcc_time is None or clang_time is None or yoolang_time is None:
-                      continue
-                  gcc_total += gcc_time
-                  clang_total += clang_time
-                  yoolang_total += yoolang_time
-                  comparable_cases += 1
-
-              lines.append(f"- Status: {perf_payload.get('status', os.environ['PERF_OUTCOME'].upper())}")
+              total_runtime = perf_payload.get("total_runtime_sec", 0.0)
+              lines.append(f"- Generated: {perf_payload.get('generated_utc', 'unknown')}")
               lines.append(f"- Cases: {perf_payload.get('cases', len(rows))}")
               lines.append(f"- Failed: {perf_payload.get('failures', 'unknown')}")
-              lines.append(f"- Total runtime: {perf_payload.get('total_runtime_sec', 0.0):.4f}s")
-              lines.append(f"- Comparable cases: {comparable_cases}")
-              lines.append(f"- GCC compile failures: {gcc_compile_fail}")
-              lines.append(f"- Clang compile failures: {clang_compile_fail}")
-              lines.append(f"- Yoolang compile failures: {yoolang_compile_fail}")
+              lines.append(f"- Total runtime (s): {float(total_runtime):.4f}")
+              lines.extend(["", "| Case | GCC | Clang++ | Yoolang | Status |", "| --- | --- | --- | --- | --- |"])
 
-              failed_rows = [row for row in rows if str(row.get("status", "")) != "OK"]
-              if failed_rows:
-                  lines.extend(["", "<details><summary>Perf failure details</summary>", ""])
-                  for row in failed_rows[:20]:
-                      lines.append(f"- `{row.get('case', 'unknown')}`: {row.get('status', '')}")
-                      detail = str(row.get("detail", "")).strip()
-                      if detail and detail != str(row.get("status", "")).strip():
-                          lines.extend(["", "```text", detail[:2000], "```", ""])
-                  if len(failed_rows) > 20:
-                      lines.append(f"- ... and {len(failed_rows) - 20} more")
-                  lines.extend(["", "</details>"])
+              display_rows = sorted(rows, key=lambda row: str(row.get("status", "")) == "OK")
+              for row in display_rows:
+                  detail = str(row.get("detail", "")).strip()
+                  status_cell = str(row.get("status", ""))
+                  if detail:
+                      status_cell = f"{status_cell}\n\n{detail}"
+                  status_cell = md_escape(truncate_text(status_cell, 4000))
+                  lines.append(
+                      "| "
+                      + " | ".join(
+                          [
+                              md_escape(str(row.get("case", ""))),
+                              md_escape(str(row.get("gcc", ""))),
+                              md_escape(str(row.get("clang", ""))),
+                              md_escape(str(row.get("yoolang", ""))),
+                              status_cell,
+                          ]
+                      )
+                      + " |"
+                  )
 
-              if comparable_cases > 0 and gcc_total > 0 and clang_total > 0:
-                  delta_vs_gcc = (yoolang_total - gcc_total) / gcc_total * 100.0
-                  delta_vs_clang = (yoolang_total - clang_total) / clang_total * 100.0
-                  lines.append(f"- Yoolang total on comparable cases: {yoolang_total:.4f}s")
-                  lines.append(f"- GCC baseline total: {gcc_total:.4f}s ({delta_vs_gcc:+.2f}% vs yoolang)")
-                  lines.append(f"- Clang baseline total: {clang_total:.4f}s ({delta_vs_clang:+.2f}% vs yoolang)")
-              else:
-                  lines.append("- Baseline comparison: not enough successful gcc/clang/yoolang runs to compare")
+          if perf_delta_md.exists():
+              lines.extend(["", perf_delta_md.read_text(errors="replace").strip(), ""])
 
           summary_path.write_text("\n".join(lines) + "\n")
           PY
@@ -234,6 +322,8 @@ jobs:
             build/github-actions/perf-tests.log
             build/perf-ci/perf-report.md
             build/perf-ci/perf-report.json
+            build/perf-ci/perf-delta.md
+            build/perf-ci/perf-delta.json
           if-no-files-found: warn
 
       - name: Fail job if functional tests failed
