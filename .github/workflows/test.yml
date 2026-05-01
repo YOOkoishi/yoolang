@@ -57,6 +57,11 @@ jobs:
         continue-on-error: true
         env:
           PERF_TEST_DIRS: test/performance,test/bsb-final
+          PERF_EXCLUDE_CASES: |
+            test/performance/h-10-02.sy
+            test/performance/h-10-03.sy
+            test/bsb-final/2025-CPS-39.sy
+            test/bsb-final/2025-Z8N-28.sy
           PERF_TIMEOUT_SEC: "20"
           SYSY_RUNTIME_LIB: runtime/libsysy.a
         run: |

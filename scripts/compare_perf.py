@@ -76,9 +76,20 @@ def _collect_cases() -> list[Path]:
         elif root.is_dir():
             cases.extend(sorted(root.rglob("*.sy")))
 
+    excluded: set[str] = set()
+    env_excludes = os.environ.get("PERF_EXCLUDE_CASES", "").strip()
+    if env_excludes:
+        for item in re.split(r"[,\n]+", env_excludes):
+            item = item.strip()
+            if item:
+                excluded.add(item)
+
     seen: set[Path] = set()
     ordered: list[Path] = []
     for case in cases:
+        rel_case = str(case.relative_to(WORKSPACE))
+        if rel_case in excluded:
+            continue
         if case not in seen:
             seen.add(case)
             ordered.append(case)
