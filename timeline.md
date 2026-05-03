@@ -38,3 +38,15 @@
 # Apr. 29
 
 添加了毕昇杯2026的测例，func和perf全部通过。基础设施我也比较满意了。
+
+# May. 3
+
+添加了 loop count 的 pass.
+
+在添加这个 pass 之前,
+
+```
+summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
+```
+
+添加之后也仍然保持一样的 summary.

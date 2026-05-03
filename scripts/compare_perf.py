@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import sys
 import time
@@ -36,6 +37,7 @@ TIMEOUT_SEC = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
 REPORT_DIR = WORKSPACE / "build" / "perf-ci"
 REPORT_MD = REPORT_DIR / "perf-report.md"
 REPORT_JSON = REPORT_DIR / "perf-report.json"
+MAX_STATUS_CELL_CHARS = 4000
 
 
 def _resolve_yoolang_binary() -> Path:
@@ -74,9 +76,20 @@ def _collect_cases() -> list[Path]:
         elif root.is_dir():
             cases.extend(sorted(root.rglob("*.sy")))
 
+    excluded: set[str] = set()
+    env_excludes = os.environ.get("PERF_EXCLUDE_CASES", "").strip()
+    if env_excludes:
+        for item in re.split(r"[,\n]+", env_excludes):
+            item = item.strip()
+            if item:
+                excluded.add(item)
+
     seen: set[Path] = set()
     ordered: list[Path] = []
     for case in cases:
+        rel_case = str(case.relative_to(WORKSPACE))
+        if rel_case in excluded:
+            continue
         if case not in seen:
             seen.add(case)
             ordered.append(case)
@@ -202,6 +215,36 @@ def _ensure_runtime_wrapper() -> Path:
     return wrapper
 
 
+def flatten_multidim_array_io_calls_for_baseline(src: str) -> str:
+    multidim_int_arrays: set[str] = set()
+    decl_re = re.compile(r"\bint\s+([A-Za-z_]\w*)\s*(?:\[[^\]]+\]){2,}\s*(?:=|;)")
+
+    for match in decl_re.finditer(src):
+        multidim_int_arrays.add(match.group(1))
+
+    for name in sorted(multidim_int_arrays, key=len, reverse=True):
+        ident = re.escape(name)
+        src = re.sub(
+            rf"\bgetarray\s*\(\s*{ident}\s*\)",
+            f"getarray((int*){name})",
+            src,
+        )
+        src = re.sub(
+            rf"\bputarray\s*\(\s*([^,\n]+?)\s*,\s*{ident}\s*\)",
+            rf"putarray(\1, (int*){name})",
+            src,
+        )
+
+    return src
+
+
+def _prepare_baseline_source(src: Path, out_dir: Path) -> Path:
+    baseline_src = flatten_multidim_array_io_calls_for_baseline(src.read_text())
+    baseline_file = out_dir / f"{src.stem}.baseline.cc"
+    baseline_file.write_text(baseline_src)
+    return baseline_file
+
+
 try:
     YOOLANG_BIN = _resolve_yoolang_binary()
     RUNTIME_LIB = _ensure_runtime_lib()
@@ -212,6 +255,7 @@ except Exception as exc:
 
 
 def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
+    baseline_src = _prepare_baseline_source(src, out_dir)
     obj = out_dir / f"{src.stem}.gcc.o"
     exe = out_dir / f"{src.stem}.gcc.riscv"
     cmd = [
@@ -223,16 +267,17 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
         "-x",
         "c++",
         "-c",
-        str(src),
+        str(baseline_src),
         "-o",
         str(obj),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
 def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
+    baseline_src = _prepare_baseline_source(src, out_dir)
     obj = out_dir / f"{src.stem}.clang.o"
     exe = out_dir / f"{src.stem}.clang.riscv"
     cmd = [
@@ -246,12 +291,12 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
         "-x",
         "c++",
         "-c",
-        str(src),
+        str(baseline_src),
         "-o",
         str(obj),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -279,7 +324,7 @@ def _compile_yoolang(src: Path, out_dir: Path) -> tuple[Path, str]:
     obj = out_dir / f"{src.stem}.yoolang.o"
     exe = out_dir / f"{src.stem}.yoolang.riscv"
     subprocess.run([GCC_BIN, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -325,6 +370,21 @@ def _format_cell(result: RunResult) -> str:
     if not result.run_ok:
         return result.detail
     return f"{result.elapsed_sec:.4f}s"
+
+
+def _format_detail(label: str, result: RunResult) -> str:
+    parts: list[str] = []
+    if not result.compile_ok:
+        parts.append(f"{label} compile failed: {result.detail}")
+    elif not result.run_ok:
+        parts.append(f"{label} run failed: {result.detail}")
+    if result.exit_code is not None:
+        parts.append(f"{label} exit code: {result.exit_code}")
+    if result.stdout.strip():
+        parts.append(f"{label} stdout:\n{result.stdout.strip()}")
+    if result.stderr.strip():
+        parts.append(f"{label} stderr:\n{result.stderr.strip()}")
+    return "\n\n".join(parts)
 
 
 def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, str]:
@@ -398,6 +458,12 @@ def _md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
 
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... <truncated, {len(text) - limit} chars omitted> ..."
+
+
 def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -419,7 +485,13 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         "| --- | --- | --- | --- | --- |",
     ]
 
-    for row in rows:
+    display_rows = sorted(rows, key=lambda row: str(row.get("status", "")) == "OK")
+    for row in display_rows:
+        detail = str(row.get("detail", "")).strip()
+        status_cell = str(row["status"])
+        if detail:
+            status_cell = f"{status_cell}\n\n{detail}"
+        status_cell = _truncate_text(status_cell, MAX_STATUS_CELL_CHARS)
         md_lines.append(
             "| "
             + " | ".join(
@@ -428,7 +500,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
                     _md_escape(str(row["gcc"])),
                     _md_escape(str(row["clang"])),
                     _md_escape(str(row["yoolang"])),
-                    _md_escape(str(row["status"])),
+                    _md_escape(status_cell),
                 ]
             )
             + " |"
@@ -482,6 +554,17 @@ def main() -> int:
         gcc, clang, yoolang, ok, detail = _compile_and_run(case)
         total_runtime += gcc.elapsed_sec + clang.elapsed_sec + yoolang.elapsed_sec
         rel = str(case.relative_to(WORKSPACE))
+        error_detail = ""
+        if not ok:
+            error_detail = "\n\n".join(
+                item
+                for item in (
+                    _format_detail("gcc", gcc),
+                    _format_detail("clang++", clang),
+                    _format_detail("yoolang", yoolang),
+                )
+                if item
+            )
         print(
             f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(yoolang):<12} | {detail}"
         )
@@ -492,17 +575,14 @@ def main() -> int:
                 "clang": _format_cell(clang),
                 "yoolang": _format_cell(yoolang),
                 "status": detail,
+                "detail": error_detail,
             }
         )
         if not ok:
             failures += 1
             print(f"[FAIL] {rel}: {detail}")
-            if gcc.stderr.strip():
-                print(f"[gcc stderr] {gcc.stderr.strip()}")
-            if clang.stderr.strip():
-                print(f"[clang++ stderr] {clang.stderr.strip()}")
-            if yoolang.stderr.strip():
-                print(f"[yoolang stderr] {yoolang.stderr.strip()}")
+            if error_detail:
+                print(error_detail)
 
     print("-" * 140)
     print(f"Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")

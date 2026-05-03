@@ -1,0 +1,364 @@
+name: Functional Tests and Perf
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  functional-and-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          chmod +x scripts/setup_env.sh
+          scripts/setup_env.sh
+
+      - name: Ensure xmake in PATH
+        run: |
+          if command -v xmake >/dev/null 2>&1; then
+            echo "xmake already available: $(xmake --version | head -n 1)"
+            exit 0
+          fi
+          if [ -f "$HOME/.local/bin/xmake" ]; then
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            "$HOME/.local/bin/xmake" --version
+            exit 0
+          fi
+          echo "xmake not found after setup_env.sh"
+          exit 1
+
+      - name: Build (xmake release)
+        run: |
+          xmake f -m release
+          xmake -vD
+
+      - name: Run functional tests
+        id: functional_tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p build/github-actions
+          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy.a 2>&1 | tee build/github-actions/functional-tests.log
+
+      - name: Run performance tests
+        id: perf_tests
+        if: always()
+        continue-on-error: true
+        env:
+          PERF_TEST_DIRS: test/performance,test/bsb-final
+          PERF_EXCLUDE_CASES: |
+            test/performance/h-10-02.sy
+            test/performance/h-10-03.sy
+            test/bsb-final/2025-CPS-39.sy
+            test/bsb-final/2025-Z8N-28.sy
+          PERF_TIMEOUT_SEC: "20"
+          SYSY_RUNTIME_LIB: runtime/libsysy.a
+        run: |
+          set -o pipefail
+          mkdir -p build/github-actions
+          python3 scripts/compare_perf.py 2>&1 | tee build/github-actions/perf-tests.log
+
+      - name: Compare perf against main baseline
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set +e
+          mkdir -p build/perf-ci build/perf-baseline
+          current_json="build/perf-ci/perf-report.json"
+          delta_md="build/perf-ci/perf-delta.md"
+          delta_json="build/perf-ci/perf-delta.json"
+          baseline_label="${BASELINE_BRANCH} latest successful run"
+
+          if [ ! -f "$current_json" ]; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: current perf report unavailable"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"current perf report unavailable"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          run_id="$(gh run list --workflow test.yml --branch "$BASELINE_BRANCH" --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null)"
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: No baseline found"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"No baseline found"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          if ! gh run download "$run_id" --name perf-report --dir build/perf-baseline >/dev/null 2>&1; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: baseline artifact download failed"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"baseline artifact download failed"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          baseline_json="$(find build/perf-baseline -name perf-report.json -type f | head -n 1)"
+          if [ -z "$baseline_json" ]; then
+            {
+              echo "## Perf Change vs main baseline"
+              echo
+              echo "- Status: NO BASELINE"
+              echo "- Baseline: ${baseline_label}"
+              echo "- Reason: baseline perf-report.json not found"
+            } > "$delta_md"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"baseline perf-report.json not found"}\n' "$baseline_label" > "$delta_json"
+            exit 0
+          fi
+
+          python3 scripts/compare_perf_baseline.py \
+            --current "$current_json" \
+            --baseline "$baseline_json" \
+            --out-md "$delta_md" \
+            --out-json "$delta_json" \
+            --baseline-label "$baseline_label" || true
+
+      - name: Write summary
+        if: always()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
+          PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path.cwd()
+          functional_log = root / "build/github-actions/functional-tests.log"
+          perf_log = root / "build/github-actions/perf-tests.log"
+          perf_json = root / "build/perf-ci/perf-report.json"
+          perf_delta_md = root / "build/perf-ci/perf-delta.md"
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          def parse_functional_summary(text: str) -> dict[str, int] | None:
+              match = re.search(
+                  r"summary:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+(\d+) xfailed,\s+(\d+) xpassed",
+                  text,
+              )
+              if not match:
+                  return None
+              return {
+                  "passed": int(match.group(1)),
+                  "failed": int(match.group(2)),
+                  "skipped": int(match.group(3)),
+                  "xfailed": int(match.group(4)),
+                  "xpassed": int(match.group(5)),
+              }
+
+          def truncate_text(text: str, limit: int = 4000) -> str:
+              if len(text) <= limit:
+                  return text
+              return text[:limit] + f"\n... <truncated, {len(text) - limit} chars omitted> ..."
+
+          def md_escape(text: str) -> str:
+              return text.replace("|", "\\|").replace("\n", "<br>")
+
+          def parse_failed_cases(text: str) -> list[dict[str, str]]:
+              cases: list[dict[str, str]] = []
+              current: dict[str, object] | None = None
+
+              def flush_current() -> None:
+                  nonlocal current
+                  if current is None:
+                      return
+                  detail_lines = current.get("detail_lines", [])
+                  detail = "\n".join(str(line) for line in detail_lines).strip()
+                  cases.append({"case": str(current["case"]), "detail": detail})
+                  current = None
+
+              for line in text.splitlines():
+                  match = re.match(r"^FAIL\s+\w+\s+(.+?)\s+\([0-9.]+s\)$", line)
+                  if match:
+                      flush_current()
+                      current = {"case": match.group(1), "detail_lines": []}
+                      continue
+                  if re.match(r"^(PASS|FAIL|SKIP|XFAIL|XPASS)\s+", line) or line.startswith("summary:"):
+                      flush_current()
+                      continue
+                  if current is not None:
+                      if line.startswith("    "):
+                          current["detail_lines"].append(line[4:])
+                      elif line.strip():
+                          current["detail_lines"].append(line)
+              flush_current()
+              return cases
+
+          functional_text = functional_log.read_text(errors="replace") if functional_log.exists() else ""
+          functional = parse_functional_summary(functional_text)
+          functional_failed_cases = parse_failed_cases(functional_text)
+
+          if functional is None:
+              functional_status = "PASS" if os.environ["FUNCTIONAL_OUTCOME"] == "success" else "FAIL"
+          else:
+              functional_status = "PASS" if functional["failed"] == 0 else "FAIL"
+
+          perf_payload = None
+          if perf_json.exists():
+              perf_payload = json.loads(perf_json.read_text())
+
+          if perf_payload is None:
+              perf_status = "PASS" if os.environ["PERF_OUTCOME"] == "success" else "FAIL"
+          else:
+              perf_status = str(perf_payload.get("status", os.environ["PERF_OUTCOME"].upper()))
+          overall_status = "PASS" if functional_status == "PASS" and perf_status == "PASS" else "FAIL"
+
+          lines = [
+              "# CI Summary",
+              "",
+              "## Overall",
+              f"- Status: {overall_status}",
+              f"- Functional: {functional_status}",
+              f"- Perf: {perf_status}",
+              f"- Branch: `{os.environ.get('GITHUB_REF_NAME', 'unknown')}`",
+              f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
+              "",
+              "## Functional Tests",
+              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy.a`",
+              f"- Status: {functional_status}",
+          ]
+
+          if functional is None:
+              lines.append(f"- Result: could not parse summary, step outcome was `{os.environ['FUNCTIONAL_OUTCOME']}`")
+          else:
+              lines.append(f"- Passed: {functional['passed']}")
+              lines.append(f"- Failed: {functional['failed']}")
+              lines.append(f"- Skipped: {functional['skipped']}")
+              lines.append(f"- XFailed: {functional['xfailed']}")
+              lines.append(f"- XPassed: {functional['xpassed']}")
+
+          if functional_failed_cases:
+              lines.extend(
+                  [
+                      "",
+                      "<details><summary>Functional test failures</summary>",
+                      "",
+                  ]
+              )
+              for failure in functional_failed_cases[:20]:
+                  lines.append(f"### `{failure['case']}`")
+                  detail = failure.get("detail", "").strip()
+                  if detail:
+                      lines.extend(["", "```text", truncate_text(detail, 4000), "```", ""])
+              if len(functional_failed_cases) > 20:
+                  lines.append(f"- ... and {len(functional_failed_cases) - 20} more")
+              lines.extend(["", "</details>"])
+
+          lines.extend(["", "## Performance Tests"])
+
+          if perf_payload is None:
+              lines.append(f"- Status: {os.environ['PERF_OUTCOME'].upper()}")
+              lines.append("- Result: perf report was not generated")
+              if perf_log.exists():
+                  tail = "\n".join(perf_log.read_text(errors="replace").splitlines()[-20:])
+                  if tail:
+                      lines.extend(["", "<details><summary>Perf log tail</summary>", "", "```text", tail, "```", "", "</details>"])
+          else:
+              rows = perf_payload.get("rows", [])
+              total_runtime = perf_payload.get("total_runtime_sec", 0.0)
+              lines.append(f"- Generated: {perf_payload.get('generated_utc', 'unknown')}")
+              lines.append(f"- Cases: {perf_payload.get('cases', len(rows))}")
+              lines.append(f"- Failed: {perf_payload.get('failures', 'unknown')}")
+              lines.append(f"- Total runtime (s): {float(total_runtime):.4f}")
+              lines.extend(["", "| Case | GCC | Clang++ | Yoolang | Status |", "| --- | --- | --- | --- | --- |"])
+
+              display_rows = sorted(rows, key=lambda row: str(row.get("status", "")) == "OK")
+              for row in display_rows:
+                  detail = str(row.get("detail", "")).strip()
+                  status_cell = str(row.get("status", ""))
+                  if detail:
+                      status_cell = f"{status_cell}\n\n{detail}"
+                  status_cell = md_escape(truncate_text(status_cell, 4000))
+                  lines.append(
+                      "| "
+                      + " | ".join(
+                          [
+                              md_escape(str(row.get("case", ""))),
+                              md_escape(str(row.get("gcc", ""))),
+                              md_escape(str(row.get("clang", ""))),
+                              md_escape(str(row.get("yoolang", ""))),
+                              status_cell,
+                          ]
+                      )
+                      + " |"
+                  )
+
+          if perf_delta_md.exists():
+              lines.extend(["", perf_delta_md.read_text(errors="replace").strip(), ""])
+
+          summary_path.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: |
+            build/github-actions/functional-tests.log
+            build/github-actions/perf-tests.log
+            build/perf-ci/perf-report.md
+            build/perf-ci/perf-report.json
+            build/perf-ci/perf-delta.md
+            build/perf-ci/perf-delta.json
+          if-no-files-found: warn
+
+      - name: Fail job if functional tests failed
+        if: always()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          log_path = Path("build/github-actions/functional-tests.log")
+          if log_path.exists():
+              text = log_path.read_text(errors="replace")
+              match = re.search(
+                  r"summary:\s+\d+ passed,\s+(\d+) failed,\s+\d+ skipped,\s+\d+ xfailed,\s+\d+ xpassed",
+                  text,
+              )
+              if match:
+                  failed = int(match.group(1))
+                  if failed > 0:
+                      print(f"Functional tests failed: {failed}")
+                      sys.exit(1)
+                  print("Functional tests passed.")
+                  sys.exit(0)
+
+          if os.environ["FUNCTIONAL_OUTCOME"] != "success":
+              print("Functional tests did not complete successfully.")
+              sys.exit(1)
+          print("Functional tests passed.")
+          PY

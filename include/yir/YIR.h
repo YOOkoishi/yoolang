@@ -103,7 +103,7 @@ class Value {
   private:
     TypePtr type_;
     std::string name_;
-    Operation *defining_op_ = nullptr;
+    Operation *defining_op_ = nullptr; // 指向创造该值的 Operation, Def (定义) 引用
 };
 
 struct ArrayInitEntry {
