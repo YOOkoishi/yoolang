@@ -34,3 +34,15 @@
 # Apr. 26
 
 添加了test 的基础设施。现在可以自动的跑所有的汇编测试，以及ir 的 verified。
+
+# May. 3
+
+添加了 loop count 的 pass.
+
+在添加这个 pass 之前,
+
+```
+summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
+```
+
+添加之后也仍然保持一样的 summary.

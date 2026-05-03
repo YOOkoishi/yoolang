@@ -1207,7 +1207,7 @@ PassResult ASTToYIRPass::run(PassContext &context) {
             return PassResult::fail(verify.errors.empty() ? "YIR verification failed"
                                                           : verify.errors.front());
         }
-        context.set_artifact<std::unique_ptr<yir::Module>>(std::move(module));
+        context.set_artifact<std::unique_ptr<yir::Module>>(std::string(kArtifactKey), std::move(module));
         return PassResult::ok(true);
     } catch (const std::exception &ex) {
         return PassResult::fail(ex.what());
