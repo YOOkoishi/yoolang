@@ -10,6 +10,7 @@
 #include "../include/yir/YIRPrinter.h"
 
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -20,6 +21,8 @@ namespace {
 
 struct CommandLineOptions {
     std::string input_path;
+    std::string output_path;
+    int opt_level = 0;
     bool emit_ast = false;
     bool emit_yir = false;
     bool emit_oir = false;
@@ -29,14 +32,17 @@ struct CommandLineOptions {
 };
 
 void print_help(const char *program, std::ostream &out) {
-    out << "Usage: " << program << " [options] <input.sy>\n\n"
+    out << "Usage: " << program << " <input.sysy> -S -o <output.s>\n"
+        << "       " << program << " [options] <input.sy>\n\n"
         << "Options:\n"
-        << "  -h, --help    Show this help message\n"
-        << "  --emit-ast    Dump the parsed AST through the pass pipeline\n"
-        << "  --emit-yir    Lower the parsed AST to YIR and dump it\n"
-        << "  --emit-oir    Lower the parsed AST to SSA OIR, verify it, and dump it\n"
-        << "  --emit-mir    Lower OIR to the RISC-V MIR and dump it\n"
-        << "  --emit-asm    Lower to RISC-V assembly (default)\n";
+        << "  -h, --help       Show this help message\n"
+        << "  -S, --emit-asm   Lower to RISC-V assembly (default)\n"
+        << "  -o <file>        Write output to <file> instead of stdout\n"
+        << "  -O1              Enable optimization level 1 (currently same pipeline as default)\n"
+        << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
+        << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
+        << "  --emit-oir       Lower the parsed AST to SSA OIR, verify it, and dump it\n"
+        << "  --emit-mir       Lower OIR to the RISC-V MIR and dump it\n";
 }
 
 bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std::string &error) {
@@ -62,8 +68,20 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
             options.emit_mir = true;
             continue;
         }
-        if (arg == "--emit-asm") {
+        if (arg == "-S" || arg == "--emit-asm") {
             options.emit_asm = true;
+            continue;
+        }
+        if (arg == "-o") {
+            if (i + 1 >= argc) {
+                error = "-o requires an output file";
+                return false;
+            }
+            options.output_path = argv[++i];
+            continue;
+        }
+        if (arg == "-O1") {
+            options.opt_level = 1;
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {
@@ -175,7 +193,18 @@ int main(int argc, char **argv) {
     pass::PassContext context;
     context.set_ast(std::move(ast));
 
-    auto pm = build_frontend_pipeline(options, std::cout);
+    std::ofstream output_file;
+    std::ostream *out = &std::cout;
+    if (!options.output_path.empty()) {
+        output_file.open(options.output_path, std::ios::out | std::ios::trunc);
+        if (!output_file) {
+            std::cerr << "Cannot open output file: " << options.output_path << std::endl;
+            return 1;
+        }
+        out = &output_file;
+    }
+
+    auto pm = build_frontend_pipeline(options, *out);
     if (pm.empty()) {
         return 0;
     }
@@ -191,7 +220,7 @@ int main(int argc, char **argv) {
             std::cerr << "YIR module was not produced\n";
             return 1;
         }
-        yir::YIRPrinter printer(std::cout);
+        yir::YIRPrinter printer(*out);
         printer.print(**module);
     }
 
@@ -201,7 +230,7 @@ int main(int argc, char **argv) {
             std::cerr << "OIR module was not produced\n";
             return 1;
         }
-        std::cout << module->print();
+        *out << module->print();
     }
 
     if (options.emit_mir) {
@@ -210,7 +239,7 @@ int main(int argc, char **argv) {
             std::cerr << "MIR module was not produced\n";
             return 1;
         }
-        mir::MIRPrinter printer(std::cout);
+        mir::MIRPrinter printer(*out);
         printer.print(*module);
     }
 
@@ -220,7 +249,7 @@ int main(int argc, char **argv) {
             std::cerr << "Assembly was not produced\n";
             return 1;
         }
-        std::cout << *asm_text;
+        *out << *asm_text;
     }
 
     return 0;

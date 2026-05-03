@@ -9,9 +9,6 @@ from pathlib import Path
 from typing import Optional
 
 
-MARKER = "; === RISC-V Assembly ==="
-
-
 @dataclass
 class RunResult:
     compile_ok: bool
@@ -40,18 +37,18 @@ REPORT_JSON = REPORT_DIR / "perf-report.json"
 MAX_STATUS_CELL_CHARS = 4000
 
 
-def _resolve_yoolang_binary() -> Path:
-    env_bin = os.environ.get("YOO_LANG_BIN", "").strip()
+def _resolve_compiler_binary() -> Path:
+    env_bin = os.environ.get("COMPILER_BIN", "").strip()
     if env_bin:
         candidate = Path(env_bin)
         return candidate if candidate.is_absolute() else (WORKSPACE / candidate)
 
     candidates = []
-    for path in (WORKSPACE / "build").rglob("yoolang"):
+    for path in (WORKSPACE / "build").rglob("compiler"):
         if path.is_file() and "release" in path.parts:
             candidates.append(path)
     if not candidates:
-        raise FileNotFoundError("cannot find built yoolang binary under build/**/release")
+        raise FileNotFoundError("cannot find built compiler binary under build/**/release")
     return sorted(candidates)[0]
 
 
@@ -246,7 +243,7 @@ def _prepare_baseline_source(src: Path, out_dir: Path) -> Path:
 
 
 try:
-    YOOLANG_BIN = _resolve_yoolang_binary()
+    COMPILER_BIN = _resolve_compiler_binary()
     RUNTIME_LIB = _ensure_runtime_lib()
     RUNTIME_WRAPPER = _ensure_runtime_wrapper()
 except Exception as exc:
@@ -300,29 +297,21 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
     return exe, "OK"
 
 
-def _emit_yoolang_asm(src: Path, out_dir: Path) -> tuple[Path, str]:
-    result = subprocess.run(
-        [str(YOOLANG_BIN), str(src), "--emit-asm"],
+def _emit_compiler_asm(src: Path, out_dir: Path) -> tuple[Path, str]:
+    asm_file = out_dir / f"{src.stem}.compiler.s"
+    subprocess.run(
+        [str(COMPILER_BIN), str(src), "-S", "-O1", "-o", str(asm_file)],
         check=True,
         capture_output=True,
         text=True,
     )
-    raw = result.stdout
-    marker_pos = raw.find(MARKER)
-    # Newer frontend prints plain assembly directly; older builds may still emit a marker.
-    if marker_pos >= 0:
-        asm_text = raw[marker_pos + len(MARKER):].lstrip("\r\n")
-    else:
-        asm_text = raw
-    asm_file = out_dir / f"{src.stem}.yoolang.s"
-    asm_file.write_text(asm_text)
     return asm_file, "OK"
 
 
-def _compile_yoolang(src: Path, out_dir: Path) -> tuple[Path, str]:
-    asm_file, _ = _emit_yoolang_asm(src, out_dir)
-    obj = out_dir / f"{src.stem}.yoolang.o"
-    exe = out_dir / f"{src.stem}.yoolang.riscv"
+def _compile_compiler(src: Path, out_dir: Path) -> tuple[Path, str]:
+    asm_file, _ = _emit_compiler_asm(src, out_dir)
+    obj = out_dir / f"{src.stem}.compiler.o"
+    exe = out_dir / f"{src.stem}.compiler.riscv"
     subprocess.run([GCC_BIN, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
     subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
@@ -396,13 +385,13 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
     compiler_specs = (
         ("gcc", _compile_gcc),
         ("clang++", _compile_clang),
-        ("yoolang", _compile_yoolang),
+        ("compiler", _compile_compiler),
     )
 
-    for name, compiler in compiler_specs:
+    for name, compile_func in compiler_specs:
         start = time.perf_counter()
         try:
-            exe, _ = compiler(src, case_dir)
+            exe, _ = compile_func(src, case_dir)
         except subprocess.CalledProcessError as exc:
             elapsed = time.perf_counter() - start
             stderr = (exc.stderr or "").strip()
@@ -420,32 +409,32 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
 
     gcc = results["gcc"]
     clang = results["clang++"]
-    yoolang = results["yoolang"]
+    compiler = results["compiler"]
 
     if not gcc.compile_ok or not gcc.run_ok:
-        return gcc, clang, yoolang, False, f"gcc {gcc.detail}"
+        return gcc, clang, compiler, False, f"gcc {gcc.detail}"
     if not clang.compile_ok or not clang.run_ok:
-        return gcc, clang, yoolang, False, f"clang++ {clang.detail}"
-    if not yoolang.compile_ok or not yoolang.run_ok:
-        return gcc, clang, yoolang, False, f"yoolang {yoolang.detail}"
+        return gcc, clang, compiler, False, f"clang++ {clang.detail}"
+    if not compiler.compile_ok or not compiler.run_ok:
+        return gcc, clang, compiler, False, f"compiler {compiler.detail}"
 
     baseline_stdout = _normalize_text(gcc.stdout)
     baseline_exit = gcc.exit_code
     clang_stdout = _normalize_text(clang.stdout)
-    yoolang_stdout = _normalize_text(yoolang.stdout)
+    compiler_stdout = _normalize_text(compiler.stdout)
 
     if clang_stdout != baseline_stdout or clang.exit_code != baseline_exit:
-        return gcc, clang, yoolang, False, f"clang++ output mismatch vs gcc for {src.name}"
-    if yoolang_stdout != baseline_stdout or yoolang.exit_code != baseline_exit:
-        return gcc, clang, yoolang, False, f"yoolang output mismatch vs gcc for {src.name}"
+        return gcc, clang, compiler, False, f"clang++ output mismatch vs gcc for {src.name}"
+    if compiler_stdout != baseline_stdout or compiler.exit_code != baseline_exit:
+        return gcc, clang, compiler, False, f"compiler output mismatch vs gcc for {src.name}"
 
-    return gcc, clang, yoolang, True, "OK"
+    return gcc, clang, compiler, True, "OK"
 
 
 def _print_header() -> None:
     print("=== RISC-V/QEMU perf compare ===")
     print(f"Workspace: {WORKSPACE}")
-    print(f"Yoolang binary: {YOOLANG_BIN}")
+    print(f"Compiler binary: {COMPILER_BIN}")
     print(f"Runtime lib: {RUNTIME_LIB}")
     print(f"Runtime wrapper: {RUNTIME_WRAPPER}")
     print(f"Test dirs: {', '.join(str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS)}")
@@ -478,10 +467,10 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         f"- Cases: {len(rows)}",
         f"- Failed: {failures}",
         f"- Total runtime (s): {total_runtime:.4f}",
-        f"- Yoolang binary: {YOOLANG_BIN}",
+        f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
         "",
-        "| Case | GCC | Clang++ | Yoolang | Status |",
+        "| Case | GCC | Clang++ | Compiler | Status |",
         "| --- | --- | --- | --- | --- |",
     ]
 
@@ -499,7 +488,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
                     _md_escape(str(row["case"])),
                     _md_escape(str(row["gcc"])),
                     _md_escape(str(row["clang"])),
-                    _md_escape(str(row["yoolang"])),
+                    _md_escape(str(row["compiler"])),
                     _md_escape(status_cell),
                 ]
             )
@@ -512,7 +501,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         "status": status,
         "generated_utc": generated,
         "workspace": str(WORKSPACE),
-        "yoolang_binary": str(YOOLANG_BIN),
+        "compiler_binary": str(COMPILER_BIN),
         "runtime_lib": str(RUNTIME_LIB),
         "test_dirs": [str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS],
         "cases": len(rows),
@@ -521,7 +510,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         "rows": rows,
     }
     REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
-    print(f"{'Case':<42} | {'GCC':<12} | {'Clang++':<12} | {'Yoolang':<12} | Status")
+    print(f"{'Case':<42} | {'GCC':<12} | {'Clang++':<12} | {'Compiler':<12} | Status")
     print("-" * 140)
 
 
@@ -551,8 +540,8 @@ def main() -> int:
     report_rows: list[dict] = []
 
     for case in CASES:
-        gcc, clang, yoolang, ok, detail = _compile_and_run(case)
-        total_runtime += gcc.elapsed_sec + clang.elapsed_sec + yoolang.elapsed_sec
+        gcc, clang, compiler, ok, detail = _compile_and_run(case)
+        total_runtime += gcc.elapsed_sec + clang.elapsed_sec + compiler.elapsed_sec
         rel = str(case.relative_to(WORKSPACE))
         error_detail = ""
         if not ok:
@@ -561,19 +550,19 @@ def main() -> int:
                 for item in (
                     _format_detail("gcc", gcc),
                     _format_detail("clang++", clang),
-                    _format_detail("yoolang", yoolang),
+                    _format_detail("compiler", compiler),
                 )
                 if item
             )
         print(
-            f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(yoolang):<12} | {detail}"
+            f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(compiler):<12} | {detail}"
         )
         report_rows.append(
             {
                 "case": rel,
                 "gcc": _format_cell(gcc),
                 "clang": _format_cell(clang),
-                "yoolang": _format_cell(yoolang),
+                "compiler": _format_cell(compiler),
                 "status": detail,
                 "detail": error_detail,
             }

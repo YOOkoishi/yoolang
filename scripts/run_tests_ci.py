@@ -22,27 +22,27 @@ def rel(path: Path) -> str:
 
 
 def resolve_binary() -> Path:
-    env_bin = os.environ.get("YOO_LANG_BIN", "").strip()
+    env_bin = os.environ.get("COMPILER_BIN", "").strip()
     if env_bin:
         candidate = Path(env_bin)
         candidate = candidate if candidate.is_absolute() else (ROOT / candidate)
         if candidate.exists():
             return candidate
-        raise SystemExit(f"error: YOO_LANG_BIN does not exist: {candidate}")
+        raise SystemExit(f"error: COMPILER_BIN does not exist: {candidate}")
 
-    preferred = ROOT / "build/linux/x86_64/release/yoolang"
+    preferred = ROOT / "build/linux/x86_64/release/compiler"
     if preferred.exists():
         return preferred
 
     candidates = sorted(
         candidate
-        for candidate in (ROOT / "build").rglob("yoolang")
+        for candidate in (ROOT / "build").rglob("compiler")
         if candidate.is_file() and "release" in candidate.parts
     )
     if candidates:
         return candidates[0]
 
-    raise SystemExit("error: yoolang binary not found; run xmake first or set YOO_LANG_BIN")
+    raise SystemExit("error: compiler binary not found; run xmake first or set COMPILER_BIN")
 
 
 def resolve_runtime() -> Path:
@@ -113,11 +113,11 @@ def main() -> int:
     perf_qemu = require_command("perf qemu runner", "QEMU_BIN", ["qemu-riscv64"])
 
     env = os.environ.copy()
-    env["YOO_LANG_BIN"] = str(binary)
+    env["COMPILER_BIN"] = str(binary)
     env["SYSY_RUNTIME_LIB"] = str(runtime)
     env["PERF_TEST_DIRS"] = rel(DEFAULT_PERF_ROOT)
 
-    print(f"Using yoolang binary: {binary}", flush=True)
+    print(f"Using compiler binary: {binary}", flush=True)
     print(f"Using SysY runtime: {runtime}", flush=True)
     print(f"Functional tests: {rel(DEFAULT_FUNCTIONAL_ROOT)}", flush=True)
     print(f"Perf tests: {env['PERF_TEST_DIRS']}", flush=True)

@@ -1,7 +1,7 @@
-// RUN: %yoolang --emit-yir %s | FileCheck %s --check-prefix=YIR
-// RUN: %yoolang --emit-oir %s | FileCheck %s --check-prefix=OIR
-// RUN: %yoolang --emit-mir %s | FileCheck %s --check-prefix=MIR
-// RUN: %yoolang --emit-asm %s | FileCheck %s --check-prefix=ASM
+// RUN: %compiler --emit-yir %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-oir %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-mir %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler --emit-asm %s | FileCheck %s --check-prefix=ASM
 
 int a[2][3] = {{1, 2, 3}, {4, 5, 6}};
 

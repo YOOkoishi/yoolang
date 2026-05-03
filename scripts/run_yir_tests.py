@@ -11,8 +11,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run text snapshot tests for YIR dumps.")
     parser.add_argument(
         "--binary",
-        default="./build/linux/x86_64/release/yoolang",
-        help="path to the yoolang binary",
+        default="./build/linux/x86_64/release/compiler",
+        help="path to the compiler binary",
     )
     parser.add_argument(
         "--test-dir",
@@ -61,7 +61,7 @@ def main():
         rc, stdout, stderr = run_one(binary, source)
         if rc != 0:
             failed += 1
-            print(f"FAIL {source}: yoolang exited with {rc}", file=sys.stderr)
+            print(f"FAIL {source}: compiler exited with {rc}", file=sys.stderr)
             if stderr:
                 print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
             continue

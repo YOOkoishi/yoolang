@@ -19,14 +19,14 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BINARY = ROOT / "build/linux/x86_64/release/yoolang"
+DEFAULT_BINARY = ROOT / "build/linux/x86_64/release/compiler"
 DEFAULT_WORK_DIR = ROOT / "tmp/test-run"
 DEFAULT_RUNTIME = ROOT / "runtime/libsysy_riscv.a"
 STAGE_FLAGS = {
     "yir": "--emit-yir",
     "oir": "--emit-oir",
     "mir": "--emit-mir",
-    "asm": "--emit-asm",
+    "asm": "-S",
 }
 
 
@@ -40,7 +40,7 @@ class TestResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run yoolang IR and end-to-end tests.")
+    parser = argparse.ArgumentParser(description="Run compiler IR and end-to-end tests.")
     parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
     parser.add_argument("--test-root", type=Path, default=ROOT / "test")
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
@@ -190,7 +190,7 @@ def run_filecheck(source: Path, binary: Path, work_dir: Path, timeout: float) ->
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_base = tmp_dir / "out"
     substitutions = {
-        "%yoolang": shlex.quote(str(binary)),
+        "%compiler": shlex.quote(str(binary)),
         "%s": shlex.quote(str(source)),
         "%S": shlex.quote(str(source.parent)),
         "%T": shlex.quote(str(tmp_dir)),
@@ -304,12 +304,11 @@ def run_e2e(
     exe_path = case_dir / "program"
 
     try:
-        with asm_path.open("wb") as asm_file:
-            compile_proc = run_process(
-                [str(binary), "--emit-asm", str(source)],
-                stdout_target=asm_file,
-                timeout=timeout,
-            )
+        compile_proc = run_process(
+            [str(binary), str(source), "-S", "-o", str(asm_path)],
+            stdout_target=subprocess.DEVNULL,
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired:
         return TestResult("e2e", name, "FAIL", time.monotonic() - start, "compiler timed out")
     if compile_proc.returncode != 0:

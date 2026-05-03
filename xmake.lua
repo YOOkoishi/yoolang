@@ -9,7 +9,7 @@ local srcs = {
     "src/pass/**.cpp",
 }
 
-target("yoolang")
+target("compiler")
     set_kind("binary")
     set_languages("c++17")
     add_includedirs("include")

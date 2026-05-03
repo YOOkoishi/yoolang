@@ -48,6 +48,10 @@ def rows_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def compiler_cell(row: dict[str, Any]) -> Any:
+    return row.get("compiler", row.get("yoolang"))
+
+
 def format_signed_sec(value: float) -> str:
     return f"{value:+.4f}s"
 
@@ -108,8 +112,8 @@ def main() -> int:
     baseline_total = 0.0
 
     for case in sorted(set(current_rows) & set(baseline_rows)):
-        current_time = parse_time(current_rows[case].get("yoolang"))
-        baseline_time = parse_time(baseline_rows[case].get("yoolang"))
+        current_time = parse_time(compiler_cell(current_rows[case]))
+        baseline_time = parse_time(compiler_cell(baseline_rows[case]))
         if current_time is None or baseline_time is None:
             continue
 
@@ -156,8 +160,8 @@ def main() -> int:
         f"- Status: {status}",
         f"- Baseline: {args.baseline_label}",
         f"- Comparable cases: {len(rows)}",
-        f"- Current Yoolang total: {current_total:.4f}s",
-        f"- Baseline Yoolang total: {baseline_total:.4f}s",
+        f"- Current compiler total: {current_total:.4f}s",
+        f"- Baseline compiler total: {baseline_total:.4f}s",
         f"- Delta: {format_signed_sec(total_delta_sec)} ({format_signed_pct(total_delta_pct)})",
         "",
     ]
@@ -190,8 +194,8 @@ def main() -> int:
         "status": status,
         "baseline": args.baseline_label,
         "comparable_cases": len(rows),
-        "current_yoolang_total": current_total,
-        "baseline_yoolang_total": baseline_total,
+        "current_compiler_total": current_total,
+        "baseline_compiler_total": baseline_total,
         "total_delta_sec": total_delta_sec,
         "total_delta_pct": total_delta_pct,
         "regressions": regressions,
