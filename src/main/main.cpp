@@ -2,6 +2,7 @@
 #include "../include/mir/MIRPrinter.h"
 #include "../include/pass/ASTDumpPass.h"
 #include "../include/pass/ASTToYIRPass.h"
+#include "../include/pass/YIRLoopCountPass.h"
 #include "../include/pass/MIRToAsmPass.h"
 #include "../include/pass/OIRToMIRPass.h"
 #include "../include/pass/PassManager.h"
@@ -120,6 +121,9 @@ pass::PassManager build_frontend_pipeline(const CommandLineOptions &options, std
     if (options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm) {
         pm.emplace_pass<pass::ASTToYIRPass>();
     }
+    if (options.emit_yir) { // only emit yir
+        pm.emplace_pass<pass::YIRLoopCountPass>(out);
+    }
     if (options.emit_oir || options.emit_mir || options.emit_asm) {
         pm.emplace_pass<pass::YIRToOIRPass>();
     }
@@ -182,7 +186,7 @@ int main(int argc, char **argv) {
     }
 
     if (options.emit_yir) {
-        auto *module = context.get_artifact<std::unique_ptr<yir::Module>>();
+        auto *module = context.get_artifact<std::unique_ptr<yir::Module>>(pass::ASTToYIRPass::kArtifactKey);
         if (module == nullptr || *module == nullptr) {
             std::cerr << "YIR module was not produced\n";
             return 1;

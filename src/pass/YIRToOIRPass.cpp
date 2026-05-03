@@ -1117,9 +1117,6 @@ PassKind YIRToOIRPass::kind() const {
 PassResult YIRToOIRPass::run(PassContext &context) {
     auto *artifact = context.get_artifact<std::unique_ptr<yir::Module>>(ASTToYIRPass::kArtifactKey);
     if (artifact == nullptr || *artifact == nullptr) {
-        artifact = context.get_artifact<std::unique_ptr<yir::Module>>();
-    }
-    if (artifact == nullptr || *artifact == nullptr) {
         return PassResult::fail("YIRToOIRPass requires YIR module in pass context");
     }
 
