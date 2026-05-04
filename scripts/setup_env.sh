@@ -4,36 +4,22 @@ set -e
 PROJECT_DIR="${GITHUB_WORKSPACE:-$(pwd)}"
 RUNTIME_DIR="$PROJECT_DIR/runtime"
 RUNTIME_BUILD_DIR="$PROJECT_DIR/build/perf-ci/runtime"
-SKIP_SYSTEM_DEPS="${SETUP_ENV_SKIP_SYSTEM_DEPS:-0}"
 
-if [ "$SKIP_SYSTEM_DEPS" = "1" ]; then
-    echo "Skipping system dependency installation."
-else
-    echo "Installing system dependencies..."
-    if [ "$(id -u)" -eq 0 ]; then
-        APT_PREFIX=""
-    elif sudo -n true >/dev/null 2>&1; then
-        APT_PREFIX="sudo"
-    else
-        echo "Error: sudo is required for system dependency installation. Set SETUP_ENV_SKIP_SYSTEM_DEPS=1 on preprovisioned runners."
-        exit 1
-    fi
-
-    $APT_PREFIX apt-get update
-    $APT_PREFIX apt-get install -y \
-        build-essential \
-        cmake \
-        curl \
-        python3 \
-        python3-pip \
-        qemu-user \
-        qemu-user-static \
-        clang \
-        binutils-riscv64-linux-gnu \
-        gcc-riscv64-linux-gnu \
-        g++-riscv64-linux-gnu \
-        libc6-dev-riscv64-cross
-fi
+echo "Installing system dependencies..."
+sudo apt-get update
+sudo apt-get install -y \
+    build-essential \
+    cmake \
+    curl \
+    python3 \
+    python3-pip \
+    qemu-user \
+    qemu-user-static \
+    clang \
+    binutils-riscv64-linux-gnu \
+    gcc-riscv64-linux-gnu \
+    g++-riscv64-linux-gnu \
+    libc6-dev-riscv64-cross
 
 if ! command -v xmake >/dev/null 2>&1; then
     echo "Installing xmake..."

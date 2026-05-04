@@ -22,13 +22,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup environment
-        env:
-          SETUP_ENV_SKIP_SYSTEM_DEPS: "1"
-        run: |
-          chmod +x scripts/setup_env.sh
-          scripts/setup_env.sh
-
       - name: Ensure xmake in PATH
         run: |
           if command -v xmake >/dev/null 2>&1; then
@@ -43,6 +36,16 @@ jobs:
           echo "xmake not found after setup_env.sh"
           exit 1
 
+      - name: Check runner dependencies
+        run: |
+          command -v python3
+          command -v cmake
+          command -v clang++
+          command -v qemu-riscv64
+          command -v riscv64-linux-gnu-gcc
+          command -v riscv64-linux-gnu-g++
+          test -f runtime/libsysy_riscv.a
+
       - name: Build (xmake release)
         run: |
           xmake f -m release
@@ -54,7 +57,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build/github-actions
-          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy.a 2>&1 | tee build/github-actions/functional-tests.log
+          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a 2>&1 | tee build/github-actions/functional-tests.log
 
       - name: Run performance tests
         id: perf_tests
@@ -68,7 +71,7 @@ jobs:
             test/bsb-final/2025-CPS-39.sy
             test/bsb-final/2025-Z8N-28.sy
           PERF_TIMEOUT_SEC: "20"
-          SYSY_RUNTIME_LIB: runtime/libsysy.a
+          SYSY_RUNTIME_LIB: runtime/libsysy_riscv.a
         run: |
           set -o pipefail
           mkdir -p build/github-actions
@@ -247,7 +250,7 @@ jobs:
               f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
               "",
               "## Functional Tests",
-              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy.a`",
+              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a`",
               f"- Status: {functional_status}",
           ]
 
