@@ -90,6 +90,10 @@ jobs:
           delta_md="build/perf-ci/perf-delta.md"
           delta_json="build/perf-ci/perf-delta.json"
           baseline_label="${BASELINE_BRANCH} latest successful run"
+          baseline_run_url=""
+          baseline_commit_sha=""
+          baseline_commit_title=""
+          baseline_commit_author=""
 
           if [ ! -f "$current_json" ]; then
             {
@@ -114,6 +118,15 @@ jobs:
             } > "$delta_md"
             printf '{"status":"NO BASELINE","baseline":"%s","reason":"No baseline found"}\n' "$baseline_label" > "$delta_json"
             exit 0
+          fi
+
+          baseline_run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+          baseline_commit_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq '.head_sha' 2>/dev/null)"
+          if [ -n "$baseline_commit_sha" ] && [ "$baseline_commit_sha" != "null" ]; then
+            baseline_commit_title="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${baseline_commit_sha}" --jq '.commit.message | split("\n")[0]' 2>/dev/null)"
+            baseline_commit_author="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${baseline_commit_sha}" --jq '.commit.author.name' 2>/dev/null)"
+          else
+            baseline_commit_sha=""
           fi
 
           if ! gh run download "$run_id" --name perf-report --dir build/perf-baseline >/dev/null 2>&1; then
@@ -146,7 +159,12 @@ jobs:
             --baseline "$baseline_json" \
             --out-md "$delta_md" \
             --out-json "$delta_json" \
-            --baseline-label "$baseline_label" || true
+            --baseline-label "$baseline_label" \
+            --baseline-run-id "$run_id" \
+            --baseline-run-url "$baseline_run_url" \
+            --baseline-commit-sha "$baseline_commit_sha" \
+            --baseline-commit-title "$baseline_commit_title" \
+            --baseline-commit-author "$baseline_commit_author" || true
 
       - name: Write summary
         if: always()
