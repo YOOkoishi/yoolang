@@ -90,6 +90,10 @@ jobs:
           delta_md="build/perf-ci/perf-delta.md"
           delta_json="build/perf-ci/perf-delta.json"
           baseline_label="${BASELINE_BRANCH} latest successful run"
+          baseline_run_url=""
+          baseline_commit_sha=""
+          baseline_commit_title=""
+          baseline_commit_author=""
 
           if [ ! -f "$current_json" ]; then
             {
@@ -114,6 +118,15 @@ jobs:
             } > "$delta_md"
             printf '{"status":"NO BASELINE","baseline":"%s","reason":"No baseline found"}\n' "$baseline_label" > "$delta_json"
             exit 0
+          fi
+
+          baseline_run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+          baseline_commit_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq '.head_sha' 2>/dev/null)"
+          if [ -n "$baseline_commit_sha" ] && [ "$baseline_commit_sha" != "null" ]; then
+            baseline_commit_title="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${baseline_commit_sha}" --jq '.commit.message | split("\n")[0]' 2>/dev/null)"
+            baseline_commit_author="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${baseline_commit_sha}" --jq '.commit.author.name' 2>/dev/null)"
+          else
+            baseline_commit_sha=""
           fi
 
           if ! gh run download "$run_id" --name perf-report --dir build/perf-baseline >/dev/null 2>&1; then
@@ -146,7 +159,13 @@ jobs:
             --baseline "$baseline_json" \
             --out-md "$delta_md" \
             --out-json "$delta_json" \
-            --baseline-label "$baseline_label" || true
+            --baseline-label "$baseline_label" \
+            --baseline-branch "$BASELINE_BRANCH" \
+            --baseline-run-id "$run_id" \
+            --baseline-run-url "$baseline_run_url" \
+            --baseline-commit-sha "$baseline_commit_sha" \
+            --baseline-commit-title "$baseline_commit_title" \
+            --baseline-commit-author "$baseline_commit_author" || true
 
       - name: Write summary
         if: always()
@@ -379,7 +398,7 @@ jobs:
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
           REPOSITORY: ${{ github.repository }}
-          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
           ACTOR: ${{ github.actor }}
           WORKFLOW: ${{ github.workflow }}
@@ -389,8 +408,10 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           import urllib.error
           import urllib.request
+          from pathlib import Path
 
           notify_url = os.environ.get("CI_NOTIFY_URL", "").strip()
           notify_token = os.environ.get("CI_NOTIFY_TOKEN", "").strip()
@@ -398,30 +419,134 @@ jobs:
               print("CI_NOTIFY_URL or CI_NOTIFY_TOKEN is not set; skipping group notification.")
               raise SystemExit(0)
 
+          def read_json(path: str) -> dict:
+              p = Path(path)
+              if not p.exists():
+                  return {}
+              try:
+                  return json.loads(p.read_text(errors="replace"))
+              except Exception as exc:
+                  print(f"failed to read {path}: {exc}")
+                  return {}
+
+          def parse_seconds(value) -> float | None:
+              if isinstance(value, (int, float)):
+                  return float(value)
+              match = re.search(r"([0-9]+(?:\.[0-9]+)?)s?", str(value))
+              return float(match.group(1)) if match else None
+
+          def fmt_seconds(value: float | None) -> str:
+              return "N/A" if value is None else f"{value:.2f}s"
+
+          def fmt_ratio(numerator: float | None, denominator: float | None) -> str:
+              if numerator is None or denominator is None or denominator <= 0:
+                  return "N/A"
+              return f"{numerator / denominator:.2f}x"
+
+          def fmt_overall(delta_pct) -> str:
+              if not isinstance(delta_pct, (int, float)):
+                  return "N/A"
+              if delta_pct > 0:
+                  return f"慢 {delta_pct:.1f}%"
+              if delta_pct < 0:
+                  return f"快 {abs(delta_pct):.1f}%"
+              return "持平 0.0%"
+
+          perf = read_json("build/perf-ci/perf-report.json")
+          delta = read_json("build/perf-ci/perf-delta.json")
+          rows = perf.get("rows", []) if isinstance(perf.get("rows"), list) else []
+          delta_rows = delta.get("rows", []) if isinstance(delta.get("rows"), list) else []
+
+          gcc_total = 0.0
+          clang_total = 0.0
+          compiler_total = 0.0
+          total_counts = {"gcc": 0, "clang": 0, "compiler": 0}
+          for row in rows:
+              gcc = parse_seconds(row.get("gcc"))
+              clang = parse_seconds(row.get("clang"))
+              compiler = parse_seconds(row.get("compiler", row.get("yoolang")))
+              if gcc is not None:
+                  gcc_total += gcc
+                  total_counts["gcc"] += 1
+              if clang is not None:
+                  clang_total += clang
+                  total_counts["clang"] += 1
+              if compiler is not None:
+                  compiler_total += compiler
+                  total_counts["compiler"] += 1
+
+          gcc_total_value = gcc_total if total_counts["gcc"] else None
+          clang_total_value = clang_total if total_counts["clang"] else None
+          compiler_total_value = compiler_total if total_counts["compiler"] else None
+
+          fast = 0
+          slow = 0
+          stable = 0
+          significant_ratio = 5.0
+          significant_abs_sec = 0.01
+          slow_cases = []
+          for row in delta_rows:
+              delta_sec = row.get("delta_sec")
+              delta_pct = row.get("delta_pct")
+              if not isinstance(delta_sec, (int, float)) or not isinstance(delta_pct, (int, float)):
+                  continue
+              if abs(delta_pct) >= significant_ratio and abs(delta_sec) >= significant_abs_sec:
+                  if delta_sec < 0:
+                      fast += 1
+                  else:
+                      slow += 1
+                      slow_cases.append(row)
+              else:
+                  stable += 1
+          slow_cases.sort(key=lambda item: (item.get("delta_pct", 0), item.get("delta_sec", 0)), reverse=True)
+
           functional = os.environ.get("FUNCTIONAL_OUTCOME", "unknown")
-          perf = os.environ.get("PERF_OUTCOME", "unknown")
-          status = "success" if functional == "success" and perf == "success" else "failure"
+          perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
+          status = "PASS" if functional == "success" and perf_outcome == "success" else "FAIL"
+          sha = os.environ.get("SHA", "")
           commit_title = os.environ.get("HEAD_COMMIT_MESSAGE", "").splitlines()[0]
 
-          payload = {
-              "repository": os.environ.get("REPOSITORY", ""),
-              "ref": os.environ.get("REF", ""),
-              "status": status,
-              "actor": os.environ.get("ACTOR", ""),
-              "sha": os.environ.get("SHA", ""),
-              "commit": commit_title,
-              "workflow": os.environ.get("WORKFLOW", ""),
-              "run_url": os.environ.get("RUN_URL", ""),
-              "functional": functional,
-              "perf": perf,
-          }
+          baseline_branch = delta.get("baseline_branch") or delta.get("baseline") or "unknown"
+          baseline_sha = str(delta.get("baseline_commit_sha") or "")
+          baseline_title = str(delta.get("baseline_commit_title") or "")
+          baseline_commit = f"{baseline_branch} @ {baseline_sha[:7] or 'unknown'}"
+          if baseline_title:
+              baseline_commit += f" {baseline_title}"
 
+          lines = [
+              f"{os.environ.get('ACTOR', 'unknown')} 提交了 yoolang CI: {status}",
+              f"branch: {os.environ.get('REF_NAME', 'unknown')}",
+              f"commit: {sha[:7] or 'unknown'} {commit_title}",
+              "",
+              f"功能测试: {'PASS' if functional == 'success' else 'FAIL'}",
+              f"性能测试: {'PASS' if perf_outcome == 'success' else 'FAIL'}",
+              "",
+              "编译器速度:",
+              f"当前 yoolang: {fmt_seconds(compiler_total_value)}",
+              f"GCC: {fmt_seconds(gcc_total_value)}, Clang++: {fmt_seconds(clang_total_value)}",
+              f"yoolang/GCC: {fmt_ratio(compiler_total_value, gcc_total_value)}, yoolang/Clang++: {fmt_ratio(compiler_total_value, clang_total_value)}",
+              "",
+              "基线对比:",
+              f"基线: {baseline_commit}",
+              f"整体: {fmt_overall(delta.get('total_delta_pct'))}",
+              f"case: {fast} 快 / {slow} 慢 / {stable} 持平 / {perf.get('failures', 0)} 失败",
+          ]
+
+          if slow_cases:
+              lines.extend(["", "最慢变化:"])
+              for row in slow_cases[:2]:
+                  case = str(row.get("case", "unknown")).rsplit("/", 1)[-1]
+                  lines.append(f"{case} 慢 {float(row.get('delta_pct', 0)):.1f}%")
+
+          lines.extend(["", f"run: {os.environ.get('RUN_URL', '')}"])
+
+          payload = {"message": "\n".join(lines)}
           req = urllib.request.Request(
               notify_url,
-              data=json.dumps(payload).encode("utf-8"),
+              data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
               headers={
                   "Authorization": "Bearer " + notify_token,
-                  "Content-Type": "application/json",
+                  "Content-Type": "application/json; charset=utf-8",
               },
               method="POST",
           )

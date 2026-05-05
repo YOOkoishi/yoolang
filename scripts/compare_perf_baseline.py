@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-md", required=True, type=Path)
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--baseline-label", default="main latest successful run")
+    parser.add_argument("--baseline-branch", default="")
+    parser.add_argument("--baseline-run-id", default="")
+    parser.add_argument("--baseline-run-url", default="")
+    parser.add_argument("--baseline-commit-sha", default="")
+    parser.add_argument("--baseline-commit-title", default="")
+    parser.add_argument("--baseline-commit-author", default="")
     return parser.parse_args()
 
 
@@ -70,6 +76,12 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
     payload = {
         "status": "NO BASELINE",
         "baseline": args.baseline_label,
+        "baseline_branch": args.baseline_branch,
+        "baseline_run_id": args.baseline_run_id,
+        "baseline_run_url": args.baseline_run_url,
+        "baseline_commit_sha": args.baseline_commit_sha,
+        "baseline_commit_title": args.baseline_commit_title,
+        "baseline_commit_author": args.baseline_commit_author,
         "reason": reason,
         "comparable_cases": 0,
         "rows": [],
@@ -159,6 +171,8 @@ def main() -> int:
         "",
         f"- Status: {status}",
         f"- Baseline: {args.baseline_label}",
+        f"- Baseline branch: {args.baseline_branch or 'unknown'}",
+        f"- Baseline commit: {args.baseline_commit_sha[:12] or 'unknown'} {args.baseline_commit_title}",
         f"- Comparable cases: {len(rows)}",
         f"- Current compiler total: {current_total:.4f}s",
         f"- Baseline compiler total: {baseline_total:.4f}s",
@@ -193,6 +207,12 @@ def main() -> int:
     payload = {
         "status": status,
         "baseline": args.baseline_label,
+        "baseline_branch": args.baseline_branch,
+        "baseline_run_id": args.baseline_run_id,
+        "baseline_run_url": args.baseline_run_url,
+        "baseline_commit_sha": args.baseline_commit_sha,
+        "baseline_commit_title": args.baseline_commit_title,
+        "baseline_commit_author": args.baseline_commit_author,
         "comparable_cases": len(rows),
         "current_compiler_total": current_total,
         "baseline_compiler_total": baseline_total,
