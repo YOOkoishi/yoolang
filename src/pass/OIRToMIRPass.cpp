@@ -1603,6 +1603,24 @@ class VRegLowerer final {
     std::unordered_map<const oir::Instruction *, int> alloca_slots_;
 };
 
+bool should_use_conservative_lowering_for_size(const oir::Module &module) {
+    constexpr std::size_t kMaxVRegBlocks = 4096;
+    constexpr std::size_t kMaxVRegInstructions = 12000;
+
+    std::size_t blocks = 0;
+    std::size_t instructions = 0;
+    for (const auto &function : module.functions()) {
+        if (function->is_external()) {
+            continue;
+        }
+        blocks += function->blocks().size();
+        for (const auto &block : function->blocks()) {
+            instructions += block->instructions().size();
+        }
+    }
+    return blocks > kMaxVRegBlocks || instructions > kMaxVRegInstructions;
+}
+
 } // namespace
 
 OIRToMIRPass::OIRToMIRPass(bool use_virtual_registers)
@@ -1625,7 +1643,7 @@ PassResult OIRToMIRPass::run(PassContext &context) {
 
     try {
         std::unique_ptr<mir::Module> lowered;
-        if (use_virtual_registers_) {
+        if (use_virtual_registers_ && !should_use_conservative_lowering_for_size(*module)) {
             VRegLowerer lowerer;
             lowered = lowerer.lower(*module);
         } else {

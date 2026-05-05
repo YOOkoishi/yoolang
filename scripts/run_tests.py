@@ -52,6 +52,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--timeout", type=float, default=20.0, help="per subprocess timeout in seconds")
     parser.add_argument(
+        "--opt-level",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="compiler optimization level for stage/e2e compiler invocations",
+    )
+    parser.add_argument(
+        "--o1",
+        action="store_const",
+        const=1,
+        dest="opt_level",
+        help="shorthand for --opt-level 1",
+    )
+    parser.add_argument(
         "--max-input-bytes",
         type=int,
         default=10 * 1024 * 1024,
@@ -231,12 +245,19 @@ def run_filecheck(source: Path, binary: Path, work_dir: Path, timeout: float) ->
     return TestResult("filecheck", rel(source), "PASS", time.monotonic() - start)
 
 
-def run_stage(source: Path, stage: str, binary: Path, timeout: float) -> TestResult:
-    name = f"{rel(source)} [{stage}]"
+def compiler_opt_flags(opt_level: int) -> list[str]:
+    if opt_level <= 0:
+        return []
+    return [f"-O{opt_level}"]
+
+
+def run_stage(source: Path, stage: str, binary: Path, timeout: float, opt_level: int) -> TestResult:
+    suffix = f", -O{opt_level}" if opt_level else ""
+    name = f"{rel(source)} [{stage}{suffix}]"
     start = time.monotonic()
     try:
         proc = run_process(
-            [str(binary), STAGE_FLAGS[stage], str(source)],
+            [str(binary), STAGE_FLAGS[stage], *compiler_opt_flags(opt_level), str(source)],
             stdout_target=subprocess.DEVNULL,
             timeout=timeout,
         )
@@ -282,9 +303,10 @@ def run_e2e(
     qemu: str | None,
     timeout: float,
     max_input_bytes: int,
+    opt_level: int,
 ) -> TestResult:
     start = time.monotonic()
-    name = rel(source)
+    name = rel(source) if opt_level == 0 else f"{rel(source)} [-O{opt_level}]"
     if gcc is None:
         return TestResult("e2e", name, "SKIP", detail="riscv64-linux-gnu-gcc not found")
     if qemu is None:
@@ -305,7 +327,7 @@ def run_e2e(
 
     try:
         compile_proc = run_process(
-            [str(binary), str(source), "-S", "-o", str(asm_path)],
+            [str(binary), str(source), "-S", *compiler_opt_flags(opt_level), "-o", str(asm_path)],
             stdout_target=subprocess.DEVNULL,
             timeout=timeout,
         )
@@ -423,7 +445,7 @@ def main() -> int:
                 "stage",
                 args.jobs,
                 stage_items,
-                lambda item: run_stage(item[0], item[1], args.binary, args.timeout),
+                lambda item: run_stage(item[0], item[1], args.binary, args.timeout, args.opt_level),
                 xfails,
             )
         )
@@ -446,6 +468,7 @@ def main() -> int:
                     qemu,
                     args.timeout,
                     args.max_input_bytes,
+                    args.opt_level,
                 ),
                 xfails,
             )

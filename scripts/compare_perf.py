@@ -395,6 +395,22 @@ def _expected_input(case: Path) -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+def _expected_output(case: Path) -> tuple[str, int] | None:
+    candidate = case.with_suffix(".out")
+    if not candidate.exists():
+        return None
+
+    text = candidate.read_text(errors="replace").replace("\r\n", "\n").strip()
+    if not text:
+        return "", 0
+
+    lines = text.splitlines()
+    last = lines[-1].strip()
+    if re.fullmatch(r"-?\d+", last):
+        return "\n".join(lines[:-1]).strip(), int(last)
+    return text, 0
+
+
 def _case_work_dir(case: Path) -> Path:
     out_dir = WORKSPACE / "build" / "perf-ci" / case.parent.relative_to(WORKSPACE) / case.stem
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -426,6 +442,7 @@ def _format_detail(label: str, result: RunResult) -> str:
 
 def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, str]:
     input_file = _expected_input(src)
+    expected = _expected_output(src)
     case_dir = _case_work_dir(src)
 
     results: dict[str, RunResult] = {}
@@ -469,10 +486,23 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
     if not compiler.compile_ok or not compiler.run_ok:
         return gcc, clang, compiler, False, f"compiler {compiler.detail}"
 
-    baseline_stdout = _normalize_text(gcc.stdout)
-    baseline_exit = gcc.exit_code
     clang_stdout = _normalize_text(clang.stdout)
     compiler_stdout = _normalize_text(compiler.stdout)
+
+    if expected is not None:
+        expected_stdout, expected_exit = expected
+        if compiler_stdout != _normalize_text(expected_stdout) or compiler.exit_code != expected_exit:
+            return (
+                gcc,
+                clang,
+                compiler,
+                False,
+                f"compiler output mismatch vs expected .out for {src.name}",
+            )
+        return gcc, clang, compiler, True, "OK"
+
+    baseline_stdout = _normalize_text(gcc.stdout)
+    baseline_exit = gcc.exit_code
 
     if clang_stdout != baseline_stdout or clang.exit_code != baseline_exit:
         return gcc, clang, compiler, False, f"clang++ output mismatch vs gcc for {src.name}"

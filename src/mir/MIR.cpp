@@ -492,27 +492,37 @@ void MachineFunction::rebuild_cfg() {
         block->clear_cfg_edges();
     }
 
-    for (auto &block : blocks_) {
+    for (std::size_t index = 0; index < blocks_.size(); ++index) {
+        auto &block = blocks_[index];
         auto &instructions = block->instructions();
-        if (instructions.empty()) {
-            continue;
-        }
-        const auto &last = instructions.back();
-        auto add_block_successor = [&](const MachineOperand &operand) {
-            if (operand.kind() != OperandKind::Block) {
-                return;
-            }
-            auto *succ = get_block(operand.string_value());
+        auto add_successor = [&](MachineBasicBlock *succ) {
             block->add_successor(succ);
             if (succ != nullptr) {
                 succ->add_predecessor(block.get());
             }
         };
+        auto add_block_successor = [&](const MachineOperand &operand) {
+            if (operand.kind() == OperandKind::Block) {
+                add_successor(get_block(operand.string_value()));
+            }
+        };
+        auto add_fallthrough_successor = [&]() {
+            if (index + 1 < blocks_.size()) {
+                add_successor(blocks_[index + 1].get());
+            }
+        };
+
+        if (instructions.empty()) {
+            add_fallthrough_successor();
+            continue;
+        }
+        const auto &last = instructions.back();
 
         if (last.opcode() == Opcode::BranchNonZero) {
             if (last.operands().size() >= 2 && last.operands()[1].kind() == OperandKind::Block) {
                 add_block_successor(last.operands()[1]);
             }
+            add_fallthrough_successor();
             continue;
         }
         if (last.opcode() == Opcode::Jump) {
@@ -532,13 +542,10 @@ void MachineFunction::rebuild_cfg() {
             const auto &prev = instructions[instructions.size() - 2];
             if (prev.opcode() == Opcode::BranchNonZero && prev.operands().size() >= 2 &&
                 prev.operands()[1].kind() == OperandKind::Block) {
-                auto *succ = get_block(prev.operands()[1].string_value());
-                block->add_successor(succ);
-                if (succ != nullptr) {
-                    succ->add_predecessor(block.get());
-                }
+                add_block_successor(prev.operands()[1]);
             }
         }
+        add_fallthrough_successor();
     }
 }
 
