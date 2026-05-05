@@ -1,21 +1,94 @@
 #include "../../include/mir/MIR.h"
 
 #include <algorithm>
+#include <cctype>
 #include <utility>
 
 namespace mir {
+namespace {
 
-MachineOperand MachineOperand::reg(std::string name) {
-    MachineOperand out;
-    out.kind_ = OperandKind::Reg;
-    out.string_value_ = std::move(name);
+bool starts_with(const std::string &value, const std::string &prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool contains_block(const std::vector<MachineBasicBlock *> &blocks, MachineBasicBlock *block) {
+    return std::find(blocks.begin(), blocks.end(), block) != blocks.end();
+}
+
+bool contains_reg(const std::vector<Register> &regs, const Register &reg) {
+    return std::find(regs.begin(), regs.end(), reg) != regs.end();
+}
+
+} // namespace
+
+Register Register::virtual_reg(std::uint32_t id, RegisterClass reg_class,
+                               ValueType value_type) {
+    Register out;
+    out.kind = RegisterKind::Virtual;
+    out.reg_class = reg_class;
+    out.value_type = value_type;
+    out.id = id;
     return out;
 }
 
+Register Register::physical(std::string name, RegisterClass reg_class, ValueType value_type) {
+    Register out;
+    out.kind = RegisterKind::Physical;
+    out.reg_class = reg_class;
+    out.value_type = value_type;
+    out.name = std::move(name);
+    return out;
+}
+
+bool Register::is_virtual() const {
+    return kind == RegisterKind::Virtual;
+}
+
+bool Register::is_physical() const {
+    return kind == RegisterKind::Physical;
+}
+
+bool Register::operator==(const Register &other) const {
+    if (kind != other.kind || reg_class != other.reg_class) {
+        return false;
+    }
+    if (is_virtual()) {
+        return id == other.id;
+    }
+    return name == other.name;
+}
+
+bool Register::operator!=(const Register &other) const {
+    return !(*this == other);
+}
+
+MachineOperand MachineOperand::reg(std::string name) {
+    return make_reg(Register::physical(std::move(name), RegisterClass::GPR), false, true);
+}
+
 MachineOperand MachineOperand::freg(std::string name) {
+    return make_reg(Register::physical(std::move(name), RegisterClass::FPR32), false, true);
+}
+
+MachineOperand MachineOperand::reg(Register reg) {
+    return make_reg(std::move(reg), false, true);
+}
+
+MachineOperand MachineOperand::reg_def(Register reg) {
+    return make_reg(std::move(reg), true, false);
+}
+
+MachineOperand MachineOperand::reg_use(Register reg) {
+    return make_reg(std::move(reg), false, true);
+}
+
+MachineOperand MachineOperand::make_reg(Register reg, bool is_def, bool is_use) {
     MachineOperand out;
-    out.kind_ = OperandKind::FReg;
-    out.string_value_ = std::move(name);
+    out.kind_ = reg.reg_class == RegisterClass::FPR32 ? OperandKind::FReg : OperandKind::Reg;
+    out.reg_value_ = std::move(reg);
+    out.is_def_ = is_def;
+    out.is_use_ = is_use;
+    out.sync_reg_string();
     return out;
 }
 
@@ -99,6 +172,64 @@ ValueType MachineOperand::type_value() const {
     return type_value_;
 }
 
+const Register &MachineOperand::reg_value() const {
+    return reg_value_;
+}
+
+bool MachineOperand::is_reg() const {
+    return kind_ == OperandKind::Reg || kind_ == OperandKind::FReg;
+}
+
+bool MachineOperand::is_def() const {
+    return is_def_;
+}
+
+bool MachineOperand::is_use() const {
+    return is_use_;
+}
+
+bool MachineOperand::is_implicit() const {
+    return is_implicit_;
+}
+
+bool MachineOperand::is_kill() const {
+    return is_kill_;
+}
+
+bool MachineOperand::is_dead() const {
+    return is_dead_;
+}
+
+void MachineOperand::set_reg(Register reg) {
+    reg_value_ = std::move(reg);
+    kind_ = reg_value_.reg_class == RegisterClass::FPR32 ? OperandKind::FReg : OperandKind::Reg;
+    sync_reg_string();
+}
+
+void MachineOperand::set_is_def(bool value) {
+    is_def_ = value;
+}
+
+void MachineOperand::set_is_use(bool value) {
+    is_use_ = value;
+}
+
+void MachineOperand::set_is_implicit(bool value) {
+    is_implicit_ = value;
+}
+
+void MachineOperand::set_is_kill(bool value) {
+    is_kill_ = value;
+}
+
+void MachineOperand::set_is_dead(bool value) {
+    is_dead_ = value;
+}
+
+void MachineOperand::sync_reg_string() {
+    string_value_ = register_name(reg_value_);
+}
+
 MachineInstr::MachineInstr(Opcode opcode, std::vector<MachineOperand> operands)
     : opcode_(opcode), operands_(std::move(operands)) {
 }
@@ -113,6 +244,26 @@ const std::vector<MachineOperand> &MachineInstr::operands() const {
 
 std::vector<MachineOperand> &MachineInstr::operands() {
     return operands_;
+}
+
+std::vector<Register> MachineInstr::defs() const {
+    std::vector<Register> out;
+    for (const auto &operand : operands_) {
+        if (operand.is_reg() && operand.is_def()) {
+            out.push_back(operand.reg_value());
+        }
+    }
+    return out;
+}
+
+std::vector<Register> MachineInstr::uses() const {
+    std::vector<Register> out;
+    for (const auto &operand : operands_) {
+        if (operand.is_reg() && operand.is_use()) {
+            out.push_back(operand.reg_value());
+        }
+    }
+    return out;
 }
 
 MachineBasicBlock::MachineBasicBlock(std::string name) : name_(std::move(name)) {
@@ -136,6 +287,84 @@ void MachineBasicBlock::add_instr(Opcode opcode, std::vector<MachineOperand> ope
 
 void MachineBasicBlock::add_instr(MachineInstr instr) {
     instructions_.push_back(std::move(instr));
+}
+
+void MachineBasicBlock::add_successor(MachineBasicBlock *successor) {
+    if (successor != nullptr && !contains_block(successors_, successor)) {
+        successors_.push_back(successor);
+    }
+}
+
+void MachineBasicBlock::add_predecessor(MachineBasicBlock *predecessor) {
+    if (predecessor != nullptr && !contains_block(predecessors_, predecessor)) {
+        predecessors_.push_back(predecessor);
+    }
+}
+
+void MachineBasicBlock::clear_cfg_edges() {
+    predecessors_.clear();
+    successors_.clear();
+}
+
+const std::vector<MachineBasicBlock *> &MachineBasicBlock::successors() const {
+    return successors_;
+}
+
+const std::vector<MachineBasicBlock *> &MachineBasicBlock::predecessors() const {
+    return predecessors_;
+}
+
+void MachineBasicBlock::set_live_in(std::vector<Register> regs) {
+    live_in_ = std::move(regs);
+}
+
+void MachineBasicBlock::set_live_out(std::vector<Register> regs) {
+    live_out_ = std::move(regs);
+}
+
+const std::vector<Register> &MachineBasicBlock::live_in() const {
+    return live_in_;
+}
+
+const std::vector<Register> &MachineBasicBlock::live_out() const {
+    return live_out_;
+}
+
+Register MachineRegisterInfo::create_virtual(RegisterClass reg_class, ValueType value_type) {
+    Register reg = Register::virtual_reg(next_vreg_id_++, reg_class, value_type);
+    virtual_registers_.push_back(reg);
+    return reg;
+}
+
+const Register *MachineRegisterInfo::virtual_register(std::uint32_t id) const {
+    for (const auto &reg : virtual_registers_) {
+        if (reg.id == id) {
+            return &reg;
+        }
+    }
+    return nullptr;
+}
+
+const std::vector<Register> &MachineRegisterInfo::virtual_registers() const {
+    return virtual_registers_;
+}
+
+void MachineRegisterInfo::set_allocation(Register vreg, Register physical) {
+    if (vreg.is_virtual()) {
+        allocations_[vreg.id] = std::move(physical);
+    }
+}
+
+std::optional<Register> MachineRegisterInfo::allocation(Register vreg) const {
+    auto found = allocations_.find(vreg.id);
+    if (found == allocations_.end()) {
+        return std::nullopt;
+    }
+    return found->second;
+}
+
+void MachineRegisterInfo::clear_allocations() {
+    allocations_.clear();
 }
 
 MachineFunction::MachineFunction(std::string name, TypeInfo return_type,
@@ -179,6 +408,14 @@ std::vector<std::unique_ptr<MachineBasicBlock>> &MachineFunction::blocks() {
 
 const std::vector<std::unique_ptr<MachineBasicBlock>> &MachineFunction::blocks() const {
     return blocks_;
+}
+
+MachineRegisterInfo &MachineFunction::regs() {
+    return regs_;
+}
+
+const MachineRegisterInfo &MachineFunction::regs() const {
+    return regs_;
 }
 
 int MachineFunction::add_stack_slot(std::string name, TypeInfo type, StackSlotKind kind) {
@@ -237,12 +474,97 @@ std::int64_t MachineFunction::return_address_offset() const {
     return return_address_offset_;
 }
 
+void MachineFunction::note_used_callee_saved(Register reg) {
+    if (!reg.is_physical() || !is_callee_saved_register(reg)) {
+        return;
+    }
+    if (!contains_reg(used_callee_saved_regs_, reg)) {
+        used_callee_saved_regs_.push_back(std::move(reg));
+    }
+}
+
+const std::vector<SavedRegister> &MachineFunction::saved_registers() const {
+    return saved_registers_;
+}
+
+void MachineFunction::rebuild_cfg() {
+    for (auto &block : blocks_) {
+        block->clear_cfg_edges();
+    }
+
+    for (auto &block : blocks_) {
+        auto &instructions = block->instructions();
+        if (instructions.empty()) {
+            continue;
+        }
+        const auto &last = instructions.back();
+        auto add_block_successor = [&](const MachineOperand &operand) {
+            if (operand.kind() != OperandKind::Block) {
+                return;
+            }
+            auto *succ = get_block(operand.string_value());
+            block->add_successor(succ);
+            if (succ != nullptr) {
+                succ->add_predecessor(block.get());
+            }
+        };
+
+        if (last.opcode() == Opcode::BranchNonZero) {
+            if (last.operands().size() >= 2 && last.operands()[1].kind() == OperandKind::Block) {
+                add_block_successor(last.operands()[1]);
+            }
+            continue;
+        }
+        if (last.opcode() == Opcode::Jump) {
+            if (!last.operands().empty() && last.operands()[0].kind() == OperandKind::Block) {
+                add_block_successor(last.operands()[0]);
+            }
+            if (instructions.size() >= 2) {
+                const auto &prev = instructions[instructions.size() - 2];
+                if (prev.opcode() == Opcode::BranchNonZero && prev.operands().size() >= 2) {
+                    add_block_successor(prev.operands()[1]);
+                }
+            }
+            continue;
+        }
+
+        if (instructions.size() >= 2) {
+            const auto &prev = instructions[instructions.size() - 2];
+            if (prev.opcode() == Opcode::BranchNonZero && prev.operands().size() >= 2 &&
+                prev.operands()[1].kind() == OperandKind::Block) {
+                auto *succ = get_block(prev.operands()[1].string_value());
+                block->add_successor(succ);
+                if (succ != nullptr) {
+                    succ->add_predecessor(block.get());
+                }
+            }
+        }
+    }
+}
+
 void MachineFunction::layout_frame() {
     std::uint64_t offset = align_to(outgoing_arg_bytes_, 16);
     for (auto &slot : stack_slots_) {
         offset = align_to(offset, slot.type.align);
         slot.offset = static_cast<std::int64_t>(offset);
         offset += slot.type.size;
+    }
+
+    saved_registers_.clear();
+    std::sort(used_callee_saved_regs_.begin(), used_callee_saved_regs_.end(),
+              [](const Register &lhs, const Register &rhs) {
+                  if (lhs.reg_class != rhs.reg_class) {
+                      return lhs.reg_class < rhs.reg_class;
+                  }
+                  return lhs.name < rhs.name;
+              });
+    for (const auto &reg : used_callee_saved_regs_) {
+        offset = align_to(offset, 8);
+        SavedRegister saved;
+        saved.reg = reg;
+        saved.offset = static_cast<std::int64_t>(offset);
+        saved_registers_.push_back(saved);
+        offset += 8;
     }
 
     if (has_call_) {
@@ -314,6 +636,16 @@ const char *value_type_name(ValueType type) {
         return "ptr";
     case ValueType::Aggregate:
         return "aggregate";
+    }
+    return "unknown";
+}
+
+const char *register_class_name(RegisterClass reg_class) {
+    switch (reg_class) {
+    case RegisterClass::GPR:
+        return "gpr";
+    case RegisterClass::FPR32:
+        return "fpr32";
     }
     return "unknown";
 }
@@ -413,6 +745,54 @@ std::uint64_t align_to(std::uint64_t value, std::uint64_t align) {
         return value;
     }
     return ((value + align - 1) / align) * align;
+}
+
+RegisterClass register_class_for_physical(const std::string &name) {
+    if (!name.empty() && name[0] == 'f') {
+        return RegisterClass::FPR32;
+    }
+    return RegisterClass::GPR;
+}
+
+std::string register_name(const Register &reg) {
+    if (reg.is_virtual()) {
+        return "%v" + std::to_string(reg.id);
+    }
+    return reg.name;
+}
+
+bool is_callee_saved_register(const Register &reg) {
+    if (!reg.is_physical()) {
+        return false;
+    }
+    const auto &name = reg.name;
+    if (name.size() >= 2 && name[0] == 's' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+        return name != "s0";
+    }
+    if (starts_with(name, "fs")) {
+        return true;
+    }
+    return false;
+}
+
+bool is_caller_saved_register(const Register &reg) {
+    if (!reg.is_physical()) {
+        return false;
+    }
+    const auto &name = reg.name;
+    if (name == "ra") {
+        return true;
+    }
+    if (!name.empty() && name[0] == 't') {
+        return true;
+    }
+    if (!name.empty() && name[0] == 'a') {
+        return true;
+    }
+    if (starts_with(name, "ft") || starts_with(name, "fa")) {
+        return true;
+    }
+    return false;
 }
 
 } // namespace mir

@@ -33,7 +33,7 @@ class AsmPrinter final {
                                 std::int64_t offset, ValueType type);
     void emit_add_sp_offset(const std::string &dst, std::int64_t offset);
     void emit_adjust_sp(std::int64_t amount);
-    void emit_memzero_loop(std::uint64_t size);
+    void emit_memzero_loop(const std::string &addr_reg, std::uint64_t size);
 
     void emit_int_slot_access(const std::string &mnemonic, const std::string &reg,
                               const std::string &base, std::int64_t offset);

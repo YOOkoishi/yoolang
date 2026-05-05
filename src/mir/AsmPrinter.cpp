@@ -94,6 +94,13 @@ void AsmPrinter::print_function(const MachineFunction &function) {
     if (function.has_call()) {
         emit_int_slot_access("sd", "ra", "sp", function.return_address_offset());
     }
+    for (const auto &saved : function.saved_registers()) {
+        if (saved.reg.reg_class == RegisterClass::FPR32) {
+            emit_float_slot_access("fsd", saved.reg.name, "sp", saved.offset);
+        } else {
+            emit_int_slot_access("sd", saved.reg.name, "sp", saved.offset);
+        }
+    }
 
     for (const auto &block : function.blocks()) {
         out_ << label_for(function.name(), block->name()) << ":\n";
@@ -145,7 +152,7 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         emit_store_mem(ops[1].string_value(), ops[0].string_value(), ops[2].type_value());
         break;
     case Opcode::MemZero:
-        emit_memzero_loop(static_cast<std::uint64_t>(ops[1].int_value()));
+        emit_memzero_loop(ops[0].string_value(), static_cast<std::uint64_t>(ops[1].int_value()));
         break;
     case Opcode::Move:
         out_ << "\tmv " << ops[0].string_value() << ", " << ops[1].string_value() << "\n";
@@ -276,6 +283,14 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
 
 void AsmPrinter::print_epilogue(const MachineFunction &function) {
     out_ << label_for(function.name(), "epilogue") << ":\n";
+    for (auto it = function.saved_registers().rbegin(); it != function.saved_registers().rend();
+         ++it) {
+        if (it->reg.reg_class == RegisterClass::FPR32) {
+            emit_float_slot_access("fld", it->reg.name, "sp", it->offset);
+        } else {
+            emit_int_slot_access("ld", it->reg.name, "sp", it->offset);
+        }
+    }
     if (function.has_call()) {
         emit_int_slot_access("ld", "ra", "sp", function.return_address_offset());
     }
@@ -371,18 +386,21 @@ void AsmPrinter::emit_adjust_sp(std::int64_t amount) {
     out_ << "\tadd sp, sp, t6\n";
 }
 
-void AsmPrinter::emit_memzero_loop(std::uint64_t size) {
+void AsmPrinter::emit_memzero_loop(const std::string &addr_reg, std::uint64_t size) {
     if (size == 0) {
         return;
     }
     std::string loop = ".Lmemzero_" + std::to_string(unique_label_id_++);
     std::string done = loop + "_done";
-    out_ << "\tli t5, " << size << "\n";
+    const std::string cursor = addr_reg == "t5" ? "t4" : "t5";
+    const std::string counter = cursor == "t5" ? "t4" : "t5";
+    out_ << "\tmv " << cursor << ", " << addr_reg << "\n";
+    out_ << "\tli " << counter << ", " << size << "\n";
     out_ << loop << ":\n";
-    out_ << "\tbeqz t5, " << done << "\n";
-    out_ << "\tsw zero, 0(t0)\n";
-    out_ << "\taddi t0, t0, 4\n";
-    out_ << "\taddi t5, t5, -4\n";
+    out_ << "\tbeqz " << counter << ", " << done << "\n";
+    out_ << "\tsw zero, 0(" << cursor << ")\n";
+    out_ << "\taddi " << cursor << ", " << cursor << ", 4\n";
+    out_ << "\taddi " << counter << ", " << counter << ", -4\n";
     out_ << "\tj " << loop << "\n";
     out_ << done << ":\n";
 }
