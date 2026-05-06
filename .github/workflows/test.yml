@@ -57,7 +57,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build/github-actions
-          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a 2>&1 | tee build/github-actions/functional-tests.log
+          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 2>&1 | tee build/github-actions/functional-tests.log
 
       - name: Run performance tests
         id: perf_tests
@@ -259,25 +259,25 @@ jobs:
           overall_status = "PASS" if functional_status == "PASS" and perf_status == "PASS" else "FAIL"
 
           lines = [
-              "# CI Summary",
+              "# 🧪 CI Summary",
               "",
-              "## Overall",
-              f"- Status: {overall_status}",
-              f"- Functional: {functional_status}",
-              f"- Perf: {perf_status}",
+              "## 📌 Overall",
+              f"- Status: {'✅' if overall_status == 'PASS' else '❌'} {overall_status}",
+              f"- Functional: {'✅' if functional_status == 'PASS' else '❌'} {functional_status}",
+              f"- Perf: {'✅' if perf_status == 'PASS' else '❌'} {perf_status}",
               f"- Branch: `{os.environ.get('GITHUB_REF_NAME', 'unknown')}`",
               f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
               "",
-              "## Functional Tests",
-              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a`",
-              f"- Status: {functional_status}",
+              "## ✅ Functional Tests",
+              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1`",
+              f"- Status: {'✅' if functional_status == 'PASS' else '❌'} {functional_status}",
           ]
 
           if functional is None:
               lines.append(f"- Result: could not parse summary, step outcome was `{os.environ['FUNCTIONAL_OUTCOME']}`")
           else:
               lines.append(f"- Passed: {functional['passed']}")
-              lines.append(f"- Failed: {functional['failed']}")
+              lines.append(f"- Failed: {'✅' if functional['failed'] == 0 else '❌'} {functional['failed']}")
               lines.append(f"- Skipped: {functional['skipped']}")
               lines.append(f"- XFailed: {functional['xfailed']}")
               lines.append(f"- XPassed: {functional['xpassed']}")
@@ -286,7 +286,7 @@ jobs:
               lines.extend(
                   [
                       "",
-                      "<details><summary>Functional test failures</summary>",
+                      "<details><summary>❌ Functional test failures</summary>",
                       "",
                   ]
               )
@@ -299,21 +299,25 @@ jobs:
                   lines.append(f"- ... and {len(functional_failed_cases) - 20} more")
               lines.extend(["", "</details>"])
 
-          lines.extend(["", "## Performance Tests"])
+          lines.extend(["", "## 📊 Performance Tests"])
 
           if perf_payload is None:
-              lines.append(f"- Status: {os.environ['PERF_OUTCOME'].upper()}")
+              lines.append(f"- Status: {'✅' if os.environ['PERF_OUTCOME'] == 'success' else '❌'} {os.environ['PERF_OUTCOME'].upper()}")
               lines.append("- Result: perf report was not generated")
               if perf_log.exists():
                   tail = "\n".join(perf_log.read_text(errors="replace").splitlines()[-20:])
                   if tail:
-                      lines.extend(["", "<details><summary>Perf log tail</summary>", "", "```text", tail, "```", "", "</details>"])
+                      lines.extend(["", "<details><summary>📄 Perf log tail</summary>", "", "```text", tail, "```", "", "</details>"])
           else:
               rows = perf_payload.get("rows", [])
               total_runtime = perf_payload.get("total_runtime_sec", 0.0)
+              status_emoji = perf_payload.get("status_emoji", "✅" if perf_status == "PASS" else "❌")
+              lines.append(f"- Status: {status_emoji} {perf_status}")
+              lines.append(f"- Compiler opt: `{perf_payload.get('compiler_opt', '-O1')}`")
               lines.append(f"- Generated: {perf_payload.get('generated_utc', 'unknown')}")
               lines.append(f"- Cases: {perf_payload.get('cases', len(rows))}")
-              lines.append(f"- Failed: {perf_payload.get('failures', 'unknown')}")
+              perf_failures = perf_payload.get('failures', 'unknown')
+              lines.append(f"- Failed: {'✅' if perf_failures == 0 else '❌'} {perf_failures}")
               lines.append(f"- Total runtime (s): {float(total_runtime):.4f}")
               lines.extend(["", "| Case | GCC | Clang++ | Compiler | Status |", "| --- | --- | --- | --- | --- |"])
 
@@ -443,14 +447,17 @@ jobs:
                   return "N/A"
               return f"{numerator / denominator:.2f}x"
 
+          def fmt_status(value: str) -> str:
+              return "✅ PASS" if value == "success" else "❌ FAIL"
+
           def fmt_overall(delta_pct) -> str:
               if not isinstance(delta_pct, (int, float)):
-                  return "N/A"
+                  return "ℹ️ N/A"
               if delta_pct > 0:
-                  return f"慢 {delta_pct:.1f}%"
+                  return f"⚠️ 慢 {delta_pct:.1f}%"
               if delta_pct < 0:
-                  return f"快 {abs(delta_pct):.1f}%"
-              return "持平 0.0%"
+                  return f"🚀 快 {abs(delta_pct):.1f}%"
+              return "✅ 持平 0.0%"
 
           perf = read_json("build/perf-ci/perf-report.json")
           delta = read_json("build/perf-ci/perf-delta.json")
@@ -503,6 +510,7 @@ jobs:
           functional = os.environ.get("FUNCTIONAL_OUTCOME", "unknown")
           perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
           status = "PASS" if functional == "success" and perf_outcome == "success" else "FAIL"
+          status_emoji = "✅" if status == "PASS" else "❌"
           sha = os.environ.get("SHA", "")
           commit_title = os.environ.get("HEAD_COMMIT_MESSAGE", "").splitlines()[0]
 
@@ -514,31 +522,31 @@ jobs:
               baseline_commit += f" {baseline_title}"
 
           lines = [
-              f"{os.environ.get('ACTOR', 'unknown')} 提交了 yoolang CI: {status}",
-              f"branch: {os.environ.get('REF_NAME', 'unknown')}",
-              f"commit: {sha[:7] or 'unknown'} {commit_title}",
+              f"{status_emoji} {os.environ.get('ACTOR', 'unknown')} 提交了 yoolang CI: {status}",
+              f"🌿 branch: {os.environ.get('REF_NAME', 'unknown')}",
+              f"🔖 commit: {sha[:7] or 'unknown'} {commit_title}",
               "",
-              f"功能测试: {'PASS' if functional == 'success' else 'FAIL'}",
-              f"性能测试: {'PASS' if perf_outcome == 'success' else 'FAIL'}",
+              f"🧪 功能测试(-O1): {fmt_status(functional)}",
+              f"📊 性能测试(-O1): {fmt_status(perf_outcome)}",
               "",
-              "编译器速度:",
-              f"当前 yoolang: {fmt_seconds(compiler_total_value)}",
-              f"GCC: {fmt_seconds(gcc_total_value)}, Clang++: {fmt_seconds(clang_total_value)}",
-              f"yoolang/GCC: {fmt_ratio(compiler_total_value, gcc_total_value)}, yoolang/Clang++: {fmt_ratio(compiler_total_value, clang_total_value)}",
+              "⚡ 编译器速度:",
+              f"🚀 当前 yoolang: {fmt_seconds(compiler_total_value)}",
+              f"🧱 GCC: {fmt_seconds(gcc_total_value)}, Clang++: {fmt_seconds(clang_total_value)}",
+              f"📐 yoolang/GCC: {fmt_ratio(compiler_total_value, gcc_total_value)}, yoolang/Clang++: {fmt_ratio(compiler_total_value, clang_total_value)}",
               "",
-              "基线对比:",
-              f"基线: {baseline_commit}",
+              "📈 基线对比:",
+              f"📍 基线: {baseline_commit}",
               f"整体: {fmt_overall(delta.get('total_delta_pct'))}",
-              f"case: {fast} 快 / {slow} 慢 / {stable} 持平 / {perf.get('failures', 0)} 失败",
+              f"case: 🚀 {fast} 快 / ⚠️ {slow} 慢 / ✅ {stable} 持平 / ❌ {perf.get('failures', 0)} 失败",
           ]
 
           if slow_cases:
-              lines.extend(["", "最慢变化:"])
+              lines.extend(["", "⚠️ 最慢变化:"])
               for row in slow_cases[:2]:
                   case = str(row.get("case", "unknown")).rsplit("/", 1)[-1]
-                  lines.append(f"{case} 慢 {float(row.get('delta_pct', 0)):.1f}%")
+                  lines.append(f"{case} ⚠️ 慢 {float(row.get('delta_pct', 0)):.1f}%")
 
-          lines.extend(["", f"run: {os.environ.get('RUN_URL', '')}"])
+          lines.extend(["", f"🔗 run: {os.environ.get('RUN_URL', '')}"])
 
           payload = {"message": "\n".join(lines)}
           req = urllib.request.Request(

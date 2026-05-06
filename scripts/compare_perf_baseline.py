@@ -17,6 +17,14 @@ TOTAL_IMPROVEMENT_DELTA_PCT = -10.0
 MAX_REGRESSION_ROWS = 10
 
 
+STATUS_EMOJI = {
+    "IMPROVEMENT": "🚀",
+    "OK": "✅",
+    "REGRESSION": "⚠️",
+    "NO BASELINE": "ℹ️",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current perf report against a baseline report.")
     parser.add_argument("--current", required=True, type=Path)
@@ -24,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-md", required=True, type=Path)
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--baseline-label", default="main latest successful run")
+    parser.add_argument("--baseline-branch", default="")
+    parser.add_argument("--baseline-run-id", default="")
+    parser.add_argument("--baseline-run-url", default="")
+    parser.add_argument("--baseline-commit-sha", default="")
+    parser.add_argument("--baseline-commit-title", default="")
+    parser.add_argument("--baseline-commit-author", default="")
     return parser.parse_args()
 
 
@@ -66,6 +80,7 @@ def md_escape(text: str) -> str:
 
 def baseline_meta(args: argparse.Namespace) -> dict[str, str]:
     return {
+        "branch": args.baseline_branch.strip(),
         "run_id": args.baseline_run_id.strip(),
         "run_url": args.baseline_run_url.strip(),
         "commit_sha": args.baseline_commit_sha.strip(),
@@ -103,7 +118,15 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "status": "NO BASELINE",
+        "status_emoji": STATUS_EMOJI["NO BASELINE"],
         "baseline": args.baseline_label,
+        "baseline_branch": args.baseline_branch,
+        "baseline_run_id": args.baseline_run_id,
+        "baseline_run_url": args.baseline_run_url,
+        "baseline_commit_sha": args.baseline_commit_sha,
+        "baseline_commit_title": args.baseline_commit_title,
+        "baseline_commit_author": args.baseline_commit_author,
+        "baseline_meta": baseline_meta(args),
         "reason": reason,
         "comparable_cases": 0,
         "rows": [],
@@ -112,9 +135,9 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
     args.out_md.write_text(
         "\n".join(
             [
-                "## Perf Change vs main baseline",
+                "## 📊 Perf Change vs main baseline",
                 "",
-                "- Status: NO BASELINE",
+                f"- Status: {STATUS_EMOJI['NO BASELINE']} NO BASELINE",
                 f"- Baseline: {args.baseline_label}",
                 *baseline_md_lines(args),
                 f"- Reason: {reason}",
@@ -190,10 +213,11 @@ def main() -> int:
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
 
     md_lines = [
-        "## Perf Change vs main baseline",
+        "## 📊 Perf Change vs main baseline",
         "",
-        f"- Status: {status}",
+        f"- Status: {STATUS_EMOJI.get(status, 'ℹ️')} {status}",
         f"- Baseline: {args.baseline_label}",
+        *baseline_md_lines(args),
         f"- Comparable cases: {len(rows)}",
         f"- Current compiler total: {current_total:.4f}s",
         f"- Baseline compiler total: {baseline_total:.4f}s",
@@ -223,11 +247,19 @@ def main() -> int:
                 + " |"
             )
     else:
-        md_lines.append("No significant per-case regressions.")
+        md_lines.append("✅ No significant per-case regressions.")
 
     payload = {
         "status": status,
+        "status_emoji": STATUS_EMOJI.get(status, "ℹ️"),
         "baseline": args.baseline_label,
+        "baseline_branch": args.baseline_branch,
+        "baseline_run_id": args.baseline_run_id,
+        "baseline_run_url": args.baseline_run_url,
+        "baseline_commit_sha": args.baseline_commit_sha,
+        "baseline_commit_title": args.baseline_commit_title,
+        "baseline_commit_author": args.baseline_commit_author,
+        "baseline_meta": baseline_meta(args),
         "comparable_cases": len(rows),
         "current_compiler_total": current_total,
         "baseline_compiler_total": baseline_total,

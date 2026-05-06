@@ -36,6 +36,13 @@ REPORT_DIR = WORKSPACE / "build" / "perf-ci"
 REPORT_MD = REPORT_DIR / "perf-report.md"
 REPORT_JSON = REPORT_DIR / "perf-report.json"
 MAX_STATUS_CELL_CHARS = 4000
+STATUS_EMOJI = {
+    "PASS": "✅",
+    "FAIL": "❌",
+    "OK": "✅",
+    "CFAIL": "🛠️",
+    "TIMEOUT": "⏱️",
+}
 
 
 def _resolve_compiler_binary() -> Path:
@@ -248,7 +255,7 @@ try:
     RUNTIME_LIB = _ensure_runtime_lib()
     RUNTIME_WRAPPER = _ensure_runtime_wrapper()
 except Exception as exc:
-    print(f"[ERROR] {exc}")
+    print(f"❌ [ERROR] {exc}")
     sys.exit(2)
 
 
@@ -541,12 +548,13 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
     generated = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
     md_lines = [
-        "# RISC-V QEMU Perf Report",
+        "# 📊 RISC-V QEMU Perf Report",
         "",
-        f"- Status: {status}",
+        f"- Status: {STATUS_EMOJI[status]} {status}",
         f"- Generated: {generated}",
         f"- Cases: {len(rows)}",
         f"- Failed: {failures}",
+        "- Compiler opt: `-O1`",
         f"- Total runtime (s): {total_runtime:.4f}",
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
@@ -580,9 +588,11 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
 
     payload = {
         "status": status,
+        "status_emoji": STATUS_EMOJI[status],
         "generated_utc": generated,
         "workspace": str(WORKSPACE),
         "compiler_binary": str(COMPILER_BIN),
+        "compiler_opt": "-O1",
         "runtime_lib": str(RUNTIME_LIB),
         "test_dirs": [str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS],
         "cases": len(rows),
@@ -609,7 +619,7 @@ else:
 
 
 if not CASES:
-    print("[ERROR] no .sy testcases found")
+    print("❌ [ERROR] no .sy testcases found")
     sys.exit(2)
 
 
@@ -636,7 +646,7 @@ def main() -> int:
                 if item
             )
         print(
-            f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(compiler):<12} | {detail}"
+            f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(compiler):<12} | {STATUS_EMOJI.get(detail, 'ℹ️')} {detail}"
         )
         report_rows.append(
             {
@@ -651,21 +661,21 @@ def main() -> int:
         )
         if not ok:
             failures += 1
-            print(f"[FAIL] {rel}: {detail}")
+            print(f"❌ [FAIL] {rel}: {detail}")
             if error_detail:
                 print(error_detail)
 
     print("-" * 140)
-    print(f"Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")
+    print(f"📌 Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")
 
     _write_reports(report_rows, failures, total_runtime)
-    print(f"Report markdown: {REPORT_MD}")
-    print(f"Report json: {REPORT_JSON}")
+    print(f"📄 Report markdown: {REPORT_MD}")
+    print(f"🧾 Report json: {REPORT_JSON}")
 
     if failures > 0:
-        print("[ERROR] perf compare failed.")
+        print("❌ [ERROR] perf compare failed.")
         return 1
-    print("[OK] perf compare passed.")
+    print("✅ [OK] perf compare passed.")
     return 0
 
 
