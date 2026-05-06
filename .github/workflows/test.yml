@@ -442,10 +442,10 @@ jobs:
           def fmt_seconds(value: float | None) -> str:
               return "N/A" if value is None else f"{value:.2f}s"
 
-          def fmt_ratio(numerator: float | None, denominator: float | None) -> str:
-              if numerator is None or denominator is None or denominator <= 0:
+          def fmt_speedup(reference_time: float | None, current_time: float | None) -> str:
+              if reference_time is None or current_time is None or current_time <= 0:
                   return "N/A"
-              return f"{numerator / denominator:.2f}x"
+              return f"{reference_time / current_time:.2f}x"
 
           def fmt_status(value: str) -> str:
               return "✅ PASS" if value == "success" else "❌ FAIL"
@@ -458,6 +458,16 @@ jobs:
               if delta_pct < 0:
                   return f"🚀 快 {abs(delta_pct):.1f}%"
               return "✅ 持平 0.0%"
+
+          def fmt_baseline_speedup(delta: dict) -> str:
+              speedup = delta.get("total_speedup")
+              if isinstance(speedup, (int, float)):
+                  return f"{speedup:.2f}x"
+              baseline_total = delta.get("baseline_compiler_total")
+              current_total = delta.get("current_compiler_total")
+              if isinstance(baseline_total, (int, float)) and isinstance(current_total, (int, float)) and current_total > 0:
+                  return f"{baseline_total / current_total:.2f}x"
+              return "N/A"
 
           perf = read_json("build/perf-ci/perf-report.json")
           delta = read_json("build/perf-ci/perf-delta.json")
@@ -520,6 +530,8 @@ jobs:
           baseline_commit = f"{baseline_branch} @ {baseline_sha[:7] or 'unknown'}"
           if baseline_title:
               baseline_commit += f" {baseline_title}"
+          current_compile_total = delta.get("current_compiler_total")
+          baseline_compile_total = delta.get("baseline_compiler_total")
 
           lines = [
               f"{status_emoji} {os.environ.get('ACTOR', 'unknown')} 提交了 yoolang CI: {status}",
@@ -532,11 +544,13 @@ jobs:
               "⚡ 编译器速度:",
               f"🚀 当前 yoolang: {fmt_seconds(compiler_total_value)}",
               f"🧱 GCC: {fmt_seconds(gcc_total_value)}, Clang++: {fmt_seconds(clang_total_value)}",
-              f"📐 yoolang/GCC: {fmt_ratio(compiler_total_value, gcc_total_value)}, yoolang/Clang++: {fmt_ratio(compiler_total_value, clang_total_value)}",
+              f"📐 yoolang/GCC 加速比: {fmt_speedup(gcc_total_value, compiler_total_value)}, yoolang/Clang++ 加速比: {fmt_speedup(clang_total_value, compiler_total_value)}",
               "",
               "📈 基线对比:",
               f"📍 基线: {baseline_commit}",
-              f"整体: {fmt_overall(delta.get('total_delta_pct'))}",
+              f"⏱️ 当前 compile 总时间: {fmt_seconds(current_compile_total if isinstance(current_compile_total, (int, float)) else None)}",
+              f"⏱️ 基线 compile 总时间: {fmt_seconds(baseline_compile_total if isinstance(baseline_compile_total, (int, float)) else None)}",
+              f"整体: {fmt_overall(delta.get('total_delta_pct'))}, 加速比 {fmt_baseline_speedup(delta)}",
               f"case: 🚀 {fast} 快 / ⚠️ {slow} 慢 / ✅ {stable} 持平 / ❌ {perf.get('failures', 0)} 失败",
           ]
 

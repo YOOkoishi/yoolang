@@ -74,6 +74,16 @@ def format_signed_pct(value: float) -> str:
     return f"{value:+.2f}%"
 
 
+def speedup_ratio(baseline_time: float, current_time: float) -> float | None:
+    if baseline_time <= 0.0 or current_time <= 0.0:
+        return None
+    return baseline_time / current_time
+
+
+def format_speedup(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.2f}x"
+
+
 def md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
@@ -177,6 +187,7 @@ def main() -> int:
 
         delta_sec = current_time - baseline_time
         delta_pct = 0.0 if baseline_time == 0.0 else (delta_sec / baseline_time) * 100.0
+        case_speedup = speedup_ratio(baseline_time, current_time)
         is_regression = delta_pct >= CASE_REGRESSION_DELTA_PCT and delta_sec >= CASE_REGRESSION_DELTA_SEC
         rows.append(
             {
@@ -185,6 +196,7 @@ def main() -> int:
                 "baseline": baseline_time,
                 "delta_sec": delta_sec,
                 "delta_pct": delta_pct,
+                "speedup": case_speedup,
                 "status": "REGRESSION" if is_regression else "OK",
             }
         )
@@ -198,12 +210,15 @@ def main() -> int:
     else:
         total_delta_sec = current_total - baseline_total
         total_delta_pct = 0.0 if baseline_total == 0.0 else (total_delta_sec / baseline_total) * 100.0
+        total_speedup = speedup_ratio(baseline_total, current_total)
         if total_delta_pct >= TOTAL_REGRESSION_DELTA_PCT:
             status = "REGRESSION"
         elif total_delta_pct <= TOTAL_IMPROVEMENT_DELTA_PCT:
             status = "IMPROVEMENT"
         else:
             status = "OK"
+    if not rows:
+        total_speedup = None
 
     regressions = [row for row in rows if row["status"] == "REGRESSION"]
     regressions.sort(key=lambda row: (row["delta_pct"], row["delta_sec"]), reverse=True)
@@ -221,6 +236,7 @@ def main() -> int:
         f"- Comparable cases: {len(rows)}",
         f"- Current compiler total: {current_total:.4f}s",
         f"- Baseline compiler total: {baseline_total:.4f}s",
+        f"- Overall speedup vs baseline: {format_speedup(total_speedup)}",
         f"- Delta: {format_signed_sec(total_delta_sec)} ({format_signed_pct(total_delta_pct)})",
         "",
     ]
@@ -228,8 +244,8 @@ def main() -> int:
     if shown_regressions:
         md_lines.extend(
             [
-                "| Case | Current | Baseline | Delta | Status |",
-                "| --- | --- | --- | --- | --- |",
+                "| Case | Current | Baseline | Speedup | Delta | Status |",
+                "| --- | --- | --- | --- | --- | --- |",
             ]
         )
         for row in shown_regressions:
@@ -240,6 +256,7 @@ def main() -> int:
                         md_escape(str(row["case"])),
                         f"{row['current']:.4f}s",
                         f"{row['baseline']:.4f}s",
+                        format_speedup(row["speedup"]),
                         f"{format_signed_sec(row['delta_sec'])} ({format_signed_pct(row['delta_pct'])})",
                         str(row["status"]),
                     ]
@@ -265,6 +282,7 @@ def main() -> int:
         "baseline_compiler_total": baseline_total,
         "total_delta_sec": total_delta_sec,
         "total_delta_pct": total_delta_pct,
+        "total_speedup": total_speedup,
         "regressions": regressions,
         "rows": rows,
     }
