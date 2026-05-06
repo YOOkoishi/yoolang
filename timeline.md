@@ -50,3 +50,7 @@ summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 ```
 
 添加之后也仍然保持一样的 summary.
+
+# May. 6
+
+添加了 RegAlloc 的 pass , 以及 MIR 的 Peephole pass,现在的速度比之前栈式分配内存要快不少（50%）。
