@@ -2,10 +2,6 @@
 
 ![yoolang](/yoolang.jpg)
 
-## 测试数据
-
-当前测试数据以普通仓库文件保存，不再依赖 Git LFS。过大的性能输入已从常规回归集中移除，避免本地与 CI 测试被单个大文件拖慢。
-
 ## 使用方法
 
 使用 xmake 作为构建工具.
@@ -17,6 +13,11 @@ xmake
 ```
 
 即可构建
+
+```bash
+compiler xxx.sy -S -o xxx.s #正常流程
+compiler xxx.sy -S -o xxx.s -O1 #启用优化
+```
 
 ## 测试
 

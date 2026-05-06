@@ -4,16 +4,16 @@
 
 namespace pass {
 
-class OIRToMIRPass final : public Pass {
+class MIRPeepholePass final : public Pass {
   public:
-    explicit OIRToMIRPass(bool use_virtual_registers = false);
+    explicit MIRPeepholePass(bool post_ra = false);
 
     std::string_view name() const override;
     PassKind kind() const override;
     PassResult run(PassContext &context) override;
 
   private:
-    bool use_virtual_registers_ = false;
+    bool post_ra_ = false;
 };
 
 } // namespace pass

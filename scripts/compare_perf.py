@@ -18,6 +18,7 @@ class RunResult:
     stderr: str = ""
     exit_code: Optional[int] = None
     detail: str = ""
+    metrics: dict[str, int] | None = None
 
 
 WORKSPACE = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[1])).resolve()
@@ -317,6 +318,53 @@ def _compile_compiler(src: Path, out_dir: Path) -> tuple[Path, str]:
     return exe, "OK"
 
 
+def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, int]:
+    asm_file = out_dir / f"{src.stem}.compiler.s"
+    metrics = {
+        "mir_instrs": 0,
+        "stack_slots": 0,
+        "load_slot": 0,
+        "store_slot": 0,
+        "move": 0,
+        "fmove": 0,
+        "asm_lines": 0,
+    }
+
+    if asm_file.exists():
+        metrics["asm_lines"] = sum(
+            1
+            for line in asm_file.read_text(errors="replace").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+    try:
+        proc = subprocess.run(
+            [str(COMPILER_BIN), str(src), "--emit-mir", "-O1"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_SEC,
+        )
+    except Exception:
+        return metrics
+
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if re.match(r"^(LI|FLI\.S|LA|FI_ADDR|LOAD_SLOT|STORE_SLOT|LOAD_MEM|STORE_MEM|MEMZERO|MV|FMV\.S|ADD|ADDW|SUBW|MUL|MULW|DIVW|REMW|AND|SLLI|SRLIW|XOR|XORI|SLT|SEQZ|SNEZ|FADD\.S|FSUB\.S|FMUL\.S|FDIV\.S|FEQ\.S|FLT\.S|FLE\.S|FCVT\.S\.W|FCVT\.W\.S|FMV\.W\.X|STORE_OUT_ARG|LOAD_IN_ARG|BNEZ|J|CALL)\b", stripped):
+            metrics["mir_instrs"] += 1
+        if " fi#" in line or stripped.startswith("fi#"):
+            metrics["stack_slots"] += 1
+        if stripped.startswith("LOAD_SLOT"):
+            metrics["load_slot"] += 1
+        elif stripped.startswith("STORE_SLOT"):
+            metrics["store_slot"] += 1
+        elif stripped.startswith("MV"):
+            metrics["move"] += 1
+        elif stripped.startswith("FMV.S"):
+            metrics["fmove"] += 1
+    return metrics
+
+
 def _run_qemu(exe: Path, input_file: Optional[Path]) -> tuple[bool, float, str, str, Optional[int], str]:
     stdin_data = input_file.read_bytes() if input_file and input_file.exists() else None
     start = time.perf_counter()
@@ -345,6 +393,22 @@ def _run_qemu(exe: Path, input_file: Optional[Path]) -> tuple[bool, float, str, 
 def _expected_input(case: Path) -> Optional[Path]:
     candidate = case.with_suffix(".in")
     return candidate if candidate.exists() else None
+
+
+def _expected_output(case: Path) -> tuple[str, int] | None:
+    candidate = case.with_suffix(".out")
+    if not candidate.exists():
+        return None
+
+    text = candidate.read_text(errors="replace").replace("\r\n", "\n").strip()
+    if not text:
+        return "", 0
+
+    lines = text.splitlines()
+    last = lines[-1].strip()
+    if re.fullmatch(r"-?\d+", last):
+        return "\n".join(lines[:-1]).strip(), int(last)
+    return text, 0
 
 
 def _case_work_dir(case: Path) -> Path:
@@ -378,6 +442,7 @@ def _format_detail(label: str, result: RunResult) -> str:
 
 def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, str]:
     input_file = _expected_input(src)
+    expected = _expected_output(src)
     case_dir = _case_work_dir(src)
 
     results: dict[str, RunResult] = {}
@@ -407,6 +472,9 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
         run_ok, elapsed, stdout, stderr, exit_code, detail = _run_qemu(exe, input_file)
         results[name] = RunResult(True, run_ok, elapsed, stdout, stderr, exit_code, detail)
 
+    if "compiler" in results and results["compiler"].compile_ok:
+        results["compiler"].metrics = _collect_codegen_metrics(src, case_dir)
+
     gcc = results["gcc"]
     clang = results["clang++"]
     compiler = results["compiler"]
@@ -418,10 +486,23 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
     if not compiler.compile_ok or not compiler.run_ok:
         return gcc, clang, compiler, False, f"compiler {compiler.detail}"
 
-    baseline_stdout = _normalize_text(gcc.stdout)
-    baseline_exit = gcc.exit_code
     clang_stdout = _normalize_text(clang.stdout)
     compiler_stdout = _normalize_text(compiler.stdout)
+
+    if expected is not None:
+        expected_stdout, expected_exit = expected
+        if compiler_stdout != _normalize_text(expected_stdout) or compiler.exit_code != expected_exit:
+            return (
+                gcc,
+                clang,
+                compiler,
+                False,
+                f"compiler output mismatch vs expected .out for {src.name}",
+            )
+        return gcc, clang, compiler, True, "OK"
+
+    baseline_stdout = _normalize_text(gcc.stdout)
+    baseline_exit = gcc.exit_code
 
     if clang_stdout != baseline_stdout or clang.exit_code != baseline_exit:
         return gcc, clang, compiler, False, f"clang++ output mismatch vs gcc for {src.name}"
@@ -565,6 +646,7 @@ def main() -> int:
                 "compiler": _format_cell(compiler),
                 "status": detail,
                 "detail": error_detail,
+                "codegen_metrics": compiler.metrics or {},
             }
         )
         if not ok:

@@ -25,7 +25,7 @@ int main() {
 
 // MIR: global @a : [2 x [3 x i32]]
 // MIR-LABEL: func @sum
-// MIR: LA t0, @a
+// MIR: LA %v{{[0-9]+}}:gpr, @a
 // MIR: CALL sum
 
 // ASM: .globl a

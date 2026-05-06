@@ -24,12 +24,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-md", required=True, type=Path)
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--baseline-label", default="main latest successful run")
-    parser.add_argument("--baseline-branch", default="")
-    parser.add_argument("--baseline-run-id", default="")
-    parser.add_argument("--baseline-run-url", default="")
-    parser.add_argument("--baseline-commit-sha", default="")
-    parser.add_argument("--baseline-commit-title", default="")
-    parser.add_argument("--baseline-commit-author", default="")
     return parser.parse_args()
 
 
@@ -70,18 +64,46 @@ def md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
 
+def baseline_meta(args: argparse.Namespace) -> dict[str, str]:
+    return {
+        "run_id": args.baseline_run_id.strip(),
+        "run_url": args.baseline_run_url.strip(),
+        "commit_sha": args.baseline_commit_sha.strip(),
+        "commit_title": args.baseline_commit_title.strip(),
+        "commit_author": args.baseline_commit_author.strip(),
+    }
+
+
+def baseline_md_lines(args: argparse.Namespace) -> list[str]:
+    meta = baseline_meta(args)
+    lines: list[str] = []
+
+    if meta["run_id"]:
+        if meta["run_url"]:
+            lines.append(f"- Baseline run: [#{md_escape(meta['run_id'])}]({meta['run_url']})")
+        else:
+            lines.append(f"- Baseline run: #{meta['run_id']}")
+
+    if meta["commit_sha"]:
+        commit_line = f"- Baseline commit: `{meta['commit_sha'][:12]}`"
+        if meta["commit_title"]:
+            commit_line += f" {md_escape(meta['commit_title'])}"
+        lines.append(commit_line)
+    elif meta["commit_title"]:
+        lines.append(f"- Baseline commit: {md_escape(meta['commit_title'])}")
+
+    if meta["commit_author"]:
+        lines.append(f"- Baseline author: {md_escape(meta['commit_author'])}")
+
+    return lines
+
+
 def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
     args.out_md.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "status": "NO BASELINE",
         "baseline": args.baseline_label,
-        "baseline_branch": args.baseline_branch,
-        "baseline_run_id": args.baseline_run_id,
-        "baseline_run_url": args.baseline_run_url,
-        "baseline_commit_sha": args.baseline_commit_sha,
-        "baseline_commit_title": args.baseline_commit_title,
-        "baseline_commit_author": args.baseline_commit_author,
         "reason": reason,
         "comparable_cases": 0,
         "rows": [],
@@ -94,6 +116,7 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
                 "",
                 "- Status: NO BASELINE",
                 f"- Baseline: {args.baseline_label}",
+                *baseline_md_lines(args),
                 f"- Reason: {reason}",
                 "",
             ]
@@ -171,8 +194,6 @@ def main() -> int:
         "",
         f"- Status: {status}",
         f"- Baseline: {args.baseline_label}",
-        f"- Baseline branch: {args.baseline_branch or 'unknown'}",
-        f"- Baseline commit: {args.baseline_commit_sha[:12] or 'unknown'} {args.baseline_commit_title}",
         f"- Comparable cases: {len(rows)}",
         f"- Current compiler total: {current_total:.4f}s",
         f"- Baseline compiler total: {baseline_total:.4f}s",
@@ -207,12 +228,6 @@ def main() -> int:
     payload = {
         "status": status,
         "baseline": args.baseline_label,
-        "baseline_branch": args.baseline_branch,
-        "baseline_run_id": args.baseline_run_id,
-        "baseline_run_url": args.baseline_run_url,
-        "baseline_commit_sha": args.baseline_commit_sha,
-        "baseline_commit_title": args.baseline_commit_title,
-        "baseline_commit_author": args.baseline_commit_author,
         "comparable_cases": len(rows),
         "current_compiler_total": current_total,
         "baseline_compiler_total": baseline_total,
