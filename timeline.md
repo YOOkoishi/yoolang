@@ -45,7 +45,7 @@
 
 在添加这个 pass 之前,
 
-```
+```bash
 summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 ```
 

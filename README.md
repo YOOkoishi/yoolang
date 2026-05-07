@@ -15,8 +15,11 @@ xmake
 即可构建
 
 ```bash
-compiler xxx.sy -S -o xxx.s #正常流程
+compiler xxx.sy -S -o xxx.s #功能测试流程
+
 compiler xxx.sy -S -o xxx.s -O1 #启用优化
+
+compiler --help #查看额外参数
 ```
 
 ## 测试
