@@ -19,6 +19,20 @@ jobs:
       cancel-in-progress: true
 
     steps:
+      - name: Configure GitHub SSH over 443
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          cat >> ~/.ssh/config <<'EOF'
+          Host github.com
+            HostName ssh.github.com
+            User git
+            Port 443
+            StrictHostKeyChecking yes
+          EOF
+          ssh-keyscan -p 443 ssh.github.com >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/config
+          chmod 644 ~/.ssh/known_hosts
       - name: Checkout over SSH
         uses: actions/checkout@v4
         with:
