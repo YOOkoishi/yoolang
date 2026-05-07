@@ -19,8 +19,13 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - name: Checkout
+      - name: Checkout over SSH
         uses: actions/checkout@v4
+        with:
+            ssh-key: ${{ secrets.CI_GITHUB_SSH_KEY }}
+            ssh-strict: true
+            persist-credentials: false
+            fetch-depth: 0
 
       - name: Ensure xmake in PATH
         run: |
@@ -77,23 +82,59 @@ jobs:
           mkdir -p build/github-actions
           python3 scripts/compare_perf.py 2>&1 | tee build/github-actions/perf-tests.log
 
-      - name: Compare perf against main baseline
+      - name: Compare perf against local main baseline
         if: always()
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
           BASELINE_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set +e
-          mkdir -p build/perf-ci build/perf-baseline
+          mkdir -p build/perf-ci
+          baseline_dir="$HOME/.cache/yoolang-ci/baselines/main"
+          baseline_json="$baseline_dir/perf-report.json"
+          baseline_meta="$baseline_dir/meta.json"
+
           current_json="build/perf-ci/perf-report.json"
           delta_md="build/perf-ci/perf-delta.md"
           delta_json="build/perf-ci/perf-delta.json"
-          baseline_label="${BASELINE_BRANCH} latest successful run"
-          baseline_run_url=""
+
+          baseline_label="local ${BASELINE_BRANCH} baseline"
           baseline_commit_sha=""
           baseline_commit_title=""
           baseline_commit_author=""
+
+          if [ -f "$baseline_meta" ]; then
+            baseline_commit_sha="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path.home() / ".cache/yoolang-ci/baselines/main/meta.json"
+          try:
+              print(json.loads(p.read_text()).get("sha", ""))
+          except Exception:
+              print("")
+          PY
+          )"
+            baseline_commit_title="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path.home() / ".cache/yoolang-ci/baselines/main/meta.json"
+          try:
+              print(json.loads(p.read_text()).get("title", ""))
+          except Exception:
+              print("")
+          PY
+          )"
+            baseline_commit_author="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path.home() / ".cache/yoolang-ci/baselines/main/meta.json"
+          try:
+              print(json.loads(p.read_text()).get("author", ""))
+          except Exception:
+              print("")
+          PY
+          )"
+          fi
 
           if [ ! -f "$current_json" ]; then
             {
@@ -107,50 +148,19 @@ jobs:
             exit 0
           fi
 
-          run_id="$(gh run list --workflow test.yml --branch "$BASELINE_BRANCH" --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null)"
-          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+          if [ ! -f "$baseline_json" ]; then
             {
               echo "## Perf Change vs main baseline"
               echo
               echo "- Status: NO BASELINE"
               echo "- Baseline: ${baseline_label}"
-              echo "- Reason: No baseline found"
-            } > "$delta_md"
-            printf '{"status":"NO BASELINE","baseline":"%s","reason":"No baseline found"}\n' "$baseline_label" > "$delta_json"
-            exit 0
-          fi
-
-          baseline_run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
-          baseline_commit_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq '.head_sha' 2>/dev/null)"
-          if [ -n "$baseline_commit_sha" ] && [ "$baseline_commit_sha" != "null" ]; then
-            baseline_commit_title="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${baseline_commit_sha}" --jq '.commit.message | split("\n")[0]' 2>/dev/null)"
-            baseline_commit_author="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${baseline_commit_sha}" --jq '.commit.author.name' 2>/dev/null)"
-          else
-            baseline_commit_sha=""
-          fi
-
-          if ! gh run download "$run_id" --name perf-report --dir build/perf-baseline >/dev/null 2>&1; then
-            {
-              echo "## Perf Change vs main baseline"
+              echo "- Reason: local main baseline not found yet"
               echo
-              echo "- Status: NO BASELINE"
-              echo "- Baseline: ${baseline_label}"
-              echo "- Reason: baseline artifact download failed"
-            } > "$delta_md"
-            printf '{"status":"NO BASELINE","baseline":"%s","reason":"baseline artifact download failed"}\n' "$baseline_label" > "$delta_json"
-            exit 0
-          fi
-
-          baseline_json="$(find build/perf-baseline -name perf-report.json -type f | head -n 1)"
-          if [ -z "$baseline_json" ]; then
-            {
-              echo "## Perf Change vs main baseline"
+              echo "Run CI successfully on main once to create:"
               echo
-              echo "- Status: NO BASELINE"
-              echo "- Baseline: ${baseline_label}"
-              echo "- Reason: baseline perf-report.json not found"
+              echo "\`$baseline_json\`"
             } > "$delta_md"
-            printf '{"status":"NO BASELINE","baseline":"%s","reason":"baseline perf-report.json not found"}\n' "$baseline_label" > "$delta_json"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"local main baseline not found yet"}\n' "$baseline_label" > "$delta_json"
             exit 0
           fi
 
@@ -161,11 +171,63 @@ jobs:
             --out-json "$delta_json" \
             --baseline-label "$baseline_label" \
             --baseline-branch "$BASELINE_BRANCH" \
-            --baseline-run-id "$run_id" \
-            --baseline-run-url "$baseline_run_url" \
+            --baseline-run-id "" \
+            --baseline-run-url "" \
             --baseline-commit-sha "$baseline_commit_sha" \
             --baseline-commit-title "$baseline_commit_title" \
             --baseline-commit-author "$baseline_commit_author" || true
+
+      - name: Save local main perf baseline
+        if: always()
+        continue-on-error: true
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set +e
+          current_json="build/perf-ci/perf-report.json"
+          baseline_dir="$HOME/.cache/yoolang-ci/baselines/main"
+
+          if [ "${GITHUB_REF_NAME}" != "${{ github.event.repository.default_branch }}" ]; then
+            echo "Not on default branch; skip saving local main baseline."
+            exit 0
+          fi
+
+          if [ "${{ steps.perf_tests.outcome }}" != "success" ]; then
+            echo "Perf step outcome is not success; skip saving local main baseline."
+            exit 0
+          fi
+
+          if [ ! -f "$current_json" ]; then
+            echo "Current perf report not found; skip saving local main baseline."
+            exit 0
+          fi
+
+          mkdir -p "$baseline_dir"
+          cp "$current_json" "$baseline_dir/perf-report.json"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          baseline_dir = Path.home() / ".cache/yoolang-ci/baselines/main"
+          baseline_dir.mkdir(parents=True, exist_ok=True)
+
+          meta = {
+              "sha": os.environ.get("GITHUB_SHA", ""),
+              "branch": os.environ.get("GITHUB_REF_NAME", ""),
+              "title": os.environ.get("HEAD_COMMIT_MESSAGE", "").splitlines()[0],
+              "author": os.environ.get("GITHUB_ACTOR", ""),
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}",
+          }
+
+          (baseline_dir / "meta.json").write_text(
+              json.dumps(meta, ensure_ascii=False, indent=2) + "\n"
+          )
+          PY
+
+          echo "Saved local main baseline to $baseline_dir/perf-report.json"
 
       - name: Write summary
         if: always()
@@ -397,8 +459,8 @@ jobs:
       - name: Notify yoolang group
         if: always()
         env:
-          CI_NOTIFY_URL: http://115.25.46.235:3003/notify
-          CI_NOTIFY_TOKEN: j2_uqpacAkW_btC6KoIN5ynC0msDA4PKQXzivEMTsmc
+          CI_NOTIFY_URL: http://127.0.0.1:3003/notify
+          CI_NOTIFY_TOKEN: ${{ secrets.CI_NOTIFY_TOKEN }}
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
           REPOSITORY: ${{ github.repository }}
