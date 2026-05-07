@@ -19,27 +19,31 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - name: Configure GitHub SSH over 443
+      - name: Checkout over SSH 443
+        env:
+          CI_GITHUB_SSH_KEY: ${{ secrets.CI_GITHUB_SSH_KEY }}
         run: |
+          set -euo pipefail
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          cat >> ~/.ssh/config <<'EOF'
-          Host github.com
-            HostName ssh.github.com
-            User git
-            Port 443
-            StrictHostKeyChecking yes
-          EOF
+
+          printf '%s\n' "$CI_GITHUB_SSH_KEY" > ~/.ssh/ci_github_key
+          chmod 600 ~/.ssh/ci_github_key
+
           ssh-keyscan -p 443 ssh.github.com >> ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/config
           chmod 644 ~/.ssh/known_hosts
-      - name: Checkout over SSH
-        uses: actions/checkout@v4
-        with:
-            ssh-key: ${{ secrets.CI_GITHUB_SSH_KEY }}
-            ssh-strict: true
-            persist-credentials: false
-            fetch-depth: 0
+
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin ssh://git@ssh.github.com:443/YOOkoishi/yoolang.git
+
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/ci_github_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+            git fetch --prune --no-recurse-submodules origin \
+            +refs/heads/*:refs/remotes/origin/* \
+            +refs/tags/*:refs/tags/*
+
+          git checkout --force "$GITHUB_SHA"
 
       - name: Ensure xmake in PATH
         run: |
