@@ -210,13 +210,21 @@ class PassManager {
     void set_stop_on_failure(bool stop_on_failure);
     bool stop_on_failure() const;
 
-    void register_pass(std::unique_ptr<Pass> pass);
+    void add_pass(std::unique_ptr<Pass> pass);
 
-    template <typename PassT, typename... Args> PassT &emplace_pass(Args &&...args) {
+    template <typename PassT, typename... Args> PassT &add_pass(Args &&...args) {
         auto pass = std::make_unique<PassT>(std::forward<Args>(args)...);
         auto *raw = pass.get();
-        register_pass(std::move(pass));
+        add_pass(std::move(pass));
         return *raw;
+    }
+
+    void register_pass(std::unique_ptr<Pass> pass) {
+        add_pass(std::move(pass));
+    }
+
+    template <typename PassT, typename... Args> PassT &emplace_pass(Args &&...args) {
+        return add_pass<PassT>(std::forward<Args>(args)...);
     }
 
     void clear();

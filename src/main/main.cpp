@@ -114,6 +114,22 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
     return true;
 }
 
+bool needs_yir(const CommandLineOptions &options) {
+    return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm;
+}
+
+bool needs_oir(const CommandLineOptions &options) {
+    return options.emit_oir || options.emit_mir || options.emit_asm;
+}
+
+bool needs_mir(const CommandLineOptions &options) {
+    return options.emit_mir || options.emit_asm;
+}
+
+bool optimizations_enabled(const CommandLineOptions &options) {
+    return options.opt_level >= 1;
+}
+
 std::unique_ptr<CompUnit> parse_ast_from_file(const std::string &input_path, std::ostream &err) {
     FILE *input = std::fopen(input_path.c_str(), "r");
     if (input == nullptr) {
@@ -137,38 +153,60 @@ std::unique_ptr<CompUnit> parse_ast_from_file(const std::string &input_path, std
     return ast;
 }
 
-pass::PassManager build_frontend_pipeline(const CommandLineOptions &options, std::ostream &out) {
-    pass::PassManager pm;
+void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, std::ostream &out) {
     if (options.emit_ast) {
-        pm.emplace_pass<pass::ASTDumpPass>(out);
+        pm.add_pass<pass::ASTDumpPass>(out);
     }
-    if (options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm) {
-        pm.emplace_pass<pass::ASTSemanticAnalysisPass>();
-        pm.emplace_pass<pass::ASTToYIRPass>();
+    if (needs_yir(options)) {
+        pm.add_pass<pass::ASTSemanticAnalysisPass>();
+        pm.add_pass<pass::ASTToYIRPass>();
     }
-    if (options.emit_yir) { // only emit yir
-        pm.emplace_pass<pass::YIRLoopCountPass>(out);
+    if (options.emit_yir) {
+        pm.add_pass<pass::YIRLoopCountPass>(out);
     }
-    if (options.emit_oir || options.emit_mir || options.emit_asm) {
-        pm.emplace_pass<pass::YIRToOIRPass>();
+}
+
+void add_oir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) {
+    if (!needs_oir(options)) {
+        return;
     }
-    if ((options.emit_oir || options.emit_mir || options.emit_asm) && options.opt_level >= 1) {
-        pm.emplace_pass<pass::OIRConstantFoldPass>();
-        pm.emplace_pass<pass::OIRAlgebraicSimplifyPass>();
-        pm.emplace_pass<pass::OIRSCCPPass>();
+
+    pm.add_pass<pass::YIRToOIRPass>();
+    if (optimizations_enabled(options)) {
+        pm.add_pass<pass::OIRConstantFoldPass>();
+        pm.add_pass<pass::OIRAlgebraicSimplifyPass>();
+        pm.add_pass<pass::OIRSCCPPass>();
     }
-    const bool use_optimized_mir = options.emit_mir || options.opt_level >= 1;
-    if (options.emit_mir || options.emit_asm) {
-        pm.emplace_pass<pass::OIRToMIRPass>(use_optimized_mir);
+}
+
+void add_mir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) {
+    if (!needs_mir(options)) {
+        return;
     }
-    if (options.emit_asm && options.opt_level >= 1) {
-        pm.emplace_pass<pass::MIRPeepholePass>(false);
-        pm.emplace_pass<pass::MIRRegAllocPass>();
-        pm.emplace_pass<pass::MIRPeepholePass>(true);
+
+    const bool emit_readable_prera_mir = options.emit_mir && !options.emit_asm;
+    const bool use_virtual_registers = optimizations_enabled(options) || emit_readable_prera_mir;
+    pm.add_pass<pass::OIRToMIRPass>(use_virtual_registers);
+
+    if (optimizations_enabled(options)) {
+        pm.add_pass<pass::MIRPeepholePass>(false);
+        pm.add_pass<pass::MIRRegAllocPass>();
+        pm.add_pass<pass::MIRPeepholePass>(true);
     }
+}
+
+void add_asm_pipeline(pass::PassManager &pm, const CommandLineOptions &options) {
     if (options.emit_asm) {
-        pm.emplace_pass<pass::MIRToAsmPass>();
+        pm.add_pass<pass::MIRToAsmPass>();
     }
+}
+
+pass::PassManager build_compilation_pipeline(const CommandLineOptions &options, std::ostream &out) {
+    pass::PassManager pm;
+    add_ast_pipeline(pm, options, out);
+    add_oir_pipeline(pm, options);
+    add_mir_pipeline(pm, options);
+    add_asm_pipeline(pm, options);
     return pm;
 }
 
@@ -222,7 +260,7 @@ int main(int argc, char **argv) {
         out = &output_file;
     }
 
-    auto pm = build_frontend_pipeline(options, *out);
+    auto pm = build_compilation_pipeline(options, *out);
     if (pm.empty()) {
         return 0;
     }

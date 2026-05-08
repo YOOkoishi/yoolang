@@ -116,9 +116,9 @@ bool PassManager::stop_on_failure() const {
     return stop_on_failure_;
 }
 
-void PassManager::register_pass(std::unique_ptr<Pass> pass) {
+void PassManager::add_pass(std::unique_ptr<Pass> pass) {
     if (pass == nullptr) {
-        throw std::invalid_argument("cannot register null pass");
+        throw std::invalid_argument("cannot add null pass");
     }
     passes_.push_back(std::move(pass));
 }
