@@ -12,8 +12,7 @@ bool Stats::changed() const {
 
 std::string Stats::message() const {
     std::ostringstream oss;
-    oss << "folded=" << folded << " sccp=" << sccp << " branches=" << branches
-        << " dce=" << dce;
+    oss << "folded=" << folded << " sccp=" << sccp << " branches=" << branches << " dce=" << dce;
     return oss.str();
 }
 

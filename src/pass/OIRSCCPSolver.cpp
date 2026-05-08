@@ -54,7 +54,8 @@ LatticeValue join_lattice(const LatticeValue &lhs, const LatticeValue &rhs) {
 
 class SCCPSolver final {
   public:
-    explicit SCCPSolver(oir::Function &function) : function_(function), module_(*function.parent()) {
+    explicit SCCPSolver(oir::Function &function)
+        : function_(function), module_(*function.parent()) {
     }
 
     bool run(Stats &stats) {
@@ -134,8 +135,7 @@ class SCCPSolver final {
             if (cond.kind == LatticeKind::Constant) {
                 auto constant = int_constant(cond.constant);
                 if (constant.has_value()) {
-                    return mark_executable(*constant != 0 ? branch->true_bb()
-                                                          : branch->false_bb());
+                    return mark_executable(*constant != 0 ? branch->true_bb() : branch->false_bb());
                 }
             }
             if (cond.kind == LatticeKind::Overdefined) {
@@ -329,8 +329,7 @@ class SCCPSolver final {
         for (auto &block : function_.blocks()) {
             for (auto &inst : block->instructions()) {
                 auto found = value_state_.find(inst.get());
-                if (found == value_state_.end() ||
-                    found->second.kind != LatticeKind::Constant ||
+                if (found == value_state_.end() || found->second.kind != LatticeKind::Constant ||
                     found->second.constant == inst.get() || !is_scalar_type(inst->type()) ||
                     found->second.constant->type() != inst->type() || !uses.has_uses(inst.get())) {
                     continue;

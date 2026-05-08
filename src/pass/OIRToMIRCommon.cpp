@@ -6,8 +6,7 @@
 namespace pass::oir_to_mir {
 
 const std::vector<std::string> kArgRegs = {"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"};
-const std::vector<std::string> kFArgRegs = {"fa0", "fa1", "fa2", "fa3",
-                                            "fa4", "fa5", "fa6", "fa7"};
+const std::vector<std::string> kFArgRegs = {"fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"};
 
 bool is_power_of_two(std::uint64_t value) {
     return value != 0 && (value & (value - 1)) == 0;

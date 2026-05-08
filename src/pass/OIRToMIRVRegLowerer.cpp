@@ -32,8 +32,9 @@ class VRegLowerer final {
             for (auto *param : function->function_type()->param_types()) {
                 params.push_back(type_info(param));
             }
-            auto *out = module_->create_function(function->name(), type_info(function->return_type()),
-                                                 std::move(params), function->is_external());
+            auto *out =
+                module_->create_function(function->name(), type_info(function->return_type()),
+                                         std::move(params), function->is_external());
             functions_[function.get()] = out;
         }
 
@@ -135,12 +136,11 @@ class VRegLowerer final {
 
     void preallocate_result(const oir::Instruction &inst) {
         if (auto *alloca = dynamic_cast<const oir::AllocaInst *>(&inst)) {
-            std::string object_name = inst.name().empty() ? slot_name(inst, "alloca.obj")
-                                                          : inst.name() + ".obj";
-            alloca_slots_[&inst] =
-                current_function_->add_stack_slot(std::move(object_name),
-                                                  type_info(alloca->allocated_type()),
-                                                  mir::StackSlotKind::Alloca);
+            std::string object_name =
+                inst.name().empty() ? slot_name(inst, "alloca.obj") : inst.name() + ".obj";
+            alloca_slots_[&inst] = current_function_->add_stack_slot(
+                std::move(object_name), type_info(alloca->allocated_type()),
+                mir::StackSlotKind::Alloca);
         }
 
         if (inst.type() == nullptr || inst.type()->is_void()) {
@@ -450,50 +450,50 @@ class VRegLowerer final {
         switch (inst.pred()) {
         case oir::CmpPred::EQ: {
             auto tmp = create_vreg(mir::ValueType::I32);
-            emit(mir::Opcode::Xor, {mir::MachineOperand::reg_def(tmp),
-                                    mir::MachineOperand::reg_use(lhs),
-                                    mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::Xor,
+                 {mir::MachineOperand::reg_def(tmp), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
             emit(mir::Opcode::SeqZ,
                  {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(tmp)});
             break;
         }
         case oir::CmpPred::NE: {
             auto tmp = create_vreg(mir::ValueType::I32);
-            emit(mir::Opcode::Xor, {mir::MachineOperand::reg_def(tmp),
-                                    mir::MachineOperand::reg_use(lhs),
-                                    mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::Xor,
+                 {mir::MachineOperand::reg_def(tmp), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
             emit(mir::Opcode::Snez,
                  {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(tmp)});
             break;
         }
         case oir::CmpPred::LT:
-            emit(mir::Opcode::Slt, {mir::MachineOperand::reg_def(dst),
-                                    mir::MachineOperand::reg_use(lhs),
-                                    mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::Slt,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
             break;
         case oir::CmpPred::LE: {
             auto tmp = create_vreg(mir::ValueType::I32);
-            emit(mir::Opcode::Slt, {mir::MachineOperand::reg_def(tmp),
-                                    mir::MachineOperand::reg_use(rhs),
-                                    mir::MachineOperand::reg_use(lhs)});
-            emit(mir::Opcode::XorI, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(tmp),
-                                     mir::MachineOperand::imm(1)});
+            emit(mir::Opcode::Slt,
+                 {mir::MachineOperand::reg_def(tmp), mir::MachineOperand::reg_use(rhs),
+                  mir::MachineOperand::reg_use(lhs)});
+            emit(mir::Opcode::XorI,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(tmp),
+                  mir::MachineOperand::imm(1)});
             break;
         }
         case oir::CmpPred::GT:
-            emit(mir::Opcode::Slt, {mir::MachineOperand::reg_def(dst),
-                                    mir::MachineOperand::reg_use(rhs),
-                                    mir::MachineOperand::reg_use(lhs)});
+            emit(mir::Opcode::Slt,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(rhs),
+                  mir::MachineOperand::reg_use(lhs)});
             break;
         case oir::CmpPred::GE: {
             auto tmp = create_vreg(mir::ValueType::I32);
-            emit(mir::Opcode::Slt, {mir::MachineOperand::reg_def(tmp),
-                                    mir::MachineOperand::reg_use(lhs),
-                                    mir::MachineOperand::reg_use(rhs)});
-            emit(mir::Opcode::XorI, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(tmp),
-                                     mir::MachineOperand::imm(1)});
+            emit(mir::Opcode::Slt,
+                 {mir::MachineOperand::reg_def(tmp), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::XorI,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(tmp),
+                  mir::MachineOperand::imm(1)});
             break;
         }
         }
@@ -505,39 +505,39 @@ class VRegLowerer final {
         auto dst = value_regs_.at(&inst);
         switch (inst.pred()) {
         case oir::CmpPred::EQ:
-            emit(mir::Opcode::FeqS, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(lhs),
-                                     mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::FeqS,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
             break;
         case oir::CmpPred::NE: {
             auto tmp = create_vreg(mir::ValueType::I1);
-            emit(mir::Opcode::FeqS, {mir::MachineOperand::reg_def(tmp),
-                                     mir::MachineOperand::reg_use(lhs),
-                                     mir::MachineOperand::reg_use(rhs)});
-            emit(mir::Opcode::XorI, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(tmp),
-                                     mir::MachineOperand::imm(1)});
+            emit(mir::Opcode::FeqS,
+                 {mir::MachineOperand::reg_def(tmp), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::XorI,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(tmp),
+                  mir::MachineOperand::imm(1)});
             break;
         }
         case oir::CmpPred::LT:
-            emit(mir::Opcode::FltS, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(lhs),
-                                     mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::FltS,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
             break;
         case oir::CmpPred::LE:
-            emit(mir::Opcode::FleS, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(lhs),
-                                     mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::FleS,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
             break;
         case oir::CmpPred::GT:
-            emit(mir::Opcode::FltS, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(rhs),
-                                     mir::MachineOperand::reg_use(lhs)});
+            emit(mir::Opcode::FltS,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(rhs),
+                  mir::MachineOperand::reg_use(lhs)});
             break;
         case oir::CmpPred::GE:
-            emit(mir::Opcode::FleS, {mir::MachineOperand::reg_def(dst),
-                                     mir::MachineOperand::reg_use(rhs),
-                                     mir::MachineOperand::reg_use(lhs)});
+            emit(mir::Opcode::FleS,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(rhs),
+                  mir::MachineOperand::reg_use(lhs)});
             break;
         }
     }
@@ -697,9 +697,8 @@ class VRegLowerer final {
         }
         if (auto *constant = dynamic_cast<oir::ConstantFloat *>(value)) {
             auto reg = create_vreg(mir::ValueType::F32);
-            emit(mir::Opcode::LoadFloatImm,
-                 {mir::MachineOperand::reg_def(reg),
-                  mir::MachineOperand::float_imm(constant->value())});
+            emit(mir::Opcode::LoadFloatImm, {mir::MachineOperand::reg_def(reg),
+                                             mir::MachineOperand::float_imm(constant->value())});
             return reg;
         }
         if (dynamic_cast<oir::ConstantZero *>(value) != nullptr ||

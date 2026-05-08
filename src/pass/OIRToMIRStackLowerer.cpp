@@ -32,8 +32,9 @@ class Lowerer final {
             for (auto *param : function->function_type()->param_types()) {
                 params.push_back(type_info(param));
             }
-            auto *out = module_->create_function(function->name(), type_info(function->return_type()),
-                                                 std::move(params), function->is_external());
+            auto *out =
+                module_->create_function(function->name(), type_info(function->return_type()),
+                                         std::move(params), function->is_external());
             functions_[function.get()] = out;
         }
 
@@ -127,12 +128,11 @@ class Lowerer final {
 
     void preallocate_result_slot(const oir::Instruction &inst) {
         if (auto *alloca = dynamic_cast<const oir::AllocaInst *>(&inst)) {
-            std::string object_name = inst.name().empty() ? slot_name(inst, "alloca.obj")
-                                                          : inst.name() + ".obj";
-            alloca_slots_[&inst] =
-                current_function_->add_stack_slot(std::move(object_name),
-                                                  type_info(alloca->allocated_type()),
-                                                  mir::StackSlotKind::Alloca);
+            std::string object_name =
+                inst.name().empty() ? slot_name(inst, "alloca.obj") : inst.name() + ".obj";
+            alloca_slots_[&inst] = current_function_->add_stack_slot(
+                std::move(object_name), type_info(alloca->allocated_type()),
+                mir::StackSlotKind::Alloca);
         }
 
         if (inst.type() == nullptr || inst.type()->is_void()) {
@@ -185,10 +185,9 @@ class Lowerer final {
             int slot = value_slots_.at(arg.get());
             if (type == mir::ValueType::F32) {
                 if (float_reg < kFArgRegs.size()) {
-                    emit(mir::Opcode::StoreSlot,
-                         {mir::MachineOperand::slot(slot),
-                          mir::MachineOperand::freg(kFArgRegs[float_reg++]),
-                          mir::MachineOperand::type(type)});
+                    emit(mir::Opcode::StoreSlot, {mir::MachineOperand::slot(slot),
+                                                  mir::MachineOperand::freg(kFArgRegs[float_reg++]),
+                                                  mir::MachineOperand::type(type)});
                 } else {
                     emit(mir::Opcode::LoadIncomingArg,
                          {mir::MachineOperand::freg("ft0"), mir::MachineOperand::imm(stack_offset),
@@ -200,9 +199,9 @@ class Lowerer final {
                 }
             } else {
                 if (int_reg < kArgRegs.size()) {
-                    emit(mir::Opcode::StoreSlot,
-                         {mir::MachineOperand::slot(slot), mir::MachineOperand::reg(kArgRegs[int_reg++]),
-                          mir::MachineOperand::type(type)});
+                    emit(mir::Opcode::StoreSlot, {mir::MachineOperand::slot(slot),
+                                                  mir::MachineOperand::reg(kArgRegs[int_reg++]),
+                                                  mir::MachineOperand::type(type)});
                 } else {
                     emit(mir::Opcode::LoadIncomingArg,
                          {mir::MachineOperand::reg("t0"), mir::MachineOperand::imm(stack_offset),
@@ -393,9 +392,8 @@ class Lowerer final {
         if (constant_offset != 0) {
             emit(mir::Opcode::LoadImm,
                  {mir::MachineOperand::reg("t1"), mir::MachineOperand::imm(constant_offset)});
-            emit(mir::Opcode::Add,
-                 {mir::MachineOperand::reg("t0"), mir::MachineOperand::reg("t0"),
-                  mir::MachineOperand::reg("t1")});
+            emit(mir::Opcode::Add, {mir::MachineOperand::reg("t0"), mir::MachineOperand::reg("t0"),
+                                    mir::MachineOperand::reg("t1")});
         }
 
         emit(mir::Opcode::StoreSlot,
@@ -479,8 +477,8 @@ class Lowerer final {
         case oir::CmpPred::LE:
             emit(mir::Opcode::Slt, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t1"),
                                     mir::MachineOperand::reg("t0")});
-            emit(mir::Opcode::XorI, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::reg("t2"), mir::MachineOperand::imm(1)});
+            emit(mir::Opcode::XorI, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t2"),
+                                     mir::MachineOperand::imm(1)});
             break;
         case oir::CmpPred::GT:
             emit(mir::Opcode::Slt, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t1"),
@@ -489,8 +487,8 @@ class Lowerer final {
         case oir::CmpPred::GE:
             emit(mir::Opcode::Slt, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t0"),
                                     mir::MachineOperand::reg("t1")});
-            emit(mir::Opcode::XorI, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::reg("t2"), mir::MachineOperand::imm(1)});
+            emit(mir::Opcode::XorI, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t2"),
+                                     mir::MachineOperand::imm(1)});
             break;
         }
         store_reg_to_value_slot(&inst, "t2");
@@ -501,36 +499,36 @@ class Lowerer final {
         load_float_value(inst.rhs(), "ft1");
         switch (inst.pred()) {
         case oir::CmpPred::EQ:
-            emit(mir::Opcode::FeqS, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::freg("ft0"),
-                                     mir::MachineOperand::freg("ft1")});
+            emit(mir::Opcode::FeqS,
+                 {mir::MachineOperand::reg("t2"), mir::MachineOperand::freg("ft0"),
+                  mir::MachineOperand::freg("ft1")});
             break;
         case oir::CmpPred::NE:
-            emit(mir::Opcode::FeqS, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::freg("ft0"),
-                                     mir::MachineOperand::freg("ft1")});
-            emit(mir::Opcode::XorI, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::reg("t2"), mir::MachineOperand::imm(1)});
+            emit(mir::Opcode::FeqS,
+                 {mir::MachineOperand::reg("t2"), mir::MachineOperand::freg("ft0"),
+                  mir::MachineOperand::freg("ft1")});
+            emit(mir::Opcode::XorI, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t2"),
+                                     mir::MachineOperand::imm(1)});
             break;
         case oir::CmpPred::LT:
-            emit(mir::Opcode::FltS, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::freg("ft0"),
-                                     mir::MachineOperand::freg("ft1")});
+            emit(mir::Opcode::FltS,
+                 {mir::MachineOperand::reg("t2"), mir::MachineOperand::freg("ft0"),
+                  mir::MachineOperand::freg("ft1")});
             break;
         case oir::CmpPred::LE:
-            emit(mir::Opcode::FleS, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::freg("ft0"),
-                                     mir::MachineOperand::freg("ft1")});
+            emit(mir::Opcode::FleS,
+                 {mir::MachineOperand::reg("t2"), mir::MachineOperand::freg("ft0"),
+                  mir::MachineOperand::freg("ft1")});
             break;
         case oir::CmpPred::GT:
-            emit(mir::Opcode::FltS, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::freg("ft1"),
-                                     mir::MachineOperand::freg("ft0")});
+            emit(mir::Opcode::FltS,
+                 {mir::MachineOperand::reg("t2"), mir::MachineOperand::freg("ft1"),
+                  mir::MachineOperand::freg("ft0")});
             break;
         case oir::CmpPred::GE:
-            emit(mir::Opcode::FleS, {mir::MachineOperand::reg("t2"),
-                                     mir::MachineOperand::freg("ft1"),
-                                     mir::MachineOperand::freg("ft0")});
+            emit(mir::Opcode::FleS,
+                 {mir::MachineOperand::reg("t2"), mir::MachineOperand::freg("ft1"),
+                  mir::MachineOperand::freg("ft0")});
             break;
         }
         store_reg_to_value_slot(&inst, "t2");
@@ -569,7 +567,8 @@ class Lowerer final {
         std::int64_t stack_offset = 0;
 
         if (symbol == "starttime" || symbol == "stoptime") {
-            emit(mir::Opcode::LoadImm, {mir::MachineOperand::reg("a0"), mir::MachineOperand::imm(0)});
+            emit(mir::Opcode::LoadImm,
+                 {mir::MachineOperand::reg("a0"), mir::MachineOperand::imm(0)});
             symbol = symbol == "starttime" ? "_sysy_starttime" : "_sysy_stoptime";
             int_reg = 1;
         }
@@ -580,9 +579,8 @@ class Lowerer final {
             if (type == mir::ValueType::F32) {
                 if (float_reg < kFArgRegs.size()) {
                     load_float_value(arg, "ft0");
-                    emit(mir::Opcode::FMove,
-                         {mir::MachineOperand::freg(kFArgRegs[float_reg++]),
-                          mir::MachineOperand::freg("ft0")});
+                    emit(mir::Opcode::FMove, {mir::MachineOperand::freg(kFArgRegs[float_reg++]),
+                                              mir::MachineOperand::freg("ft0")});
                 } else {
                     load_float_value(arg, "ft0");
                     emit(mir::Opcode::StoreOutgoingArg,
@@ -593,9 +591,8 @@ class Lowerer final {
             } else {
                 if (int_reg < kArgRegs.size()) {
                     load_int_value(arg, "t0");
-                    emit(mir::Opcode::Move,
-                         {mir::MachineOperand::reg(kArgRegs[int_reg++]),
-                          mir::MachineOperand::reg("t0")});
+                    emit(mir::Opcode::Move, {mir::MachineOperand::reg(kArgRegs[int_reg++]),
+                                             mir::MachineOperand::reg("t0")});
                 } else {
                     load_int_value(arg, "t0");
                     emit(mir::Opcode::StoreOutgoingArg,
@@ -671,8 +668,8 @@ class Lowerer final {
 
                 auto *incoming = incoming_for(*phi, edge.pred);
                 auto type = type_info(phi->type());
-                int temp = current_function_->add_stack_slot("phi.tmp." + std::to_string(temp_index_++),
-                                                             type, mir::StackSlotKind::PhiTemp);
+                int temp = current_function_->add_stack_slot(
+                    "phi.tmp." + std::to_string(temp_index_++), type, mir::StackSlotKind::PhiTemp);
                 store_value_to_slot(incoming, temp);
                 temp_slots.push_back(temp);
                 phi_slots.push_back(value_slots_.at(phi));
@@ -681,9 +678,9 @@ class Lowerer final {
             for (std::size_t i = 0; i < temp_slots.size(); ++i) {
                 auto type = current_function_->stack_slot(temp_slots[i])->type.value_type;
                 if (type == mir::ValueType::F32) {
-                    emit(mir::Opcode::LoadSlot,
-                         {mir::MachineOperand::freg("ft0"), mir::MachineOperand::slot(temp_slots[i]),
-                          mir::MachineOperand::type(type)});
+                    emit(mir::Opcode::LoadSlot, {mir::MachineOperand::freg("ft0"),
+                                                 mir::MachineOperand::slot(temp_slots[i]),
+                                                 mir::MachineOperand::type(type)});
                     emit(mir::Opcode::StoreSlot,
                          {mir::MachineOperand::slot(phi_slots[i]), mir::MachineOperand::freg("ft0"),
                           mir::MachineOperand::type(type)});
@@ -717,7 +714,8 @@ class Lowerer final {
         }
         if (dynamic_cast<oir::ConstantZero *>(value) != nullptr ||
             dynamic_cast<oir::UndefValue *>(value) != nullptr) {
-            emit(mir::Opcode::LoadImm, {mir::MachineOperand::reg(reg), mir::MachineOperand::imm(0)});
+            emit(mir::Opcode::LoadImm,
+                 {mir::MachineOperand::reg(reg), mir::MachineOperand::imm(0)});
             return;
         }
         if (auto *global = dynamic_cast<oir::GlobalVariable *>(value)) {
@@ -737,8 +735,8 @@ class Lowerer final {
 
     void load_float_value(oir::Value *value, const std::string &reg) {
         if (auto *constant = dynamic_cast<oir::ConstantFloat *>(value)) {
-            emit(mir::Opcode::LoadFloatImm,
-                 {mir::MachineOperand::freg(reg), mir::MachineOperand::float_imm(constant->value())});
+            emit(mir::Opcode::LoadFloatImm, {mir::MachineOperand::freg(reg),
+                                             mir::MachineOperand::float_imm(constant->value())});
             return;
         }
         if (dynamic_cast<oir::ConstantZero *>(value) != nullptr ||
