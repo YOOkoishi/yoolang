@@ -691,6 +691,18 @@ void PhiInst::add_incoming(Value *value, BasicBlock *from) {
     add_operand(from);
 }
 
+void PhiInst::remove_incoming_from(BasicBlock *from) {
+    for (std::size_t i = 0; i < incoming_.size();) {
+        if (incoming_[i].second != from) {
+            ++i;
+            continue;
+        }
+        incoming_.erase(incoming_.begin() + static_cast<std::ptrdiff_t>(i));
+        operands_.erase(operands_.begin() + static_cast<std::ptrdiff_t>(i * 2),
+                        operands_.begin() + static_cast<std::ptrdiff_t>(i * 2 + 2));
+    }
+}
+
 const std::vector<std::pair<Value *, BasicBlock *>> &PhiInst::incoming() const {
     return incoming_;
 }
@@ -783,6 +795,16 @@ void BasicBlock::add_successor(BasicBlock *succ) {
     if (std::find(successors_.begin(), successors_.end(), succ) == successors_.end()) {
         successors_.push_back(succ);
     }
+}
+
+void BasicBlock::remove_predecessor(BasicBlock *pred) {
+    predecessors_.erase(std::remove(predecessors_.begin(), predecessors_.end(), pred),
+                        predecessors_.end());
+}
+
+void BasicBlock::remove_successor(BasicBlock *succ) {
+    successors_.erase(std::remove(successors_.begin(), successors_.end(), succ),
+                      successors_.end());
 }
 
 const std::vector<BasicBlock *> &BasicBlock::predecessors() const {

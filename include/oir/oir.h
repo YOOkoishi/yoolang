@@ -356,6 +356,7 @@ class PhiInst final : public Instruction {
     PhiInst(Type *type, BasicBlock *parent, const std::string &name = "");
 
     void add_incoming(Value *value, BasicBlock *from);
+    void remove_incoming_from(BasicBlock *from);
     const std::vector<std::pair<Value *, BasicBlock *>> &incoming() const;
     void set_operand(std::size_t index, Value *value) override;
     std::string print() const override;
@@ -388,6 +389,8 @@ class BasicBlock final : public Value {
 
     void add_predecessor(BasicBlock *pred);
     void add_successor(BasicBlock *succ);
+    void remove_predecessor(BasicBlock *pred);
+    void remove_successor(BasicBlock *succ);
     const std::vector<BasicBlock *> &predecessors() const;
     const std::vector<BasicBlock *> &successors() const;
 

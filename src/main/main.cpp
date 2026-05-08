@@ -4,7 +4,10 @@
 #include "../include/pass/ASTToYIRPass.h"
 #include "../include/pass/YIRLoopCountPass.h"
 #include "../include/pass/MIRToAsmPass.h"
+#include "../include/pass/OIRAlgebraicSimplifyPass.h"
+#include "../include/pass/OIRConstantFoldPass.h"
 #include "../include/pass/OIRToMIRPass.h"
+#include "../include/pass/OIRSCCPPass.h"
 #include "../include/pass/MIRPeepholePass.h"
 #include "../include/pass/MIRRegAllocPass.h"
 #include "../include/pass/PassManager.h"
@@ -40,7 +43,7 @@ void print_help(const char *program, std::ostream &out) {
         << "  -h, --help       Show this help message\n"
         << "  -S, --emit-asm   Lower to RISC-V assembly (default)\n"
         << "  -o <file>        Write output to <file> instead of stdout\n"
-        << "  -O1              Enable vreg MIR lowering, RA, and MIR peephole optimizations\n"
+        << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR peephole optimizations\n"
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
         << "  --emit-oir       Lower the parsed AST to SSA OIR, verify it, and dump it\n"
@@ -146,6 +149,11 @@ pass::PassManager build_frontend_pipeline(const CommandLineOptions &options, std
     }
     if (options.emit_oir || options.emit_mir || options.emit_asm) {
         pm.emplace_pass<pass::YIRToOIRPass>();
+    }
+    if ((options.emit_oir || options.emit_mir || options.emit_asm) && options.opt_level >= 1) {
+        pm.emplace_pass<pass::OIRConstantFoldPass>();
+        pm.emplace_pass<pass::OIRAlgebraicSimplifyPass>();
+        pm.emplace_pass<pass::OIRSCCPPass>();
     }
     const bool use_optimized_mir = options.emit_mir || options.opt_level >= 1;
     if (options.emit_mir || options.emit_asm) {

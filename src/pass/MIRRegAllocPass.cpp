@@ -397,15 +397,16 @@ class RegAllocator {
                     if (old_reg == nullptr) {
                         continue;
                     }
-                    auto temp = function.regs().create_virtual(old_reg->reg_class,
-                                                               old_reg->value_type);
+                    auto old_reg_class = old_reg->reg_class;
+                    auto old_value_type = old_reg->value_type;
+                    auto temp = function.regs().create_virtual(old_reg_class, old_value_type);
                     if (operand.is_use()) {
                         before.emplace_back(
                             mir::Opcode::LoadSlot,
                             std::vector<mir::MachineOperand>{
                                 mir::MachineOperand::reg_def(temp),
                                 mir::MachineOperand::slot(found_slot->second),
-                                mir::MachineOperand::type(old_reg->value_type)});
+                                mir::MachineOperand::type(old_value_type)});
                     }
                     operand.set_reg(temp);
                     if (operand.is_def()) {
@@ -414,7 +415,7 @@ class RegAllocator {
                             std::vector<mir::MachineOperand>{
                                 mir::MachineOperand::slot(found_slot->second),
                                 mir::MachineOperand::reg_use(temp),
-                                mir::MachineOperand::type(old_reg->value_type)});
+                                mir::MachineOperand::type(old_value_type)});
                     }
                 }
                 rewritten.insert(rewritten.end(), std::make_move_iterator(before.begin()),

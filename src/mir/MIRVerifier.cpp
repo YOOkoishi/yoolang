@@ -59,10 +59,18 @@ class Verifier {
         case Opcode::LoadSlot:
             require(ops.size() >= 3 && ops[0].is_reg() && ops[1].kind() == OperandKind::Slot,
                     function, block, instr, "malformed LOAD_SLOT");
+            require(ops[2].kind() == OperandKind::Type, function, block, instr,
+                    "LOAD_SLOT missing type operand");
+            verify_reg_matches_type(function, block, instr, ops[0].reg_value(),
+                                    ops[2].type_value(), "LOAD_SLOT destination");
             break;
         case Opcode::StoreSlot:
             require(ops.size() >= 3 && ops[0].kind() == OperandKind::Slot && ops[1].is_reg(),
                     function, block, instr, "malformed STORE_SLOT");
+            require(ops[2].kind() == OperandKind::Type, function, block, instr,
+                    "STORE_SLOT missing type operand");
+            verify_reg_matches_type(function, block, instr, ops[1].reg_value(),
+                                    ops[2].type_value(), "STORE_SLOT source");
             break;
         case Opcode::LoadMem:
         case Opcode::StoreMem:
@@ -78,6 +86,20 @@ class Verifier {
             break;
         default:
             break;
+        }
+    }
+
+    void verify_reg_matches_type(const MachineFunction &function, const MachineBasicBlock &block,
+                                 const MachineInstr &instr, const Register &reg, ValueType type,
+                                 const std::string &what) const {
+        if (type == ValueType::F32) {
+            require(reg.reg_class == RegisterClass::FPR32, function, block, instr,
+                    what + " must be an FPR for f32");
+            return;
+        }
+        if (type == ValueType::I1 || type == ValueType::I32 || type == ValueType::Ptr) {
+            require(reg.reg_class == RegisterClass::GPR, function, block, instr,
+                    what + " must be a GPR for integer/pointer type");
         }
     }
 
