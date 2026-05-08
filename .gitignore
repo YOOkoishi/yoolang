@@ -39,7 +39,7 @@ test/**/*.zip
 !.vscode/settings.json
 .idea/
 *.swp
-*.swo
+*.rm -rf test 参考swo
 *~
 *.bak
 __pycache__/

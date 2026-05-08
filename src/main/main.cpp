@@ -1,6 +1,7 @@
 #include "../include/front/parser.h"
 #include "../include/mir/MIRPrinter.h"
 #include "../include/pass/ASTDumpPass.h"
+#include "../include/pass/ASTSemanticAnalysisPass.h"
 #include "../include/pass/ASTToYIRPass.h"
 #include "../include/pass/YIRLoopCountPass.h"
 #include "../include/pass/MIRToAsmPass.h"
@@ -142,6 +143,7 @@ pass::PassManager build_frontend_pipeline(const CommandLineOptions &options, std
         pm.emplace_pass<pass::ASTDumpPass>(out);
     }
     if (options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm) {
+        pm.emplace_pass<pass::ASTSemanticAnalysisPass>();
         pm.emplace_pass<pass::ASTToYIRPass>();
     }
     if (options.emit_yir) { // only emit yir
