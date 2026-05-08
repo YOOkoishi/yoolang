@@ -2,6 +2,12 @@
 
 ![yoolang](/yoolang.jpg)
 
+## 申明
+
+本 gitlab 仓库是 github 仓库[yoolang](https://github.com/YOOkoishi/yoolang)的一个快照,如果组委会或其余参赛队需要参考git记录，请查看github仓库。
+
+本编译器使用的部分脚本，测试用例使用ai生成。
+
 ## 使用方法
 
 使用 xmake 作为构建工具.
