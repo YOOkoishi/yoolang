@@ -6,7 +6,10 @@
 #include "../include/pass/YIRLoopCountPass.h"
 #include "../include/pass/MIRToAsmPass.h"
 #include "../include/pass/OIRAlgebraicSimplifyPass.h"
+#include "../include/pass/OIRCFGCleanupPass.h"
 #include "../include/pass/OIRConstantFoldPass.h"
+#include "../include/pass/OIRDeadCodeEliminationPass.h"
+#include "../include/pass/OIRGVNPass.h"
 #include "../include/pass/OIRToMIRPass.h"
 #include "../include/pass/OIRSCCPPass.h"
 #include "../include/pass/MIRPeepholePass.h"
@@ -174,8 +177,12 @@ void add_oir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
     pm.add_pass<pass::YIRToOIRPass>();
     if (optimizations_enabled(options)) {
         pm.add_pass<pass::OIRConstantFoldPass>();
+        pm.add_pass<pass::OIRCFGCleanupPass>();
         pm.add_pass<pass::OIRAlgebraicSimplifyPass>();
+        pm.add_pass<pass::OIRGVNPass>();
         pm.add_pass<pass::OIRSCCPPass>();
+        pm.add_pass<pass::OIRCFGCleanupPass>();
+        pm.add_pass<pass::OIRDeadCodeEliminationPass>();
     }
 }
 

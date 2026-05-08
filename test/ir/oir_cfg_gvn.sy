@@ -1,0 +1,30 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int gvn_cross_block(int a, int b, int c) {
+  int x = a + b;
+  if (c != 0) {
+    int y = a + b;
+    return x + y;
+  }
+  return x;
+}
+
+int unreachable_cleanup() {
+  if (1) {
+    return 7;
+  }
+  return 9;
+}
+
+int main() {
+  return gvn_cross_block(1, 2, 1) + unreachable_cleanup();
+}
+
+// OIR-LABEL: define i32 @gvn_cross_block
+// OIR: add i32 %a.arg, %b.arg
+// OIR-NOT: add i32 %a.arg, %b.arg
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @unreachable_cleanup
+// OIR-NOT: ret i32 9
+// OIR: ret i32 7

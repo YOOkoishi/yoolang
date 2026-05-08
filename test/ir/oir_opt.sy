@@ -39,7 +39,6 @@ int main() {
 // OIR-NOT: srem
 
 // OIR-LABEL: define i32 @folded_branch
-// OIR: br %if.then
 // OIR-NOT: br i1
 // OIR: ret i32 1
 

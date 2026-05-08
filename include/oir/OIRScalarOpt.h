@@ -16,6 +16,8 @@ struct Stats {
     unsigned sccp = 0;
     unsigned branches = 0;
     unsigned dce = 0;
+    unsigned cfg = 0;
+    unsigned gvn = 0;
 
     bool changed() const;
     std::string message() const;
@@ -47,6 +49,8 @@ bool local_simplify(oir::Module &module, Stats &stats, SimplifyMode mode);
 bool simplify_branches(oir::Module &module, Stats &stats);
 bool run_sccp(oir::Module &module, Stats &stats);
 bool eliminate_dead_code(oir::Module &module, Stats &stats);
+bool cleanup_cfg(oir::Module &module, Stats &stats);
+bool global_value_numbering(oir::Module &module, Stats &stats);
 bool verify_oir(oir::Module &module, std::string &message);
 
 template <typename Fn>
