@@ -474,11 +474,13 @@ jobs:
           print("Functional tests passed.")
           PY
 
-      - name: Notify yoolang group
+      - name: Notify Discord
         if: always()
         env:
-          CI_NOTIFY_URL: http://127.0.0.1:3003/notify
-          CI_NOTIFY_TOKEN: ${{ secrets.CI_NOTIFY_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          HTTPS_PROXY: http://127.0.0.1:7890
+          HTTP_PROXY: http://127.0.0.1:7890
+          NO_PROXY: localhost,127.0.0.1,::1
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
           REPOSITORY: ${{ github.repository }}
@@ -497,10 +499,9 @@ jobs:
           import urllib.request
           from pathlib import Path
 
-          notify_url = os.environ.get("CI_NOTIFY_URL", "").strip()
-          notify_token = os.environ.get("CI_NOTIFY_TOKEN", "").strip()
-          if not notify_url or not notify_token:
-              print("CI_NOTIFY_URL or CI_NOTIFY_TOKEN is not set; skipping group notification.")
+          webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+          if not webhook_url:
+              print("DISCORD_WEBHOOK_URL is not set; skipping Discord notification.")
               raise SystemExit(0)
 
           def read_json(path: str) -> dict:
@@ -642,13 +643,17 @@ jobs:
 
           lines.extend(["", f"🔗 run: {os.environ.get('RUN_URL', '')}"])
 
-          payload = {"message": "\n".join(lines)}
+          message = "\n".join(lines)
+          if len(message) > 1900:
+              message = message[:1900] + "\n... <truncated>"
+
+          payload = {"content": message}
           req = urllib.request.Request(
-              notify_url,
+              webhook_url,
               data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
               headers={
-                  "Authorization": "Bearer " + notify_token,
                   "Content-Type": "application/json; charset=utf-8",
+                  "User-Agent": "yoolang-ci",
               },
               method="POST",
           )
@@ -656,7 +661,7 @@ jobs:
               with urllib.request.urlopen(req, timeout=10) as resp:
                   print(resp.read().decode("utf-8", errors="replace"))
           except (TimeoutError, urllib.error.URLError) as exc:
-              print(f"group notification failed: {exc}")
+              print(f"Discord notification failed: {exc}")
           except Exception as exc:
-              print(f"group notification failed unexpectedly: {exc!r}")
+              print(f"Discord notification failed unexpectedly: {exc!r}")
           PY
