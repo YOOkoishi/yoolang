@@ -129,7 +129,7 @@ std::string expression_key(const ReplacementMap &replacements, oir::Instruction 
 
 class ScopedValueTable final {
   public:
-    oir::Instruction *find(const std::string &key) const {
+    oir::Value *find(const std::string &key) const {
         auto found = table_.find(key);
         if (found == table_.end() || found->second.empty()) {
             return nullptr;
@@ -137,8 +137,8 @@ class ScopedValueTable final {
         return found->second.back();
     }
 
-    void push(const std::string &key, oir::Instruction *inst) {
-        table_[key].push_back(inst);
+    void push(const std::string &key, oir::Value *value) {
+        table_[key].push_back(value);
         stack_.push_back(key);
     }
 
@@ -162,25 +162,79 @@ class ScopedValueTable final {
     }
 
   private:
-    std::unordered_map<std::string, std::vector<oir::Instruction *>> table_;
+    std::unordered_map<std::string, std::vector<oir::Value *>> table_;
     std::vector<std::string> stack_;
 };
 
+struct AvailableMemoryValue {
+    std::string key;
+    oir::Value *ptr = nullptr;
+    oir::Value *value = nullptr;
+};
+
+using MemoryTable = std::vector<AvailableMemoryValue>;
+
+oir::Value *find_available_memory_value(const MemoryTable &memory, const std::string &key,
+                                        oir::Type *type) {
+    for (auto it = memory.rbegin(); it != memory.rend(); ++it) {
+        if (it->key == key && it->value != nullptr && it->value->type() == type) {
+            return it->value;
+        }
+    }
+    return nullptr;
+}
+
+void invalidate_aliasing_memory(MemoryTable &memory, oir::Value *ptr,
+                                const oir::OIRAliasAnalysis &alias_analysis) {
+    memory.erase(std::remove_if(memory.begin(), memory.end(),
+                                [ptr, &alias_analysis](const AvailableMemoryValue &entry) {
+                                    return alias_analysis.alias(ptr, entry.ptr) !=
+                                           oir::AliasResult::NoAlias;
+                                }),
+                 memory.end());
+}
+
+void rewrite_operands(oir::Instruction &inst, const ReplacementMap &replacements) {
+    for (std::size_t i = 0; i < inst.operand_count(); ++i) {
+        auto *old_operand = inst.operand(i);
+        auto *new_operand = resolve_value(replacements, old_operand);
+        if (new_operand != old_operand && new_operand->type() == old_operand->type()) {
+            inst.set_operand(i, new_operand);
+        }
+    }
+}
+
 void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *block,
-                  ScopedValueTable &table, ReplacementMap &replacements) {
+                  ScopedValueTable &table, ReplacementMap &replacements,
+                  const oir::OIRAliasAnalysis &alias_analysis) {
     auto mark = table.mark();
+    MemoryTable memory;
     for (auto &inst_ptr : const_cast<oir::BasicBlock *>(block)->instructions()) {
         auto *inst = inst_ptr.get();
-        if (!is_gvn_candidate(*inst) || inst->type() == nullptr || inst->type()->is_void()) {
+        rewrite_operands(*inst, replacements);
+
+        if (auto *load = dynamic_cast<oir::LoadInst *>(inst)) {
+            auto key = value_key(replacements, load->ptr());
+            if (auto *available = find_available_memory_value(memory, key, load->type())) {
+                replacements[load] = available;
+                continue;
+            }
+            memory.push_back({key, load->ptr(), load});
             continue;
         }
 
-        for (std::size_t i = 0; i < inst->operand_count(); ++i) {
-            auto *old_operand = inst->operand(i);
-            auto *new_operand = resolve_value(replacements, old_operand);
-            if (new_operand != old_operand && new_operand->type() == old_operand->type()) {
-                inst->set_operand(i, new_operand);
-            }
+        if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
+            invalidate_aliasing_memory(memory, store->ptr(), alias_analysis);
+            memory.push_back({value_key(replacements, store->ptr()), store->ptr(), store->value()});
+            continue;
+        }
+
+        if (dynamic_cast<oir::CallInst *>(inst) != nullptr) {
+            memory.clear();
+        }
+
+        if (!is_gvn_candidate(*inst) || inst->type() == nullptr || inst->type()->is_void()) {
+            continue;
         }
 
         auto key = expression_key(replacements, *inst);
@@ -197,7 +251,7 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
     }
 
     for (auto *child : dom_tree.children(block)) {
-        number_block(dom_tree, child, table, replacements);
+        number_block(dom_tree, child, table, replacements, alias_analysis);
     }
     table.pop_to(mark);
 }
@@ -216,22 +270,38 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
 
     if (block_count > 1000 || instruction_count > 8000) {
         ReplacementMap replacements;
+        oir::OIRAliasAnalysis alias_analysis;
         for (auto &block : function.blocks()) {
             ScopedValueTable table;
+            MemoryTable memory;
             for (auto &inst_ptr : block->instructions()) {
                 auto *inst = inst_ptr.get();
-                if (!is_gvn_candidate(*inst) || inst->type() == nullptr ||
-                    inst->type()->is_void()) {
+                rewrite_operands(*inst, replacements);
+
+                if (auto *load = dynamic_cast<oir::LoadInst *>(inst)) {
+                    auto key = value_key(replacements, load->ptr());
+                    if (auto *available = find_available_memory_value(memory, key, load->type())) {
+                        replacements[load] = available;
+                        continue;
+                    }
+                    memory.push_back({key, load->ptr(), load});
                     continue;
                 }
 
-                for (std::size_t i = 0; i < inst->operand_count(); ++i) {
-                    auto *old_operand = inst->operand(i);
-                    auto *new_operand = resolve_value(replacements, old_operand);
-                    if (new_operand != old_operand &&
-                        new_operand->type() == old_operand->type()) {
-                        inst->set_operand(i, new_operand);
-                    }
+                if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
+                    invalidate_aliasing_memory(memory, store->ptr(), alias_analysis);
+                    memory.push_back(
+                        {value_key(replacements, store->ptr()), store->ptr(), store->value()});
+                    continue;
+                }
+
+                if (dynamic_cast<oir::CallInst *>(inst) != nullptr) {
+                    memory.clear();
+                }
+
+                if (!is_gvn_candidate(*inst) || inst->type() == nullptr ||
+                    inst->type()->is_void()) {
+                    continue;
                 }
 
                 auto key = expression_key(replacements, *inst);
@@ -256,7 +326,8 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
     oir::DominatorTree dom_tree(function);
     ScopedValueTable table;
     ReplacementMap replacements;
-    number_block(dom_tree, function.entry_block(), table, replacements);
+    oir::OIRAliasAnalysis alias_analysis;
+    number_block(dom_tree, function.entry_block(), table, replacements, alias_analysis);
     if (apply_replacements(module, replacements) == 0) {
         return false;
     }

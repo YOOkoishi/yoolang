@@ -5,11 +5,74 @@
 #include "../../include/pass/OIRGVNPass.h"
 #include "../../include/pass/OIRLICMPass.h"
 #include "../../include/pass/OIRMem2RegPass.h"
+#include "../../include/pass/OIROptimizationPipelinePass.h"
 #include "../../include/pass/OIRSCCPPass.h"
 
 #include "../../include/oir/OIRScalarOpt.h"
 
 namespace pass {
+
+namespace {
+
+bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
+    bool changed = false;
+    changed |= oir_opt::simplify_branches(module, stats);
+    changed |= oir_opt::cleanup_cfg(module, stats);
+    changed |= oir_opt::promote_memory_to_registers(module, stats);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+    changed |= oir_opt::run_sccp(module, stats);
+    changed |= oir_opt::simplify_branches(module, stats);
+    changed |= oir_opt::cleanup_cfg(module, stats);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+    changed |= oir_opt::global_value_numbering(module, stats);
+    changed |= oir_opt::loop_invariant_code_motion(module, stats);
+    changed |= oir_opt::global_value_numbering(module, stats);
+    changed |= oir_opt::run_sccp(module, stats);
+    changed |= oir_opt::simplify_branches(module, stats);
+    changed |= oir_opt::cleanup_cfg(module, stats);
+    changed |= oir_opt::eliminate_dead_code(module, stats);
+    return changed;
+}
+
+} // namespace
+
+namespace oir_opt {
+
+bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
+    bool changed = false;
+    constexpr unsigned kMaxIterations = 8;
+    for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
+        if (!run_aggressive_iteration(module, stats)) {
+            break;
+        }
+        changed = true;
+    }
+
+    changed |= simplify_branches(module, stats);
+    changed |= cleanup_cfg(module, stats);
+    changed |= eliminate_dead_code(module, stats);
+    return changed;
+}
+
+} // namespace oir_opt
+
+std::string_view OIROptimizationPipelinePass::name() const {
+    return "OIROptimizationPipelinePass";
+}
+
+PassKind OIROptimizationPipelinePass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIROptimizationPipelinePass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIROptimizationPipelinePass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            return oir_opt::optimize_oir_aggressively(module, stats);
+        });
+}
 
 std::string_view OIRConstantFoldPass::name() const {
     return "OIRConstantFoldPass";

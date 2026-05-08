@@ -1,0 +1,32 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int store_load_forward(int x) {
+  int a[2];
+  a[0] = x;
+  return a[0] + a[0];
+}
+
+int licm_mul(int n, int x) {
+  int i = 0;
+  int s = 0;
+  while (i < n) {
+    int t = x * 42;
+    s = s + t;
+    i = i + 1;
+  }
+  return s;
+}
+
+int main() {
+  return store_load_forward(7) + licm_mul(4, 3);
+}
+
+// OIR-LABEL: define i32 @store_load_forward
+// OIR-NOT: load i32
+// OIR: add i32 %x.arg, %x.arg
+
+// OIR-LABEL: define i32 @licm_mul
+// OIR: %{{.*}} = mul i32 %x.arg, 42
+// OIR: while.cond
+// OIR-LABEL: while.body
+// OIR-NOT: mul i32 %x.arg, 42
