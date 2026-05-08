@@ -58,3 +58,7 @@ summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 # May 8
 
 优化了oir的一些功能，添加了几个中端的常量优化pass，常量折叠，代数化简，SCCP 等。
+
+# May 9
+
+重构了main函数中的pipeline,添加了 OIR 层面的 DCE GVN LICM 等优化。 但是目前效果不是很好。
