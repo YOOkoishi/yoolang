@@ -67,10 +67,12 @@ const oir::Module *PassContext::ssa_module() const {
 }
 
 void PassContext::set_ssa_module(std::unique_ptr<oir::Module> module) {
+    invalidate_oir_analyses();
     ssa_module_ = std::move(module);
 }
 
 std::unique_ptr<oir::Module> PassContext::take_ssa_module() {
+    invalidate_oir_analyses();
     return std::move(ssa_module_);
 }
 
@@ -100,6 +102,10 @@ bool PassContext::has_artifact(const std::string &key) const {
 
 void PassContext::erase_artifact(const std::string &key) {
     artifacts_.erase(key);
+}
+
+void PassContext::invalidate_oir_analyses() {
+    oir_analyses_.clear();
 }
 
 void PassManager::set_stop_on_failure(bool stop_on_failure) {

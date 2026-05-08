@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
 #include <utility>
@@ -34,6 +35,10 @@ struct PassResult {
 };
 
 class PassContext {
+  private:
+    struct AnalysisBase;
+    template <typename T> struct AnalysisModel;
+
   public:
     PassContext() = default;
 
@@ -106,6 +111,44 @@ class PassContext {
         return value;
     }
 
+    template <typename AnalysisT> AnalysisT *get_analysis() {
+        auto it = oir_analyses_.find(std::type_index(typeid(AnalysisT)));
+        if (it == oir_analyses_.end()) {
+            return nullptr;
+        }
+        auto *model = dynamic_cast<AnalysisModel<AnalysisT> *>(it->second.get());
+        return model == nullptr ? nullptr : &model->value;
+    }
+
+    template <typename AnalysisT> const AnalysisT *get_analysis() const {
+        auto it = oir_analyses_.find(std::type_index(typeid(AnalysisT)));
+        if (it == oir_analyses_.end()) {
+            return nullptr;
+        }
+        auto *model = dynamic_cast<const AnalysisModel<AnalysisT> *>(it->second.get());
+        return model == nullptr ? nullptr : &model->value;
+    }
+
+    template <typename AnalysisT, typename... Args>
+    AnalysisT &get_or_build_analysis(Args &&...args) {
+        auto key = std::type_index(typeid(AnalysisT));
+        auto found = oir_analyses_.find(key);
+        if (found != oir_analyses_.end()) {
+            auto *model = dynamic_cast<AnalysisModel<AnalysisT> *>(found->second.get());
+            if (model == nullptr) {
+                throw std::runtime_error("cached OIR analysis has unexpected type");
+            }
+            return model->value;
+        }
+
+        auto analysis = std::make_unique<AnalysisModel<AnalysisT>>(std::forward<Args>(args)...);
+        auto *raw = analysis.get();
+        oir_analyses_[key] = std::move(analysis);
+        return raw->value;
+    }
+
+    void invalidate_oir_analyses();
+
   private:
     struct ArtifactBase {
         virtual ~ArtifactBase() = default;
@@ -113,6 +156,17 @@ class PassContext {
 
     template <typename T> struct Artifact final : ArtifactBase {
         explicit Artifact(T value) : value(std::move(value)) {
+        }
+        T value;
+    };
+
+    struct AnalysisBase {
+        virtual ~AnalysisBase() = default;
+    };
+
+    template <typename T> struct AnalysisModel final : AnalysisBase {
+        template <typename... Args>
+        explicit AnalysisModel(Args &&...args) : value(std::forward<Args>(args)...) {
         }
         T value;
     };
@@ -125,6 +179,7 @@ class PassContext {
     std::unique_ptr<oir::Module> ssa_module_;
     std::unique_ptr<mir::Module> machine_module_;
     std::unordered_map<std::string, std::unique_ptr<ArtifactBase>> artifacts_;
+    std::unordered_map<std::type_index, std::unique_ptr<AnalysisBase>> oir_analyses_;
 };
 
 class Pass {

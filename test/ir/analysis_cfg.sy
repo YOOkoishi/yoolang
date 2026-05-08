@@ -1,0 +1,30 @@
+// RUN: %compiler --emit-oir %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-mir %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+
+int choose(int a, int b) {
+  int x = a + b;
+  if (x > 10) {
+    x = x - 1;
+  } else {
+    x = x + 1;
+  }
+  return x;
+}
+
+int main() {
+  return choose(4, 9);
+}
+
+// OIR-LABEL: define i32 @choose
+// OIR: br i1
+// OIR: phi
+// OIR: ret i32
+
+// MIR-LABEL: func @choose
+// MIR: BNEZ
+// MIR: edge.
+
+// ASM-LABEL: choose:
+// ASM: bnez
+// ASM: ret

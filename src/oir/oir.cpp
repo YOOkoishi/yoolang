@@ -386,6 +386,25 @@ Value *User::operand(std::size_t index) const {
     return operands_[index];
 }
 
+void User::set_operand(std::size_t index, Value *value) {
+    operands_[index] = value;
+}
+
+void User::replace_operand(Value *old_value, Value *new_value) {
+    replace_operands(old_value, new_value);
+}
+
+std::size_t User::replace_operands(Value *old_value, Value *new_value) {
+    std::size_t replaced = 0;
+    for (std::size_t i = 0; i < operands_.size(); ++i) {
+        if (operands_[i] == old_value) {
+            set_operand(i, new_value);
+            ++replaced;
+        }
+    }
+    return replaced;
+}
+
 std::size_t User::operand_count() const {
     return operands_.size();
 }
@@ -674,6 +693,19 @@ void PhiInst::add_incoming(Value *value, BasicBlock *from) {
 
 const std::vector<std::pair<Value *, BasicBlock *>> &PhiInst::incoming() const {
     return incoming_;
+}
+
+void PhiInst::set_operand(std::size_t index, Value *value) {
+    User::set_operand(index, value);
+    const std::size_t incoming_index = index / 2;
+    if (incoming_index >= incoming_.size()) {
+        return;
+    }
+    if (index % 2 == 0) {
+        incoming_[incoming_index].first = value;
+    } else {
+        incoming_[incoming_index].second = static_cast<BasicBlock *>(value);
+    }
 }
 
 std::string PhiInst::print() const {

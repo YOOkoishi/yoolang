@@ -1,0 +1,32 @@
+// RUN: %compiler --emit-oir %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-mir %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+
+int sum_to(int n) {
+  int i = 0;
+  int sum = 0;
+  while (i < n) {
+    sum = sum + i;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return sum_to(6);
+}
+
+// OIR-LABEL: define i32 @sum_to
+// OIR: phi
+// OIR: icmp lt
+// OIR: br i1
+// OIR: br %while.cond
+// OIR: ret i32
+
+// MIR-LABEL: func @sum_to
+// MIR: BNEZ
+// MIR: J %while.cond
+
+// ASM-LABEL: sum_to:
+// ASM: bnez
+// ASM: ret

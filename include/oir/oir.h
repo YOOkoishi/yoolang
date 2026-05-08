@@ -191,6 +191,9 @@ class User : public Value {
 
     void add_operand(Value *value);
     Value *operand(std::size_t index) const;
+    virtual void set_operand(std::size_t index, Value *value);
+    void replace_operand(Value *old_value, Value *new_value);
+    std::size_t replace_operands(Value *old_value, Value *new_value);
     std::size_t operand_count() const;
     const std::vector<Value *> &operands() const;
 
@@ -354,6 +357,7 @@ class PhiInst final : public Instruction {
 
     void add_incoming(Value *value, BasicBlock *from);
     const std::vector<std::pair<Value *, BasicBlock *>> &incoming() const;
+    void set_operand(std::size_t index, Value *value) override;
     std::string print() const override;
 
   private:
