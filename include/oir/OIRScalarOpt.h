@@ -18,6 +18,8 @@ struct Stats {
     unsigned dce = 0;
     unsigned cfg = 0;
     unsigned gvn = 0;
+    unsigned mem2reg = 0;
+    unsigned licm = 0;
 
     bool changed() const;
     std::string message() const;
@@ -50,6 +52,8 @@ bool simplify_branches(oir::Module &module, Stats &stats);
 bool run_sccp(oir::Module &module, Stats &stats);
 bool eliminate_dead_code(oir::Module &module, Stats &stats);
 bool cleanup_cfg(oir::Module &module, Stats &stats);
+bool promote_memory_to_registers(oir::Module &module, Stats &stats);
+bool loop_invariant_code_motion(oir::Module &module, Stats &stats);
 bool global_value_numbering(oir::Module &module, Stats &stats);
 bool verify_oir(oir::Module &module, std::string &message);
 

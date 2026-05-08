@@ -7,13 +7,14 @@
 namespace pass::oir_opt {
 
 bool Stats::changed() const {
-    return folded != 0 || sccp != 0 || branches != 0 || dce != 0 || cfg != 0 || gvn != 0;
+    return folded != 0 || sccp != 0 || branches != 0 || dce != 0 || cfg != 0 || gvn != 0 ||
+           mem2reg != 0 || licm != 0;
 }
 
 std::string Stats::message() const {
     std::ostringstream oss;
-    oss << "folded=" << folded << " sccp=" << sccp << " branches=" << branches
-        << " dce=" << dce << " cfg=" << cfg << " gvn=" << gvn;
+    oss << "folded=" << folded << " sccp=" << sccp << " branches=" << branches << " dce=" << dce
+        << " cfg=" << cfg << " gvn=" << gvn << " mem2reg=" << mem2reg << " licm=" << licm;
     return oss.str();
 }
 

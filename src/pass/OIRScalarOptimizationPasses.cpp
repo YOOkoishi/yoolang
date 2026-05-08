@@ -3,6 +3,8 @@
 #include "../../include/pass/OIRConstantFoldPass.h"
 #include "../../include/pass/OIRDeadCodeEliminationPass.h"
 #include "../../include/pass/OIRGVNPass.h"
+#include "../../include/pass/OIRLICMPass.h"
+#include "../../include/pass/OIRMem2RegPass.h"
 #include "../../include/pass/OIRSCCPPass.h"
 
 #include "../../include/oir/OIRScalarOpt.h"
@@ -41,8 +43,7 @@ PassResult OIRAlgebraicSimplifyPass::run(PassContext &context) {
     return oir_opt::run_oir_transform(
         context, "OIRAlgebraicSimplifyPass requires OIR module in pass context",
         [](oir::Module &module, oir_opt::Stats &stats) {
-            bool changed =
-                oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+            bool changed = oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
             changed |= oir_opt::eliminate_dead_code(module, stats);
             return changed;
         });
@@ -57,14 +58,51 @@ PassKind OIRCFGCleanupPass::kind() const {
 }
 
 PassResult OIRCFGCleanupPass::run(PassContext &context) {
-    return oir_opt::run_oir_transform(
-        context, "OIRCFGCleanupPass requires OIR module in pass context",
-        [](oir::Module &module, oir_opt::Stats &stats) {
-            bool changed = oir_opt::simplify_branches(module, stats);
-            changed |= oir_opt::cleanup_cfg(module, stats);
-            changed |= oir_opt::eliminate_dead_code(module, stats);
-            return changed;
-        });
+    return oir_opt::run_oir_transform(context,
+                                      "OIRCFGCleanupPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed = oir_opt::simplify_branches(module, stats);
+                                          changed |= oir_opt::cleanup_cfg(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+std::string_view OIRMem2RegPass::name() const {
+    return "OIRMem2RegPass";
+}
+
+PassKind OIRMem2RegPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRMem2RegPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRMem2RegPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed =
+                                              oir_opt::promote_memory_to_registers(module, stats);
+                                          changed |= oir_opt::cleanup_cfg(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+std::string_view OIRLICMPass::name() const {
+    return "OIRLICMPass";
+}
+
+PassKind OIRLICMPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRLICMPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRLICMPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed =
+                                              oir_opt::loop_invariant_code_motion(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
 }
 
 std::string_view OIRGVNPass::name() const {

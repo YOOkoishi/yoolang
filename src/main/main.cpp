@@ -3,18 +3,20 @@
 #include "../include/pass/ASTDumpPass.h"
 #include "../include/pass/ASTSemanticAnalysisPass.h"
 #include "../include/pass/ASTToYIRPass.h"
-#include "../include/pass/YIRLoopCountPass.h"
+#include "../include/pass/MIRPeepholePass.h"
+#include "../include/pass/MIRRegAllocPass.h"
 #include "../include/pass/MIRToAsmPass.h"
 #include "../include/pass/OIRAlgebraicSimplifyPass.h"
 #include "../include/pass/OIRCFGCleanupPass.h"
 #include "../include/pass/OIRConstantFoldPass.h"
 #include "../include/pass/OIRDeadCodeEliminationPass.h"
 #include "../include/pass/OIRGVNPass.h"
-#include "../include/pass/OIRToMIRPass.h"
+#include "../include/pass/OIRLICMPass.h"
+#include "../include/pass/OIRMem2RegPass.h"
 #include "../include/pass/OIRSCCPPass.h"
-#include "../include/pass/MIRPeepholePass.h"
-#include "../include/pass/MIRRegAllocPass.h"
+#include "../include/pass/OIRToMIRPass.h"
 #include "../include/pass/PassManager.h"
+#include "../include/pass/YIRLoopCountPass.h"
 #include "../include/pass/YIRToOIRPass.h"
 #include "../include/yir/YIRPrinter.h"
 
@@ -47,7 +49,8 @@ void print_help(const char *program, std::ostream &out) {
         << "  -h, --help       Show this help message\n"
         << "  -S, --emit-asm   Lower to RISC-V assembly (default)\n"
         << "  -o <file>        Write output to <file> instead of stdout\n"
-        << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR peephole optimizations\n"
+        << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR peephole "
+           "optimizations\n"
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
         << "  --emit-oir       Lower the parsed AST to SSA OIR, verify it, and dump it\n"
@@ -178,7 +181,9 @@ void add_oir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
     if (optimizations_enabled(options)) {
         pm.add_pass<pass::OIRConstantFoldPass>();
         pm.add_pass<pass::OIRCFGCleanupPass>();
+        pm.add_pass<pass::OIRMem2RegPass>();
         pm.add_pass<pass::OIRAlgebraicSimplifyPass>();
+        pm.add_pass<pass::OIRLICMPass>();
         pm.add_pass<pass::OIRGVNPass>();
         pm.add_pass<pass::OIRSCCPPass>();
         pm.add_pass<pass::OIRCFGCleanupPass>();
@@ -278,7 +283,8 @@ int main(int argc, char **argv) {
     }
 
     if (options.emit_yir) {
-        auto *module = context.get_artifact<std::unique_ptr<yir::Module>>(pass::ASTToYIRPass::kArtifactKey);
+        auto *module =
+            context.get_artifact<std::unique_ptr<yir::Module>>(pass::ASTToYIRPass::kArtifactKey);
         if (module == nullptr || *module == nullptr) {
             std::cerr << "YIR module was not produced\n";
             return 1;
