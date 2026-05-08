@@ -39,7 +39,7 @@
 
 添加了毕昇杯2026的测例，func和perf全部通过。基础设施我也比较满意了。
 
-# May. 3
+# May 3
 
 添加了 loop count 的 pass.
 
@@ -51,6 +51,10 @@ summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 
 添加之后也仍然保持一样的 summary.
 
-# May. 6
+# May 6
 
 添加了 RegAlloc 的 pass , 以及 MIR 的 Peephole pass,现在的速度比之前栈式分配内存要快不少（50%）。
+
+# May 8
+
+优化了oir的一些功能，添加了几个中端的常量优化pass，常量折叠，代数化简，SCCP 等。
