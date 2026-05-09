@@ -205,10 +205,9 @@ void rewrite_operands(oir::Instruction &inst, const ReplacementMap &replacements
 }
 
 void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *block,
-                  ScopedValueTable &table, ReplacementMap &replacements,
+                  ScopedValueTable &table, MemoryTable memory, ReplacementMap &replacements,
                   const oir::OIRAliasAnalysis &alias_analysis) {
     auto mark = table.mark();
-    MemoryTable memory;
     for (auto &inst_ptr : const_cast<oir::BasicBlock *>(block)->instructions()) {
         auto *inst = inst_ptr.get();
         rewrite_operands(*inst, replacements);
@@ -251,7 +250,11 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
     }
 
     for (auto *child : dom_tree.children(block)) {
-        number_block(dom_tree, child, table, replacements, alias_analysis);
+        MemoryTable child_memory;
+        if (child->predecessors().size() == 1 && child->predecessors().front() == block) {
+            child_memory = memory;
+        }
+        number_block(dom_tree, child, table, child_memory, replacements, alias_analysis);
     }
     table.pop_to(mark);
 }
@@ -325,9 +328,10 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
 
     oir::DominatorTree dom_tree(function);
     ScopedValueTable table;
+    MemoryTable memory;
     ReplacementMap replacements;
     oir::OIRAliasAnalysis alias_analysis;
-    number_block(dom_tree, function.entry_block(), table, replacements, alias_analysis);
+    number_block(dom_tree, function.entry_block(), table, memory, replacements, alias_analysis);
     if (apply_replacements(module, replacements) == 0) {
         return false;
     }

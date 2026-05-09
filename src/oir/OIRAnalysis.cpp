@@ -1,13 +1,85 @@
 #include "../../include/oir/OIRAnalysis.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <deque>
+#include <optional>
 
 namespace oir {
 namespace {
 
 template <typename T> bool contains_value(const std::vector<T> &values, T value) {
     return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+std::optional<std::int64_t> constant_int_value(const Value *value) {
+    if (auto *constant = dynamic_cast<const ConstantInt *>(value)) {
+        return constant->value();
+    }
+    if (dynamic_cast<const ConstantZero *>(value) != nullptr && value->type()->is_integer()) {
+        return 0;
+    }
+    return std::nullopt;
+}
+
+bool same_index_value(const Value *lhs, const Value *rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+
+    auto lhs_constant = constant_int_value(lhs);
+    auto rhs_constant = constant_int_value(rhs);
+    return lhs_constant.has_value() && rhs_constant.has_value() &&
+           *lhs_constant == *rhs_constant;
+}
+
+bool distinct_constant_indices(const Value *lhs, const Value *rhs) {
+    auto lhs_constant = constant_int_value(lhs);
+    auto rhs_constant = constant_int_value(rhs);
+    return lhs_constant.has_value() && rhs_constant.has_value() &&
+           *lhs_constant != *rhs_constant;
+}
+
+struct PointerPath {
+    const Value *root = nullptr;
+    std::vector<const Value *> indices;
+};
+
+PointerPath collect_pointer_path(const Value *value) {
+    if (auto *gep = dynamic_cast<const GetElementPtrInst *>(value)) {
+        auto path = collect_pointer_path(gep->base_ptr());
+        for (auto *index : gep->indices()) {
+            path.indices.push_back(index);
+        }
+        return path;
+    }
+
+    return {value, {}};
+}
+
+bool same_index_path(const std::vector<const Value *> &lhs,
+                     const std::vector<const Value *> &rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (!same_index_value(lhs[i], rhs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool has_disjoint_constant_index(const std::vector<const Value *> &lhs,
+                                 const std::vector<const Value *> &rhs) {
+    const auto common = std::min(lhs.size(), rhs.size());
+    for (std::size_t i = 0; i < common; ++i) {
+        if (same_index_value(lhs[i], rhs[i])) {
+            continue;
+        }
+        return distinct_constant_indices(lhs[i], rhs[i]);
+    }
+    return false;
 }
 
 } // namespace
@@ -360,9 +432,28 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
         return AliasResult::MayAlias;
     }
 
-    auto *root_a = underlying_object(a);
-    auto *root_b = underlying_object(b);
+    auto path_a = collect_pointer_path(a);
+    auto path_b = collect_pointer_path(b);
+    auto *root_a = underlying_object(path_a.root);
+    auto *root_b = underlying_object(path_b.root);
+
+    if (path_a.root != nullptr && path_a.root == path_b.root) {
+        if (same_index_path(path_a.indices, path_b.indices)) {
+            return AliasResult::MustAlias;
+        }
+        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
+            return AliasResult::NoAlias;
+        }
+        return AliasResult::MayAlias;
+    }
+
     if (root_a == root_b && is_distinct_object(root_a)) {
+        if (same_index_path(path_a.indices, path_b.indices)) {
+            return AliasResult::MustAlias;
+        }
+        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
+            return AliasResult::NoAlias;
+        }
         return AliasResult::MayAlias;
     }
     if (root_a != nullptr && root_b != nullptr && root_a != root_b && is_distinct_object(root_a) &&
