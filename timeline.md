@@ -62,3 +62,7 @@ summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 # May 9
 
 重构了main函数中的pipeline,添加了 OIR 层面的 DCE GVN LICM 等优化。 但是目前效果不是很好。
+
+# May 10
+
+添加了保守的inline,效果还行，但是在板子上不行，可能需要 memory_ssa 形式好一些。
