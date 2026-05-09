@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace pass::oir_opt {
@@ -25,7 +27,132 @@ oir::BasicBlock *find_preheader(const oir::Loop &loop) {
         }
         preheader = pred;
     }
+    if (preheader == nullptr || preheader->successors().size() != 1 ||
+        preheader->successors().front() != loop.header) {
+        return nullptr;
+    }
     return preheader;
+}
+
+void replace_branch_target(oir::BranchInst &branch, oir::BasicBlock *old_target,
+                           oir::BasicBlock *new_target) {
+    if (branch.is_conditional()) {
+        if (branch.true_bb() == old_target) {
+            branch.set_operand(1, new_target);
+        }
+        if (branch.false_bb() == old_target) {
+            branch.set_operand(2, new_target);
+        }
+        return;
+    }
+    if (branch.target_bb() == old_target) {
+        branch.set_operand(0, new_target);
+    }
+}
+
+std::vector<std::pair<oir::Value *, oir::BasicBlock *>>
+incoming_from_outside(const oir::PhiInst &phi, const oir::Loop &loop) {
+    std::vector<std::pair<oir::Value *, oir::BasicBlock *>> incoming;
+    for (const auto &item : phi.incoming()) {
+        if (!contains_block(loop, item.second)) {
+            incoming.push_back(item);
+        }
+    }
+    return incoming;
+}
+
+oir::Value *
+create_preheader_phi(oir::BasicBlock *preheader, oir::PhiInst &header_phi,
+                     const std::vector<std::pair<oir::Value *, oir::BasicBlock *>> &incoming) {
+    if (incoming.empty()) {
+        return nullptr;
+    }
+
+    auto *first = incoming.front().first;
+    bool all_same = true;
+    for (const auto &item : incoming) {
+        if (item.first != first) {
+            all_same = false;
+            break;
+        }
+    }
+    if (all_same) {
+        return first;
+    }
+
+    auto phi = std::make_unique<oir::PhiInst>(
+        header_phi.type(), preheader,
+        header_phi.name().empty() ? "licm.pre" : header_phi.name() + ".pre");
+    auto *raw = phi.get();
+    raw->set_parent(preheader);
+    for (const auto &item : incoming) {
+        raw->add_incoming(item.first, item.second);
+    }
+    preheader->instructions().push_back(std::move(phi));
+    return raw;
+}
+
+oir::BasicBlock *ensure_preheader(oir::Function &function, const oir::Loop &loop, Stats &stats) {
+    if (auto *existing = find_preheader(loop)) {
+        return existing;
+    }
+
+    std::vector<oir::BasicBlock *> outside_preds;
+    for (auto *pred : loop.header->predecessors()) {
+        if (!contains_block(loop, pred)) {
+            outside_preds.push_back(pred);
+        }
+    }
+    if (outside_preds.empty()) {
+        return nullptr;
+    }
+
+    auto *preheader = function.create_block("licm.preheader");
+    std::unordered_map<oir::PhiInst *, oir::Value *> header_phi_values;
+    for (auto &inst : const_cast<oir::BasicBlock *>(loop.header)->instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        auto outside_incoming = incoming_from_outside(*phi, loop);
+        if (!outside_incoming.empty()) {
+            header_phi_values[phi] = create_preheader_phi(preheader, *phi, outside_incoming);
+        }
+    }
+
+    auto branch =
+        std::make_unique<oir::BranchInst>(function.parent()->types().void_ty(),
+                                          const_cast<oir::BasicBlock *>(loop.header), preheader);
+    branch->set_parent(preheader);
+    preheader->instructions().push_back(std::move(branch));
+
+    for (auto *pred : outside_preds) {
+        if (auto *term = dynamic_cast<oir::BranchInst *>(pred->terminator())) {
+            replace_branch_target(*term, const_cast<oir::BasicBlock *>(loop.header), preheader);
+        }
+        pred->remove_successor(const_cast<oir::BasicBlock *>(loop.header));
+        pred->add_successor(preheader);
+        preheader->add_predecessor(pred);
+        const_cast<oir::BasicBlock *>(loop.header)->remove_predecessor(pred);
+    }
+
+    preheader->add_successor(const_cast<oir::BasicBlock *>(loop.header));
+    const_cast<oir::BasicBlock *>(loop.header)->add_predecessor(preheader);
+
+    for (auto &[phi, value] : header_phi_values) {
+        for (auto *pred : outside_preds) {
+            phi->remove_incoming_from(pred);
+        }
+        phi->add_incoming(value, preheader);
+    }
+
+    ++stats.cfg;
+    return preheader;
+}
+
+bool is_speculatable_divisor(oir::Value *value) {
+    auto constant = int_constant(value);
+    return constant.has_value() && *constant != 0;
 }
 
 bool is_licm_candidate(const oir::Instruction &inst) {
@@ -45,7 +172,10 @@ bool is_licm_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::FPToSI:
         return true;
     case oir::Instruction::OpID::SDiv:
-    case oir::Instruction::OpID::SRem:
+    case oir::Instruction::OpID::SRem: {
+        const auto *binary = dynamic_cast<const oir::BinaryInst *>(&inst);
+        return binary != nullptr && is_speculatable_divisor(binary->rhs());
+    }
     case oir::Instruction::OpID::Ret:
     case oir::Instruction::OpID::Br:
     case oir::Instruction::OpID::Alloca:
@@ -106,8 +236,8 @@ void move_before_terminator(oir::Instruction *inst, oir::BasicBlock *dest) {
     }
 }
 
-bool run_on_loop(const oir::Loop &loop, Stats &stats) {
-    auto *preheader = find_preheader(loop);
+bool run_on_loop(oir::Function &function, const oir::Loop &loop, Stats &stats) {
+    auto *preheader = ensure_preheader(function, loop, stats);
     if (preheader == nullptr || !preheader->has_terminator()) {
         return false;
     }
@@ -155,7 +285,7 @@ bool run_on_function(oir::Function &function, Stats &stats) {
         return lhs.blocks.size() < rhs.blocks.size();
     });
     for (const auto &loop : loops) {
-        changed |= run_on_loop(loop, stats);
+        changed |= run_on_loop(function, loop, stats);
     }
     return changed;
 }

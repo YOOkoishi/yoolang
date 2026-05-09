@@ -55,6 +55,7 @@ bool cleanup_cfg(oir::Module &module, Stats &stats);
 bool promote_memory_to_registers(oir::Module &module, Stats &stats);
 bool loop_invariant_code_motion(oir::Module &module, Stats &stats);
 bool global_value_numbering(oir::Module &module, Stats &stats);
+bool optimize_oir_aggressively(oir::Module &module, Stats &stats);
 bool verify_oir(oir::Module &module, std::string &message);
 
 template <typename Fn>

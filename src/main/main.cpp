@@ -13,6 +13,7 @@
 #include "../include/pass/OIRGVNPass.h"
 #include "../include/pass/OIRLICMPass.h"
 #include "../include/pass/OIRMem2RegPass.h"
+#include "../include/pass/OIROptimizationPipelinePass.h"
 #include "../include/pass/OIRSCCPPass.h"
 #include "../include/pass/OIRToMIRPass.h"
 #include "../include/pass/PassManager.h"
@@ -179,15 +180,7 @@ void add_oir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
 
     pm.add_pass<pass::YIRToOIRPass>();
     if (optimizations_enabled(options)) {
-        pm.add_pass<pass::OIRConstantFoldPass>();
-        pm.add_pass<pass::OIRCFGCleanupPass>();
-        pm.add_pass<pass::OIRMem2RegPass>();
-        pm.add_pass<pass::OIRAlgebraicSimplifyPass>();
-        pm.add_pass<pass::OIRLICMPass>();
-        pm.add_pass<pass::OIRGVNPass>();
-        pm.add_pass<pass::OIRSCCPPass>();
-        pm.add_pass<pass::OIRCFGCleanupPass>();
-        pm.add_pass<pass::OIRDeadCodeEliminationPass>();
+        pm.add_pass<pass::OIROptimizationPipelinePass>();
     }
 }
 
