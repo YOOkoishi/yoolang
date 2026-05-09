@@ -11,6 +11,7 @@
 #include "../include/pass/OIRConstantFoldPass.h"
 #include "../include/pass/OIRDeadCodeEliminationPass.h"
 #include "../include/pass/OIRGVNPass.h"
+#include "../include/pass/OIRInlinePass.h"
 #include "../include/pass/OIRLICMPass.h"
 #include "../include/pass/OIRMem2RegPass.h"
 #include "../include/pass/OIROptimizationPipelinePass.h"

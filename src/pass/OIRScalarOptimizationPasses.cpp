@@ -3,6 +3,7 @@
 #include "../../include/pass/OIRConstantFoldPass.h"
 #include "../../include/pass/OIRDeadCodeEliminationPass.h"
 #include "../../include/pass/OIRGVNPass.h"
+#include "../../include/pass/OIRInlinePass.h"
 #include "../../include/pass/OIRLICMPass.h"
 #include "../../include/pass/OIRMem2RegPass.h"
 #include "../../include/pass/OIROptimizationPipelinePass.h"
@@ -42,6 +43,13 @@ namespace oir_opt {
 
 bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     bool changed = false;
+    changed |= simplify_branches(module, stats);
+    changed |= cleanup_cfg(module, stats);
+    changed |= promote_memory_to_registers(module, stats);
+    changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
+    changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
+    changed |= inline_functions(module, stats);
+
     constexpr unsigned kMaxIterations = 8;
     for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
         if (!run_aggressive_iteration(module, stats)) {
@@ -203,6 +211,26 @@ PassResult OIRSCCPPass::run(PassContext &context) {
                                           changed |= oir_opt::eliminate_dead_code(module, stats);
                                           return changed;
                                       });
+}
+
+std::string_view OIRInlinePass::name() const {
+    return "OIRInlinePass";
+}
+
+PassKind OIRInlinePass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRInlinePass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIRInlinePass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            bool changed = oir_opt::inline_functions(module, stats);
+            changed |= oir_opt::simplify_branches(module, stats);
+            changed |= oir_opt::cleanup_cfg(module, stats);
+            changed |= oir_opt::eliminate_dead_code(module, stats);
+            return changed;
+        });
 }
 
 std::string_view OIRDeadCodeEliminationPass::name() const {
