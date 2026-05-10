@@ -649,6 +649,8 @@ jobs:
           stable = 0
           significant_ratio = 5.0
           significant_abs_sec = 0.01
+          fast_cases = []
+          slow_cases = []
           for row in delta_rows:
               delta_sec = row.get("delta_sec")
               delta_pct = row.get("delta_pct")
@@ -657,10 +659,14 @@ jobs:
               if abs(delta_pct) >= significant_ratio and abs(delta_sec) >= significant_abs_sec:
                   if delta_sec < 0:
                       fast += 1
+                      fast_cases.append(row)
                   else:
                       slow += 1
+                      slow_cases.append(row)
               else:
                   stable += 1
+          fast_cases.sort(key=lambda item: (item.get("delta_pct", 0), item.get("delta_sec", 0)))
+          slow_cases.sort(key=lambda item: (item.get("delta_pct", 0), item.get("delta_sec", 0)), reverse=True)
 
           functional = os.environ.get("FUNCTIONAL_OUTCOME", "unknown")
           perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
@@ -704,6 +710,18 @@ jobs:
               f"yoolang {fmt_seconds(compiler_total_value)} / GCC {fmt_seconds(gcc_total_value)} / Clang++ {fmt_seconds(clang_total_value)}",
               f"📐 加速比: GCC {fmt_speedup(gcc_total_value, compiler_total_value)} / Clang++ {fmt_speedup(clang_total_value, compiler_total_value)}",
           ]
+
+          if slow_cases:
+              lines.extend(["", "⚠️ 最慢变化:"])
+              for row in slow_cases[:2]:
+                  case = str(row.get("case", "unknown")).rsplit("/", 1)[-1]
+                  lines.append(f"{case} ⚠️ 慢 {float(row.get('delta_pct', 0)):.1f}%")
+
+          if fast_cases:
+              lines.extend(["", "🚀 最快变化:"])
+              for row in fast_cases[:2]:
+                  case = str(row.get("case", "unknown")).rsplit("/", 1)[-1]
+                  lines.append(f"{case} 🚀 快 {abs(float(row.get('delta_pct', 0))):.1f}%")
 
           message = "\n".join(lines)
           if len(message) > 1900:
