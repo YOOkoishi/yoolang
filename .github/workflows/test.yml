@@ -118,6 +118,7 @@ jobs:
 
           baseline_label="local ${BASELINE_BRANCH} baseline"
           baseline_commit_sha=""
+          baseline_commit_time=""
           baseline_commit_title=""
           baseline_commit_author=""
 
@@ -128,6 +129,16 @@ jobs:
           p = Path.home() / ".cache/yoolang-ci/baselines/main/meta.json"
           try:
               print(json.loads(p.read_text()).get("sha", ""))
+          except Exception:
+              print("")
+          PY
+          )"
+            baseline_commit_time="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path.home() / ".cache/yoolang-ci/baselines/main/meta.json"
+          try:
+              print(json.loads(p.read_text()).get("timestamp", ""))
           except Exception:
               print("")
           PY
@@ -192,6 +203,7 @@ jobs:
             --baseline-run-id "" \
             --baseline-run-url "" \
             --baseline-commit-sha "$baseline_commit_sha" \
+            --baseline-commit-time "$baseline_commit_time" \
             --baseline-commit-title "$baseline_commit_title" \
             --baseline-commit-author "$baseline_commit_author" || true
 
@@ -200,6 +212,7 @@ jobs:
         continue-on-error: true
         env:
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          GITHUB_EVENT_HEAD_COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
         run: |
           set +e
           current_json="build/perf-ci/perf-report.json"
@@ -226,15 +239,28 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import subprocess
           from pathlib import Path
 
           baseline_dir = Path.home() / ".cache/yoolang-ci/baselines/main"
           baseline_dir.mkdir(parents=True, exist_ok=True)
 
+          timestamp = os.environ.get("GITHUB_EVENT_HEAD_COMMIT_TIMESTAMP", "")
+          if not timestamp:
+              try:
+                  timestamp = subprocess.check_output(
+                      ["git", "show", "-s", "--format=%cI", "HEAD"],
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  ).strip()
+              except Exception:
+                  timestamp = ""
+
           meta = {
               "sha": os.environ.get("GITHUB_SHA", ""),
               "branch": os.environ.get("GITHUB_REF_NAME", ""),
-              "title": os.environ.get("HEAD_COMMIT_MESSAGE", "").splitlines()[0],
+              "timestamp": timestamp,
+              "title": (os.environ.get("HEAD_COMMIT_MESSAGE", "").splitlines() or [""])[0],
               "author": os.environ.get("GITHUB_ACTOR", ""),
               "run_id": os.environ.get("GITHUB_RUN_ID", ""),
               "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}",
@@ -483,20 +509,20 @@ jobs:
           NO_PROXY: localhost,127.0.0.1,::1
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
-          REPOSITORY: ${{ github.repository }}
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
           ACTOR: ${{ github.actor }}
-          WORKFLOW: ${{ github.workflow }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          HEAD_COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
         run: |
           python3 - <<'PY'
           import json
           import os
           import re
+          import subprocess
           import urllib.error
           import urllib.request
+          from datetime import datetime
           from pathlib import Path
 
           webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
@@ -550,6 +576,47 @@ jobs:
                   return f"{baseline_total / current_total:.2f}x"
               return "N/A"
 
+          def short_text(value: str, limit: int = 120) -> str:
+              value = " ".join(value.split())
+              if len(value) <= limit:
+                  return value
+              return value[: limit - 3].rstrip() + "..."
+
+          def first_line(value: str) -> str:
+              lines = value.splitlines()
+              return lines[0] if lines else ""
+
+          def format_commit_time(value: str) -> str:
+              value = value.strip()
+              if not value:
+                  return "unknown"
+              normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+              try:
+                  dt = datetime.fromisoformat(normalized)
+              except ValueError:
+                  return short_text(value, 19)
+              if dt.tzinfo is not None:
+                  dt = dt.astimezone()
+              return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+          def git_commit_time(ref: str) -> str:
+              if not ref:
+                  return ""
+              try:
+                  return subprocess.check_output(
+                      ["git", "show", "-s", "--format=%cI", ref],
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  ).strip()
+              except Exception:
+                  return ""
+
+          def current_commit_time() -> str:
+              timestamp = os.environ.get("HEAD_COMMIT_TIMESTAMP", "").strip()
+              if not timestamp:
+                  timestamp = git_commit_time("HEAD")
+              return format_commit_time(timestamp)
+
           perf = read_json("build/perf-ci/perf-report.json")
           delta = read_json("build/perf-ci/perf-delta.json")
           rows = perf.get("rows", []) if isinstance(perf.get("rows"), list) else []
@@ -582,7 +649,6 @@ jobs:
           stable = 0
           significant_ratio = 5.0
           significant_abs_sec = 0.01
-          slow_cases = []
           for row in delta_rows:
               delta_sec = row.get("delta_sec")
               delta_pct = row.get("delta_pct")
@@ -593,55 +659,51 @@ jobs:
                       fast += 1
                   else:
                       slow += 1
-                      slow_cases.append(row)
               else:
                   stable += 1
-          slow_cases.sort(key=lambda item: (item.get("delta_pct", 0), item.get("delta_sec", 0)), reverse=True)
 
           functional = os.environ.get("FUNCTIONAL_OUTCOME", "unknown")
           perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
           status = "PASS" if functional == "success" and perf_outcome == "success" else "FAIL"
           status_emoji = "✅" if status == "PASS" else "❌"
           sha = os.environ.get("SHA", "")
-          commit_title = os.environ.get("HEAD_COMMIT_MESSAGE", "").splitlines()[0]
+          commit_title = short_text(first_line(os.environ.get("HEAD_COMMIT_MESSAGE", "")))
 
           baseline_branch = delta.get("baseline_branch") or delta.get("baseline") or "unknown"
           baseline_sha = str(delta.get("baseline_commit_sha") or "")
-          baseline_title = str(delta.get("baseline_commit_title") or "")
-          baseline_commit = f"{baseline_branch} @ {baseline_sha[:7] or 'unknown'}"
+          baseline_timestamp = str(delta.get("baseline_commit_time") or "").strip()
+          if not baseline_timestamp:
+              baseline_timestamp = git_commit_time(baseline_sha)
+          baseline_time = format_commit_time(baseline_timestamp)
+          baseline_title = short_text(str(delta.get("baseline_commit_title") or ""))
+          baseline_commit = f"{baseline_branch} @ {baseline_sha[:7] or 'unknown'} 🕒 {baseline_time}"
           if baseline_title:
               baseline_commit += f" {baseline_title}"
           current_compile_total = delta.get("current_compiler_total")
           baseline_compile_total = delta.get("baseline_compiler_total")
 
           lines = [
-              f"{status_emoji} {os.environ.get('ACTOR', 'unknown')} 提交了 yoolang CI: {status}",
+              f"{status_emoji} 🚀 提交者：{os.environ.get('ACTOR', 'unknown')}",
+              "",
               f"🌿 branch: {os.environ.get('REF_NAME', 'unknown')}",
-              f"🔖 commit: {sha[:7] or 'unknown'} {commit_title}",
+              f"🔖 commit: {sha[:7] or 'unknown'} 🕒 {current_commit_time()}",
+              f"📄 {commit_title}",
               "",
-              f"🧪 功能测试(-O1): {fmt_status(functional)}",
-              f"📊 性能测试(-O1): {fmt_status(perf_outcome)}",
-              "",
-              "⚡ 编译器速度:",
-              f"🚀 当前 yoolang: {fmt_seconds(compiler_total_value)}",
-              f"🧱 GCC: {fmt_seconds(gcc_total_value)}, Clang++: {fmt_seconds(clang_total_value)}",
-              f"📐 yoolang/GCC 加速比: {fmt_speedup(gcc_total_value, compiler_total_value)}, yoolang/Clang++ 加速比: {fmt_speedup(clang_total_value, compiler_total_value)}",
+              f"🧪 功能测试: {fmt_status(functional)}",
+              f"📊 性能测试: {fmt_status(perf_outcome)}",
               "",
               "📈 基线对比:",
-              f"📍 基线: {baseline_commit}",
               f"⏱️ 当前 compile 总时间: {fmt_seconds(current_compile_total if isinstance(current_compile_total, (int, float)) else None)}",
               f"⏱️ 基线 compile 总时间: {fmt_seconds(baseline_compile_total if isinstance(baseline_compile_total, (int, float)) else None)}",
               f"整体: {fmt_overall(delta.get('total_delta_pct'))}, 加速比 {fmt_baseline_speedup(delta)}",
-              f"case: 🚀 {fast} 快 / ⚠️ {slow} 慢 / ✅ {stable} 持平 / ❌ {perf.get('failures', 0)} 失败",
+              "",
+              f"📍 基线: {baseline_commit}",
+              f"⏱️ case: 🚀 {fast} 快 / ⚠️ {slow} 慢 / ✅ {stable} 持平 / ❌ {perf.get('failures', 0)} 失败",
+              "",
+              "⚡ 编译器速度:",
+              f"yoolang {fmt_seconds(compiler_total_value)} / GCC {fmt_seconds(gcc_total_value)} / Clang++ {fmt_seconds(clang_total_value)}",
+              f"📐 加速比: GCC {fmt_speedup(gcc_total_value, compiler_total_value)} / Clang++ {fmt_speedup(clang_total_value, compiler_total_value)}",
           ]
-
-          if slow_cases:
-              lines.extend(["", "⚠️ 最慢变化:"])
-              for row in slow_cases[:2]:
-                  case = str(row.get("case", "unknown")).rsplit("/", 1)[-1]
-                  lines.append(f"{case} ⚠️ 慢 {float(row.get('delta_pct', 0)):.1f}%")
-
-          lines.extend(["", f"🔗 run: {os.environ.get('RUN_URL', '')}"])
 
           message = "\n".join(lines)
           if len(message) > 1900:

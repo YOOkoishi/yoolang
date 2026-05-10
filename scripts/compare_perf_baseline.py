@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-run-id", default="")
     parser.add_argument("--baseline-run-url", default="")
     parser.add_argument("--baseline-commit-sha", default="")
+    parser.add_argument("--baseline-commit-time", default="")
     parser.add_argument("--baseline-commit-title", default="")
     parser.add_argument("--baseline-commit-author", default="")
     return parser.parse_args()
@@ -94,6 +95,7 @@ def baseline_meta(args: argparse.Namespace) -> dict[str, str]:
         "run_id": args.baseline_run_id.strip(),
         "run_url": args.baseline_run_url.strip(),
         "commit_sha": args.baseline_commit_sha.strip(),
+        "commit_time": args.baseline_commit_time.strip(),
         "commit_title": args.baseline_commit_title.strip(),
         "commit_author": args.baseline_commit_author.strip(),
     }
@@ -134,6 +136,7 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
         "baseline_run_id": args.baseline_run_id,
         "baseline_run_url": args.baseline_run_url,
         "baseline_commit_sha": args.baseline_commit_sha,
+        "baseline_commit_time": args.baseline_commit_time,
         "baseline_commit_title": args.baseline_commit_title,
         "baseline_commit_author": args.baseline_commit_author,
         "baseline_meta": baseline_meta(args),
@@ -274,6 +277,7 @@ def main() -> int:
         "baseline_run_id": args.baseline_run_id,
         "baseline_run_url": args.baseline_run_url,
         "baseline_commit_sha": args.baseline_commit_sha,
+        "baseline_commit_time": args.baseline_commit_time,
         "baseline_commit_title": args.baseline_commit_title,
         "baseline_commit_author": args.baseline_commit_author,
         "baseline_meta": baseline_meta(args),
