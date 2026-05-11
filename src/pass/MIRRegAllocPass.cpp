@@ -30,6 +30,8 @@ struct AllocationAttempt {
     std::set<VRegId> spills;
 };
 
+using RematMap = std::map<VRegId, mir::MachineInstr>;
+
 bool is_virtual_of_class(const mir::Register &reg, mir::RegisterClass reg_class) {
     return reg.is_virtual() && reg.reg_class == reg_class;
 }
@@ -132,6 +134,11 @@ std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineIns
     return out;
 }
 
+bool is_rematerializable_opcode(mir::Opcode opcode) {
+    return opcode == mir::Opcode::LoadImm || opcode == mir::Opcode::LoadGlobalAddr ||
+           opcode == mir::Opcode::LoadStackAddr;
+}
+
 class RegAllocator {
   public:
     void run(mir::MachineFunction &function) {
@@ -144,7 +151,9 @@ class RegAllocator {
             std::set<VRegId> spills;
 
             for (auto reg_class : {mir::RegisterClass::GPR, mir::RegisterClass::FPR32}) {
-                auto attempt = allocate_class(function, live, reg_class);
+                auto remat = collect_rematerializable_defs(function);
+                auto spill_costs = compute_spill_costs(function, reg_class, remat);
+                auto attempt = allocate_class(function, live, reg_class, spill_costs);
                 colors.insert(attempt.colors.begin(), attempt.colors.end());
                 spills.insert(attempt.spills.begin(), attempt.spills.end());
             }
@@ -155,7 +164,7 @@ class RegAllocator {
                 verify_no_virtual_regs(function);
                 return;
             }
-            rewrite_spills(function, spills);
+            rewrite_spills(function, spills, collect_rematerializable_defs(function));
         }
         throw std::runtime_error("register allocation did not converge after spill rewriting");
     }
@@ -213,10 +222,116 @@ class RegAllocator {
         return info;
     }
 
+    RematMap collect_rematerializable_defs(const mir::MachineFunction &function) const {
+        std::map<VRegId, unsigned> def_counts;
+        RematMap candidates;
+        std::set<VRegId> rejected;
+
+        for (const auto &block_ptr : function.blocks()) {
+            for (const auto &instr : block_ptr->instructions()) {
+                const auto defs = instr.defs();
+                for (const auto &def : defs) {
+                    if (def.is_virtual()) {
+                        ++def_counts[def.id];
+                    }
+                }
+
+                if (defs.size() != 1 || !defs[0].is_virtual() ||
+                    !is_rematerializable_opcode(instr.opcode())) {
+                    for (const auto &def : defs) {
+                        if (def.is_virtual()) {
+                            rejected.insert(def.id);
+                        }
+                    }
+                    continue;
+                }
+                candidates[defs[0].id] = instr;
+            }
+        }
+
+        RematMap out;
+        for (const auto &[id, instr] : candidates) {
+            if (def_counts[id] == 1 && rejected.find(id) == rejected.end()) {
+                out[id] = instr;
+            }
+        }
+        return out;
+    }
+
+    std::map<mir::MachineBasicBlock *, unsigned>
+    estimate_loop_depths(const mir::MachineFunction &function) const {
+        std::map<mir::MachineBasicBlock *, unsigned> depth;
+        std::map<mir::MachineBasicBlock *, std::size_t> index;
+        for (std::size_t i = 0; i < function.blocks().size(); ++i) {
+            auto *block = function.blocks()[i].get();
+            depth[block] = 0;
+            index[block] = i;
+        }
+
+        for (std::size_t i = 0; i < function.blocks().size(); ++i) {
+            auto *block = function.blocks()[i].get();
+            for (auto *succ : block->successors()) {
+                auto found = index.find(succ);
+                if (found == index.end() || found->second > i) {
+                    continue;
+                }
+                for (std::size_t j = found->second; j <= i; ++j) {
+                    ++depth[function.blocks()[j].get()];
+                }
+            }
+        }
+        return depth;
+    }
+
+    std::map<VRegId, double> compute_spill_costs(const mir::MachineFunction &function,
+                                                 mir::RegisterClass reg_class,
+                                                 const RematMap &remat) const {
+        auto loop_depths = estimate_loop_depths(function);
+        std::map<VRegId, double> costs;
+
+        for (const auto &reg : function.regs().virtual_registers()) {
+            if (reg.reg_class == reg_class) {
+                costs[reg.id] = 0.1;
+            }
+        }
+
+        for (const auto &block_ptr : function.blocks()) {
+            double weight = 1.0;
+            auto found_depth = loop_depths.find(block_ptr.get());
+            unsigned depth = found_depth == loop_depths.end() ? 0 : found_depth->second;
+            for (unsigned i = 0; i < depth; ++i) {
+                weight *= 10.0;
+            }
+
+            for (const auto &instr : block_ptr->instructions()) {
+                for (const auto &operand : instr.operands()) {
+                    if (!operand.is_reg() || !operand.reg_value().is_virtual() ||
+                        operand.reg_value().reg_class != reg_class) {
+                        continue;
+                    }
+                    if (operand.is_use()) {
+                        costs[operand.reg_value().id] += weight;
+                    }
+                    if (operand.is_def()) {
+                        costs[operand.reg_value().id] += weight * 0.5;
+                    }
+                }
+            }
+        }
+
+        for (auto &[id, cost] : costs) {
+            if (remat.find(id) != remat.end()) {
+                cost = cost * 0.05 + 0.05;
+            }
+        }
+
+        return costs;
+    }
+
     AllocationAttempt allocate_class(
         mir::MachineFunction &function,
         const std::map<mir::MachineBasicBlock *, BlockLiveInfo> &live_info,
-        mir::RegisterClass reg_class) {
+        mir::RegisterClass reg_class, const std::map<VRegId, double> &spill_costs) {
         std::set<VRegId> nodes;
         std::map<VRegId, std::set<VRegId>> graph;
         std::map<VRegId, std::set<std::string>> forbidden;
@@ -299,12 +414,13 @@ class RegAllocator {
             }
         }
 
-        return color_graph(nodes, graph, forbidden, reg_class);
+        return color_graph(nodes, graph, forbidden, spill_costs, reg_class);
     }
 
     AllocationAttempt color_graph(const std::set<VRegId> &nodes,
                                   const std::map<VRegId, std::set<VRegId>> &graph,
                                   const std::map<VRegId, std::set<std::string>> &forbidden,
+                                  const std::map<VRegId, double> &spill_costs,
                                   mir::RegisterClass reg_class) {
         AllocationAttempt out;
         auto colors = allocatable(reg_class);
@@ -327,8 +443,13 @@ class RegAllocator {
                 }
             }
             if (picked == remaining.end()) {
-                picked = std::max_element(remaining.begin(), remaining.end(), [&](auto lhs, auto rhs) {
-                    return graph.at(lhs).size() < graph.at(rhs).size();
+                auto spill_priority = [&](VRegId id) {
+                    auto found_cost = spill_costs.find(id);
+                    const double cost = found_cost == spill_costs.end() ? 1.0 : found_cost->second;
+                    return cost / static_cast<double>(graph.at(id).size() + 1);
+                };
+                picked = std::min_element(remaining.begin(), remaining.end(), [&](auto lhs, auto rhs) {
+                    return spill_priority(lhs) < spill_priority(rhs);
                 });
             }
             stack.push_back(*picked);
@@ -367,11 +488,35 @@ class RegAllocator {
         return out;
     }
 
-    void rewrite_spills(mir::MachineFunction &function, const std::set<VRegId> &spills) {
+    mir::MachineInstr rematerialize_as(const mir::MachineInstr &instr, mir::Register dst) const {
+        auto operands = instr.operands();
+        for (auto &operand : operands) {
+            if (operand.is_reg() && operand.is_def()) {
+                operand.set_reg(dst);
+            }
+        }
+        return mir::MachineInstr(instr.opcode(), std::move(operands));
+    }
+
+    bool is_original_remat_def(const mir::MachineInstr &instr, VRegId id,
+                               const RematMap &remat) const {
+        auto found = remat.find(id);
+        if (found == remat.end() || instr.opcode() != found->second.opcode()) {
+            return false;
+        }
+        const auto defs = instr.defs();
+        return defs.size() == 1 && defs[0].is_virtual() && defs[0].id == id;
+    }
+
+    void rewrite_spills(mir::MachineFunction &function, const std::set<VRegId> &spills,
+                        const RematMap &remat) {
         std::map<VRegId, int> slots;
         for (auto id : spills) {
             const auto *reg = function.regs().virtual_register(id);
             if (reg == nullptr) {
+                continue;
+            }
+            if (remat.find(id) != remat.end()) {
                 continue;
             }
             slots[id] = function.add_stack_slot("spill.v" + std::to_string(id),
@@ -382,6 +527,18 @@ class RegAllocator {
         for (auto &block_ptr : function.blocks()) {
             std::vector<mir::MachineInstr> rewritten;
             for (auto instr : block_ptr->instructions()) {
+                bool skip_instr = false;
+                for (const auto &def : instr.defs()) {
+                    if (def.is_virtual() && spills.find(def.id) != spills.end() &&
+                        is_original_remat_def(instr, def.id, remat)) {
+                        skip_instr = true;
+                        break;
+                    }
+                }
+                if (skip_instr) {
+                    continue;
+                }
+
                 std::vector<mir::MachineInstr> before;
                 std::vector<mir::MachineInstr> after;
                 for (auto &operand : instr.operands()) {
@@ -389,10 +546,11 @@ class RegAllocator {
                         continue;
                     }
                     auto id = operand.reg_value().id;
-                    auto found_slot = slots.find(id);
-                    if (found_slot == slots.end()) {
+                    if (spills.find(id) == spills.end()) {
                         continue;
                     }
+                    auto found_slot = slots.find(id);
+                    auto found_remat = remat.find(id);
                     const auto *old_reg = function.regs().virtual_register(id);
                     if (old_reg == nullptr) {
                         continue;
@@ -401,15 +559,25 @@ class RegAllocator {
                     auto old_value_type = old_reg->value_type;
                     auto temp = function.regs().create_virtual(old_reg_class, old_value_type);
                     if (operand.is_use()) {
-                        before.emplace_back(
-                            mir::Opcode::LoadSlot,
-                            std::vector<mir::MachineOperand>{
-                                mir::MachineOperand::reg_def(temp),
-                                mir::MachineOperand::slot(found_slot->second),
-                                mir::MachineOperand::type(old_value_type)});
+                        if (found_remat != remat.end()) {
+                            before.push_back(rematerialize_as(found_remat->second, temp));
+                        } else {
+                            if (found_slot == slots.end()) {
+                                continue;
+                            }
+                            before.emplace_back(
+                                mir::Opcode::LoadSlot,
+                                std::vector<mir::MachineOperand>{
+                                    mir::MachineOperand::reg_def(temp),
+                                    mir::MachineOperand::slot(found_slot->second),
+                                    mir::MachineOperand::type(old_value_type)});
+                        }
                     }
                     operand.set_reg(temp);
                     if (operand.is_def()) {
+                        if (found_slot == slots.end()) {
+                            continue;
+                        }
                         after.emplace_back(
                             mir::Opcode::StoreSlot,
                             std::vector<mir::MachineOperand>{

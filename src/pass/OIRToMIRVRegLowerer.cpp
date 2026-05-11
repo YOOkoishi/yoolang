@@ -94,6 +94,29 @@ class VRegLowerer final {
         return current_function_->regs().create_virtual(reg_class_for(type), type);
     }
 
+    bool fits_simm12(std::int64_t value) const {
+        return value >= -2048 && value <= 2047;
+    }
+
+    bool neg_fits_simm12(std::int64_t value) const {
+        return value >= -2047 && value <= 2048;
+    }
+
+    std::uint64_t abs_u64(std::int64_t value) const {
+        if (value >= 0) {
+            return static_cast<std::uint64_t>(value);
+        }
+        return static_cast<std::uint64_t>(-(value + 1)) + 1;
+    }
+
+    const oir::ConstantInt *constant_int(const oir::Value *value) const {
+        return dynamic_cast<const oir::ConstantInt *>(value);
+    }
+
+    mir::Register zero_reg() const {
+        return phys_gpr("zero");
+    }
+
     void lower_function(const oir::Function &function, mir::MachineFunction &out) {
         current_function_ = &out;
         value_regs_.clear();
@@ -377,23 +400,194 @@ class VRegLowerer final {
         }
 
         if (constant_offset != 0) {
-            auto offset = create_vreg(mir::ValueType::I32);
             auto next = create_vreg(mir::ValueType::Ptr);
-            emit(mir::Opcode::LoadImm,
-                 {mir::MachineOperand::reg_def(offset), mir::MachineOperand::imm(constant_offset)});
-            emit(mir::Opcode::Add,
-                 {mir::MachineOperand::reg_def(next), mir::MachineOperand::reg_use(acc),
-                  mir::MachineOperand::reg_use(offset)});
+            if (fits_simm12(constant_offset)) {
+                emit(mir::Opcode::AddI,
+                     {mir::MachineOperand::reg_def(next), mir::MachineOperand::reg_use(acc),
+                      mir::MachineOperand::imm(constant_offset)});
+            } else {
+                auto offset = create_vreg(mir::ValueType::I32);
+                emit(mir::Opcode::LoadImm,
+                     {mir::MachineOperand::reg_def(offset),
+                      mir::MachineOperand::imm(constant_offset)});
+                emit(mir::Opcode::Add,
+                     {mir::MachineOperand::reg_def(next), mir::MachineOperand::reg_use(acc),
+                      mir::MachineOperand::reg_use(offset)});
+            }
             acc = next;
         }
 
         emit_move(dst, acc);
     }
 
+    bool try_lower_const_mul(mir::Register dst, mir::Register value, std::int64_t constant) {
+        if (constant == 0) {
+            emit_move(dst, zero_reg());
+            return true;
+        }
+        if (constant == 1) {
+            emit_move(dst, value);
+            return true;
+        }
+        if (constant == -1) {
+            emit(mir::Opcode::SubW,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(zero_reg()),
+                  mir::MachineOperand::reg_use(value)});
+            return true;
+        }
+
+        auto magnitude = abs_u64(constant);
+        if (is_power_of_two(magnitude) && log2_u64(magnitude) < 32) {
+            auto shifted = constant < 0 ? create_vreg(mir::ValueType::I32) : dst;
+            emit(mir::Opcode::SllIW,
+                 {mir::MachineOperand::reg_def(shifted), mir::MachineOperand::reg_use(value),
+                  mir::MachineOperand::imm(log2_u64(magnitude))});
+            if (constant < 0) {
+                emit(mir::Opcode::SubW,
+                     {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(zero_reg()),
+                      mir::MachineOperand::reg_use(shifted)});
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    void emit_signed_div_pow2(mir::Register dst, mir::Register value, unsigned shift,
+                              bool negate_result) {
+        auto sign = create_vreg(mir::ValueType::I32);
+        emit(mir::Opcode::SraIW,
+             {mir::MachineOperand::reg_def(sign), mir::MachineOperand::reg_use(value),
+              mir::MachineOperand::imm(31)});
+        emit(mir::Opcode::SrliW,
+             {mir::MachineOperand::reg_def(sign), mir::MachineOperand::reg_use(sign),
+              mir::MachineOperand::imm(32 - shift)});
+
+        auto adjusted = create_vreg(mir::ValueType::I32);
+        emit(mir::Opcode::AddW,
+             {mir::MachineOperand::reg_def(adjusted), mir::MachineOperand::reg_use(value),
+              mir::MachineOperand::reg_use(sign)});
+
+        auto quotient = negate_result ? create_vreg(mir::ValueType::I32) : dst;
+        emit(mir::Opcode::SraIW,
+             {mir::MachineOperand::reg_def(quotient), mir::MachineOperand::reg_use(adjusted),
+              mir::MachineOperand::imm(shift)});
+        if (negate_result) {
+            emit(mir::Opcode::SubW,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(zero_reg()),
+                  mir::MachineOperand::reg_use(quotient)});
+        }
+    }
+
+    bool try_lower_const_div(mir::Register dst, mir::Register value, std::int64_t constant) {
+        if (constant == 1) {
+            emit_move(dst, value);
+            return true;
+        }
+        if (constant == -1) {
+            emit(mir::Opcode::SubW,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(zero_reg()),
+                  mir::MachineOperand::reg_use(value)});
+            return true;
+        }
+
+        auto magnitude = abs_u64(constant);
+        if (is_power_of_two(magnitude)) {
+            auto shift = log2_u64(magnitude);
+            if (shift > 0 && shift < 31) {
+                emit_signed_div_pow2(dst, value, shift, constant < 0);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool try_lower_const_rem(mir::Register dst, mir::Register value, std::int64_t constant) {
+        if (constant == 1 || constant == -1) {
+            emit_move(dst, zero_reg());
+            return true;
+        }
+
+        auto magnitude = abs_u64(constant);
+        if (is_power_of_two(magnitude)) {
+            auto shift = log2_u64(magnitude);
+            if (shift > 0 && shift < 31) {
+                auto quotient = create_vreg(mir::ValueType::I32);
+                emit_signed_div_pow2(quotient, value, shift, false);
+                auto product = create_vreg(mir::ValueType::I32);
+                emit(mir::Opcode::SllIW,
+                     {mir::MachineOperand::reg_def(product),
+                      mir::MachineOperand::reg_use(quotient), mir::MachineOperand::imm(shift)});
+                emit(mir::Opcode::SubW,
+                     {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(value),
+                      mir::MachineOperand::reg_use(product)});
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void lower_int_binary(const oir::BinaryInst &inst) {
+        auto dst = value_regs_.at(&inst);
+
+        auto *lhs_const = constant_int(inst.lhs());
+        auto *rhs_const = constant_int(inst.rhs());
+
+        if (inst.op() == oir::Instruction::OpID::Add) {
+            if (rhs_const != nullptr && fits_simm12(rhs_const->value())) {
+                emit(mir::Opcode::AddIW,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.lhs())),
+                      mir::MachineOperand::imm(rhs_const->value())});
+                return;
+            }
+            if (lhs_const != nullptr && fits_simm12(lhs_const->value())) {
+                emit(mir::Opcode::AddIW,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.rhs())),
+                      mir::MachineOperand::imm(lhs_const->value())});
+                return;
+            }
+        } else if (inst.op() == oir::Instruction::OpID::Sub) {
+            if (rhs_const != nullptr && neg_fits_simm12(rhs_const->value())) {
+                emit(mir::Opcode::AddIW,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.lhs())),
+                      mir::MachineOperand::imm(0 - rhs_const->value())});
+                return;
+            }
+            if (lhs_const != nullptr && lhs_const->value() == 0) {
+                emit(mir::Opcode::SubW,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(zero_reg()),
+                      mir::MachineOperand::reg_use(value_reg(inst.rhs()))});
+                return;
+            }
+        } else if (inst.op() == oir::Instruction::OpID::Mul) {
+            if (rhs_const != nullptr && try_lower_const_mul(dst, value_reg(inst.lhs()),
+                                                            rhs_const->value())) {
+                return;
+            }
+            if (lhs_const != nullptr && try_lower_const_mul(dst, value_reg(inst.rhs()),
+                                                            lhs_const->value())) {
+                return;
+            }
+        } else if (inst.op() == oir::Instruction::OpID::SDiv) {
+            if (rhs_const != nullptr &&
+                try_lower_const_div(dst, value_reg(inst.lhs()), rhs_const->value())) {
+                return;
+            }
+        } else if (inst.op() == oir::Instruction::OpID::SRem) {
+            if (rhs_const != nullptr &&
+                try_lower_const_rem(dst, value_reg(inst.lhs()), rhs_const->value())) {
+                return;
+            }
+        }
+
         auto lhs = value_reg(inst.lhs());
         auto rhs = value_reg(inst.rhs());
-        auto dst = value_regs_.at(&inst);
         mir::Opcode opcode = mir::Opcode::AddW;
         switch (inst.op()) {
         case oir::Instruction::OpID::Add:
@@ -690,6 +884,9 @@ class VRegLowerer final {
 
     mir::Register value_reg(oir::Value *value) {
         if (auto *constant = dynamic_cast<oir::ConstantInt *>(value)) {
+            if (constant->value() == 0) {
+                return zero_reg();
+            }
             auto reg = create_vreg(type_info(value->type()).value_type);
             emit(mir::Opcode::LoadImm,
                  {mir::MachineOperand::reg_def(reg), mir::MachineOperand::imm(constant->value())});
@@ -704,14 +901,12 @@ class VRegLowerer final {
         if (dynamic_cast<oir::ConstantZero *>(value) != nullptr ||
             dynamic_cast<oir::UndefValue *>(value) != nullptr) {
             auto type = type_info(value->type()).value_type;
-            auto reg = create_vreg(type);
-            if (type == mir::ValueType::F32) {
-                emit(mir::Opcode::LoadFloatImm,
-                     {mir::MachineOperand::reg_def(reg), mir::MachineOperand::float_imm(0.0F)});
-            } else {
-                emit(mir::Opcode::LoadImm,
-                     {mir::MachineOperand::reg_def(reg), mir::MachineOperand::imm(0)});
+            if (type != mir::ValueType::F32) {
+                return zero_reg();
             }
+            auto reg = create_vreg(type);
+            emit(mir::Opcode::LoadFloatImm,
+                 {mir::MachineOperand::reg_def(reg), mir::MachineOperand::float_imm(0.0F)});
             return reg;
         }
         if (auto *global = dynamic_cast<oir::GlobalVariable *>(value)) {

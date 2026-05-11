@@ -26,8 +26,10 @@ class AsmPrinter final {
                         ValueType type);
     void emit_store_slot(const MachineFunction &function, const std::string &reg, int slot,
                          ValueType type);
-    void emit_load_mem(const std::string &reg, const std::string &addr_reg, ValueType type);
-    void emit_store_mem(const std::string &reg, const std::string &addr_reg, ValueType type);
+    void emit_load_mem(const std::string &reg, const std::string &addr_reg, std::int64_t offset,
+                       ValueType type);
+    void emit_store_mem(const std::string &reg, const std::string &addr_reg, std::int64_t offset,
+                        ValueType type);
     void emit_store_outgoing_arg(const std::string &reg, std::int64_t offset, ValueType type);
     void emit_load_incoming_arg(const MachineFunction &function, const std::string &reg,
                                 std::int64_t offset, ValueType type);

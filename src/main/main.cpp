@@ -53,7 +53,7 @@ void print_help(const char *program, std::ostream &out) {
         << "  -h, --help       Show this help message\n"
         << "  -S, --emit-asm   Lower to RISC-V assembly (default)\n"
         << "  -o <file>        Write output to <file> instead of stdout\n"
-        << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR peephole "
+        << "  -O1/-O2/-O3      Enable OIR optimizations, vreg MIR lowering, RA, and MIR peephole "
            "optimizations\n"
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
@@ -96,8 +96,8 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
             options.output_path = argv[++i];
             continue;
         }
-        if (arg == "-O1") {
-            options.opt_level = 1;
+        if (arg == "-O1" || arg == "-O2" || arg == "-O3") {
+            options.opt_level = arg[2] - '0';
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {

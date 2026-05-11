@@ -26,5 +26,5 @@ int main() {
 // MIR: edge.
 
 // ASM-LABEL: choose:
-// ASM: bnez
+// ASM: bge
 // ASM: ret

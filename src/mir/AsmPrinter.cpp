@@ -146,10 +146,18 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         emit_store_slot(function, ops[1].string_value(), ops[0].slot_id(), ops[2].type_value());
         break;
     case Opcode::LoadMem:
-        emit_load_mem(ops[0].string_value(), ops[1].string_value(), ops[2].type_value());
+        emit_load_mem(ops[0].string_value(), ops[1].string_value(), 0, ops[2].type_value());
         break;
     case Opcode::StoreMem:
-        emit_store_mem(ops[1].string_value(), ops[0].string_value(), ops[2].type_value());
+        emit_store_mem(ops[1].string_value(), ops[0].string_value(), 0, ops[2].type_value());
+        break;
+    case Opcode::LoadMemOffset:
+        emit_load_mem(ops[0].string_value(), ops[1].string_value(), ops[2].int_value(),
+                      ops[3].type_value());
+        break;
+    case Opcode::StoreMemOffset:
+        emit_store_mem(ops[1].string_value(), ops[0].string_value(), ops[2].int_value(),
+                       ops[3].type_value());
         break;
     case Opcode::MemZero:
         emit_memzero_loop(ops[0].string_value(), static_cast<std::uint64_t>(ops[1].int_value()));
@@ -167,6 +175,14 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
     case Opcode::AddW:
         out_ << "\taddw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].string_value() << "\n";
+        break;
+    case Opcode::AddI:
+        out_ << "\taddi " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
+        break;
+    case Opcode::AddIW:
+        out_ << "\taddiw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
         break;
     case Opcode::SubW:
         out_ << "\tsubw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
@@ -194,6 +210,14 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         break;
     case Opcode::SllI:
         out_ << "\tslli " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
+        break;
+    case Opcode::SllIW:
+        out_ << "\tslliw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
+        break;
+    case Opcode::SraIW:
+        out_ << "\tsraiw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";
         break;
     case Opcode::SrliW:
@@ -268,6 +292,26 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\tbnez " << ops[0].string_value() << ", "
              << label_for(function.name(), ops[1].string_value()) << "\n";
         break;
+    case Opcode::BranchZero:
+        out_ << "\tbeqz " << ops[0].string_value() << ", "
+             << label_for(function.name(), ops[1].string_value()) << "\n";
+        break;
+    case Opcode::BranchEq:
+        out_ << "\tbeq " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << label_for(function.name(), ops[2].string_value()) << "\n";
+        break;
+    case Opcode::BranchNe:
+        out_ << "\tbne " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << label_for(function.name(), ops[2].string_value()) << "\n";
+        break;
+    case Opcode::BranchLT:
+        out_ << "\tblt " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << label_for(function.name(), ops[2].string_value()) << "\n";
+        break;
+    case Opcode::BranchGE:
+        out_ << "\tbge " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << label_for(function.name(), ops[2].string_value()) << "\n";
+        break;
     case Opcode::Jump:
         if (ops[0].kind() == OperandKind::Block) {
             out_ << "\tj " << label_for(function.name(), ops[0].string_value()) << "\n";
@@ -323,24 +367,24 @@ void AsmPrinter::emit_store_slot(const MachineFunction &function, const std::str
 }
 
 void AsmPrinter::emit_load_mem(const std::string &reg, const std::string &addr_reg,
-                               ValueType type) {
+                               std::int64_t offset, ValueType type) {
     if (is_float_type(type)) {
-        out_ << "\tflw " << reg << ", 0(" << addr_reg << ")\n";
+        emit_float_slot_access("flw", reg, addr_reg, offset);
     } else if (type == ValueType::Ptr) {
-        out_ << "\tld " << reg << ", 0(" << addr_reg << ")\n";
+        emit_int_slot_access("ld", reg, addr_reg, offset);
     } else {
-        out_ << "\tlw " << reg << ", 0(" << addr_reg << ")\n";
+        emit_int_slot_access("lw", reg, addr_reg, offset);
     }
 }
 
 void AsmPrinter::emit_store_mem(const std::string &reg, const std::string &addr_reg,
-                                ValueType type) {
+                                std::int64_t offset, ValueType type) {
     if (is_float_type(type)) {
-        out_ << "\tfsw " << reg << ", 0(" << addr_reg << ")\n";
+        emit_float_slot_access("fsw", reg, addr_reg, offset);
     } else if (type == ValueType::Ptr) {
-        out_ << "\tsd " << reg << ", 0(" << addr_reg << ")\n";
+        emit_int_slot_access("sd", reg, addr_reg, offset);
     } else {
-        out_ << "\tsw " << reg << ", 0(" << addr_reg << ")\n";
+        emit_int_slot_access("sw", reg, addr_reg, offset);
     }
 }
 

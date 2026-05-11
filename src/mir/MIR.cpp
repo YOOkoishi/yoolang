@@ -19,6 +19,35 @@ bool contains_reg(const std::vector<Register> &regs, const Register &reg) {
     return std::find(regs.begin(), regs.end(), reg) != regs.end();
 }
 
+bool is_conditional_branch(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::BranchNonZero:
+    case Opcode::BranchZero:
+    case Opcode::BranchEq:
+    case Opcode::BranchNe:
+    case Opcode::BranchLT:
+    case Opcode::BranchGE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::size_t branch_target_operand_index(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::BranchNonZero:
+    case Opcode::BranchZero:
+        return 1;
+    case Opcode::BranchEq:
+    case Opcode::BranchNe:
+    case Opcode::BranchLT:
+    case Opcode::BranchGE:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
 } // namespace
 
 Register Register::virtual_reg(std::uint32_t id, RegisterClass reg_class,
@@ -518,9 +547,11 @@ void MachineFunction::rebuild_cfg() {
         }
         const auto &last = instructions.back();
 
-        if (last.opcode() == Opcode::BranchNonZero) {
-            if (last.operands().size() >= 2 && last.operands()[1].kind() == OperandKind::Block) {
-                add_block_successor(last.operands()[1]);
+        if (is_conditional_branch(last.opcode())) {
+            const auto target_index = branch_target_operand_index(last.opcode());
+            if (last.operands().size() > target_index &&
+                last.operands()[target_index].kind() == OperandKind::Block) {
+                add_block_successor(last.operands()[target_index]);
             }
             add_fallthrough_successor();
             continue;
@@ -531,8 +562,10 @@ void MachineFunction::rebuild_cfg() {
             }
             if (instructions.size() >= 2) {
                 const auto &prev = instructions[instructions.size() - 2];
-                if (prev.opcode() == Opcode::BranchNonZero && prev.operands().size() >= 2) {
-                    add_block_successor(prev.operands()[1]);
+                const auto target_index = branch_target_operand_index(prev.opcode());
+                if (is_conditional_branch(prev.opcode()) &&
+                    prev.operands().size() > target_index) {
+                    add_block_successor(prev.operands()[target_index]);
                 }
             }
             continue;
@@ -540,9 +573,11 @@ void MachineFunction::rebuild_cfg() {
 
         if (instructions.size() >= 2) {
             const auto &prev = instructions[instructions.size() - 2];
-            if (prev.opcode() == Opcode::BranchNonZero && prev.operands().size() >= 2 &&
-                prev.operands()[1].kind() == OperandKind::Block) {
-                add_block_successor(prev.operands()[1]);
+            const auto target_index = branch_target_operand_index(prev.opcode());
+            if (is_conditional_branch(prev.opcode()) &&
+                prev.operands().size() > target_index &&
+                prev.operands()[target_index].kind() == OperandKind::Block) {
+                add_block_successor(prev.operands()[target_index]);
             }
         }
         add_fallthrough_successor();
@@ -677,6 +712,10 @@ const char *opcode_name(Opcode opcode) {
         return "LOAD_MEM";
     case Opcode::StoreMem:
         return "STORE_MEM";
+    case Opcode::LoadMemOffset:
+        return "LOAD_MEM_OFF";
+    case Opcode::StoreMemOffset:
+        return "STORE_MEM_OFF";
     case Opcode::MemZero:
         return "MEMZERO";
     case Opcode::Move:
@@ -687,6 +726,10 @@ const char *opcode_name(Opcode opcode) {
         return "ADD";
     case Opcode::AddW:
         return "ADDW";
+    case Opcode::AddI:
+        return "ADDI";
+    case Opcode::AddIW:
+        return "ADDIW";
     case Opcode::SubW:
         return "SUBW";
     case Opcode::Mul:
@@ -701,6 +744,10 @@ const char *opcode_name(Opcode opcode) {
         return "AND";
     case Opcode::SllI:
         return "SLLI";
+    case Opcode::SllIW:
+        return "SLLIW";
+    case Opcode::SraIW:
+        return "SRAIW";
     case Opcode::SrliW:
         return "SRLIW";
     case Opcode::Xor:
@@ -739,6 +786,16 @@ const char *opcode_name(Opcode opcode) {
         return "LOAD_IN_ARG";
     case Opcode::BranchNonZero:
         return "BNEZ";
+    case Opcode::BranchZero:
+        return "BEQZ";
+    case Opcode::BranchEq:
+        return "BEQ";
+    case Opcode::BranchNe:
+        return "BNE";
+    case Opcode::BranchLT:
+        return "BLT";
+    case Opcode::BranchGE:
+        return "BGE";
     case Opcode::Jump:
         return "J";
     case Opcode::Call:

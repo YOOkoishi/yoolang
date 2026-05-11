@@ -76,10 +76,32 @@ class Verifier {
         case Opcode::StoreMem:
             require(ops.size() >= 3 && ops[0].is_reg() && ops[1].is_reg(), function, block,
                     instr, "malformed memory instruction");
+            require(ops[2].kind() == OperandKind::Type, function, block, instr,
+                    "memory instruction missing type operand");
+            break;
+        case Opcode::LoadMemOffset:
+        case Opcode::StoreMemOffset:
+            require(ops.size() >= 4 && ops[0].is_reg() && ops[1].is_reg() &&
+                        ops[2].kind() == OperandKind::Imm,
+                    function, block, instr, "malformed offset memory instruction");
+            require(ops[3].kind() == OperandKind::Type, function, block, instr,
+                    "offset memory instruction missing type operand");
             break;
         case Opcode::BranchNonZero:
             require(ops.size() >= 2 && ops[0].is_reg() && ops[1].kind() == OperandKind::Block,
                     function, block, instr, "malformed BNEZ");
+            break;
+        case Opcode::BranchZero:
+            require(ops.size() >= 2 && ops[0].is_reg() && ops[1].kind() == OperandKind::Block,
+                    function, block, instr, "malformed BEQZ");
+            break;
+        case Opcode::BranchEq:
+        case Opcode::BranchNe:
+        case Opcode::BranchLT:
+        case Opcode::BranchGE:
+            require(ops.size() >= 3 && ops[0].is_reg() && ops[1].is_reg() &&
+                        ops[2].kind() == OperandKind::Block,
+                    function, block, instr, "malformed binary branch");
             break;
         case Opcode::Jump:
             require(!ops.empty(), function, block, instr, "malformed J");
