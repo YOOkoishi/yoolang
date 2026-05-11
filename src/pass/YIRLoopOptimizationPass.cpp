@@ -5,6 +5,7 @@
 #include "../../include/yir/YIRLoopAnalysis.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <unordered_map>
@@ -14,8 +15,11 @@ namespace pass {
 namespace {
 
 using ValueMap = std::unordered_map<const yir::Value *, yir::Value *>;
+using ConstI32Map = std::unordered_map<const yir::Value *, std::int64_t>;
 using ValueSet = std::unordered_set<const yir::Value *>;
 using OpList = yir::Region::OpList;
+
+bool clone_region(const yir::Region &src, yir::Region &dst, const ValueMap &map);
 
 yir::Value *map_value(yir::Value *value, const ValueMap &map) {
     auto found = map.find(value);
@@ -132,6 +136,39 @@ std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const 
                                                                     : op.result()->type(),
                                              op.result() == nullptr ? "" : op.result()->name());
     }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        auto clone = std::make_unique<yir::IfOp>(map_value(if_op->condition(), map));
+        clone->set_has_else(if_op->has_else());
+        if (!clone_region(if_op->then_region(), clone->then_region(), map)) {
+            return nullptr;
+        }
+        if (if_op->has_else() &&
+            !clone_region(if_op->else_region(), clone->else_region(), map)) {
+            return nullptr;
+        }
+        return clone;
+    }
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        auto clone = std::make_unique<yir::ForOp>(map_value(for_op->induction_var(), map),
+                                                  map_value(for_op->lower_bound(), map),
+                                                  map_value(for_op->upper_bound(), map),
+                                                  map_value(for_op->step(), map));
+        if (!clone_region(for_op->body_region(), clone->body_region(), map)) {
+            return nullptr;
+        }
+        return clone;
+    }
+    if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        auto clone = std::make_unique<yir::WhileOp>();
+        if (!clone_region(while_op->cond_region(), clone->cond_region(), map) ||
+            !clone_region(while_op->body_region(), clone->body_region(), map)) {
+            return nullptr;
+        }
+        return clone;
+    }
+    if (auto *cond = dynamic_cast<const yir::CondOp *>(&op)) {
+        return std::make_unique<yir::CondOp>(map_value(cond->condition(), map));
+    }
     if (auto *ret = dynamic_cast<const yir::ReturnOp *>(&op)) {
         return std::make_unique<yir::ReturnOp>(ret->has_value() ? map_value(ret->value(), map)
                                                                 : nullptr);
@@ -139,15 +176,43 @@ std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const 
     return nullptr;
 }
 
+bool clone_region(const yir::Region &src, yir::Region &dst, const ValueMap &map) {
+    ValueMap local_map = map;
+    for (const auto &op : src.operations()) {
+        auto clone = clone_simple_op(*op, local_map);
+        if (clone == nullptr) {
+            return false;
+        }
+        clone->set_parent(&dst);
+        if (op->result() != nullptr && clone->result() != nullptr) {
+            local_map[op->result()] = clone->result();
+        }
+        dst.operations().push_back(std::move(clone));
+    }
+    return true;
+}
+
 bool is_unroll_safe(const yir::Region &region) {
     for (const auto &op : region.operations()) {
-        if (dynamic_cast<const yir::IfOp *>(op.get()) != nullptr ||
-            dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
-            dynamic_cast<const yir::ForOp *>(op.get()) != nullptr ||
-            dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
+        if (dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
             dynamic_cast<const yir::ContinueOp *>(op.get()) != nullptr ||
             dynamic_cast<const yir::ArrayInitOp *>(op.get()) != nullptr) {
             return false;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (!is_unroll_safe(if_op->then_region()) ||
+                (if_op->has_else() && !is_unroll_safe(if_op->else_region()))) {
+                return false;
+            }
+        } else if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            if (!is_unroll_safe(while_op->cond_region()) ||
+                !is_unroll_safe(while_op->body_region())) {
+                return false;
+            }
+        } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (!is_unroll_safe(for_op->body_region())) {
+                return false;
+            }
         }
         if (clone_simple_op(*op, {}) == nullptr) {
             return false;
@@ -160,16 +225,49 @@ std::size_t operation_count(const yir::Region &region) {
     std::size_t count = 0;
     for (const auto &op : region.operations()) {
         ++count;
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            count += operation_count(if_op->then_region());
+            if (if_op->has_else()) {
+                count += operation_count(if_op->else_region());
+            }
+        } else if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            count += operation_count(while_op->cond_region());
+            count += operation_count(while_op->body_region());
+        } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            count += operation_count(for_op->body_region());
+        }
     }
     return count;
 }
 
-bool const_i32(const yir::Value *value, std::int64_t &out) {
+bool const_i32(const yir::Value *value, const ConstI32Map &global_constants, std::int64_t &out) {
     auto *constant = value == nullptr ? nullptr : dynamic_cast<const yir::ConstI32Op *>(value->defining_op());
     if (constant == nullptr) {
-        return false;
+        auto found = global_constants.find(value);
+        if (found == global_constants.end()) {
+            return false;
+        }
+        out = found->second;
+        return true;
     }
     out = constant->value();
+    return true;
+}
+
+bool parse_i32_literal(const std::string &literal, std::int64_t &out) {
+    if (literal.empty()) {
+        return false;
+    }
+    if (literal == "zero") {
+        out = 0;
+        return true;
+    }
+    char *end = nullptr;
+    long value = std::strtol(literal.c_str(), &end, 10);
+    if (end == literal.c_str() || *end != '\0') {
+        return false;
+    }
+    out = value;
     return true;
 }
 
@@ -252,6 +350,76 @@ bool region_has_call(const yir::Region &region) {
     return false;
 }
 
+bool region_has_array_load(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (dynamic_cast<const yir::ArrayLoadOp *>(op.get()) != nullptr) {
+            return true;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (region_has_array_load(if_op->then_region()) ||
+                (if_op->has_else() && region_has_array_load(if_op->else_region()))) {
+                return true;
+            }
+        } else if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            if (region_has_array_load(while_op->cond_region()) ||
+                region_has_array_load(while_op->body_region())) {
+                return true;
+            }
+        } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (region_has_array_load(for_op->body_region())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool region_has_array_store(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (dynamic_cast<const yir::ArrayStoreOp *>(op.get()) != nullptr) {
+            return true;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (region_has_array_store(if_op->then_region()) ||
+                (if_op->has_else() && region_has_array_store(if_op->else_region()))) {
+                return true;
+            }
+        } else if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            if (region_has_array_store(while_op->cond_region()) ||
+                region_has_array_store(while_op->body_region())) {
+                return true;
+            }
+        } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (region_has_array_store(for_op->body_region())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool region_has_if(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (region_has_if(if_op->then_region()) ||
+                (if_op->has_else() && region_has_if(if_op->else_region()))) {
+                return true;
+            }
+            return true;
+        }
+        if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            if (region_has_if(while_op->cond_region()) || region_has_if(while_op->body_region())) {
+                return true;
+            }
+        } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (region_has_if(for_op->body_region())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool operands_invariant(const yir::Operation &op, const ValueSet &assigned,
                         const ValueSet &defined_in_loop, const ValueSet &hoisted) {
     for (auto *operand : op.operands()) {
@@ -267,10 +435,16 @@ bool operands_invariant(const yir::Operation &op, const ValueSet &assigned,
     return true;
 }
 
+bool can_hoist_array_load(const yir::ArrayLoadOp &load, const ValueSet &assigned,
+                          bool has_call) {
+    return !has_call && assigned.find(load.array()) == assigned.end();
+}
+
 class Optimizer final {
   public:
     bool run(yir::Module &module) {
         changed_ = false;
+        collect_global_constants(module);
         for (auto &function : module.functions()) {
             optimize_region(function->body());
         }
@@ -292,11 +466,11 @@ class Optimizer final {
                 changed_ = hoist_loop_invariants(ops, i, while_op->body_region(), nullptr) ||
                            changed_;
             } else if (auto *for_op = dynamic_cast<yir::ForOp *>(ops[i].get())) {
+                optimize_region(for_op->body_region());
                 if (try_unroll_for(ops, i, *for_op)) {
                     changed_ = true;
                     continue;
                 }
-                optimize_region(for_op->body_region());
                 changed_ = hoist_loop_invariants(ops, i, for_op->body_region(),
                                                  for_op->induction_var()) ||
                            changed_;
@@ -325,8 +499,13 @@ class Optimizer final {
         auto &body_ops = body.operations();
         for (std::size_t i = 0; i < body_ops.size();) {
             auto &op = body_ops[i];
-            if ((has_call && !is_constant_like(*op)) || !is_licm_candidate(*op) ||
-                !operands_invariant(*op, assigned, defined_in_loop, hoisted)) {
+            bool candidate = is_licm_candidate(*op);
+            if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(op.get())) {
+                candidate = can_hoist_array_load(*load, assigned, has_call);
+            } else if (has_call && !is_constant_like(*op)) {
+                candidate = false;
+            }
+            if (!candidate || !operands_invariant(*op, assigned, defined_in_loop, hoisted)) {
                 ++i;
                 continue;
             }
@@ -345,15 +524,20 @@ class Optimizer final {
         std::int64_t lower = 0;
         std::int64_t upper = 0;
         std::int64_t step = 0;
-        if (!const_i32(for_op.lower_bound(), lower) || !const_i32(for_op.upper_bound(), upper) ||
-            !const_i32(for_op.step(), step) || step <= 0) {
+        if (!const_i32(for_op.lower_bound(), global_constants_, lower) ||
+            !const_i32(for_op.upper_bound(), global_constants_, upper) ||
+            !const_i32(for_op.step(), global_constants_, step) || step <= 0) {
             return false;
         }
         std::int64_t trip_count = upper <= lower ? 0 : (upper - lower + step - 1) / step;
-        if (trip_count < 0 || trip_count > 4 || !is_unroll_safe(for_op.body_region())) {
+        if (trip_count < 0 || trip_count > 8 || !is_unroll_safe(for_op.body_region())) {
             return false;
         }
-        constexpr std::int64_t kMaxUnrolledOps = 48;
+        if (region_has_array_store(for_op.body_region()) &&
+            !region_has_array_load(for_op.body_region()) && !region_has_if(for_op.body_region())) {
+            return false;
+        }
+        constexpr std::int64_t kMaxUnrolledOps = 1600;
         const std::int64_t unrolled_ops =
             trip_count * static_cast<std::int64_t>(operation_count(for_op.body_region()) + 1);
         if (unrolled_ops > kMaxUnrolledOps) {
@@ -398,7 +582,21 @@ class Optimizer final {
         return true;
     }
 
+    void collect_global_constants(const yir::Module &module) {
+        global_constants_.clear();
+        for (const auto &global : module.globals()) {
+            if (!global->is_const() || global->storage_type()->kind() != yir::Type::Kind::I32) {
+                continue;
+            }
+            std::int64_t value = 0;
+            if (parse_i32_literal(global->initializer(), value)) {
+                global_constants_[global->address()] = value;
+            }
+        }
+    }
+
     bool changed_ = false;
+    ConstI32Map global_constants_;
 };
 
 } // namespace

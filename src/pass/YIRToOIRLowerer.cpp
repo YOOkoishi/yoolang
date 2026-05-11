@@ -173,6 +173,12 @@ class Lowerer final {
             out->set_initializer_literal(global->initializer().empty() ? "zero"
                                                                        : global->initializer());
             memory_addresses_[global->address()] = out;
+            if (global->is_const() && global->storage_type()->kind() == yir::Type::Kind::I32) {
+                std::int64_t value = 0;
+                if (parse_i32_literal(global->initializer(), value)) {
+                    const_i32_globals_[global->address()] = value;
+                }
+            }
         }
     }
 
@@ -867,6 +873,10 @@ class Lowerer final {
         if (value == nullptr) {
             return nullptr;
         }
+        auto const_global = const_i32_globals_.find(value);
+        if (const_global != const_i32_globals_.end()) {
+            return module_->create_i32(static_cast<std::int32_t>(const_global->second));
+        }
         if (ssa_vars_.find(value) != ssa_vars_.end()) {
             auto found = value_map_.find(value);
             if (found == value_map_.end()) {
@@ -950,6 +960,23 @@ class Lowerer final {
             return module_->create_i1(literal == "true" || literal == "1");
         }
         return module_->create_i32(std::strtoll(literal.c_str(), nullptr, 10));
+    }
+
+    bool parse_i32_literal(const std::string &literal, std::int64_t &out) const {
+        if (literal.empty()) {
+            return false;
+        }
+        if (literal == "zero") {
+            out = 0;
+            return true;
+        }
+        char *end = nullptr;
+        auto value = std::strtoll(literal.c_str(), &end, 10);
+        if (end == literal.c_str() || *end != '\0') {
+            return false;
+        }
+        out = value;
+        return true;
     }
 
     oir::Value *to_bool(oir::Value *value, const std::string &name) {
@@ -1095,6 +1122,7 @@ class Lowerer final {
     std::unordered_map<const yir::Function *, oir::Function *> functions_;
     std::unordered_map<const yir::Value *, oir::Value *> value_map_;
     std::unordered_map<const yir::Value *, oir::Value *> memory_addresses_;
+    std::unordered_map<const yir::Value *, std::int64_t> const_i32_globals_;
     std::unordered_set<const yir::Value *> ssa_vars_;
     std::unordered_map<std::string, unsigned> name_counts_;
     std::unordered_set<std::string> used_names_;
