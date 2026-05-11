@@ -18,7 +18,9 @@
 #include "../include/pass/OIRSCCPPass.h"
 #include "../include/pass/OIRToMIRPass.h"
 #include "../include/pass/PassManager.h"
-#include "../include/pass/YIRLoopCountPass.h"
+#include "../include/pass/YIRLoopAnalysisPass.h"
+#include "../include/pass/YIRLoopCanonicalizePass.h"
+#include "../include/pass/YIRLoopOptimizationPass.h"
 #include "../include/pass/YIRToOIRPass.h"
 #include "../include/yir/YIRPrinter.h"
 
@@ -168,9 +170,11 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
     if (needs_yir(options)) {
         pm.add_pass<pass::ASTSemanticAnalysisPass>();
         pm.add_pass<pass::ASTToYIRPass>();
-    }
-    if (options.emit_yir) {
-        pm.add_pass<pass::YIRLoopCountPass>(out);
+        if (optimizations_enabled(options)) {
+            pm.add_pass<pass::YIRLoopCanonicalizePass>();
+            pm.add_pass<pass::YIRLoopOptimizationPass>();
+            pm.add_pass<pass::YIRLoopAnalysisPass>();
+        }
     }
 }
 

@@ -27,6 +27,6 @@ int main() {
 
 // OIR-LABEL: define i32 @licm_mul
 // OIR: %{{.*}} = mul i32 %x.arg, 42
-// OIR: while.cond
-// OIR-LABEL: while.body
+// OIR: for.cond
+// OIR-LABEL: for.body
 // OIR-NOT: mul i32 %x.arg, 42
