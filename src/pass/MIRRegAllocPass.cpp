@@ -103,8 +103,31 @@ std::vector<mir::Register> caller_saved(mir::RegisterClass reg_class) {
     return out;
 }
 
+std::set<std::string> reserved_scratch_names(mir::RegisterClass reg_class) {
+    if (reg_class == mir::RegisterClass::GPR) {
+        return {"t4", "t5"};
+    }
+    return {"ft9", "ft10", "ft11"};
+}
+
+std::vector<mir::Register> spill_scratch_registers(mir::RegisterClass reg_class) {
+    if (reg_class == mir::RegisterClass::GPR) {
+        return {mir::Register::physical("t6", reg_class),
+                mir::Register::physical("t5", reg_class),
+                mir::Register::physical("t4", reg_class)};
+    }
+    return {mir::Register::physical("ft11", reg_class),
+            mir::Register::physical("ft10", reg_class),
+            mir::Register::physical("ft9", reg_class)};
+}
+
 std::vector<mir::Register> allocatable(mir::RegisterClass reg_class) {
     auto out = caller_saved(reg_class);
+    auto reserved = reserved_scratch_names(reg_class);
+    out.erase(std::remove_if(out.begin(), out.end(), [&](const mir::Register &reg) {
+                  return reserved.find(reg.name) != reserved.end();
+              }),
+              out.end());
     if (reg_class == mir::RegisterClass::GPR) {
         for (const std::string &name :
              {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
@@ -539,8 +562,94 @@ class RegAllocator {
                     continue;
                 }
 
+                std::set<VRegId> use_ids;
+                std::set<VRegId> def_ids;
+                std::map<VRegId, mir::RegisterClass> reg_classes;
+                std::map<VRegId, mir::ValueType> value_types;
+                std::map<VRegId, const mir::MachineInstr *> remat_instrs;
+                std::map<VRegId, int> spill_slots;
+
+                for (const auto &operand : instr.operands()) {
+                    if (!operand.is_reg() || !operand.reg_value().is_virtual()) {
+                        continue;
+                    }
+                    auto id = operand.reg_value().id;
+                    if (spills.find(id) == spills.end()) {
+                        continue;
+                    }
+
+                    const auto *old_reg = function.regs().virtual_register(id);
+                    if (old_reg == nullptr) {
+                        continue;
+                    }
+                    reg_classes[id] = old_reg->reg_class;
+                    value_types[id] = old_reg->value_type;
+                    if (auto found_slot = slots.find(id); found_slot != slots.end()) {
+                        spill_slots[id] = found_slot->second;
+                    }
+                    if (auto found_remat = remat.find(id); found_remat != remat.end()) {
+                        remat_instrs[id] = &found_remat->second;
+                    }
+                    if (operand.is_use()) {
+                        use_ids.insert(id);
+                    }
+                    if (operand.is_def()) {
+                        def_ids.insert(id);
+                    }
+                }
+
                 std::vector<mir::MachineInstr> before;
                 std::vector<mir::MachineInstr> after;
+                std::map<VRegId, mir::Register> replacements;
+                std::map<mir::RegisterClass, std::vector<mir::Register>> scratch_pools{
+                    {mir::RegisterClass::GPR, spill_scratch_registers(mir::RegisterClass::GPR)},
+                    {mir::RegisterClass::FPR32,
+                     spill_scratch_registers(mir::RegisterClass::FPR32)}};
+
+                auto allocate_replacement = [&](VRegId id) -> mir::Register {
+                    auto found = replacements.find(id);
+                    if (found != replacements.end()) {
+                        return found->second;
+                    }
+
+                    auto reg_class = reg_classes.at(id);
+                    auto &pool = scratch_pools[reg_class];
+                    mir::Register replacement;
+                    if (!pool.empty()) {
+                        replacement = pool.front();
+                        pool.erase(pool.begin());
+                    } else {
+                        replacement = function.regs().create_virtual(reg_class, value_types.at(id));
+                    }
+                    replacements.emplace(id, replacement);
+                    return replacement;
+                };
+
+                for (auto id : use_ids) {
+                    auto replacement = allocate_replacement(id);
+                    auto found_remat = remat_instrs.find(id);
+                    if (found_remat != remat_instrs.end()) {
+                        before.push_back(rematerialize_as(*found_remat->second, replacement));
+                        continue;
+                    }
+
+                    auto found_slot = spill_slots.find(id);
+                    if (found_slot == spill_slots.end()) {
+                        continue;
+                    }
+
+                    before.emplace_back(
+                        mir::Opcode::LoadSlot,
+                        std::vector<mir::MachineOperand>{
+                            mir::MachineOperand::reg_def(replacement),
+                            mir::MachineOperand::slot(found_slot->second),
+                            mir::MachineOperand::type(value_types.at(id))});
+                }
+
+                for (auto id : def_ids) {
+                    (void)allocate_replacement(id);
+                }
+
                 for (auto &operand : instr.operands()) {
                     if (!operand.is_reg() || !operand.reg_value().is_virtual()) {
                         continue;
@@ -549,42 +658,20 @@ class RegAllocator {
                     if (spills.find(id) == spills.end()) {
                         continue;
                     }
-                    auto found_slot = slots.find(id);
-                    auto found_remat = remat.find(id);
-                    const auto *old_reg = function.regs().virtual_register(id);
-                    if (old_reg == nullptr) {
+                    operand.set_reg(replacements.at(id));
+                }
+
+                for (auto id : def_ids) {
+                    auto found_slot = spill_slots.find(id);
+                    if (found_slot == spill_slots.end()) {
                         continue;
                     }
-                    auto old_reg_class = old_reg->reg_class;
-                    auto old_value_type = old_reg->value_type;
-                    auto temp = function.regs().create_virtual(old_reg_class, old_value_type);
-                    if (operand.is_use()) {
-                        if (found_remat != remat.end()) {
-                            before.push_back(rematerialize_as(found_remat->second, temp));
-                        } else {
-                            if (found_slot == slots.end()) {
-                                continue;
-                            }
-                            before.emplace_back(
-                                mir::Opcode::LoadSlot,
-                                std::vector<mir::MachineOperand>{
-                                    mir::MachineOperand::reg_def(temp),
-                                    mir::MachineOperand::slot(found_slot->second),
-                                    mir::MachineOperand::type(old_value_type)});
-                        }
-                    }
-                    operand.set_reg(temp);
-                    if (operand.is_def()) {
-                        if (found_slot == slots.end()) {
-                            continue;
-                        }
-                        after.emplace_back(
-                            mir::Opcode::StoreSlot,
-                            std::vector<mir::MachineOperand>{
-                                mir::MachineOperand::slot(found_slot->second),
-                                mir::MachineOperand::reg_use(temp),
-                                mir::MachineOperand::type(old_value_type)});
-                    }
+                    after.emplace_back(
+                        mir::Opcode::StoreSlot,
+                        std::vector<mir::MachineOperand>{
+                            mir::MachineOperand::slot(found_slot->second),
+                            mir::MachineOperand::reg_use(replacements.at(id)),
+                            mir::MachineOperand::type(value_types.at(id))});
                 }
                 rewritten.insert(rewritten.end(), std::make_move_iterator(before.begin()),
                                  std::make_move_iterator(before.end()));

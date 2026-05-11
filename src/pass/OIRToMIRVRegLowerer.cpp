@@ -766,10 +766,14 @@ class VRegLowerer final {
         std::size_t int_reg = 0;
         std::size_t float_reg = 0;
         std::int64_t stack_offset = 0;
+        std::vector<mir::Register> staged_int_args;
+        std::vector<mir::Register> staged_float_args;
 
         if (symbol == "starttime" || symbol == "stoptime") {
+            auto zero = create_vreg(mir::ValueType::I32);
             emit(mir::Opcode::LoadImm,
-                 {mir::MachineOperand::reg_def(phys_gpr("a0")), mir::MachineOperand::imm(0)});
+                 {mir::MachineOperand::reg_def(zero), mir::MachineOperand::imm(0)});
+            staged_int_args.push_back(zero);
             symbol = symbol == "starttime" ? "_sysy_starttime" : "_sysy_stoptime";
             int_reg = 1;
         }
@@ -780,7 +784,10 @@ class VRegLowerer final {
             auto src = value_reg(arg);
             if (type == mir::ValueType::F32) {
                 if (float_reg < kFArgRegs.size()) {
-                    emit_move(phys_fpr(kFArgRegs[float_reg++]), src);
+                    auto staged = create_vreg(type);
+                    emit_move(staged, src);
+                    staged_float_args.push_back(staged);
+                    ++float_reg;
                 } else {
                     emit(mir::Opcode::StoreOutgoingArg,
                          {mir::MachineOperand::reg_use(src), mir::MachineOperand::imm(stack_offset),
@@ -789,7 +796,10 @@ class VRegLowerer final {
                 }
             } else {
                 if (int_reg < kArgRegs.size()) {
-                    emit_move(phys_gpr(kArgRegs[int_reg++]), src);
+                    auto staged = create_vreg(type);
+                    emit_move(staged, src);
+                    staged_int_args.push_back(staged);
+                    ++int_reg;
                 } else {
                     emit(mir::Opcode::StoreOutgoingArg,
                          {mir::MachineOperand::reg_use(src), mir::MachineOperand::imm(stack_offset),
@@ -800,6 +810,12 @@ class VRegLowerer final {
         }
 
         current_function_->reserve_outgoing_arg_bytes(static_cast<std::uint64_t>(stack_offset));
+        for (std::size_t i = 0; i < staged_int_args.size(); ++i) {
+            emit_move(phys_gpr(kArgRegs[i]), staged_int_args[i]);
+        }
+        for (std::size_t i = 0; i < staged_float_args.size(); ++i) {
+            emit_move(phys_fpr(kFArgRegs[i]), staged_float_args[i]);
+        }
         emit(mir::Opcode::Call, {mir::MachineOperand::symbol(symbol)});
 
         if (!inst.type()->is_void()) {
