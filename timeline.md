@@ -66,3 +66,7 @@ summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 # May 10
 
 添加了保守的inline,效果还行，但是在板子上不行，可能需要 memory_ssa 形式好一些。
+
+# May 11
+
+增强了后端的窥孔和图着色，修改了一些问题，加速了蛮多。
