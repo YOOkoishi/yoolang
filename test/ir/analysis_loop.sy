@@ -28,5 +28,5 @@ int main() {
 // MIR: J %while.cond
 
 // ASM-LABEL: sum_to:
-// ASM: bge
+// ASM: {{bge|blt}}
 // ASM: ret

@@ -20,6 +20,8 @@ struct Stats {
     unsigned gvn = 0;
     unsigned mem2reg = 0;
     unsigned licm = 0;
+    unsigned loop_rotate = 0;
+    unsigned loop_unswitch = 0;
     unsigned inlined = 0;
 
     bool changed() const;
@@ -55,6 +57,8 @@ bool eliminate_dead_code(oir::Module &module, Stats &stats);
 bool cleanup_cfg(oir::Module &module, Stats &stats);
 bool promote_memory_to_registers(oir::Module &module, Stats &stats);
 bool loop_invariant_code_motion(oir::Module &module, Stats &stats);
+bool rotate_loops(oir::Module &module, Stats &stats);
+bool unswitch_loops(oir::Module &module, Stats &stats);
 bool global_value_numbering(oir::Module &module, Stats &stats);
 bool inline_functions(oir::Module &module, Stats &stats);
 bool optimize_oir_aggressively(oir::Module &module, Stats &stats);

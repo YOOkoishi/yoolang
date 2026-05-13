@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <sstream>
 
 namespace oir {
 namespace {
@@ -38,6 +39,114 @@ bool distinct_constant_indices(const Value *lhs, const Value *rhs) {
     auto rhs_constant = constant_int_value(rhs);
     return lhs_constant.has_value() && rhs_constant.has_value() &&
            *lhs_constant != *rhs_constant;
+}
+
+bool loop_contains(const Loop &loop, const BasicBlock *block) {
+    return contains_value(loop.blocks, block);
+}
+
+bool is_scev_speculatable(const Instruction &inst) {
+    switch (inst.op()) {
+    case Instruction::OpID::Add:
+    case Instruction::OpID::Sub:
+    case Instruction::OpID::Mul:
+    case Instruction::OpID::SDiv:
+    case Instruction::OpID::SRem:
+    case Instruction::OpID::FAdd:
+    case Instruction::OpID::FSub:
+    case Instruction::OpID::FMul:
+    case Instruction::OpID::FDiv:
+    case Instruction::OpID::ICmp:
+    case Instruction::OpID::FCmp:
+    case Instruction::OpID::GetElementPtr:
+    case Instruction::OpID::ZExt:
+    case Instruction::OpID::SIToFP:
+    case Instruction::OpID::FPToSI:
+        return true;
+    case Instruction::OpID::Ret:
+    case Instruction::OpID::Br:
+    case Instruction::OpID::Alloca:
+    case Instruction::OpID::Load:
+    case Instruction::OpID::Store:
+    case Instruction::OpID::Call:
+    case Instruction::OpID::Phi:
+        return false;
+    }
+    return false;
+}
+
+CmpPred inverse_predicate(CmpPred pred) {
+    switch (pred) {
+    case CmpPred::EQ:
+        return CmpPred::EQ;
+    case CmpPred::NE:
+        return CmpPred::NE;
+    case CmpPred::LT:
+        return CmpPred::GT;
+    case CmpPred::LE:
+        return CmpPred::GE;
+    case CmpPred::GT:
+        return CmpPred::LT;
+    case CmpPred::GE:
+        return CmpPred::LE;
+    }
+    return pred;
+}
+
+std::optional<std::int64_t> trip_count_for(std::int64_t start, std::int64_t bound,
+                                           std::int64_t step, CmpPred pred) {
+    if (step == 0) {
+        return std::nullopt;
+    }
+
+    switch (pred) {
+    case CmpPred::LT: {
+        if (step <= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t distance = bound - start;
+        if (distance <= 0) {
+            return 0;
+        }
+        return (distance + step - 1) / step;
+    }
+    case CmpPred::LE: {
+        if (step <= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t distance = bound - start;
+        if (distance < 0) {
+            return 0;
+        }
+        return distance / step + 1;
+    }
+    case CmpPred::GT: {
+        if (step >= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t step_abs = -step;
+        const std::int64_t distance = start - bound;
+        if (distance <= 0) {
+            return 0;
+        }
+        return (distance + step_abs - 1) / step_abs;
+    }
+    case CmpPred::GE: {
+        if (step >= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t step_abs = -step;
+        const std::int64_t distance = start - bound;
+        if (distance < 0) {
+            return 0;
+        }
+        return distance / step_abs + 1;
+    }
+    case CmpPred::EQ:
+    case CmpPred::NE:
+        return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 struct PointerPath {
@@ -422,6 +531,337 @@ void LoopInfo::rebuild_block_map() {
             }
         }
     }
+}
+
+SCEVExpr::SCEVExpr() = default;
+
+SCEVExpr::SCEVExpr(SCEVKind kind) : kind_(kind) {
+}
+
+SCEVExpr SCEVExpr::unknown() {
+    return SCEVExpr(SCEVKind::Unknown);
+}
+
+SCEVExpr SCEVExpr::constant(std::int64_t value) {
+    SCEVExpr expr(SCEVKind::Constant);
+    expr.constant_ = value;
+    return expr;
+}
+
+SCEVExpr SCEVExpr::symbol(const Value *value) {
+    if (value == nullptr) {
+        return unknown();
+    }
+    SCEVExpr expr(SCEVKind::Symbol);
+    expr.symbol_ = value;
+    return expr;
+}
+
+SCEVExpr SCEVExpr::add(SCEVExpr lhs, SCEVExpr rhs) {
+    if (lhs.is_unknown() || rhs.is_unknown()) {
+        return unknown();
+    }
+    auto lhs_const = lhs.constant_value();
+    auto rhs_const = rhs.constant_value();
+    if (lhs_const.has_value() && rhs_const.has_value()) {
+        return constant(*lhs_const + *rhs_const);
+    }
+    if (lhs_const.has_value() && *lhs_const == 0) {
+        return rhs;
+    }
+    if (rhs_const.has_value() && *rhs_const == 0) {
+        return lhs;
+    }
+    SCEVExpr expr(SCEVKind::Add);
+    expr.lhs_ = std::make_shared<SCEVExpr>(std::move(lhs));
+    expr.rhs_ = std::make_shared<SCEVExpr>(std::move(rhs));
+    return expr;
+}
+
+SCEVExpr SCEVExpr::mul(SCEVExpr lhs, SCEVExpr rhs) {
+    if (lhs.is_unknown() || rhs.is_unknown()) {
+        return unknown();
+    }
+    auto lhs_const = lhs.constant_value();
+    auto rhs_const = rhs.constant_value();
+    if (lhs_const.has_value() && rhs_const.has_value()) {
+        return constant(*lhs_const * *rhs_const);
+    }
+    if ((lhs_const.has_value() && *lhs_const == 0) ||
+        (rhs_const.has_value() && *rhs_const == 0)) {
+        return constant(0);
+    }
+    if (lhs_const.has_value() && *lhs_const == 1) {
+        return rhs;
+    }
+    if (rhs_const.has_value() && *rhs_const == 1) {
+        return lhs;
+    }
+    SCEVExpr expr(SCEVKind::Mul);
+    expr.lhs_ = std::make_shared<SCEVExpr>(std::move(lhs));
+    expr.rhs_ = std::make_shared<SCEVExpr>(std::move(rhs));
+    return expr;
+}
+
+SCEVExpr SCEVExpr::add_rec(SCEVExpr start, SCEVExpr step, const Loop *loop) {
+    if (start.is_unknown() || step.is_unknown() || loop == nullptr) {
+        return unknown();
+    }
+    SCEVExpr expr(SCEVKind::AddRec);
+    expr.lhs_ = std::make_shared<SCEVExpr>(std::move(start));
+    expr.rhs_ = std::make_shared<SCEVExpr>(std::move(step));
+    expr.loop_ = loop;
+    return expr;
+}
+
+SCEVKind SCEVExpr::kind() const {
+    return kind_;
+}
+
+bool SCEVExpr::is_unknown() const {
+    return kind_ == SCEVKind::Unknown;
+}
+
+std::optional<std::int64_t> SCEVExpr::constant_value() const {
+    if (kind_ != SCEVKind::Constant) {
+        return std::nullopt;
+    }
+    return constant_;
+}
+
+const Value *SCEVExpr::symbol_value() const {
+    return symbol_;
+}
+
+const Loop *SCEVExpr::loop() const {
+    return loop_;
+}
+
+const SCEVExpr *SCEVExpr::lhs() const {
+    return lhs_.get();
+}
+
+const SCEVExpr *SCEVExpr::rhs() const {
+    return rhs_.get();
+}
+
+std::string SCEVExpr::str() const {
+    switch (kind_) {
+    case SCEVKind::Unknown:
+        return "<unknown>";
+    case SCEVKind::Constant:
+        return std::to_string(constant_);
+    case SCEVKind::Symbol:
+        return symbol_ == nullptr || symbol_->name().empty() ? "<symbol>" : "%" + symbol_->name();
+    case SCEVKind::Add:
+        return "(" + (lhs_ == nullptr ? "<null>" : lhs_->str()) + " + " +
+               (rhs_ == nullptr ? "<null>" : rhs_->str()) + ")";
+    case SCEVKind::Mul:
+        return "(" + (lhs_ == nullptr ? "<null>" : lhs_->str()) + " * " +
+               (rhs_ == nullptr ? "<null>" : rhs_->str()) + ")";
+    case SCEVKind::AddRec: {
+        std::ostringstream oss;
+        oss << "{" << (lhs_ == nullptr ? "<null>" : lhs_->str()) << ",+,"
+            << (rhs_ == nullptr ? "<null>" : rhs_->str()) << "}";
+        if (loop_ != nullptr && loop_->header != nullptr) {
+            oss << "<%" << loop_->header->name() << ">";
+        }
+        return oss.str();
+    }
+    }
+    return "<unknown>";
+}
+
+ScalarEvolution::ScalarEvolution(const Function &function, const LoopInfo &loop_info)
+    : function_(&function), loop_info_(&loop_info) {
+}
+
+SCEVExpr ScalarEvolution::expression_for(const Value *value, const Loop *loop) const {
+    std::unordered_set<const Value *> active;
+    return expression_for_impl(value, loop, active);
+}
+
+SCEVExpr ScalarEvolution::expression_for_impl(
+    const Value *value, const Loop *loop, std::unordered_set<const Value *> &active) const {
+    if (value == nullptr) {
+        return SCEVExpr::unknown();
+    }
+    if (auto constant = constant_int_value(value)) {
+        return SCEVExpr::constant(*constant);
+    }
+
+    auto *inst = dynamic_cast<const Instruction *>(value);
+    if (inst == nullptr) {
+        return SCEVExpr::symbol(value);
+    }
+    if (!active.insert(value).second) {
+        return SCEVExpr::unknown();
+    }
+
+    auto finish = [&](SCEVExpr expr) {
+        active.erase(value);
+        return expr;
+    };
+
+    if (loop != nullptr) {
+        if (auto *phi = dynamic_cast<const PhiInst *>(inst)) {
+            if (phi->parent() == loop->header) {
+                auto add_rec = try_add_rec(*phi, *loop, active);
+                if (!add_rec.is_unknown()) {
+                    return finish(std::move(add_rec));
+                }
+            }
+        }
+    }
+
+    if (auto *binary = dynamic_cast<const BinaryInst *>(inst)) {
+        auto lhs = expression_for_impl(binary->lhs(), loop, active);
+        auto rhs = expression_for_impl(binary->rhs(), loop, active);
+        switch (binary->op()) {
+        case Instruction::OpID::Add:
+            return finish(SCEVExpr::add(std::move(lhs), std::move(rhs)));
+        case Instruction::OpID::Sub:
+            return finish(SCEVExpr::add(std::move(lhs),
+                                        SCEVExpr::mul(SCEVExpr::constant(-1), std::move(rhs))));
+        case Instruction::OpID::Mul:
+            return finish(SCEVExpr::mul(std::move(lhs), std::move(rhs)));
+        default:
+            break;
+        }
+    }
+
+    if (auto *cast = dynamic_cast<const CastInst *>(inst)) {
+        switch (cast->op()) {
+        case Instruction::OpID::ZExt:
+        case Instruction::OpID::SIToFP:
+        case Instruction::OpID::FPToSI:
+            return finish(expression_for_impl(cast->src(), loop, active));
+        default:
+            break;
+        }
+    }
+
+    if (loop != nullptr && loop_contains(*loop, inst->parent())) {
+        return finish(SCEVExpr::unknown());
+    }
+    return finish(SCEVExpr::symbol(value));
+}
+
+SCEVExpr ScalarEvolution::try_add_rec(
+    const PhiInst &phi, const Loop &loop, std::unordered_set<const Value *> &active) const {
+    if (phi.incoming().size() != 2) {
+        return SCEVExpr::unknown();
+    }
+
+    const Value *start = nullptr;
+    const Value *latch_value = nullptr;
+    for (const auto &incoming : phi.incoming()) {
+        if (loop_contains(loop, incoming.second)) {
+            if (latch_value != nullptr) {
+                return SCEVExpr::unknown();
+            }
+            latch_value = incoming.first;
+        } else {
+            if (start != nullptr) {
+                return SCEVExpr::unknown();
+            }
+            start = incoming.first;
+        }
+    }
+    if (start == nullptr || latch_value == nullptr) {
+        return SCEVExpr::unknown();
+    }
+
+    auto *step_inst = dynamic_cast<const BinaryInst *>(latch_value);
+    if (step_inst == nullptr) {
+        return SCEVExpr::unknown();
+    }
+
+    const Value *step_value = nullptr;
+    bool negate_step = false;
+    if (step_inst->op() == Instruction::OpID::Add) {
+        if (step_inst->lhs() == &phi) {
+            step_value = step_inst->rhs();
+        } else if (step_inst->rhs() == &phi) {
+            step_value = step_inst->lhs();
+        }
+    } else if (step_inst->op() == Instruction::OpID::Sub && step_inst->lhs() == &phi) {
+        step_value = step_inst->rhs();
+        negate_step = true;
+    }
+    if (step_value == nullptr || !is_loop_invariant(step_value, loop)) {
+        return SCEVExpr::unknown();
+    }
+
+    auto start_expr = expression_for_impl(start, nullptr, active);
+    auto step_expr = expression_for_impl(step_value, nullptr, active);
+    if (negate_step) {
+        step_expr = SCEVExpr::mul(SCEVExpr::constant(-1), std::move(step_expr));
+    }
+    return SCEVExpr::add_rec(std::move(start_expr), std::move(step_expr), &loop);
+}
+
+std::optional<std::int64_t> ScalarEvolution::constant_expr_value(const SCEVExpr &expr) const {
+    return expr.constant_value();
+}
+
+std::optional<std::int64_t> ScalarEvolution::constant_trip_count(const Loop &loop) const {
+    auto *branch = dynamic_cast<const BranchInst *>(loop.header->terminator());
+    if (branch == nullptr || !branch->is_conditional()) {
+        return std::nullopt;
+    }
+    auto *cmp = dynamic_cast<const CmpInst *>(branch->cond());
+    if (cmp == nullptr || cmp->op() != Instruction::OpID::ICmp) {
+        return std::nullopt;
+    }
+
+    auto lhs = expression_for(cmp->lhs(), &loop);
+    auto rhs = expression_for(cmp->rhs(), &loop);
+
+    auto count_from = [&](const SCEVExpr &add_rec, const SCEVExpr &bound,
+                          CmpPred pred) -> std::optional<std::int64_t> {
+        if (add_rec.kind() != SCEVKind::AddRec || add_rec.lhs() == nullptr ||
+            add_rec.rhs() == nullptr) {
+            return std::nullopt;
+        }
+        auto start = constant_expr_value(*add_rec.lhs());
+        auto step = constant_expr_value(*add_rec.rhs());
+        auto limit = constant_expr_value(bound);
+        if (!start.has_value() || !step.has_value() || !limit.has_value()) {
+            return std::nullopt;
+        }
+        return trip_count_for(*start, *limit, *step, pred);
+    };
+
+    if (auto count = count_from(lhs, rhs, cmp->pred())) {
+        return count;
+    }
+    return count_from(rhs, lhs, inverse_predicate(cmp->pred()));
+}
+
+bool ScalarEvolution::is_loop_invariant(const Value *value, const Loop &loop) const {
+    if (value == nullptr) {
+        return false;
+    }
+    if (constant_int_value(value).has_value()) {
+        return true;
+    }
+    auto *inst = dynamic_cast<const Instruction *>(value);
+    if (inst == nullptr) {
+        return true;
+    }
+    if (!loop_contains(loop, inst->parent())) {
+        return true;
+    }
+    if (!is_scev_speculatable(*inst)) {
+        return false;
+    }
+    for (auto *operand : inst->operands()) {
+        if (!is_loop_invariant(operand, loop)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {

@@ -29,6 +29,8 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
     changed |= oir_opt::global_value_numbering(module, stats);
     changed |= oir_opt::loop_invariant_code_motion(module, stats);
+    changed |= oir_opt::unswitch_loops(module, stats);
+    changed |= oir_opt::rotate_loops(module, stats);
     changed |= oir_opt::global_value_numbering(module, stats);
     changed |= oir_opt::run_sccp(module, stats);
     changed |= oir_opt::simplify_branches(module, stats);
