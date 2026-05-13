@@ -62,8 +62,8 @@ int main() {
 
 // MIR-LABEL: func @loop_phi
 // MIR: BNEZ %v{{[0-9]+}}:gpr
-// MIR: edge.
 // MIR: MV %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr
+// MIR-NOT: edge.
 
 // MIR-LABEL: func @float_arith
 // MIR: virtual registers:

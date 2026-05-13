@@ -18,6 +18,7 @@ constexpr unsigned kMaxInlineSites = 128;
 constexpr unsigned kMaxCalleeBlocks = 8;
 constexpr unsigned kMaxCalleeCost = 45;
 constexpr unsigned kMaxCalleeReturns = 4;
+constexpr unsigned kMaxCalleeParams = 16;
 
 using ValueMap = std::unordered_map<oir::Value *, oir::Value *>;
 using BlockMap = std::unordered_map<oir::BasicBlock *, oir::BasicBlock *>;
@@ -109,6 +110,9 @@ bool is_eligible_call(const oir::Function &caller, const oir::CallInst &call,
         return false;
     }
     if (call.type() != callee->return_type() || call.args().size() != callee->args().size()) {
+        return false;
+    }
+    if (callee->args().size() > kMaxCalleeParams) {
         return false;
     }
     if (contains_call_to(*callee, *callee) || contains_call_to(*callee, caller)) {

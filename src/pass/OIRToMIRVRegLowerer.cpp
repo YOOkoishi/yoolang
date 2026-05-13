@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -146,6 +147,7 @@ class VRegLowerer final {
 
         for (const auto &block : function.blocks()) {
             current_block_ = blocks_.at(block.get());
+            emit_block_entry_phi_copies(*block);
             for (const auto &inst : block->instructions()) {
                 lower_instruction(*inst);
             }
@@ -189,6 +191,9 @@ class VRegLowerer final {
                 continue;
             }
             for (auto *pred : target->predecessors()) {
+                if (!needs_dedicated_phi_edge(pred, target)) {
+                    continue;
+                }
                 std::string name = "edge." + pred->name() + ".to." + target->name();
                 auto *edge = out.create_block(name);
                 edge_blocks_[edge_key(pred, target)] = edge;
@@ -205,6 +210,29 @@ class VRegLowerer final {
             return false;
         }
         return false;
+    }
+
+    bool needs_dedicated_phi_edge(const oir::BasicBlock *pred,
+                                  const oir::BasicBlock *target) const {
+        const bool critical = pred->successors().size() > 1 && target->predecessors().size() > 1;
+        const bool conditional_self_edge = pred == target && pred->successors().size() > 1;
+        return critical || conditional_self_edge;
+    }
+
+    bool has_edge_block(const oir::BasicBlock *pred, const oir::BasicBlock *target) const {
+        return edge_blocks_.find(edge_key(pred, target)) != edge_blocks_.end();
+    }
+
+    void emit_block_entry_phi_copies(const oir::BasicBlock &block) {
+        if (!block_has_phi(block) || block.predecessors().size() != 1) {
+            return;
+        }
+
+        auto *pred = block.predecessors().front();
+        if (pred == &block || pred->successors().size() <= 1 || has_edge_block(pred, &block)) {
+            return;
+        }
+        emit_phi_copies_for_edge(pred, &block);
     }
 
     void emit_parameter_copies(const oir::Function &function) {
@@ -479,6 +507,106 @@ class VRegLowerer final {
         }
     }
 
+    struct SignedMagic {
+        std::int32_t magic = 0;
+        unsigned shift = 0;
+    };
+
+    SignedMagic signed_magic_info(std::int32_t divisor) const {
+        const std::uint32_t ad =
+            divisor < 0 ? static_cast<std::uint32_t>(-static_cast<std::int64_t>(divisor))
+                        : static_cast<std::uint32_t>(divisor);
+        const std::uint32_t two31 = 0x80000000U;
+        const std::uint32_t sign = static_cast<std::uint32_t>(divisor) >> 31U;
+        const std::uint32_t t = two31 + sign;
+        const std::uint32_t anc = t - 1U - (t % ad);
+
+        unsigned p = 31;
+        std::uint32_t q1 = two31 / anc;
+        std::uint32_t r1 = two31 - q1 * anc;
+        std::uint32_t q2 = two31 / ad;
+        std::uint32_t r2 = two31 - q2 * ad;
+        std::uint32_t delta = 0;
+        do {
+            ++p;
+            q1 <<= 1U;
+            r1 <<= 1U;
+            if (r1 >= anc) {
+                ++q1;
+                r1 -= anc;
+            }
+            q2 <<= 1U;
+            r2 <<= 1U;
+            if (r2 >= ad) {
+                ++q2;
+                r2 -= ad;
+            }
+            delta = ad - r2;
+        } while (q1 < delta || (q1 == delta && r1 == 0));
+
+        std::int64_t magic = static_cast<std::int64_t>(q2) + 1;
+        if (divisor < 0) {
+            magic = -magic;
+        }
+        return {static_cast<std::int32_t>(magic), p - 32U};
+    }
+
+    bool try_lower_magic_const_div(mir::Register dst, mir::Register value,
+                                   std::int64_t constant) {
+        if (constant == 0 || constant < std::numeric_limits<std::int32_t>::min() ||
+            constant > std::numeric_limits<std::int32_t>::max() ||
+            constant == std::numeric_limits<std::int32_t>::min()) {
+            return false;
+        }
+
+        const auto divisor = static_cast<std::int32_t>(constant);
+        auto magic = signed_magic_info(divisor);
+        auto magic_reg = create_vreg(mir::ValueType::I32);
+        emit(mir::Opcode::LoadImm,
+             {mir::MachineOperand::reg_def(magic_reg), mir::MachineOperand::imm(magic.magic)});
+
+        auto product = create_vreg(mir::ValueType::I32);
+        emit(mir::Opcode::Mul,
+             {mir::MachineOperand::reg_def(product), mir::MachineOperand::reg_use(value),
+              mir::MachineOperand::reg_use(magic_reg)});
+
+        auto quotient = create_vreg(mir::ValueType::I32);
+        emit(mir::Opcode::SraI,
+             {mir::MachineOperand::reg_def(quotient), mir::MachineOperand::reg_use(product),
+              mir::MachineOperand::imm(32)});
+
+        if (divisor > 0 && magic.magic < 0) {
+            auto adjusted = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::AddW,
+                 {mir::MachineOperand::reg_def(adjusted),
+                  mir::MachineOperand::reg_use(quotient), mir::MachineOperand::reg_use(value)});
+            quotient = adjusted;
+        } else if (divisor < 0 && magic.magic > 0) {
+            auto adjusted = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::SubW,
+                 {mir::MachineOperand::reg_def(adjusted),
+                  mir::MachineOperand::reg_use(quotient), mir::MachineOperand::reg_use(value)});
+            quotient = adjusted;
+        }
+
+        if (magic.shift != 0) {
+            auto shifted = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::SraIW,
+                 {mir::MachineOperand::reg_def(shifted),
+                  mir::MachineOperand::reg_use(quotient), mir::MachineOperand::imm(magic.shift)});
+            quotient = shifted;
+        }
+
+        auto sign = create_vreg(mir::ValueType::I32);
+        emit(mir::Opcode::SrliW,
+             {mir::MachineOperand::reg_def(sign), mir::MachineOperand::reg_use(quotient),
+              mir::MachineOperand::imm(31)});
+        emit(mir::Opcode::AddW,
+             {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(quotient),
+              mir::MachineOperand::reg_use(sign)});
+        return true;
+    }
+
     bool try_lower_const_div(mir::Register dst, mir::Register value, std::int64_t constant) {
         if (constant == 1) {
             emit_move(dst, value);
@@ -500,7 +628,7 @@ class VRegLowerer final {
             }
         }
 
-        return false;
+        return try_lower_magic_const_div(dst, value, constant);
     }
 
     bool try_lower_const_rem(mir::Register dst, mir::Register value, std::int64_t constant) {
@@ -524,6 +652,27 @@ class VRegLowerer final {
                       mir::MachineOperand::reg_use(product)});
                 return true;
             }
+        }
+
+        if (constant != 0 && constant != std::numeric_limits<std::int32_t>::min()) {
+            auto quotient = create_vreg(mir::ValueType::I32);
+            if (!try_lower_magic_const_div(quotient, value, constant)) {
+                return false;
+            }
+
+            auto constant_reg = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::LoadImm,
+                 {mir::MachineOperand::reg_def(constant_reg),
+                  mir::MachineOperand::imm(static_cast<std::int32_t>(constant))});
+            auto product = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::MulW,
+                 {mir::MachineOperand::reg_def(product),
+                  mir::MachineOperand::reg_use(quotient),
+                  mir::MachineOperand::reg_use(constant_reg)});
+            emit(mir::Opcode::SubW,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(value),
+                  mir::MachineOperand::reg_use(product)});
+            return true;
         }
 
         return false;
@@ -842,6 +991,10 @@ class VRegLowerer final {
 
     void lower_branch(const oir::BranchInst &inst) {
         if (!inst.is_conditional()) {
+            if (!has_edge_block(inst.parent(), inst.target_bb()) &&
+                inst.parent()->successors().size() == 1 && block_has_phi(*inst.target_bb())) {
+                emit_phi_copies_for_edge(inst.parent(), inst.target_bb());
+            }
             emit(mir::Opcode::Jump,
                  {mir::MachineOperand::block(branch_target(inst.parent(), inst.target_bb()))});
             return;
@@ -866,26 +1019,30 @@ class VRegLowerer final {
     void fill_phi_edge_blocks() {
         for (const auto &edge : pending_edge_blocks_) {
             current_block_ = edge.block;
-            std::vector<mir::Register> temps;
-            std::vector<mir::Register> phis;
-            for (const auto &inst : edge.target->instructions()) {
-                auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
-                if (phi == nullptr) {
-                    break;
-                }
-
-                auto *incoming = incoming_for(*phi, edge.pred);
-                auto type = type_info(phi->type()).value_type;
-                auto temp = create_vreg(type);
-                emit_move(temp, value_reg(incoming));
-                temps.push_back(temp);
-                phis.push_back(value_regs_.at(phi));
-            }
-
-            for (std::size_t i = 0; i < temps.size(); ++i) {
-                emit_move(phis[i], temps[i]);
-            }
+            emit_phi_copies_for_edge(edge.pred, edge.target);
             emit(mir::Opcode::Jump, {mir::MachineOperand::block(edge.target->name())});
+        }
+    }
+
+    void emit_phi_copies_for_edge(const oir::BasicBlock *pred, const oir::BasicBlock *target) {
+        std::vector<mir::Register> temps;
+        std::vector<mir::Register> phis;
+        for (const auto &inst : target->instructions()) {
+            auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+            if (phi == nullptr) {
+                break;
+            }
+
+            auto *incoming = incoming_for(*phi, pred);
+            auto type = type_info(phi->type()).value_type;
+            auto temp = create_vreg(type);
+            emit_move(temp, value_reg(incoming));
+            temps.push_back(temp);
+            phis.push_back(value_regs_.at(phi));
+        }
+
+        for (std::size_t i = 0; i < temps.size(); ++i) {
+            emit_move(phis[i], temps[i]);
         }
     }
 

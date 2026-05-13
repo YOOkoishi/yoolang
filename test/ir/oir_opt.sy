@@ -1,5 +1,7 @@
 // RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
 
+const int C = 16;
+
 int algebra(int x) {
   int a = x + 0;
   int b = 0 + a;
@@ -27,8 +29,19 @@ int zext_cmp(int x) {
   return 0;
 }
 
+int global_const(int x) {
+  return x / C + x % C;
+}
+
+int tail_sum(int n, int acc) {
+  if (n == 0) {
+    return acc;
+  }
+  return tail_sum(n - 1, acc + n);
+}
+
 int main() {
-  return algebra(42) + folded_branch() + zext_cmp(3);
+  return algebra(42) + folded_branch() + zext_cmp(3) + global_const(99) + tail_sum(4, 0);
 }
 
 // OIR-LABEL: define i32 @algebra
@@ -47,3 +60,14 @@ int main() {
 // OIR-NOT: zext
 // OIR-NOT: icmp ne i32
 // OIR: br i1
+
+// OIR-LABEL: define i32 @global_const
+// OIR-NOT: load i32, i32* @C
+// OIR: sdiv i32 %x.arg, 16
+// OIR: srem i32 %x.arg, 16
+// OIR-NOT: load i32, i32* @C
+
+// OIR-LABEL: define i32 @tail_sum
+// OIR: %n.arg.tail = phi
+// OIR-NOT: call i32 @tail_sum
+// OIR: ret i32

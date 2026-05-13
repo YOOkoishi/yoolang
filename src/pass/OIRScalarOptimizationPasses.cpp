@@ -3,11 +3,14 @@
 #include "../../include/pass/OIRConstantFoldPass.h"
 #include "../../include/pass/OIRDeadCodeEliminationPass.h"
 #include "../../include/pass/OIRGVNPass.h"
+#include "../../include/pass/OIRGlobalOptPass.h"
 #include "../../include/pass/OIRInlinePass.h"
 #include "../../include/pass/OIRLICMPass.h"
+#include "../../include/pass/OIRLoopStrengthReductionPass.h"
 #include "../../include/pass/OIRMem2RegPass.h"
 #include "../../include/pass/OIROptimizationPipelinePass.h"
 #include "../../include/pass/OIRSCCPPass.h"
+#include "../../include/pass/OIRTailRecursionEliminationPass.h"
 
 #include "../../include/oir/OIRScalarOpt.h"
 
@@ -17,6 +20,7 @@ namespace {
 
 bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
+    changed |= oir_opt::propagate_global_constants(module, stats);
     changed |= oir_opt::simplify_branches(module, stats);
     changed |= oir_opt::cleanup_cfg(module, stats);
     changed |= oir_opt::promote_memory_to_registers(module, stats);
@@ -29,8 +33,10 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
     changed |= oir_opt::global_value_numbering(module, stats);
     changed |= oir_opt::loop_invariant_code_motion(module, stats);
+    changed |= oir_opt::reduce_gep_strength(module, stats);
     changed |= oir_opt::unswitch_loops(module, stats);
     changed |= oir_opt::rotate_loops(module, stats);
+    changed |= oir_opt::reduce_gep_strength(module, stats);
     changed |= oir_opt::global_value_numbering(module, stats);
     changed |= oir_opt::run_sccp(module, stats);
     changed |= oir_opt::simplify_branches(module, stats);
@@ -45,11 +51,14 @@ namespace oir_opt {
 
 bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     bool changed = false;
+    changed |= propagate_global_constants(module, stats);
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
     changed |= promote_memory_to_registers(module, stats);
     changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
     changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
+    changed |= eliminate_tail_recursion(module, stats);
+    changed |= propagate_global_constants(module, stats);
     changed |= inline_functions(module, stats);
 
     constexpr unsigned kMaxIterations = 8;
@@ -62,6 +71,8 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
 
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
+    changed |= reduce_gep_strength(module, stats);
+    changed |= propagate_global_constants(module, stats);
     changed |= eliminate_dead_code(module, stats);
     return changed;
 }
@@ -178,6 +189,25 @@ PassResult OIRLICMPass::run(PassContext &context) {
                                       });
 }
 
+std::string_view OIRLoopStrengthReductionPass::name() const {
+    return "OIRLoopStrengthReductionPass";
+}
+
+PassKind OIRLoopStrengthReductionPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRLoopStrengthReductionPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIRLoopStrengthReductionPass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            bool changed = oir_opt::reduce_gep_strength(module, stats);
+            changed |= oir_opt::global_value_numbering(module, stats);
+            changed |= oir_opt::eliminate_dead_code(module, stats);
+            return changed;
+        });
+}
+
 std::string_view OIRGVNPass::name() const {
     return "OIRGVNPass";
 }
@@ -228,6 +258,45 @@ PassResult OIRInlinePass::run(PassContext &context) {
         context, "OIRInlinePass requires OIR module in pass context",
         [](oir::Module &module, oir_opt::Stats &stats) {
             bool changed = oir_opt::inline_functions(module, stats);
+            changed |= oir_opt::simplify_branches(module, stats);
+            changed |= oir_opt::cleanup_cfg(module, stats);
+            changed |= oir_opt::eliminate_dead_code(module, stats);
+            return changed;
+        });
+}
+
+std::string_view OIRGlobalOptPass::name() const {
+    return "OIRGlobalOptPass";
+}
+
+PassKind OIRGlobalOptPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRGlobalOptPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context,
+                                      "OIRGlobalOptPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed =
+                                              oir_opt::propagate_global_constants(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+std::string_view OIRTailRecursionEliminationPass::name() const {
+    return "OIRTailRecursionEliminationPass";
+}
+
+PassKind OIRTailRecursionEliminationPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRTailRecursionEliminationPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIRTailRecursionEliminationPass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            bool changed = oir_opt::eliminate_tail_recursion(module, stats);
             changed |= oir_opt::simplify_branches(module, stats);
             changed |= oir_opt::cleanup_cfg(module, stats);
             changed |= oir_opt::eliminate_dead_code(module, stats);

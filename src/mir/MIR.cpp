@@ -746,6 +746,8 @@ const char *opcode_name(Opcode opcode) {
         return "SLLI";
     case Opcode::SllIW:
         return "SLLIW";
+    case Opcode::SraI:
+        return "SRAI";
     case Opcode::SraIW:
         return "SRAIW";
     case Opcode::SrliW:

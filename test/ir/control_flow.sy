@@ -31,7 +31,7 @@ int main() {
 // MIR-LABEL: func @main() -> i32
 // MIR: BNEZ
 // MIR: J %epilogue
-// MIR: edge.
+// MIR-NOT: edge.
 
 // ASM-LABEL: main:
 // ASM: bnez

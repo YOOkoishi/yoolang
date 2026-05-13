@@ -155,7 +155,34 @@ bool is_speculatable_divisor(oir::Value *value) {
     return constant.has_value() && *constant != 0;
 }
 
-bool is_licm_candidate(const oir::Instruction &inst) {
+const oir::GlobalVariable *underlying_global(const oir::Value *value) {
+    if (auto *global = dynamic_cast<const oir::GlobalVariable *>(value)) {
+        return global;
+    }
+    if (auto *gep = dynamic_cast<const oir::GetElementPtrInst *>(value)) {
+        return underlying_global(gep->base_ptr());
+    }
+    return nullptr;
+}
+
+bool loop_has_store_or_call(const oir::Loop &loop) {
+    for (auto *const_block : loop.blocks) {
+        for (const auto &inst : const_block->instructions()) {
+            if (inst->op() == oir::Instruction::OpID::Store ||
+                inst->op() == oir::Instruction::OpID::Call) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool is_global_load(const oir::Instruction &inst) {
+    auto *load = dynamic_cast<const oir::LoadInst *>(&inst);
+    return load != nullptr && underlying_global(load->ptr()) != nullptr;
+}
+
+bool is_licm_candidate(const oir::Instruction &inst, bool allow_global_loads) {
     switch (inst.op()) {
     case oir::Instruction::OpID::Add:
     case oir::Instruction::OpID::Sub:
@@ -179,11 +206,12 @@ bool is_licm_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Ret:
     case oir::Instruction::OpID::Br:
     case oir::Instruction::OpID::Alloca:
-    case oir::Instruction::OpID::Load:
     case oir::Instruction::OpID::Store:
     case oir::Instruction::OpID::Call:
     case oir::Instruction::OpID::Phi:
         return false;
+    case oir::Instruction::OpID::Load:
+        return allow_global_loads && is_global_load(inst);
     }
     return false;
 }
@@ -201,8 +229,9 @@ bool operand_is_invariant(const oir::Loop &loop, oir::Value *value,
 }
 
 bool instruction_is_invariant(const oir::Loop &loop, const oir::Instruction &inst,
-                              const std::unordered_set<oir::Instruction *> &moving) {
-    if (!is_licm_candidate(inst)) {
+                              const std::unordered_set<oir::Instruction *> &moving,
+                              bool allow_global_loads) {
+    if (!is_licm_candidate(inst, allow_global_loads)) {
         return false;
     }
     for (auto *operand : inst.operands()) {
@@ -244,6 +273,7 @@ bool run_on_loop(oir::Function &function, const oir::Loop &loop, Stats &stats) {
 
     bool changed = false;
     bool keep_going = true;
+    const bool allow_global_loads = !loop_has_store_or_call(loop);
     std::unordered_set<oir::Instruction *> moved;
     while (keep_going) {
         keep_going = false;
@@ -254,7 +284,7 @@ bool run_on_loop(oir::Function &function, const oir::Loop &loop, Stats &stats) {
                 if (moved.find(inst.get()) != moved.end()) {
                     continue;
                 }
-                if (instruction_is_invariant(loop, *inst, moved)) {
+                if (instruction_is_invariant(loop, *inst, moved, allow_global_loads)) {
                     to_move.push_back(inst.get());
                 }
             }

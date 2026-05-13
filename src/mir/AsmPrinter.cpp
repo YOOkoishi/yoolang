@@ -216,6 +216,10 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\tslliw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";
         break;
+    case Opcode::SraI:
+        out_ << "\tsrai " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
+        break;
     case Opcode::SraIW:
         out_ << "\tsraiw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";

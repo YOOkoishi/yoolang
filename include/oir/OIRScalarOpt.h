@@ -23,6 +23,9 @@ struct Stats {
     unsigned loop_rotate = 0;
     unsigned loop_unswitch = 0;
     unsigned inlined = 0;
+    unsigned globals = 0;
+    unsigned tail_recursion = 0;
+    unsigned lsr = 0;
 
     bool changed() const;
     std::string message() const;
@@ -61,6 +64,9 @@ bool rotate_loops(oir::Module &module, Stats &stats);
 bool unswitch_loops(oir::Module &module, Stats &stats);
 bool global_value_numbering(oir::Module &module, Stats &stats);
 bool inline_functions(oir::Module &module, Stats &stats);
+bool propagate_global_constants(oir::Module &module, Stats &stats);
+bool eliminate_tail_recursion(oir::Module &module, Stats &stats);
+bool reduce_gep_strength(oir::Module &module, Stats &stats);
 bool optimize_oir_aggressively(oir::Module &module, Stats &stats);
 bool verify_oir(oir::Module &module, std::string &message);
 

@@ -306,6 +306,7 @@ bool is_pure_def(mir::Opcode opcode) {
     case mir::Opcode::And:
     case mir::Opcode::SllI:
     case mir::Opcode::SllIW:
+    case mir::Opcode::SraI:
     case mir::Opcode::SraIW:
     case mir::Opcode::SrliW:
     case mir::Opcode::Xor:
@@ -528,6 +529,65 @@ bool replace_branch_with(mir::MachineBasicBlock &block, std::size_t index, mir::
     return true;
 }
 
+std::optional<std::string> jump_only_target(const mir::MachineBasicBlock &block) {
+    if (block.instructions().size() != 1) {
+        return std::nullopt;
+    }
+    const auto &jump = block.instructions().front();
+    if (jump.opcode() != mir::Opcode::Jump || jump.operands().empty() ||
+        jump.operands()[0].kind() != mir::OperandKind::Block ||
+        jump.operands()[0].string_value() == block.name() ||
+        jump.operands()[0].string_value() == "epilogue") {
+        return std::nullopt;
+    }
+    return jump.operands()[0].string_value();
+}
+
+std::string resolve_jump_only_target(const mir::MachineFunction &function, std::string target) {
+    for (std::size_t depth = 0; depth < function.blocks().size(); ++depth) {
+        auto *block = function.get_block(target);
+        if (block == nullptr) {
+            break;
+        }
+        auto next = jump_only_target(*block);
+        if (!next || *next == target) {
+            break;
+        }
+        target = *next;
+    }
+    return target;
+}
+
+bool redirect_jump_only_blocks(mir::MachineFunction &function, Stats &stats) {
+    bool changed = false;
+    for (auto &block_ptr : function.blocks()) {
+        for (auto &instr : block_ptr->instructions()) {
+            std::optional<std::size_t> target_index;
+            if (instr.opcode() == mir::Opcode::Jump) {
+                target_index = 0;
+            } else if (is_conditional_branch(instr.opcode())) {
+                target_index = branch_target_index(instr.opcode());
+            }
+
+            if (!target_index || instr.operands().size() <= *target_index ||
+                instr.operands()[*target_index].kind() != mir::OperandKind::Block) {
+                continue;
+            }
+
+            const auto old_target = instr.operands()[*target_index].string_value();
+            auto new_target = resolve_jump_only_target(function, old_target);
+            if (new_target == old_target) {
+                continue;
+            }
+
+            instr.operands()[*target_index] = mir::MachineOperand::block(std::move(new_target));
+            ++stats.jumps;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 bool fuse_compare_branches(mir::MachineFunction &function, Stats &stats) {
     auto counts = count_vregs(function);
     bool changed = false;
@@ -637,6 +697,7 @@ bool simplify_block(mir::MachineBasicBlock &block, const mir::MachineBasicBlock 
             changed = true;
         } else if ((instr.opcode() == mir::Opcode::SllI ||
                     instr.opcode() == mir::Opcode::SllIW ||
+                    instr.opcode() == mir::Opcode::SraI ||
                     instr.opcode() == mir::Opcode::SraIW ||
                     instr.opcode() == mir::Opcode::SrliW) &&
                    ops.size() >= 3 && ops[2].kind() == mir::OperandKind::Imm &&
@@ -760,6 +821,7 @@ bool optimize_function(mir::MachineFunction &function, bool post_ra, Stats &stat
             iteration_changed |= fuse_compare_branches(function, stats);
             iteration_changed |= local_cse(function, stats);
             iteration_changed |= fold_address_offsets(function, stats);
+            iteration_changed |= redirect_jump_only_blocks(function, stats);
             iteration_changed |= remove_dead_defs(function, stats);
             if (!iteration_changed) {
                 break;
@@ -768,6 +830,7 @@ bool optimize_function(mir::MachineFunction &function, bool post_ra, Stats &stat
         }
     }
 
+    changed |= redirect_jump_only_blocks(function, stats);
     for (std::size_t i = 0; i < function.blocks().size(); ++i) {
         auto *next = i + 1 < function.blocks().size() ? function.blocks()[i + 1].get() : nullptr;
         changed |= simplify_block(*function.blocks()[i], next, post_ra, stats);

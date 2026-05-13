@@ -23,7 +23,7 @@ int main() {
 
 // MIR-LABEL: func @choose
 // MIR: BNEZ
-// MIR: edge.
+// MIR-NOT: edge.
 
 // ASM-LABEL: choose:
 // ASM: bge

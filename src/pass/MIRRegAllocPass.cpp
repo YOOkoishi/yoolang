@@ -393,6 +393,19 @@ class RegAllocator {
             for (auto instr_it = block->instructions().rbegin();
                  instr_it != block->instructions().rend(); ++instr_it) {
                 const auto &instr = *instr_it;
+                std::vector<VRegId> instr_uses;
+                for (const auto &use : instr.uses()) {
+                    if (is_virtual_of_class(use, reg_class) &&
+                        std::find(instr_uses.begin(), instr_uses.end(), use.id) ==
+                            instr_uses.end()) {
+                        instr_uses.push_back(use.id);
+                    }
+                }
+                for (std::size_t i = 0; i < instr_uses.size(); ++i) {
+                    for (std::size_t j = i + 1; j < instr_uses.size(); ++j) {
+                        add_edge(instr_uses[i], instr_uses[j]);
+                    }
+                }
 
                 if (instr.opcode() == mir::Opcode::Call) {
                     for (const auto &phys : caller_saved(reg_class)) {
@@ -605,6 +618,17 @@ class RegAllocator {
                     {mir::RegisterClass::GPR, spill_scratch_registers(mir::RegisterClass::GPR)},
                     {mir::RegisterClass::FPR32,
                      spill_scratch_registers(mir::RegisterClass::FPR32)}};
+                for (const auto &operand : instr.operands()) {
+                    if (!operand.is_reg() || !operand.reg_value().is_physical()) {
+                        continue;
+                    }
+                    auto &pool = scratch_pools[operand.reg_value().reg_class];
+                    pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                              [&](const mir::Register &scratch) {
+                                                  return same_phys(scratch, operand.reg_value());
+                                              }),
+                               pool.end());
+                }
 
                 auto allocate_replacement = [&](VRegId id) -> mir::Register {
                     auto found = replacements.find(id);
