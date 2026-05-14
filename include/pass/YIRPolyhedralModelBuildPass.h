@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <cstdint>
 
 namespace yir {
 class Value;
@@ -13,28 +14,43 @@ class Operation;
 
 namespace pass {
 
+// A simple affine expression: c0*v0 + c1*v1 + ... + constant
+struct PolyAffineExpr {
+    std::int64_t constant = 0;
+    std::vector<std::pair<const yir::Value*, std::int64_t>> terms;
+    bool valid = true;
+};
+
+struct PolyLoopBound {
+    const yir::Value* iv; // Induction variable
+    PolyAffineExpr lower;
+    PolyAffineExpr upper;
+};
+
 struct PolyAccess {
     enum class Kind { Read, Write };
     Kind kind;
     const yir::Value *memory;
-    // We will just store string text expressions of relation for now
-    std::string relation_str; 
+    std::vector<PolyAffineExpr> indices; // Representation for A[expr1][expr2]
 };
 
 struct PolyStmt {
     std::size_t id;
     const yir::Operation *op;
-    std::vector<const yir::Value *> dims;
+    std::vector<const yir::Value *> dims; // The nested loops surrounding this stmt
     
-    std::string domain_str;
+    std::vector<PolyLoopBound> domain;
     std::vector<PolyAccess> reads;
     std::vector<PolyAccess> writes;
-    std::string schedule_str;
+    
+    // Schedule: simply depth -> index, e.g., [i, j, stmt_lexical_id]
+    std::vector<const yir::Value *> schedule_dims;
+    std::size_t lexical_id;
 };
 
 struct PolyScop {
     std::size_t id;
-    std::vector<const yir::Value *> params;
+    std::vector<const yir::Value *> params; // Loop invariants/symbols
     std::vector<PolyStmt> statements;
 };
 

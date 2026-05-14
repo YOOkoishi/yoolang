@@ -10,6 +10,39 @@ namespace pass {
 
 namespace {
 
+// Simplistic evaluator to extract affine expressions from standard YIR operations
+class AffineExtractor {
+public:
+    PolyAffineExpr extract(const yir::Value* val) {
+        PolyAffineExpr expr;
+        if (!val) {
+            expr.valid = false;
+            return expr;
+        }
+
+        if (auto* const_op = dynamic_cast<const yir::ConstI32Op*>(val->defining_op())) {
+            expr.constant = const_op->value();
+            return expr;
+        }
+
+        // Just basic mapping to variables for now if complex analysis is skipped.
+        // A complete version would traverse Add/Sub/Mul.
+        if (auto* add = dynamic_cast<const yir::AddIOp*>(val->defining_op())) {
+            auto lhs = extract(add->lhs());
+            auto rhs = extract(add->rhs());
+            if (lhs.valid && rhs.valid) {
+                expr.constant = lhs.constant + rhs.constant;
+                expr.terms = lhs.terms;
+                for (const auto& t : rhs.terms) expr.terms.push_back(t);
+                return expr;
+            }
+        }
+
+        expr.terms.push_back({val, 1});
+        return expr;
+    }
+};
+
 class PolyhedralBuilder {
 public:
     explicit PolyhedralBuilder(const YIRSCoPInfo& scop_info, const YIRPolyhedralCanonicalInfo& canonical_info)
@@ -21,21 +54,17 @@ public:
             PolyScop poly_scop;
             poly_scop.id = scop.id;
 
-            // Collect parameters (symbols)
             for (auto* sym : scop.symbols) {
                 poly_scop.params.push_back(sym);
             }
 
-            // Extract model for each statement
             for (const auto& stmt : scop.statements) {
                 PolyStmt poly_stmt;
                 poly_stmt.id = stmt.id;
                 poly_stmt.op = stmt.op;
+                poly_stmt.lexical_id = stmt.id;
 
-                // Very basic placeholder extraction
-                poly_stmt.schedule_str = extract_schedule(stmt.op);
-                poly_stmt.domain_str = extract_domain(stmt.op);
-
+                extract_domain(poly_stmt, stmt.op);
                 extract_accesses(*stmt.op, poly_stmt.reads, poly_stmt.writes);
 
                 poly_scop.statements.push_back(std::move(poly_stmt));
@@ -46,24 +75,58 @@ public:
     }
 
 private:
-    std::string extract_schedule(const yir::Operation* op) {
-        // Placeholder for phase 2.3: poly-schedule-extract
-        std::stringstream ss;
-        ss << "[i, j, " << op << "]";
-        return ss.str();
+    void extract_domain(PolyStmt& poly_stmt, const yir::Operation* op) {
+        AffineExtractor extractor;
+        // In this customized scheme A, we rely on the canonical_info which already recorded loops
+        // that surround statements. We find which loops in canonical_info enclose the statement.
+        for (const auto& loop_seq : canonical_info_.loops) {
+            if (is_descendant(&loop_seq.loop->body_region(), op)) {
+                poly_stmt.dims.insert(poly_stmt.dims.begin(), loop_seq.loop->induction_var());
+                poly_stmt.schedule_dims.insert(poly_stmt.schedule_dims.begin(), loop_seq.loop->induction_var());
+
+                PolyLoopBound bound;
+                bound.iv = loop_seq.loop->induction_var();
+                bound.lower = extractor.extract(loop_seq.loop->lower_bound());
+                bound.upper = extractor.extract(loop_seq.loop->upper_bound());
+                poly_stmt.domain.insert(poly_stmt.domain.begin(), std::move(bound));
+            }
+        }
     }
 
-    std::string extract_domain(const yir::Operation* op) {
-        // Placeholder for phase 2.1: poly-domain-extract
-        return "{ [i, j] : 0 <= i < N and 0 <= j < M }";
+    bool is_descendant(const yir::Region* region, const yir::Operation* target) const {
+        for (const auto& op : region->operations()) {
+            if (op.get() == target) return true;
+            if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
+                if (is_descendant(&if_op->then_region(), target)) return true;
+                if (if_op->has_else() && is_descendant(&if_op->else_region(), target)) return true;
+            } else if (auto* while_op = dynamic_cast<const yir::WhileOp*>(op.get())) {
+                if (is_descendant(&while_op->cond_region(), target)) return true;
+                if (is_descendant(&while_op->body_region(), target)) return true;
+            } else if (auto* for_op = dynamic_cast<const yir::ForOp*>(op.get())) {
+                if (is_descendant(&for_op->body_region(), target)) return true;
+            }
+        }
+        return false;
     }
 
     void extract_accesses(const yir::Operation& op, std::vector<PolyAccess>& reads, std::vector<PolyAccess>& writes) {
-        // Placeholder for phase 2.2: poly-access-extract
+        AffineExtractor extractor;
         if (auto* load = dynamic_cast<const yir::ArrayLoadOp*>(&op)) {
-            reads.push_back({PolyAccess::Kind::Read, load->array(), "A[i, j]"});
+            PolyAccess access;
+            access.kind = PolyAccess::Kind::Read;
+            access.memory = load->array();
+            for (auto* index_val : load->indices()) {
+                access.indices.push_back(extractor.extract(index_val));
+            }
+            reads.push_back(std::move(access));
         } else if (auto* store = dynamic_cast<const yir::ArrayStoreOp*>(&op)) {
-            writes.push_back({PolyAccess::Kind::Write, store->array(), "A[i, j]"});
+            PolyAccess access;
+            access.kind = PolyAccess::Kind::Write;
+            access.memory = store->array();
+            for (auto* index_val : store->indices()) {
+                access.indices.push_back(extractor.extract(index_val));
+            }
+            writes.push_back(std::move(access));
         }
     }
 
@@ -100,7 +163,7 @@ PassResult YIRPolyhedralModelBuildPass::run(PassContext &context) {
     context.set_artifact<PolyModelInfo>(std::string(kArtifactKey), std::move(info));
 
     std::ostringstream oss;
-    oss << "Built " << num_models << " Polyhedral Models.";
+    oss << "Built " << num_models << " Custom Polyhedral Models.";
     return PassResult::ok(false, oss.str());
 }
 
