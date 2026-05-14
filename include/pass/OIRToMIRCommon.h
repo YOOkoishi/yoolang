@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../../include/mir/MIR.h"
-#include "../../include/oir/oir.h"
+#include "../../include/oir/OIR.h"
 
 #include <cstdint>
 #include <memory>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "oir.h"
+#include "OIR.h"
 
 #include <cstddef>
 #include <cstdint>

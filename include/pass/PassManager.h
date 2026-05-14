@@ -2,7 +2,7 @@
 
 #include "../ast/ast.h"
 #include "../mir/MIR.h"
-#include "../oir/oir.h"
+#include "../oir/OIR.h"
 
 #include <memory>
 #include <stdexcept>

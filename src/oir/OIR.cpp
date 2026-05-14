@@ -1,4 +1,4 @@
-#include "../../include/oir/oir.h"
+#include "../../include/oir/OIR.h"
 
 #include <algorithm>
 #include <iomanip>

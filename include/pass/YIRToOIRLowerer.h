@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../include/oir/oir.h"
+#include "../../include/oir/OIR.h"
 #include "../../include/yir/YIR.h"
 
 #include <memory>
