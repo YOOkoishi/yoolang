@@ -319,7 +319,7 @@ class AffineMaterializer final {
         auto *coefficient =
             insert_op<yir::ConstI32Op>(ops, insert_pos, static_cast<int>(component.value),
                                        fresh_name("c"));
-        return insert_op<yir::MulIOp>(ops, insert_pos, coefficient, component.term,
+        return insert_op<yir::MulIOp>(ops, insert_pos, component.term, coefficient,
                                       fresh_name("mul"));
     }
 
