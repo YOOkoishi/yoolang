@@ -25,6 +25,8 @@
 #include "../include/pass/YIRLoopAnalysisPass.h"
 #include "../include/pass/YIRLoopOptimizationPass.h"
 #include "../include/pass/YIRPolyhedralCanonicalizePass.h"
+#include "../include/pass/YIRSCoPDetectPass.h"
+#include "../include/pass/YIRPolyhedralModelBuildPass.h"
 #include "../include/pass/YIRToOIRPass.h"
 #include "../include/yir/YIRPrinter.h"
 
@@ -180,6 +182,8 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
         pm.add_pass<pass::ASTToYIRPass>();
         if (optimizations_enabled(options)) {
             pm.add_pass<pass::YIRPolyhedralCanonicalizePass>();
+            pm.add_pass<pass::YIRSCoPDetectPass>();
+            pm.add_pass<pass::YIRPolyhedralModelBuildPass>();
             pm.add_pass<pass::YIRLoopOptimizationPass>();
             pm.add_pass<pass::YIRLoopAnalysisPass>();
         }
