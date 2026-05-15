@@ -9,14 +9,13 @@ bool eliminate_dead_code(oir::Module &module, Stats &stats) {
     bool keep_going = true;
     while (keep_going) {
         keep_going = false;
-        oir::UseAnalysis uses(module);
         for (auto &function : module.functions()) {
             if (function->is_external()) {
                 continue;
             }
             for (auto &block : function->blocks()) {
                 for (auto it = block->instructions().begin(); it != block->instructions().end();) {
-                    if (is_pure_instruction(**it) && !uses.has_uses(it->get())) {
+                    if (is_pure_instruction(**it) && !(*it)->has_uses()) {
                         it = block->instructions().erase(it);
                         ++stats.dce;
                         changed = true;

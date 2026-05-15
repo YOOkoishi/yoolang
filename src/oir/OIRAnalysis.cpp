@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <sstream>
 
@@ -251,10 +252,7 @@ void UseAnalysis::replace_all_uses_with(Value *old_value, Value *new_value) {
         return;
     }
 
-    auto worklist = users(old_value);
-    for (auto *user : worklist) {
-        user->replace_operands(old_value, new_value);
-    }
+    old_value->replace_all_uses_with(new_value);
 
     if (module_ != nullptr) {
         scan(*module_);
@@ -265,6 +263,9 @@ void UseAnalysis::replace_all_uses_with(Value *old_value, Value *new_value) {
 
 void UseAnalysis::scan_instruction(Instruction *instruction) {
     for (auto *operand : instruction->operands()) {
+        if (operand == nullptr) {
+            continue;
+        }
         users_[operand].push_back(instruction);
     }
 }
@@ -277,6 +278,7 @@ DominatorTree::DominatorTree(const Function &function) : function_(&function) {
     compute_dominators();
     compute_immediate_dominators();
     compute_children();
+    compute_dom_dfs_numbers();
 }
 
 bool DominatorTree::dominates(const BasicBlock *a, const BasicBlock *b) const {
@@ -291,8 +293,15 @@ bool DominatorTree::dominates(const BasicBlock *a, const BasicBlock *b) const {
         return false;
     }
 
-    auto found = dominators_.find(b);
-    return found != dominators_.end() && found->second.find(a) != found->second.end();
+    auto pre_a = dom_pre_.find(a);
+    auto pre_b = dom_pre_.find(b);
+    auto post_a = dom_post_.find(a);
+    auto post_b = dom_post_.find(b);
+    if (pre_a == dom_pre_.end() || pre_b == dom_pre_.end() || post_a == dom_post_.end() ||
+        post_b == dom_post_.end()) {
+        return false;
+    }
+    return pre_a->second <= pre_b->second && post_b->second <= post_a->second;
 }
 
 const BasicBlock *DominatorTree::immediate_dominator(const BasicBlock *block) const {
@@ -332,91 +341,86 @@ void DominatorTree::compute_reachable() {
 }
 
 void DominatorTree::compute_dominators() {
-    BlockSet all_reachable(reachable_blocks_.begin(), reachable_blocks_.end());
-    auto *entry = function_->entry_block();
-
-    for (auto *block : blocks_) {
-        if (!is_reachable(block)) {
-            dominators_[block] = {block};
-        } else if (block == entry) {
-            dominators_[block] = {block};
-        } else {
-            dominators_[block] = all_reachable;
-        }
-    }
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto *block : reachable_blocks_) {
-            if (block == entry) {
-                continue;
-            }
-
-            BlockSet next;
-            bool saw_reachable_pred = false;
-            for (auto *pred : block->predecessors()) {
-                if (!is_reachable(pred)) {
-                    continue;
-                }
-                if (!saw_reachable_pred) {
-                    next = dominators_.at(pred);
-                    saw_reachable_pred = true;
-                    continue;
-                }
-
-                for (auto it = next.begin(); it != next.end();) {
-                    if (dominators_.at(pred).find(*it) == dominators_.at(pred).end()) {
-                        it = next.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-
-            if (!saw_reachable_pred) {
-                next.clear();
-            }
-            next.insert(block);
-            if (next != dominators_.at(block)) {
-                dominators_[block] = std::move(next);
-                changed = true;
-            }
-        }
-    }
+    dominators_.clear();
 }
 
 void DominatorTree::compute_immediate_dominators() {
     auto *entry = function_->entry_block();
+    idom_.clear();
+    for (auto *block : blocks_) {
+        idom_[block] = nullptr;
+    }
+    if (entry == nullptr || !is_reachable(entry)) {
+        return;
+    }
+
+    std::vector<const BasicBlock *> postorder;
+    std::unordered_set<const BasicBlock *> seen;
+    std::function<void(const BasicBlock *)> dfs = [&](const BasicBlock *block) {
+        if (!seen.insert(block).second) {
+            return;
+        }
+        for (auto *succ : block->successors()) {
+            if (is_reachable(succ)) {
+                dfs(succ);
+            }
+        }
+        postorder.push_back(block);
+    };
+    dfs(entry);
+
+    std::vector<const BasicBlock *> rpo(postorder.rbegin(), postorder.rend());
+    std::unordered_map<const BasicBlock *, std::size_t> rpo_index;
+    for (std::size_t i = 0; i < rpo.size(); ++i) {
+        rpo_index[rpo[i]] = i;
+    }
+
+    std::unordered_map<const BasicBlock *, const BasicBlock *> work_idom;
+    work_idom[entry] = entry;
+
+    auto intersect = [&](const BasicBlock *lhs, const BasicBlock *rhs) {
+        auto *finger_lhs = lhs;
+        auto *finger_rhs = rhs;
+        while (finger_lhs != finger_rhs) {
+            while (rpo_index.at(finger_lhs) > rpo_index.at(finger_rhs)) {
+                finger_lhs = work_idom.at(finger_lhs);
+            }
+            while (rpo_index.at(finger_rhs) > rpo_index.at(finger_lhs)) {
+                finger_rhs = work_idom.at(finger_rhs);
+            }
+        }
+        return finger_lhs;
+    };
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto *block : rpo) {
+            if (block == entry) {
+                continue;
+            }
+
+            const BasicBlock *new_idom = nullptr;
+            for (auto *pred : block->predecessors()) {
+                if (!is_reachable(pred) || work_idom.find(pred) == work_idom.end()) {
+                    continue;
+                }
+                new_idom = new_idom == nullptr ? pred : intersect(pred, new_idom);
+            }
+            if (new_idom != nullptr && work_idom[block] != new_idom) {
+                work_idom[block] = new_idom;
+                changed = true;
+            }
+        }
+    }
+
     for (auto *block : blocks_) {
         if (!is_reachable(block) || block == entry) {
             idom_[block] = nullptr;
             continue;
         }
-
-        const auto &doms = dominators_.at(block);
-        const BasicBlock *best = nullptr;
-        for (auto *candidate : doms) {
-            if (candidate == block) {
-                continue;
-            }
-
-            bool dominated_by_all_other_strict_doms = true;
-            for (auto *other : doms) {
-                if (other == block || other == candidate) {
-                    continue;
-                }
-                if (dominators_.at(candidate).find(other) == dominators_.at(candidate).end()) {
-                    dominated_by_all_other_strict_doms = false;
-                    break;
-                }
-            }
-            if (dominated_by_all_other_strict_doms) {
-                best = candidate;
-                break;
-            }
-        }
-        idom_[block] = best;
+        auto found = work_idom.find(block);
+        idom_[block] = found == work_idom.end() ? nullptr : found->second;
     }
 }
 
@@ -429,6 +433,25 @@ void DominatorTree::compute_children() {
             children_[item.second].push_back(item.first);
         }
     }
+}
+
+void DominatorTree::compute_dom_dfs_numbers() {
+    dom_pre_.clear();
+    dom_post_.clear();
+    auto *entry = function_->entry_block();
+    if (entry == nullptr || !is_reachable(entry)) {
+        return;
+    }
+
+    std::size_t next = 0;
+    std::function<void(const BasicBlock *)> dfs = [&](const BasicBlock *block) {
+        dom_pre_[block] = next++;
+        for (auto *child : children(block)) {
+            dfs(child);
+        }
+        dom_post_[block] = next++;
+    };
+    dfs(entry);
 }
 
 LoopInfo::LoopInfo(const Function &function, const DominatorTree &dom_tree)

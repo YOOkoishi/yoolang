@@ -1,6 +1,7 @@
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
+#include "../../include/oir/OIRCFGUtils.h"
 
 #include <algorithm>
 #include <memory>
@@ -32,22 +33,6 @@ oir::BasicBlock *find_preheader(const oir::Loop &loop) {
         return nullptr;
     }
     return preheader;
-}
-
-void replace_branch_target(oir::BranchInst &branch, oir::BasicBlock *old_target,
-                           oir::BasicBlock *new_target) {
-    if (branch.is_conditional()) {
-        if (branch.true_bb() == old_target) {
-            branch.set_operand(1, new_target);
-        }
-        if (branch.false_bb() == old_target) {
-            branch.set_operand(2, new_target);
-        }
-        return;
-    }
-    if (branch.target_bb() == old_target) {
-        branch.set_operand(0, new_target);
-    }
 }
 
 std::vector<std::pair<oir::Value *, oir::BasicBlock *>>
@@ -120,29 +105,14 @@ oir::BasicBlock *ensure_preheader(oir::Function &function, const oir::Loop &loop
         }
     }
 
-    auto branch =
-        std::make_unique<oir::BranchInst>(function.parent()->types().void_ty(),
-                                          const_cast<oir::BasicBlock *>(loop.header), preheader);
-    branch->set_parent(preheader);
-    preheader->instructions().push_back(std::move(branch));
+    oir::cfg::append_unconditional_branch(*function.parent(), preheader,
+                                          const_cast<oir::BasicBlock *>(loop.header));
 
     for (auto *pred : outside_preds) {
-        if (auto *term = dynamic_cast<oir::BranchInst *>(pred->terminator())) {
-            replace_branch_target(*term, const_cast<oir::BasicBlock *>(loop.header), preheader);
-        }
-        pred->remove_successor(const_cast<oir::BasicBlock *>(loop.header));
-        pred->add_successor(preheader);
-        preheader->add_predecessor(pred);
-        const_cast<oir::BasicBlock *>(loop.header)->remove_predecessor(pred);
+        oir::cfg::replace_successor(pred, const_cast<oir::BasicBlock *>(loop.header), preheader);
     }
 
-    preheader->add_successor(const_cast<oir::BasicBlock *>(loop.header));
-    const_cast<oir::BasicBlock *>(loop.header)->add_predecessor(preheader);
-
     for (auto &[phi, value] : header_phi_values) {
-        for (auto *pred : outside_preds) {
-            phi->remove_incoming_from(pred);
-        }
         phi->add_incoming(value, preheader);
     }
 

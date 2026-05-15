@@ -1,5 +1,7 @@
 #include "../../include/oir/OIRScalarOpt.h"
 
+#include "../../include/oir/OIRCFGUtils.h"
+
 #include <iterator>
 #include <memory>
 #include <unordered_set>
@@ -7,21 +9,6 @@
 
 namespace pass::oir_opt {
 namespace {
-
-void replace_phi_incoming_block(oir::BasicBlock *block, oir::BasicBlock *old_pred,
-                                oir::BasicBlock *new_pred) {
-    for (auto &inst : block->instructions()) {
-        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
-        if (phi == nullptr) {
-            break;
-        }
-        for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
-            if (phi->incoming()[i].second == old_pred) {
-                phi->set_operand(i * 2 + 1, new_pred);
-            }
-        }
-    }
-}
 
 oir::CallInst *tail_self_call(oir::Function &function, oir::BasicBlock &block) {
     if (block.instructions().size() < 2) {
@@ -68,11 +55,7 @@ TailRecLoop create_argument_loop_header(oir::Function &function) {
 
     auto old_successors = loop.entry->successors();
     for (auto *succ : old_successors) {
-        replace_phi_incoming_block(succ, loop.entry, loop.header);
-        succ->remove_predecessor(loop.entry);
-        succ->add_predecessor(loop.header);
-        loop.entry->remove_successor(succ);
-        loop.header->add_successor(succ);
+        oir::cfg::move_successor_edge(loop.entry, loop.header, succ);
     }
 
     for (auto &arg : function.args()) {
@@ -93,13 +76,7 @@ TailRecLoop create_argument_loop_header(oir::Function &function) {
         loop.header->instructions().push_back(std::move(inst));
     }
 
-    auto branch =
-        std::make_unique<oir::BranchInst>(function.parent()->types().void_ty(), loop.header,
-                                          loop.entry);
-    branch->set_parent(loop.entry);
-    loop.entry->instructions().push_back(std::move(branch));
-    loop.entry->add_successor(loop.header);
-    loop.header->add_predecessor(loop.entry);
+    oir::cfg::append_unconditional_branch(*function.parent(), loop.entry, loop.header);
     return loop;
 }
 
@@ -147,13 +124,7 @@ bool rewrite_tail_calls(oir::Function &function, const TailRecLoop &loop, Stats 
         auto &insts = block->instructions();
         insts.pop_back();
         insts.pop_back();
-        auto branch =
-            std::make_unique<oir::BranchInst>(function.parent()->types().void_ty(), loop.header,
-                                              block);
-        branch->set_parent(block);
-        insts.push_back(std::move(branch));
-        block->add_successor(loop.header);
-        loop.header->add_predecessor(block);
+        oir::cfg::append_unconditional_branch(*function.parent(), block, loop.header);
 
         ++stats.tail_recursion;
         changed = true;

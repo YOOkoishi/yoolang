@@ -175,13 +175,14 @@ gep_index_strides(const oir::GetElementPtrInst &gep) {
 
 std::optional<GEPCandidate>
 analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
-            const std::vector<InductionInfo> &inductions, const oir::UseAnalysis &uses) {
-    if (uses.use_count(&gep) == 0 || value_defined_in_loop(gep.base_ptr(), loop)) {
+            const std::vector<InductionInfo> &inductions) {
+    if (!gep.has_uses() || value_defined_in_loop(gep.base_ptr(), loop)) {
         return std::nullopt;
     }
 
-    for (auto *user : uses.users(&gep)) {
-        if (!contains_block(loop, user->parent())) {
+    for (auto *user : gep.users()) {
+        auto *inst_user = dynamic_cast<oir::Instruction *>(user);
+        if (inst_user == nullptr || !contains_block(loop, inst_user->parent())) {
             return std::nullopt;
         }
     }
@@ -242,8 +243,7 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
 }
 
 std::vector<GEPCandidate>
-collect_candidates(const oir::Loop &loop, const std::vector<InductionInfo> &inductions,
-                   const oir::UseAnalysis &uses) {
+collect_candidates(const oir::Loop &loop, const std::vector<InductionInfo> &inductions) {
     std::vector<GEPCandidate> candidates;
     for (auto *const_block : loop.blocks) {
         auto *block = mutable_block(const_block);
@@ -252,7 +252,7 @@ collect_candidates(const oir::Loop &loop, const std::vector<InductionInfo> &indu
             if (gep == nullptr) {
                 continue;
             }
-            auto candidate = analyze_gep(*gep, loop, inductions, uses);
+            auto candidate = analyze_gep(*gep, loop, inductions);
             if (candidate) {
                 candidates.push_back(*candidate);
             }
@@ -326,9 +326,7 @@ bool run_on_loop(oir::Module &module, const oir::Loop &loop, Stats &stats) {
         return false;
     }
 
-    auto *function = mutable_block(loop.header)->parent();
-    oir::UseAnalysis uses(*function);
-    auto candidates = collect_candidates(loop, inductions, uses);
+    auto candidates = collect_candidates(loop, inductions);
     return apply_lsr(module, loop, preheader, latch, candidates, stats);
 }
 

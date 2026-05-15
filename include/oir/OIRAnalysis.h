@@ -52,6 +52,7 @@ class DominatorTree final {
     void compute_dominators();
     void compute_immediate_dominators();
     void compute_children();
+    void compute_dom_dfs_numbers();
 
     const Function *function_ = nullptr;
     std::vector<const BasicBlock *> blocks_;
@@ -60,6 +61,8 @@ class DominatorTree final {
     std::unordered_map<const BasicBlock *, BlockSet> dominators_;
     std::unordered_map<const BasicBlock *, const BasicBlock *> idom_;
     std::unordered_map<const BasicBlock *, std::vector<const BasicBlock *>> children_;
+    std::unordered_map<const BasicBlock *, std::size_t> dom_pre_;
+    std::unordered_map<const BasicBlock *, std::size_t> dom_post_;
 };
 
 struct Loop {

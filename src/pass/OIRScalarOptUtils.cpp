@@ -228,22 +228,16 @@ unsigned apply_replacements(oir::Module &module, const ReplacementMap &replaceme
     }
 
     unsigned replaced_operands = 0;
-    for (auto &function : module.functions()) {
-        if (function->is_external()) {
+    (void)module;
+    for (const auto &[old_value, replacement] : replacements) {
+        auto *new_value = resolve_replacement(replacements, replacement);
+        if (old_value == nullptr || new_value == nullptr || old_value == new_value ||
+            old_value->type() != new_value->type()) {
             continue;
         }
-        for (auto &block : function->blocks()) {
-            for (auto &inst : block->instructions()) {
-                for (std::size_t i = 0; i < inst->operand_count(); ++i) {
-                    auto *old_operand = inst->operand(i);
-                    auto *new_operand = resolve_replacement(replacements, old_operand);
-                    if (new_operand != old_operand && new_operand->type() == old_operand->type()) {
-                        inst->set_operand(i, new_operand);
-                        ++replaced_operands;
-                    }
-                }
-            }
-        }
+        const auto before = old_value->use_count();
+        old_value->replace_all_uses_with(new_value);
+        replaced_operands += static_cast<unsigned>(before - old_value->use_count());
     }
     return replaced_operands;
 }

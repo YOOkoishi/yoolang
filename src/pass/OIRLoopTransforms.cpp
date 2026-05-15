@@ -1,6 +1,7 @@
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
+#include "../../include/oir/OIRCFGUtils.h"
 
 #include <algorithm>
 #include <deque>
@@ -162,39 +163,11 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
     return nullptr;
 }
 
-void remove_phi_incoming_from(oir::BasicBlock *block, oir::BasicBlock *pred) {
-    for (auto &inst : block->instructions()) {
-        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
-        if (phi == nullptr) {
-            break;
-        }
-        phi->remove_incoming_from(pred);
-    }
-}
-
-void add_edge(oir::BasicBlock *pred, oir::BasicBlock *succ) {
-    pred->add_successor(succ);
-    succ->add_predecessor(pred);
-}
-
-void remove_edge_no_phi_update(oir::BasicBlock *pred, oir::BasicBlock *succ) {
-    pred->remove_successor(succ);
-    succ->remove_predecessor(pred);
-}
-
-void remove_edge(oir::BasicBlock *pred, oir::BasicBlock *succ) {
-    remove_edge_no_phi_update(pred, succ);
-    remove_phi_incoming_from(succ, pred);
-}
-
 void replace_terminator_with_br(oir::BasicBlock *block, oir::BasicBlock *target) {
     if (block->has_terminator()) {
         block->instructions().pop_back();
     }
-    auto branch = std::make_unique<oir::BranchInst>(block->parent()->parent()->types().void_ty(),
-                                                    target, block);
-    branch->set_parent(block);
-    block->instructions().push_back(std::move(branch));
+    oir::cfg::append_unconditional_branch(*block->parent()->parent(), block, target);
 }
 
 void replace_terminator_with_cond_br(oir::BasicBlock *block, oir::Value *condition,
@@ -202,10 +175,8 @@ void replace_terminator_with_cond_br(oir::BasicBlock *block, oir::Value *conditi
     if (block->has_terminator()) {
         block->instructions().pop_back();
     }
-    auto branch = std::make_unique<oir::BranchInst>(block->parent()->parent()->types().void_ty(),
-                                                    condition, true_bb, false_bb, block);
-    branch->set_parent(block);
-    block->instructions().push_back(std::move(branch));
+    oir::cfg::append_conditional_branch(*block->parent()->parent(), block, condition, true_bb,
+                                        false_bb);
 }
 
 oir::BasicBlock *find_preheader(const oir::Loop &loop) {
@@ -649,15 +620,15 @@ bool rotate_loop(oir::Function &function, const oir::Loop &loop, const oir::Scal
                                     header_phi_values);
     move_header_phis_to_body(header, body);
 
-    remove_edge_no_phi_update(preheader, header);
-    remove_edge_no_phi_update(latch, header);
-    remove_edge_no_phi_update(header, body);
-    remove_edge_no_phi_update(header, exit);
+    oir::cfg::remove_edge_no_phi_update(preheader, header);
+    oir::cfg::remove_edge_no_phi_update(latch, header);
+    oir::cfg::remove_edge_no_phi_update(header, body);
+    oir::cfg::remove_edge_no_phi_update(header, exit);
 
-    add_edge(preheader, body);
-    add_edge(preheader, exit);
-    add_edge(latch, body);
-    add_edge(latch, exit);
+    oir::cfg::add_edge(preheader, body);
+    oir::cfg::add_edge(preheader, exit);
+    oir::cfg::add_edge(latch, body);
+    oir::cfg::add_edge(latch, exit);
 
     replace_terminator_with_cond_br(preheader, preheader_condition, true_bb, false_bb);
     replace_terminator_with_cond_br(latch, latch_condition, true_bb, false_bb);
@@ -861,7 +832,7 @@ void build_cloned_cfg_and_exit_phis(const oir::Loop &loop,
             auto block_found = block_map.find(succ);
             auto *clone_succ =
                 block_found == block_map.end() ? succ : block_found->second;
-            add_edge(clone, clone_succ);
+            oir::cfg::add_edge(clone, clone_succ);
 
             if (block_found != block_map.end()) {
                 continue;
@@ -921,9 +892,9 @@ void force_branch_direction(oir::BranchInst &branch, bool take_true) {
     auto *taken = take_true ? branch.true_bb() : branch.false_bb();
     auto *removed = take_true ? branch.false_bb() : branch.true_bb();
     if (taken != removed) {
-        remove_edge(block, removed);
+        oir::cfg::remove_edge(block, removed);
     }
-    add_edge(block, taken);
+    oir::cfg::add_edge(block, taken);
     replace_terminator_with_br(block, taken);
 }
 
@@ -965,7 +936,7 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
         return false;
     }
 
-    add_edge(preheader, clone_header);
+    oir::cfg::add_edge(preheader, clone_header);
     replace_terminator_with_cond_br(preheader, branch->cond(), mutable_block(loop.header),
                                     clone_header);
     force_branch_direction(*branch, true);

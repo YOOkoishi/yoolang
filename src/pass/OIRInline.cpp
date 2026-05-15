@@ -1,6 +1,7 @@
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
+#include "../../include/oir/OIRCFGUtils.h"
 
 #include <algorithm>
 #include <list>
@@ -33,21 +34,6 @@ std::string inline_name(const oir::Function &callee, const oir::Value &value,
                         unsigned inline_index) {
     std::string base = value.name().empty() ? "tmp" : value.name();
     return "inl." + callee.name() + "." + std::to_string(inline_index) + "." + base;
-}
-
-void replace_phi_incoming_block(oir::BasicBlock *block, oir::BasicBlock *old_pred,
-                                oir::BasicBlock *new_pred) {
-    for (auto &inst : block->instructions()) {
-        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
-        if (phi == nullptr) {
-            break;
-        }
-        for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
-            if (phi->incoming()[i].second == old_pred) {
-                phi->set_operand(i * 2 + 1, new_pred);
-            }
-        }
-    }
 }
 
 CalleeInfo inspect_callee(const oir::Function &function) {
@@ -228,34 +214,12 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
     throw std::runtime_error("unsupported instruction while cloning inline body");
 }
 
-void append_unconditional_branch(oir::Module &module, oir::BasicBlock *from,
-                                 oir::BasicBlock *to) {
-    from->add_successor(to);
-    to->add_predecessor(from);
-    from->append_instruction(
-        std::make_unique<oir::BranchInst>(module.types().void_ty(), to, from));
-}
-
-void append_conditional_branch(oir::Module &module, oir::BasicBlock *from, oir::Value *cond,
-                               oir::BasicBlock *true_bb, oir::BasicBlock *false_bb) {
-    from->add_successor(true_bb);
-    from->add_successor(false_bb);
-    true_bb->add_predecessor(from);
-    false_bb->add_predecessor(from);
-    from->append_instruction(std::make_unique<oir::BranchInst>(module.types().void_ty(), cond,
-                                                               true_bb, false_bb, from));
-}
-
 void split_call_block(oir::BasicBlock *block,
                       std::list<std::unique_ptr<oir::Instruction>>::iterator call_it,
                       oir::BasicBlock *continuation) {
     auto original_successors = block->successors();
     for (auto *succ : original_successors) {
-        block->remove_successor(succ);
-        succ->remove_predecessor(block);
-        continuation->add_successor(succ);
-        succ->add_predecessor(continuation);
-        replace_phi_incoming_block(succ, block, continuation);
+        oir::cfg::move_successor_edge(block, continuation, succ);
     }
 
     auto &from = block->instructions();
@@ -329,17 +293,17 @@ void clone_callee_into_caller(oir::Module &module, oir::Function &caller, oir::F
                 returns.push_back(
                     {out_block, ret->has_value() ? map_value(ret->value(), values, blocks)
                                                   : nullptr});
-                append_unconditional_branch(module, out_block, continuation);
+                oir::cfg::append_unconditional_branch(module, out_block, continuation);
                 continue;
             }
             if (auto *br = dynamic_cast<oir::BranchInst *>(inst)) {
                 if (br->is_conditional()) {
-                    append_conditional_branch(
+                    oir::cfg::append_conditional_branch(
                         module, out_block, map_value(br->cond(), values, blocks),
                         static_cast<oir::BasicBlock *>(map_value(br->true_bb(), values, blocks)),
                         static_cast<oir::BasicBlock *>(map_value(br->false_bb(), values, blocks)));
                 } else {
-                    append_unconditional_branch(
+                    oir::cfg::append_unconditional_branch(
                         module, out_block,
                         static_cast<oir::BasicBlock *>(map_value(br->target_bb(), values, blocks)));
                 }
@@ -394,7 +358,7 @@ bool inline_call(oir::Module &module, oir::Function &caller, oir::BasicBlock *bl
     split_call_block(block, call_it, continuation);
     clone_callee_into_caller(module, caller, *callee, *call, continuation, values, blocks, returns,
                              inline_index);
-    append_unconditional_branch(module, block, blocks.at(callee->entry_block()));
+    oir::cfg::append_unconditional_branch(module, block, blocks.at(callee->entry_block()));
 
     if (!call->type()->is_void()) {
         ReplacementMap replacements;

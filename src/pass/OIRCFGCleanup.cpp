@@ -1,5 +1,7 @@
 #include "../../include/oir/OIRScalarOpt.h"
 
+#include "../../include/oir/OIRCFGUtils.h"
+
 #include <deque>
 #include <memory>
 #include <unordered_set>
@@ -7,47 +9,6 @@
 
 namespace pass::oir_opt {
 namespace {
-
-void remove_phi_incoming_from(oir::BasicBlock *block, oir::BasicBlock *pred) {
-    for (auto &inst : block->instructions()) {
-        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
-        if (phi == nullptr) {
-            break;
-        }
-        phi->remove_incoming_from(pred);
-    }
-}
-
-void replace_phi_incoming_block(oir::BasicBlock *block, oir::BasicBlock *old_pred,
-                                oir::BasicBlock *new_pred) {
-    for (auto &inst : block->instructions()) {
-        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
-        if (phi == nullptr) {
-            break;
-        }
-        for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
-            if (phi->incoming()[i].second == old_pred) {
-                phi->set_operand(i * 2 + 1, new_pred);
-            }
-        }
-    }
-}
-
-void replace_branch_target(oir::BranchInst &branch, oir::BasicBlock *old_target,
-                           oir::BasicBlock *new_target) {
-    if (branch.is_conditional()) {
-        if (branch.true_bb() == old_target) {
-            branch.set_operand(1, new_target);
-        }
-        if (branch.false_bb() == old_target) {
-            branch.set_operand(2, new_target);
-        }
-        return;
-    }
-    if (branch.target_bb() == old_target) {
-        branch.set_operand(0, new_target);
-    }
-}
 
 std::unordered_set<oir::BasicBlock *> reachable_blocks(oir::Function &function) {
     std::unordered_set<oir::BasicBlock *> reachable;
@@ -80,6 +41,7 @@ bool remove_unreachable_blocks(oir::Function &function, Stats &stats) {
         }
     }
 
+    std::unordered_set<oir::BasicBlock *> unreachable_set(unreachable.begin(), unreachable.end());
     for (auto *block : unreachable) {
         auto predecessors = block->predecessors();
         auto successors = block->successors();
@@ -90,8 +52,16 @@ bool remove_unreachable_blocks(oir::Function &function, Stats &stats) {
         for (auto *succ : successors) {
             succ->remove_predecessor(block);
             block->remove_successor(succ);
-            remove_phi_incoming_from(succ, block);
+            if (unreachable_set.find(succ) == unreachable_set.end()) {
+                oir::cfg::remove_phi_incoming_from(succ, block);
+            }
         }
+    }
+
+    for (auto *block : unreachable) {
+        oir::cfg::drop_all_references(*block);
+    }
+    for (auto *block : unreachable) {
         function.erase_block(block);
         ++stats.cfg;
     }
@@ -190,18 +160,10 @@ bool redirect_empty_jump_block(oir::Function &function, oir::BasicBlock *block, 
     }
 
     for (auto *pred : predecessors) {
-        auto *pred_branch = dynamic_cast<oir::BranchInst *>(pred->terminator());
-        if (pred_branch != nullptr) {
-            replace_branch_target(*pred_branch, block, target);
-        }
-        pred->remove_successor(block);
-        pred->add_successor(target);
-        target->add_predecessor(pred);
-        block->remove_predecessor(pred);
+        oir::cfg::replace_successor(pred, block, target);
     }
 
-    target->remove_predecessor(block);
-    block->remove_successor(target);
+    oir::cfg::remove_edge(block, target);
     function.erase_block(block);
     ++stats.cfg;
     return true;
@@ -256,16 +218,11 @@ bool merge_with_single_predecessor_successor(oir::Module &module, oir::Function 
     }
 
     block->instructions().pop_back();
-    block->remove_successor(succ);
-    succ->remove_predecessor(block);
+    oir::cfg::remove_edge_no_phi_update(block, succ);
 
     auto succ_successors = succ->successors();
     for (auto *succ_succ : succ_successors) {
-        succ_succ->remove_predecessor(succ);
-        succ_succ->add_predecessor(block);
-        block->add_successor(succ_succ);
-        replace_phi_incoming_block(succ_succ, succ, block);
-        succ->remove_successor(succ_succ);
+        oir::cfg::move_successor_edge(succ, block, succ_succ);
     }
 
     auto &succ_insts = succ->instructions();

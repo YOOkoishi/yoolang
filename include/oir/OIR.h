@@ -135,8 +135,15 @@ class TypeContext {
     std::unordered_map<std::string, FunctionType *> function_types_;
 };
 
+class User;
+
 class Value {
   public:
+    struct Use {
+        User *user = nullptr;
+        std::size_t operand_index = 0;
+    };
+
     Value(Type *type, const std::string &name = "");
     virtual ~Value() = default;
 
@@ -144,11 +151,23 @@ class Value {
     const std::string &name() const;
     void set_name(const std::string &name);
 
+    const std::vector<Use> &uses() const;
+    std::vector<User *> users() const;
+    std::size_t use_count() const;
+    bool has_uses() const;
+    void replace_all_uses_with(Value *new_value);
+
     virtual std::string print() const = 0;
 
   private:
+    void add_use(User *user, std::size_t operand_index);
+    void remove_use(User *user, std::size_t operand_index);
+
     Type *type_;
     std::string name_;
+    std::vector<Use> uses_;
+
+    friend class User;
 };
 
 class ConstantInt final : public Value {
@@ -188,16 +207,20 @@ class UndefValue final : public Value {
 class User : public Value {
   public:
     User(Type *type, const std::string &name = "");
+    ~User() override;
 
     void add_operand(Value *value);
     Value *operand(std::size_t index) const;
     virtual void set_operand(std::size_t index, Value *value);
     void replace_operand(Value *old_value, Value *new_value);
     std::size_t replace_operands(Value *old_value, Value *new_value);
+    void drop_all_operands();
     std::size_t operand_count() const;
     const std::vector<Value *> &operands() const;
 
   protected:
+    void erase_operands(std::size_t first, std::size_t count);
+
     std::vector<Value *> operands_;
 };
 
@@ -410,6 +433,7 @@ class BasicBlock final : public Value {
 class Function final : public Value {
   public:
     Function(FunctionType *type, const std::string &name, Module *parent, bool is_external = false);
+    ~Function() override;
 
     FunctionType *function_type() const;
     Type *return_type() const;
@@ -489,9 +513,9 @@ class Module final {
   private:
     std::string name_;
     TypeContext types_;
+    std::vector<std::unique_ptr<Value>> owned_constants_;
     std::vector<std::unique_ptr<GlobalVariable>> globals_;
     std::vector<std::unique_ptr<Function>> functions_;
-    std::vector<std::unique_ptr<Value>> owned_constants_;
     std::unordered_map<std::string, Function *> function_table_;
     std::unordered_map<std::string, GlobalVariable *> global_table_;
 };

@@ -261,6 +261,14 @@ void rename_block(
 void erase_dead_instructions(oir::Function &function,
                              const std::unordered_set<oir::Instruction *> &dead) {
     for (auto &block : function.blocks()) {
+        for (auto &inst : block->instructions()) {
+            if (dead.find(inst.get()) != dead.end()) {
+                inst->drop_all_operands();
+            }
+        }
+    }
+
+    for (auto &block : function.blocks()) {
         for (auto it = block->instructions().begin(); it != block->instructions().end();) {
             if (dead.find(it->get()) != dead.end()) {
                 it = block->instructions().erase(it);

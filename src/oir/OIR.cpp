@@ -1,8 +1,13 @@
 #include "../../include/oir/OIR.h"
 
+#include "../../include/oir/OIRAnalysis.h"
+
 #include <algorithm>
+#include <functional>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace oir {
 
@@ -120,6 +125,72 @@ std::string typed_value_ref(const Value *value) {
         return "<null>";
     }
     return value->type()->print() + " " + value_ref(value);
+}
+
+std::string function_ref(const Function *function) {
+    return function == nullptr ? "<null function>" : "@" + function->name();
+}
+
+std::string block_ref(const BasicBlock *block) {
+    return block == nullptr ? "<null block>" : "%" + block->name();
+}
+
+std::string inst_ref(const Instruction *inst) {
+    if (inst == nullptr) {
+        return "<null inst>";
+    }
+    if (!inst->name().empty()) {
+        return "%" + inst->name();
+    }
+    return op_to_string(inst->op()) + " in " + block_ref(inst->parent());
+}
+
+struct UseKey {
+    const User *user = nullptr;
+    std::size_t operand_index = 0;
+
+    bool operator==(const UseKey &other) const {
+        return user == other.user && operand_index == other.operand_index;
+    }
+};
+
+struct UseKeyHash {
+    std::size_t operator()(const UseKey &key) const {
+        return std::hash<const void *>{}(key.user) ^ (std::hash<std::size_t>{}(key.operand_index)
+                                                      << 1U);
+    }
+};
+
+bool contains_block_ptr(const std::vector<BasicBlock *> &blocks, const BasicBlock *needle) {
+    return std::find(blocks.begin(), blocks.end(), needle) != blocks.end();
+}
+
+bool has_duplicate_block(const std::vector<BasicBlock *> &blocks) {
+    std::unordered_set<const BasicBlock *> seen;
+    for (auto *block : blocks) {
+        if (!seen.insert(block).second) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<BasicBlock *> branch_targets(const BranchInst &branch) {
+    std::vector<BasicBlock *> targets;
+    auto add_unique = [&targets](BasicBlock *target) {
+        if (target != nullptr &&
+            std::find(targets.begin(), targets.end(), target) == targets.end()) {
+            targets.push_back(target);
+        }
+    };
+
+    if (branch.is_conditional()) {
+        add_unique(branch.true_bb());
+        add_unique(branch.false_bb());
+    } else {
+        add_unique(branch.target_bb());
+    }
+    return targets;
 }
 
 } // namespace
@@ -335,6 +406,54 @@ void Value::set_name(const std::string &name) {
     name_ = name;
 }
 
+const std::vector<Value::Use> &Value::uses() const {
+    return uses_;
+}
+
+std::vector<User *> Value::users() const {
+    std::vector<User *> out;
+    out.reserve(uses_.size());
+    for (const auto &use : uses_) {
+        out.push_back(use.user);
+    }
+    return out;
+}
+
+std::size_t Value::use_count() const {
+    return uses_.size();
+}
+
+bool Value::has_uses() const {
+    return !uses_.empty();
+}
+
+void Value::replace_all_uses_with(Value *new_value) {
+    if (new_value == nullptr || new_value == this || new_value->type() != type()) {
+        return;
+    }
+
+    auto worklist = uses_;
+    for (const auto &use : worklist) {
+        if (use.user != nullptr && use.operand_index < use.user->operand_count() &&
+            use.user->operand(use.operand_index) == this) {
+            use.user->set_operand(use.operand_index, new_value);
+        }
+    }
+}
+
+void Value::add_use(User *user, std::size_t operand_index) {
+    uses_.push_back({user, operand_index});
+}
+
+void Value::remove_use(User *user, std::size_t operand_index) {
+    auto found = std::find_if(uses_.begin(), uses_.end(), [user, operand_index](const Use &use) {
+        return use.user == user && use.operand_index == operand_index;
+    });
+    if (found != uses_.end()) {
+        uses_.erase(found);
+    }
+}
+
 ConstantInt::ConstantInt(Type *type, std::int64_t value)
     : Value(type, std::to_string(value)), value_(value) {
 }
@@ -378,7 +497,14 @@ std::string UndefValue::print() const {
 User::User(Type *type, const std::string &name) : Value(type, name) {
 }
 
+User::~User() {
+    drop_all_operands();
+}
+
 void User::add_operand(Value *value) {
+    if (value != nullptr) {
+        value->add_use(this, operands_.size());
+    }
     operands_.push_back(value);
 }
 
@@ -387,7 +513,17 @@ Value *User::operand(std::size_t index) const {
 }
 
 void User::set_operand(std::size_t index, Value *value) {
+    auto *old_value = operands_[index];
+    if (old_value == value) {
+        return;
+    }
+    if (old_value != nullptr) {
+        old_value->remove_use(this, index);
+    }
     operands_[index] = value;
+    if (value != nullptr) {
+        value->add_use(this, index);
+    }
 }
 
 void User::replace_operand(Value *old_value, Value *new_value) {
@@ -403,6 +539,42 @@ std::size_t User::replace_operands(Value *old_value, Value *new_value) {
         }
     }
     return replaced;
+}
+
+void User::drop_all_operands() {
+    for (std::size_t i = 0; i < operands_.size(); ++i) {
+        if (operands_[i] != nullptr) {
+            operands_[i]->remove_use(this, i);
+        }
+    }
+    operands_.clear();
+}
+
+void User::erase_operands(std::size_t first, std::size_t count) {
+    if (first >= operands_.size() || count == 0) {
+        return;
+    }
+
+    const auto last = std::min(first + count, operands_.size());
+    for (std::size_t i = first; i < last; ++i) {
+        if (operands_[i] != nullptr) {
+            operands_[i]->remove_use(this, i);
+        }
+    }
+    for (std::size_t i = last; i < operands_.size(); ++i) {
+        if (operands_[i] != nullptr) {
+            operands_[i]->remove_use(this, i);
+        }
+    }
+
+    operands_.erase(operands_.begin() + static_cast<std::ptrdiff_t>(first),
+                    operands_.begin() + static_cast<std::ptrdiff_t>(last));
+
+    for (std::size_t i = first; i < operands_.size(); ++i) {
+        if (operands_[i] != nullptr) {
+            operands_[i]->add_use(this, i);
+        }
+    }
 }
 
 std::size_t User::operand_count() const {
@@ -698,8 +870,7 @@ void PhiInst::remove_incoming_from(BasicBlock *from) {
             continue;
         }
         incoming_.erase(incoming_.begin() + static_cast<std::ptrdiff_t>(i));
-        operands_.erase(operands_.begin() + static_cast<std::ptrdiff_t>(i * 2),
-                        operands_.begin() + static_cast<std::ptrdiff_t>(i * 2 + 2));
+        erase_operands(i * 2, 2);
     }
 }
 
@@ -835,6 +1006,14 @@ Function::Function(FunctionType *type, const std::string &name, Module *parent, 
     : Value(type, name), parent_(parent), is_external_(is_external), next_block_id_(0) {
 }
 
+Function::~Function() {
+    for (auto &block : blocks_) {
+        for (auto &inst : block->instructions()) {
+            inst->drop_all_operands();
+        }
+    }
+}
+
 FunctionType *Function::function_type() const {
     return static_cast<FunctionType *>(type());
 }
@@ -877,6 +1056,9 @@ void Function::erase_block(BasicBlock *block) {
         blocks_.begin(), blocks_.end(),
         [block](const std::unique_ptr<BasicBlock> &candidate) { return candidate.get() == block; });
     if (it != blocks_.end()) {
+        for (auto &inst : (*it)->instructions()) {
+            inst->drop_all_operands();
+        }
         blocks_.erase(it);
     }
 }
@@ -1228,109 +1410,367 @@ PhiInst *IRBuilder::create_phi(Type *type, const std::string &name) {
 }
 
 VerifyResult Verifier::verify_module(const Module &module) {
+    auto fail = [](std::string message) { return VerifyResult{false, std::move(message)}; };
+
+    auto use_list_error = [](const Value *value) -> std::string {
+        if (value == nullptr) {
+            return "";
+        }
+        for (const auto &use : value->uses()) {
+            if (use.user == nullptr) {
+                return "value " + value_ref(value) + " has a null use-list user";
+            }
+            if (use.operand_index >= use.user->operand_count()) {
+                return "value " + value_ref(value) + " has stale use-list index in user " +
+                       value_ref(use.user);
+            }
+            if (use.user->operand(use.operand_index) != value) {
+                return "value " + value_ref(value) + " has stale use-list entry in user " +
+                       value_ref(use.user);
+            }
+        }
+        return "";
+    };
+
     for (const auto &function_ptr : module.functions()) {
         const auto *function = function_ptr.get();
+        if (function->parent() != &module) {
+            return fail("function " + function_ref(function) + " has wrong module parent");
+        }
         if (function->is_external()) {
             continue;
         }
 
         if (function->blocks().empty()) {
-            return {false, "function @" + function->name() + " has no basic blocks"};
+            return fail("function " + function_ref(function) + " has no basic blocks");
+        }
+
+        for (std::size_t i = 0; i < function->args().size(); ++i) {
+            const auto *arg = function->args()[i].get();
+            if (arg->parent() != function || arg->index() != i) {
+                return fail("argument %" + arg->name() + " in " + function_ref(function) +
+                            " has inconsistent parent or index");
+            }
+            if (auto error = use_list_error(arg); !error.empty()) {
+                return fail(error);
+            }
+        }
+        if (auto error = use_list_error(function); !error.empty()) {
+            return fail(error);
+        }
+
+        std::unordered_set<const BasicBlock *> block_set;
+        std::unordered_map<const Instruction *, const BasicBlock *> inst_blocks;
+        std::unordered_map<const Instruction *, std::size_t> inst_indices;
+        for (const auto &block_ptr : function->blocks()) {
+            const auto *block = block_ptr.get();
+            block_set.insert(block);
+            if (block->parent() != function) {
+                return fail("block " + block_ref(block) + " has wrong function parent in " +
+                            function_ref(function));
+            }
+            const auto &insts = block->instructions();
+
+            if (insts.empty()) {
+                return fail("block " + block_ref(block) + " in " + function_ref(function) +
+                            " is empty");
+            }
+
+            bool saw_non_phi = false;
+            std::size_t inst_index = 0;
+            for (auto it = insts.begin(); it != insts.end(); ++it) {
+                const auto *inst = it->get();
+                const bool is_last = std::next(it) == insts.end();
+                inst_blocks[inst] = block;
+                inst_indices[inst] = inst_index++;
+
+                if (inst->parent() != block) {
+                    return fail("instruction " + inst_ref(inst) + " has wrong parent; expected " +
+                                block_ref(block));
+                }
+
+                if (inst->is_terminator() && !is_last) {
+                    return fail("terminator " + inst_ref(inst) + " in block " +
+                                block_ref(block) + " is not the last instruction");
+                }
+                if (inst->op() == Instruction::OpID::Phi) {
+                    if (saw_non_phi) {
+                        return fail("phi instruction " + inst_ref(inst) + " in block " +
+                                    block_ref(block) + " appears after a non-phi instruction");
+                    }
+                } else {
+                    saw_non_phi = true;
+                }
+            }
+
+            if (!block->has_terminator()) {
+                return fail("block " + block_ref(block) + " in " + function_ref(function) +
+                            " has no terminator");
+            }
+            if (has_duplicate_block(block->predecessors())) {
+                return fail("block " + block_ref(block) + " has duplicate predecessors");
+            }
+            if (has_duplicate_block(block->successors())) {
+                return fail("block " + block_ref(block) + " has duplicate successors");
+            }
+
+            for (auto *pred : block->predecessors()) {
+                if (pred == nullptr || pred->parent() != function) {
+                    return fail("block " + block_ref(block) +
+                                " has predecessor outside its function");
+                }
+                if (!contains_block_ptr(pred->successors(), block)) {
+                    return fail("CFG mismatch: predecessor " + block_ref(pred) +
+                                " does not list successor " + block_ref(block));
+                }
+            }
+            for (auto *succ : block->successors()) {
+                if (succ == nullptr || succ->parent() != function) {
+                    return fail("block " + block_ref(block) +
+                                " has successor outside its function");
+                }
+                if (!contains_block_ptr(succ->predecessors(), block)) {
+                    return fail("CFG mismatch: successor " + block_ref(succ) +
+                                " does not list predecessor " + block_ref(block));
+                }
+            }
+
+            const auto *terminator = block->terminator();
+            if (const auto *br = dynamic_cast<const BranchInst *>(terminator)) {
+                if (br->operand_count() != 1 && br->operand_count() != 3) {
+                    return fail("branch in " + block_ref(block) + " has invalid operand count");
+                }
+                auto targets = branch_targets(*br);
+                for (auto *target : targets) {
+                    if (target->parent() != function) {
+                        return fail("branch in " + block_ref(block) +
+                                    " targets block outside " + function_ref(function));
+                    }
+                    if (!contains_block_ptr(block->successors(), target)) {
+                        return fail("CFG mismatch: branch in " + block_ref(block) +
+                                    " targets " + block_ref(target) +
+                                    " but successor list is missing it");
+                    }
+                }
+                for (auto *succ : block->successors()) {
+                    if (!contains_block_ptr(targets, succ)) {
+                        return fail("CFG mismatch: block " + block_ref(block) +
+                                    " lists successor " + block_ref(succ) +
+                                    " not named by its terminator");
+                    }
+                }
+            } else if (dynamic_cast<const ReturnInst *>(terminator) != nullptr) {
+                if (!block->successors().empty()) {
+                    return fail("return block " + block_ref(block) +
+                                " must not have CFG successors");
+                }
+            } else {
+                return fail("block " + block_ref(block) + " has unknown terminator kind");
+            }
+        }
+
+        DominatorTree dom_tree(*function);
+        auto normal_def_error = [&](const Instruction *def,
+                                    const Instruction *use) -> std::string {
+            if (def == use) {
+                return "instruction " + inst_ref(use) + " uses itself";
+            }
+            auto def_block_found = inst_blocks.find(def);
+            auto use_block_found = inst_blocks.find(use);
+            if (def_block_found == inst_blocks.end() || use_block_found == inst_blocks.end()) {
+                return "instruction operand in " + inst_ref(use) +
+                       " is not defined in the same function";
+            }
+            auto *def_block = def_block_found->second;
+            auto *use_block = use_block_found->second;
+            if (def_block == use_block) {
+                if (inst_indices.at(def) >= inst_indices.at(use)) {
+                    return "definition " + inst_ref(def) + " does not precede use in " +
+                           inst_ref(use);
+                }
+                return "";
+            }
+            if (dom_tree.is_reachable(use_block) && !dom_tree.dominates(def_block, use_block)) {
+                return "definition " + inst_ref(def) + " in " + block_ref(def_block) +
+                       " does not dominate use in " + inst_ref(use);
+            }
+            return "";
+        };
+
+        auto phi_def_error = [&](const Instruction *def, const PhiInst *phi,
+                                 const BasicBlock *pred) -> std::string {
+            auto def_block_found = inst_blocks.find(def);
+            if (def_block_found == inst_blocks.end()) {
+                return "phi " + inst_ref(phi) + " uses instruction from another function";
+            }
+            auto *def_block = def_block_found->second;
+            if (def_block == pred) {
+                return "";
+            }
+            if (dom_tree.is_reachable(pred) && !dom_tree.dominates(def_block, pred)) {
+                return "phi " + inst_ref(phi) + " incoming definition " + inst_ref(def) +
+                       " does not dominate predecessor " + block_ref(pred);
+            }
+            return "";
+        };
+
+        auto check_operand_parent = [&](const Value *operand, const Instruction *inst,
+                                        std::size_t index) -> VerifyResult {
+            if (operand == nullptr) {
+                return fail("instruction " + inst_ref(inst) + " has null operand " +
+                            std::to_string(index));
+            }
+            if (auto *arg = dynamic_cast<const Argument *>(operand)) {
+                if (arg->parent() != function) {
+                    return fail("instruction " + inst_ref(inst) +
+                                " uses argument from another function");
+                }
+            } else if (auto *def = dynamic_cast<const Instruction *>(operand)) {
+                if (def->parent() == nullptr || def->parent()->parent() != function) {
+                    return fail("instruction " + inst_ref(inst) +
+                                " uses instruction from another function");
+                }
+                if (inst->op() != Instruction::OpID::Phi) {
+                    if (auto error = normal_def_error(def, inst); !error.empty()) {
+                        return fail(error);
+                    }
+                }
+            } else if (auto *bb = dynamic_cast<const BasicBlock *>(operand)) {
+                if (bb->parent() != function) {
+                    return fail("instruction " + inst_ref(inst) +
+                                " uses block from another function");
+                }
+            } else if (auto *callee = dynamic_cast<const Function *>(operand)) {
+                if (callee->parent() != &module) {
+                    return fail("instruction " + inst_ref(inst) +
+                                " uses function from another module");
+                }
+            }
+            return {true, "ok"};
+        };
+
+        std::unordered_map<const Value *, std::vector<UseKey>> actual_uses;
+        for (const auto &block_ptr : function->blocks()) {
+            for (const auto &inst_ptr : block_ptr->instructions()) {
+                const auto *inst = inst_ptr.get();
+                for (std::size_t i = 0; i < inst->operand_count(); ++i) {
+                    auto *operand = inst->operand(i);
+                    if (operand != nullptr) {
+                        actual_uses[operand].push_back({inst, i});
+                    }
+                }
+            }
+        }
+        for (const auto &[value, uses] : actual_uses) {
+            if (auto error = use_list_error(value); !error.empty()) {
+                return fail(error);
+            }
+
+            std::unordered_set<UseKey, UseKeyHash> recorded;
+            for (const auto &use : value->uses()) {
+                recorded.insert({use.user, use.operand_index});
+            }
+            for (const auto &use : uses) {
+                if (recorded.find(use) == recorded.end()) {
+                    return fail("missing use-list entry for operand " +
+                                std::to_string(use.operand_index) + " of " +
+                                value_ref(use.user) + " using " + value_ref(value));
+                }
+            }
         }
 
         for (const auto &block_ptr : function->blocks()) {
             const auto *block = block_ptr.get();
-            const auto &insts = block->instructions();
-
-            if (insts.empty()) {
-                return {false, "block %" + block->name() + " is empty"};
+            if (auto error = use_list_error(block); !error.empty()) {
+                return fail(error);
             }
-
-            bool saw_non_phi = false;
-            for (auto it = insts.begin(); it != insts.end(); ++it) {
-                const auto *inst = it->get();
-                const bool is_last = std::next(it) == insts.end();
-
-                if (inst->is_terminator() && !is_last) {
-                    return {false, "terminator in block %" + block->name() +
-                                       " is not the last instruction"};
+            for (const auto &inst_ptr : block->instructions()) {
+                const auto *inst = inst_ptr.get();
+                if (auto error = use_list_error(inst); !error.empty()) {
+                    return fail(error);
                 }
-                if (inst->op() == Instruction::OpID::Phi) {
-                    if (saw_non_phi) {
-                        return {false, "phi instruction in block %" + block->name() +
-                                           " appears after a non-phi instruction"};
+                for (std::size_t i = 0; i < inst->operand_count(); ++i) {
+                    auto result = check_operand_parent(inst->operand(i), inst, i);
+                    if (!result.ok) {
+                        return result;
                     }
-                } else {
-                    saw_non_phi = true;
                 }
 
                 switch (inst->op()) {
                 case Instruction::OpID::Br: {
                     const auto *br = dynamic_cast<const BranchInst *>(inst);
                     if (br == nullptr) {
-                        return {false, "branch instruction type mismatch"};
+                        return fail("branch instruction type mismatch in " + block_ref(block));
                     }
                     if (!br->is_conditional() && br->target_bb() == nullptr) {
-                        return {false, "unconditional branch missing target"};
+                        return fail("unconditional branch in " + block_ref(block) +
+                                    " is missing target");
                     }
                     if (br->is_conditional()) {
                         if (br->cond() == nullptr || br->true_bb() == nullptr ||
                             br->false_bb() == nullptr) {
-                            return {false, "conditional branch is incomplete"};
+                            return fail("conditional branch in " + block_ref(block) +
+                                        " is incomplete");
                         }
                         auto *cond_ty = dynamic_cast<IntegerType *>(br->cond()->type());
                         if (cond_ty == nullptr || cond_ty->bit_width() != 1) {
-                            return {false, "conditional branch expects i1 condition"};
+                            return fail("conditional branch in " + block_ref(block) +
+                                        " expects i1 condition");
                         }
-                        if (br->true_bb()->parent() != function ||
-                            br->false_bb()->parent() != function) {
-                            return {false, "conditional branch target is outside the function"};
-                        }
-                    } else if (br->target_bb()->parent() != function) {
-                        return {false, "branch target is outside the function"};
                     }
                     break;
                 }
                 case Instruction::OpID::Ret: {
                     const auto *ret = dynamic_cast<const ReturnInst *>(inst);
                     if (ret == nullptr) {
-                        return {false, "return instruction type mismatch"};
+                        return fail("return instruction type mismatch in " + block_ref(block));
+                    }
+                    if (ret->operand_count() > 1) {
+                        return fail("return in " + block_ref(block) + " has too many operands");
                     }
                     if (function->return_type()->is_void()) {
                         if (ret->has_value()) {
-                            return {false, "void function @" + function->name() +
-                                               " cannot return a value"};
+                            return fail("void function " + function_ref(function) +
+                                        " cannot return a value");
                         }
                     } else {
                         if (!ret->has_value()) {
-                            return {false, "non-void function @" + function->name() +
-                                               " must return a value"};
+                            return fail("non-void function " + function_ref(function) +
+                                        " must return a value");
                         }
                         if (ret->value()->type() != function->return_type()) {
-                            return {false, "return type mismatch in function @" + function->name()};
+                            return fail("return type mismatch in function " +
+                                        function_ref(function));
                         }
                     }
                     break;
                 }
                 case Instruction::OpID::Load: {
                     const auto *load = dynamic_cast<const LoadInst *>(inst);
+                    if (load == nullptr) {
+                        return fail("load instruction type mismatch in " + block_ref(block));
+                    }
                     auto *ptr_ty = dynamic_cast<PointerType *>(load->ptr()->type());
                     if (ptr_ty == nullptr) {
-                        return {false, "load expects pointer operand"};
+                        return fail("load " + inst_ref(load) + " expects pointer operand");
                     }
                     if (ptr_ty->element_type() != load->type()) {
-                        return {false, "load result type does not match pointer element type"};
+                        return fail("load " + inst_ref(load) +
+                                    " result type does not match pointer element type");
                     }
                     break;
                 }
                 case Instruction::OpID::Store: {
                     const auto *store = dynamic_cast<const StoreInst *>(inst);
+                    if (store == nullptr) {
+                        return fail("store instruction type mismatch in " + block_ref(block));
+                    }
                     auto *ptr_ty = dynamic_cast<PointerType *>(store->ptr()->type());
                     if (ptr_ty == nullptr) {
-                        return {false, "store expects pointer operand"};
+                        return fail("store in " + block_ref(block) + " expects pointer operand");
                     }
                     if (ptr_ty->element_type() != store->value()->type()) {
-                        return {false, "store value type mismatch"};
+                        return fail("store in " + block_ref(block) + " value type mismatch");
                     }
                     break;
                 }
@@ -1345,12 +1785,12 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 case Instruction::OpID::FDiv: {
                     const auto *bin = dynamic_cast<const BinaryInst *>(inst);
                     if (bin == nullptr) {
-                        return {false, "binary instruction type mismatch"};
+                        return fail("binary instruction type mismatch in " + block_ref(block));
                     }
                     if (bin->lhs()->type() != bin->rhs()->type() ||
                         bin->lhs()->type() != bin->type()) {
-                        return {false,
-                                "binary instruction type mismatch between operands and result"};
+                        return fail("binary instruction " + inst_ref(bin) +
+                                    " type mismatch between operands and result");
                     }
                     break;
                 }
@@ -1358,35 +1798,37 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 case Instruction::OpID::FCmp: {
                     const auto *cmp = dynamic_cast<const CmpInst *>(inst);
                     if (cmp == nullptr) {
-                        return {false, "compare instruction type mismatch"};
+                        return fail("compare instruction type mismatch in " + block_ref(block));
                     }
                     if (cmp->lhs()->type() != cmp->rhs()->type()) {
-                        return {false, "compare operands must have same type"};
+                        return fail("compare " + inst_ref(cmp) +
+                                    " operands must have same type");
                     }
                     auto *result_ty = dynamic_cast<IntegerType *>(cmp->type());
                     if (result_ty == nullptr || result_ty->bit_width() != 1) {
-                        return {false, "compare result must be i1"};
+                        return fail("compare " + inst_ref(cmp) + " result must be i1");
                     }
                     if (inst->op() == Instruction::OpID::ICmp &&
                         !cmp->lhs()->type()->is_integer()) {
-                        return {false, "icmp operands must be integer"};
+                        return fail("icmp " + inst_ref(cmp) + " operands must be integer");
                     }
                     if (inst->op() == Instruction::OpID::FCmp && !cmp->lhs()->type()->is_float()) {
-                        return {false, "fcmp operands must be float"};
+                        return fail("fcmp " + inst_ref(cmp) + " operands must be float");
                     }
                     break;
                 }
                 case Instruction::OpID::GetElementPtr: {
                     const auto *gep = dynamic_cast<const GetElementPtrInst *>(inst);
                     if (gep == nullptr) {
-                        return {false, "gep instruction type mismatch"};
+                        return fail("gep instruction type mismatch in " + block_ref(block));
                     }
                     if (!gep->base_ptr()->type()->is_pointer() || !gep->type()->is_pointer()) {
-                        return {false, "gep expects pointer base and pointer result"};
+                        return fail("gep " + inst_ref(gep) +
+                                    " expects pointer base and pointer result");
                     }
                     for (auto *index : gep->indices()) {
                         if (!index->type()->is_integer()) {
-                            return {false, "gep index must be integer"};
+                            return fail("gep " + inst_ref(gep) + " index must be integer");
                         }
                     }
                     break;
@@ -1394,18 +1836,52 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 case Instruction::OpID::Phi: {
                     const auto *phi = dynamic_cast<const PhiInst *>(inst);
                     if (phi == nullptr) {
-                        return {false, "phi instruction type mismatch"};
+                        return fail("phi instruction type mismatch in " + block_ref(block));
+                    }
+                    if (phi->operand_count() != phi->incoming().size() * 2) {
+                        return fail("phi " + inst_ref(phi) +
+                                    " operand count does not match incoming list");
                     }
                     if (phi->incoming().size() != block->predecessors().size()) {
-                        return {false, "phi incoming count does not match predecessor count"};
+                        return fail("phi " + inst_ref(phi) +
+                                    " incoming count does not match predecessor count in " +
+                                    block_ref(block));
                     }
-                    for (const auto &item : phi->incoming()) {
-                        if (item.first->type() != phi->type()) {
-                            return {false, "phi incoming value type mismatch"};
+                    std::unordered_set<const BasicBlock *> incoming_preds;
+                    for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
+                        const auto &item = phi->incoming()[i];
+                        if (item.first == nullptr || item.second == nullptr) {
+                            return fail("phi " + inst_ref(phi) + " has null incoming");
                         }
-                        const auto &preds = block->predecessors();
-                        if (std::find(preds.begin(), preds.end(), item.second) == preds.end()) {
-                            return {false, "phi incoming predecessor is not a CFG predecessor"};
+                        if (phi->operand(i * 2) != item.first ||
+                            phi->operand(i * 2 + 1) != item.second) {
+                            return fail("phi " + inst_ref(phi) +
+                                        " operands and incoming list are out of sync");
+                        }
+                        if (!incoming_preds.insert(item.second).second) {
+                            return fail("phi " + inst_ref(phi) +
+                                        " has duplicate incoming predecessor " +
+                                        block_ref(item.second));
+                        }
+                        if (item.first->type() != phi->type()) {
+                            return fail("phi " + inst_ref(phi) +
+                                        " incoming value type mismatch");
+                        }
+                        if (!contains_block_ptr(block->predecessors(), item.second)) {
+                            return fail("phi " + inst_ref(phi) + " incoming predecessor " +
+                                        block_ref(item.second) +
+                                        " is not a CFG predecessor of " + block_ref(block));
+                        }
+                        if (auto *arg = dynamic_cast<const Argument *>(item.first)) {
+                            if (arg->parent() != function) {
+                                return fail("phi " + inst_ref(phi) +
+                                            " uses argument from another function");
+                            }
+                        } else if (auto *def = dynamic_cast<const Instruction *>(item.first)) {
+                            if (auto error = phi_def_error(def, phi, item.second);
+                                !error.empty()) {
+                                return fail(error);
+                            }
                         }
                     }
                     break;
@@ -1414,10 +1890,12 @@ VerifyResult Verifier::verify_module(const Module &module) {
                     break;
                 }
             }
+        }
+    }
 
-            if (!block->has_terminator()) {
-                return {false, "block %" + block->name() + " has no terminator"};
-            }
+    for (const auto &global : module.globals()) {
+        if (auto error = use_list_error(global.get()); !error.empty()) {
+            return fail(error);
         }
     }
 
