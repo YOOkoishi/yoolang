@@ -238,6 +238,7 @@ bool fold_branch(oir::Module &module, oir::BasicBlock &block,
 
     auto replacement = std::make_unique<oir::BranchInst>(module.types().void_ty(), target, &block);
     replacement->set_parent(&block);
+    (*term_it)->drop_all_operands();
     *term_it = std::move(replacement);
     ++stats.branches;
     return true;

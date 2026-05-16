@@ -595,6 +595,12 @@ SCEVExpr SCEVExpr::add(SCEVExpr lhs, SCEVExpr rhs) {
     if (rhs_const.has_value() && *rhs_const == 0) {
         return lhs;
     }
+    if (lhs.kind() == SCEVKind::AddRec && lhs.lhs() != nullptr && lhs.rhs() != nullptr) {
+        return add_rec(add(*lhs.lhs(), std::move(rhs)), *lhs.rhs(), lhs.loop());
+    }
+    if (rhs.kind() == SCEVKind::AddRec && rhs.lhs() != nullptr && rhs.rhs() != nullptr) {
+        return add_rec(add(std::move(lhs), *rhs.lhs()), *rhs.rhs(), rhs.loop());
+    }
     SCEVExpr expr(SCEVKind::Add);
     expr.lhs_ = std::make_shared<SCEVExpr>(std::move(lhs));
     expr.rhs_ = std::make_shared<SCEVExpr>(std::move(rhs));
@@ -619,6 +625,16 @@ SCEVExpr SCEVExpr::mul(SCEVExpr lhs, SCEVExpr rhs) {
     }
     if (rhs_const.has_value() && *rhs_const == 1) {
         return lhs;
+    }
+    if (lhs.kind() == SCEVKind::AddRec && rhs_const.has_value() && lhs.lhs() != nullptr &&
+        lhs.rhs() != nullptr) {
+        return add_rec(mul(*lhs.lhs(), SCEVExpr::constant(*rhs_const)),
+                       mul(*lhs.rhs(), SCEVExpr::constant(*rhs_const)), lhs.loop());
+    }
+    if (rhs.kind() == SCEVKind::AddRec && lhs_const.has_value() && rhs.lhs() != nullptr &&
+        rhs.rhs() != nullptr) {
+        return add_rec(mul(SCEVExpr::constant(*lhs_const), *rhs.lhs()),
+                       mul(SCEVExpr::constant(*lhs_const), *rhs.rhs()), rhs.loop());
     }
     SCEVExpr expr(SCEVKind::Mul);
     expr.lhs_ = std::make_shared<SCEVExpr>(std::move(lhs));
@@ -895,10 +911,12 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
         return AliasResult::MayAlias;
     }
 
+    auto loc_a = memory_location(a);
+    auto loc_b = memory_location(b);
     auto path_a = collect_pointer_path(a);
     auto path_b = collect_pointer_path(b);
-    auto *root_a = underlying_object(path_a.root);
-    auto *root_b = underlying_object(path_b.root);
+    auto *root_a = loc_a.base != nullptr ? loc_a.base : underlying_object(path_a.root);
+    auto *root_b = loc_b.base != nullptr ? loc_b.base : underlying_object(path_b.root);
 
     if (path_a.root != nullptr && path_a.root == path_b.root) {
         if (same_index_path(path_a.indices, path_b.indices)) {
@@ -906,6 +924,15 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
         }
         if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
             return AliasResult::NoAlias;
+        }
+        if (loc_a.offset && loc_b.offset && loc_a.size && loc_b.size) {
+            const auto a_begin = *loc_a.offset;
+            const auto b_begin = *loc_b.offset;
+            const auto a_end = a_begin + static_cast<std::int64_t>(*loc_a.size);
+            const auto b_end = b_begin + static_cast<std::int64_t>(*loc_b.size);
+            if (a_end <= b_begin || b_end <= a_begin) {
+                return AliasResult::NoAlias;
+            }
         }
         return AliasResult::MayAlias;
     }
@@ -917,6 +944,18 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
         if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
             return AliasResult::NoAlias;
         }
+        if (loc_a.offset && loc_b.offset && loc_a.size && loc_b.size) {
+            const auto a_begin = *loc_a.offset;
+            const auto b_begin = *loc_b.offset;
+            const auto a_end = a_begin + static_cast<std::int64_t>(*loc_a.size);
+            const auto b_end = b_begin + static_cast<std::int64_t>(*loc_b.size);
+            if (a_end <= b_begin || b_end <= a_begin) {
+                return AliasResult::NoAlias;
+            }
+            if (a_begin == b_begin && *loc_a.size == *loc_b.size) {
+                return AliasResult::MustAlias;
+            }
+        }
         return AliasResult::MayAlias;
     }
     if (root_a != nullptr && root_b != nullptr && root_a != root_b && is_distinct_object(root_a) &&
@@ -925,6 +964,95 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
     }
 
     return AliasResult::MayAlias;
+}
+
+std::uint64_t OIRAliasAnalysis::type_size(const Type *type) const {
+    if (type == nullptr || type->is_void() || type->is_label() || type->is_function()) {
+        return 0;
+    }
+    if (auto *integer = dynamic_cast<const IntegerType *>(type)) {
+        return (integer->bit_width() + 7) / 8;
+    }
+    if (type->is_float()) {
+        return 4;
+    }
+    if (type->is_pointer()) {
+        return 8;
+    }
+    if (auto *array = dynamic_cast<const ArrayType *>(type)) {
+        return type_size(array->element_type()) * array->element_count();
+    }
+    return 0;
+}
+
+std::optional<std::int64_t>
+OIRAliasAnalysis::constant_gep_offset(const GetElementPtrInst &gep) const {
+    auto *ptr_type = dynamic_cast<const PointerType *>(gep.base_ptr()->type());
+    if (ptr_type == nullptr) {
+        return std::nullopt;
+    }
+
+    std::int64_t offset = 0;
+    const Type *cursor = ptr_type->element_type();
+    auto indices = gep.indices();
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        auto index = constant_int_value(indices[i]);
+        if (!index) {
+            return std::nullopt;
+        }
+
+        std::uint64_t stride = 0;
+        if (i == 0) {
+            stride = type_size(cursor);
+        } else if (auto *array = dynamic_cast<const ArrayType *>(cursor)) {
+            stride = type_size(array->element_type());
+            cursor = array->element_type();
+        } else {
+            stride = type_size(cursor);
+        }
+        if (stride == 0) {
+            return std::nullopt;
+        }
+        offset += *index * static_cast<std::int64_t>(stride);
+    }
+    return offset;
+}
+
+MemoryLocation OIRAliasAnalysis::memory_location(const Value *value) const {
+    if (value == nullptr) {
+        return {};
+    }
+    if (auto *gep = dynamic_cast<const GetElementPtrInst *>(value)) {
+        auto base = memory_location(gep->base_ptr());
+        auto gep_offset = constant_gep_offset(*gep);
+        if (base.offset && gep_offset) {
+            base.offset = *base.offset + *gep_offset;
+        } else {
+            base.offset = std::nullopt;
+        }
+        if (auto *ptr = dynamic_cast<const PointerType *>(gep->type())) {
+            base.size = type_size(ptr->element_type());
+        }
+        return base;
+    }
+
+    MemoryLocation loc;
+    loc.base = underlying_object(value);
+    loc.offset = 0;
+    if (auto *ptr = dynamic_cast<const PointerType *>(value->type())) {
+        loc.size = type_size(ptr->element_type());
+    }
+    return loc;
+}
+
+bool OIRAliasAnalysis::points_to_constant_global(const Value *value) const {
+    auto *base = dynamic_cast<const GlobalVariable *>(memory_location(value).base);
+    return base != nullptr && base->is_const();
+}
+
+bool OIRAliasAnalysis::call_may_clobber(const CallInst &call, const Value *ptr) const {
+    (void)call;
+    return !points_to_constant_global(ptr);
 }
 
 bool OIRAliasAnalysis::may_read_memory(const Instruction &inst) const {

@@ -46,7 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
     parser.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
     parser.add_argument("--xfail-file", type=Path, default=ROOT / "test/xfail.txt")
-    parser.add_argument("--suite", action="append", choices=["all", "filecheck", "stage", "e2e"])
+    parser.add_argument(
+        "--suite", action="append", choices=["all", "infra", "filecheck", "stage", "e2e"]
+    )
     parser.add_argument("--stage", action="append", choices=sorted(STAGE_FLAGS))
     parser.add_argument("--filter", help="only run tests whose path contains this substring")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
@@ -79,7 +81,7 @@ def parse_args() -> argparse.Namespace:
 
 def expand_suites(values: list[str] | None) -> list[str]:
     if not values or "all" in values:
-        return ["filecheck", "stage", "e2e"]
+        return ["infra", "filecheck", "stage", "e2e"]
     out: list[str] = []
     for value in values:
         if value not in out:
@@ -243,6 +245,23 @@ def run_filecheck(source: Path, binary: Path, work_dir: Path, timeout: float) ->
             return TestResult("filecheck", rel(source), "FAIL", time.monotonic() - start, detail)
 
     return TestResult("filecheck", rel(source), "PASS", time.monotonic() - start)
+
+
+def run_infra(timeout: float) -> TestResult:
+    start = time.monotonic()
+    script = ROOT / "scripts/oir_infra_tests.py"
+    try:
+        proc = run_process([sys.executable, str(script)], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return TestResult("infra", rel(script), "FAIL", time.monotonic() - start, "infra tests timed out")
+    if proc.returncode != 0:
+        detail = ""
+        if proc.stdout:
+            detail += "stdout:\n" + short_output(proc.stdout)
+        if proc.stderr:
+            detail += "stderr:\n" + short_output(proc.stderr)
+        return TestResult("infra", rel(script), "FAIL", time.monotonic() - start, detail)
+    return TestResult("infra", rel(script), "PASS", time.monotonic() - start, short_output(proc.stdout))
 
 
 def compiler_opt_flags(opt_level: int) -> list[str]:
@@ -424,6 +443,13 @@ def main() -> int:
     stages = args.stage or sorted(STAGE_FLAGS)
     xfails = load_xfails(args.xfail_file)
     results: list[TestResult] = []
+
+    if "infra" in suites:
+        result = apply_xfail(run_infra(args.timeout), xfails)
+        results.append(result)
+        print(f"{result.status:4} {result.suite:9} {result.name} ({result.elapsed:.2f}s)")
+        if result.status == "FAIL" and result.detail:
+            print(indent(result.detail.rstrip(), "    "))
 
     if "filecheck" in suites:
         tests = discover_filecheck_tests(args.test_root, args.filter)

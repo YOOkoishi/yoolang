@@ -122,7 +122,9 @@ bool rewrite_tail_calls(oir::Function &function, const TailRecLoop &loop, Stats 
         }
 
         auto &insts = block->instructions();
+        insts.back()->drop_all_operands();
         insts.pop_back();
+        insts.back()->drop_all_operands();
         insts.pop_back();
         oir::cfg::append_unconditional_branch(*function.parent(), block, loop.header);
 

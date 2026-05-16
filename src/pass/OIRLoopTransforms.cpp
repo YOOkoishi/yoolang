@@ -165,6 +165,7 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
 
 void replace_terminator_with_br(oir::BasicBlock *block, oir::BasicBlock *target) {
     if (block->has_terminator()) {
+        block->terminator()->drop_all_operands();
         block->instructions().pop_back();
     }
     oir::cfg::append_unconditional_branch(*block->parent()->parent(), block, target);
@@ -173,6 +174,7 @@ void replace_terminator_with_br(oir::BasicBlock *block, oir::BasicBlock *target)
 void replace_terminator_with_cond_br(oir::BasicBlock *block, oir::Value *condition,
                                      oir::BasicBlock *true_bb, oir::BasicBlock *false_bb) {
     if (block->has_terminator()) {
+        block->terminator()->drop_all_operands();
         block->instructions().pop_back();
     }
     oir::cfg::append_conditional_branch(*block->parent()->parent(), block, condition, true_bb,
@@ -311,23 +313,6 @@ bool loop_has_non_condition_side_exit(const oir::Loop &loop, const oir::BasicBlo
                 continue;
             }
             return true;
-        }
-    }
-    return false;
-}
-
-bool loop_has_memory_or_call(const oir::Loop &loop) {
-    for (auto *block : loop.blocks) {
-        for (const auto &inst : block->instructions()) {
-            switch (inst->op()) {
-            case oir::Instruction::OpID::Alloca:
-            case oir::Instruction::OpID::Load:
-            case oir::Instruction::OpID::Store:
-            case oir::Instruction::OpID::Call:
-                return true;
-            default:
-                break;
-            }
         }
     }
     return false;
@@ -546,8 +531,7 @@ bool rotate_loop(oir::Function &function, const oir::Loop &loop, const oir::Scal
     auto *preheader = find_preheader(loop);
     auto *latch = single_latch(loop);
     if (preheader == nullptr || latch == nullptr || !preheader->has_terminator() ||
-        !latch->has_terminator() || block_starts_with_phi(*latch) ||
-        loop_has_memory_or_call(loop)) {
+        !latch->has_terminator() || block_starts_with_phi(*latch)) {
         return false;
     }
 
@@ -658,26 +642,15 @@ std::size_t loop_instruction_count(const std::vector<oir::BasicBlock *> &blocks)
     return count;
 }
 
-bool loop_has_memory_or_call(const std::vector<oir::BasicBlock *> &blocks) {
-    for (auto *block : blocks) {
-        for (const auto &inst : block->instructions()) {
-            switch (inst->op()) {
-            case oir::Instruction::OpID::Alloca:
-            case oir::Instruction::OpID::Load:
-            case oir::Instruction::OpID::Store:
-            case oir::Instruction::OpID::Call:
-                return true;
-            default:
-                break;
-            }
-        }
-    }
-    return false;
-}
-
 bool value_defined_in_loop(const oir::Value *value, const oir::Loop &loop) {
     auto *inst = dynamic_cast<const oir::Instruction *>(value);
     return inst != nullptr && contains_block(loop, inst->parent());
+}
+
+void push_unique_value(std::vector<oir::Value *> &values, oir::Value *value) {
+    if (std::find(values.begin(), values.end(), value) == values.end()) {
+        values.push_back(value);
+    }
 }
 
 std::vector<oir::BasicBlock *> loop_exit_blocks(const std::vector<oir::BasicBlock *> &blocks,
@@ -696,20 +669,40 @@ std::vector<oir::BasicBlock *> loop_exit_blocks(const std::vector<oir::BasicBloc
     return exits;
 }
 
+std::vector<oir::Value *> loop_values_used_on_exit_edge(oir::BasicBlock *exit,
+                                                        const oir::Loop &loop) {
+    std::vector<oir::Value *> values;
+    for (const auto &inst : exit->instructions()) {
+        if (dynamic_cast<const oir::PhiInst *>(inst.get()) != nullptr) {
+            continue;
+        }
+        for (auto *operand : inst->operands()) {
+            if (value_defined_in_loop(operand, loop)) {
+                push_unique_value(values, operand);
+            }
+        }
+    }
+
+    for (auto *succ : exit->successors()) {
+        for (const auto &inst : succ->instructions()) {
+            auto *phi = dynamic_cast<const oir::PhiInst *>(inst.get());
+            if (phi == nullptr) {
+                break;
+            }
+            for (const auto &incoming : phi->incoming()) {
+                if (incoming.second == exit && value_defined_in_loop(incoming.first, loop)) {
+                    push_unique_value(values, incoming.first);
+                }
+            }
+        }
+    }
+    return values;
+}
+
 bool direct_loop_value_uses_are_repairable(const std::vector<oir::BasicBlock *> &blocks,
                                            const oir::Loop &loop) {
     for (auto *exit : loop_exit_blocks(blocks, loop)) {
-        bool has_direct_loop_value_use = false;
-        for (const auto &inst : exit->instructions()) {
-            if (dynamic_cast<const oir::PhiInst *>(inst.get()) != nullptr) {
-                continue;
-            }
-            for (auto *operand : inst->operands()) {
-                has_direct_loop_value_use =
-                    has_direct_loop_value_use || value_defined_in_loop(operand, loop);
-            }
-        }
-        if (!has_direct_loop_value_use) {
+        if (loop_values_used_on_exit_edge(exit, loop).empty()) {
             continue;
         }
         for (auto *pred : exit->predecessors()) {
@@ -735,6 +728,24 @@ void replace_non_phi_uses_in_block(oir::BasicBlock *block, oir::Value *old_value
     }
 }
 
+void replace_phi_uses_on_successor_edges(oir::BasicBlock *exit, oir::Value *old_value,
+                                         oir::Value *new_value) {
+    for (auto *succ : exit->successors()) {
+        for (auto &inst : succ->instructions()) {
+            auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+            if (phi == nullptr) {
+                break;
+            }
+            for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
+                const auto &incoming = phi->incoming()[i];
+                if (incoming.second == exit && incoming.first == old_value) {
+                    phi->set_operand(i * 2, new_value);
+                }
+            }
+        }
+    }
+}
+
 void materialize_unswitched_exit_values(const std::vector<oir::BasicBlock *> &original_blocks,
                                         const oir::Loop &loop, const BlockMap &block_map,
                                         const ValueMap &value_map) {
@@ -744,21 +755,7 @@ void materialize_unswitched_exit_values(const std::vector<oir::BasicBlock *> &or
     }
 
     for (auto *exit : loop_exit_blocks(original_blocks, loop)) {
-        std::vector<oir::Value *> direct_values;
-        for (const auto &inst : exit->instructions()) {
-            if (dynamic_cast<const oir::PhiInst *>(inst.get()) != nullptr) {
-                continue;
-            }
-            for (auto *operand : inst->operands()) {
-                if (!value_defined_in_loop(operand, loop)) {
-                    continue;
-                }
-                if (std::find(direct_values.begin(), direct_values.end(), operand) ==
-                    direct_values.end()) {
-                    direct_values.push_back(operand);
-                }
-            }
-        }
+        auto direct_values = loop_values_used_on_exit_edge(exit, loop);
 
         for (auto *value : direct_values) {
             auto exit_phi = std::make_unique<oir::PhiInst>(
@@ -781,6 +778,7 @@ void materialize_unswitched_exit_values(const std::vector<oir::BasicBlock *> &or
             }
             exit->instructions().insert(insert_pos, std::move(exit_phi));
             replace_non_phi_uses_in_block(exit, value, raw);
+            replace_phi_uses_on_successor_edges(exit, value, raw);
         }
     }
 }
@@ -807,6 +805,54 @@ oir::BranchInst *find_unswitch_branch(const oir::Loop &loop, const oir::ScalarEv
         }
     }
     return nullptr;
+}
+
+bool is_safely_speculatable_for_unswitch(const oir::Instruction &inst) {
+    if (!is_cloneable_pure_instruction(inst)) {
+        return false;
+    }
+    switch (inst.op()) {
+    case oir::Instruction::OpID::SDiv:
+    case oir::Instruction::OpID::SRem:
+    case oir::Instruction::OpID::FDiv:
+        return false;
+    default:
+        return true;
+    }
+}
+
+oir::Value *materialize_invariant_value(oir::Value *value, const oir::Loop &loop,
+                                        oir::BasicBlock *preheader, ValueMap &map) {
+    auto found = map.find(value);
+    if (found != map.end()) {
+        return found->second;
+    }
+
+    auto *inst = dynamic_cast<oir::Instruction *>(value);
+    if (inst == nullptr || !contains_block(loop, inst->parent())) {
+        map[value] = value;
+        return value;
+    }
+    if (!is_safely_speculatable_for_unswitch(*inst)) {
+        return nullptr;
+    }
+
+    for (std::size_t i = 0; i < inst->operand_count(); ++i) {
+        auto *mapped_operand = materialize_invariant_value(inst->operand(i), loop, preheader, map);
+        if (mapped_operand == nullptr) {
+            return nullptr;
+        }
+        map[inst->operand(i)] = mapped_operand;
+    }
+
+    auto clone = clone_instruction(*inst, map, preheader, ".usw.cond");
+    if (clone == nullptr || clone->type() == nullptr || clone->type()->is_void()) {
+        return nullptr;
+    }
+    auto *raw = clone.get();
+    preheader->insert_before_terminator(std::move(clone));
+    map[value] = raw;
+    return raw;
 }
 
 void fix_cloned_operands(const std::vector<oir::BasicBlock *> &clones, const ValueMap &map) {
@@ -912,7 +958,6 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
 
     auto original_blocks = function_ordered_loop_blocks(function, loop);
     if (original_blocks.empty() || original_blocks.size() > 12 ||
-        loop_has_memory_or_call(original_blocks) ||
         loop_instruction_count(original_blocks) > 120 ||
         !direct_loop_value_uses_are_repairable(original_blocks, loop)) {
         return false;
@@ -920,6 +965,13 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
 
     auto *branch = find_unswitch_branch(loop, scev);
     if (branch == nullptr) {
+        return false;
+    }
+
+    ValueMap condition_map;
+    auto *unswitch_condition =
+        materialize_invariant_value(branch->cond(), loop, preheader, condition_map);
+    if (unswitch_condition == nullptr) {
         return false;
     }
 
@@ -937,7 +989,7 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
     }
 
     oir::cfg::add_edge(preheader, clone_header);
-    replace_terminator_with_cond_br(preheader, branch->cond(), mutable_block(loop.header),
+    replace_terminator_with_cond_br(preheader, unswitch_condition, mutable_block(loop.header),
                                     clone_header);
     force_branch_direction(*branch, true);
     force_branch_direction(*clone_branch, false);

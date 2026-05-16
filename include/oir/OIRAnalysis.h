@@ -152,9 +152,18 @@ class ScalarEvolution final {
 
 enum class AliasResult { NoAlias, MayAlias, MustAlias };
 
+struct MemoryLocation {
+    const Value *base = nullptr;
+    std::optional<std::int64_t> offset;
+    std::optional<std::uint64_t> size;
+};
+
 class OIRAliasAnalysis final {
   public:
     AliasResult alias(const Value *a, const Value *b) const;
+    MemoryLocation memory_location(const Value *value) const;
+    bool points_to_constant_global(const Value *value) const;
+    bool call_may_clobber(const CallInst &call, const Value *ptr) const;
     bool may_read_memory(const Instruction &inst) const;
     bool may_write_memory(const Instruction &inst) const;
     bool has_side_effect(const Instruction &inst) const;
@@ -162,6 +171,8 @@ class OIRAliasAnalysis final {
   private:
     const Value *underlying_object(const Value *value) const;
     bool is_distinct_object(const Value *value) const;
+    std::optional<std::int64_t> constant_gep_offset(const GetElementPtrInst &gep) const;
+    std::uint64_t type_size(const Type *type) const;
 };
 
 } // namespace oir

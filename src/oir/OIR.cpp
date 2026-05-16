@@ -406,6 +406,10 @@ void Value::set_name(const std::string &name) {
     name_ = name;
 }
 
+void Value::set_type(Type *type) {
+    type_ = type;
+}
+
 const std::vector<Value::Use> &Value::uses() const {
     return uses_;
 }
@@ -759,6 +763,10 @@ std::vector<Value *> CallInst::args() const {
     return out;
 }
 
+void CallInst::remove_arg(std::size_t arg_index) {
+    erase_operands(arg_index + 1, 1);
+}
+
 std::string CallInst::print() const {
     std::ostringstream oss;
     if (!name().empty()) {
@@ -916,6 +924,10 @@ std::size_t Argument::index() const {
     return index_;
 }
 
+void Argument::set_index(std::size_t index) {
+    index_ = index;
+}
+
 std::string Argument::print() const {
     return type()->print() + " %" + name();
 }
@@ -1034,11 +1046,31 @@ void Function::set_external(bool is_external) {
     is_external_ = is_external;
 }
 
+void Function::set_function_type(FunctionType *type) {
+    set_type(type);
+}
+
 Argument *Function::add_argument(Type *type, const std::string &name) {
     auto arg = std::make_unique<Argument>(type, name, this, args_.size());
     auto *raw = arg.get();
     args_.push_back(std::move(arg));
     return raw;
+}
+
+void Function::keep_arguments(const std::vector<bool> &keep) {
+    if (keep.size() != args_.size()) {
+        return;
+    }
+    std::vector<std::unique_ptr<Argument>> kept;
+    kept.reserve(args_.size());
+    for (std::size_t i = 0; i < args_.size(); ++i) {
+        if (!keep[i]) {
+            continue;
+        }
+        args_[i]->set_index(kept.size());
+        kept.push_back(std::move(args_[i]));
+    }
+    args_ = std::move(kept);
 }
 
 BasicBlock *Function::create_block(const std::string &name) {
@@ -1242,6 +1274,10 @@ std::vector<std::unique_ptr<GlobalVariable>> &Module::globals() {
 
 const std::vector<std::unique_ptr<GlobalVariable>> &Module::globals() const {
     return globals_;
+}
+
+const std::vector<std::unique_ptr<Value>> &Module::owned_constants() const {
+    return owned_constants_;
 }
 
 std::vector<std::unique_ptr<Function>> &Module::functions() {
@@ -1895,6 +1931,11 @@ VerifyResult Verifier::verify_module(const Module &module) {
 
     for (const auto &global : module.globals()) {
         if (auto error = use_list_error(global.get()); !error.empty()) {
+            return fail(error);
+        }
+    }
+    for (const auto &constant : module.owned_constants()) {
+        if (auto error = use_list_error(constant.get()); !error.empty()) {
             return fail(error);
         }
     }

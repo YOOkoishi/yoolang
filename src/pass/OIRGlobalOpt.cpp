@@ -1,8 +1,11 @@
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace pass::oir_opt {
 namespace {
@@ -43,6 +46,136 @@ bool parse_f32_literal(const std::string &literal, float &out) {
     }
     out = value;
     return true;
+}
+
+std::vector<std::string> scalar_initializer_tokens(const std::string &literal) {
+    std::vector<std::string> tokens;
+    std::string current;
+    auto flush = [&]() {
+        auto value = trim(current);
+        current.clear();
+        if (!value.empty()) {
+            tokens.push_back(value);
+        }
+    };
+
+    for (char ch : literal) {
+        switch (ch) {
+        case '{':
+        case '}':
+        case ',':
+        case '\n':
+        case '\r':
+        case '\t':
+        case ' ':
+            flush();
+            break;
+        default:
+            current.push_back(ch);
+            break;
+        }
+    }
+    flush();
+    return tokens;
+}
+
+std::uint64_t scalar_element_count(oir::Type *type) {
+    if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
+        return array->element_count() * scalar_element_count(array->element_type());
+    }
+    return 1;
+}
+
+oir::Type *scalar_element_type(oir::Type *type) {
+    while (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
+        type = array->element_type();
+    }
+    return type;
+}
+
+std::optional<std::uint64_t> linear_index_for(oir::Type *type,
+                                              const std::vector<std::int64_t> &indices,
+                                              std::size_t &pos) {
+    auto *array = dynamic_cast<oir::ArrayType *>(type);
+    if (array == nullptr) {
+        return 0;
+    }
+    if (pos >= indices.size() || indices[pos] < 0 ||
+        static_cast<std::uint64_t>(indices[pos]) >= array->element_count()) {
+        return std::nullopt;
+    }
+    const auto index = static_cast<std::uint64_t>(indices[pos++]);
+    auto nested = linear_index_for(array->element_type(), indices, pos);
+    if (!nested) {
+        return std::nullopt;
+    }
+    return index * scalar_element_count(array->element_type()) + *nested;
+}
+
+bool collect_global_indices(oir::Value *ptr, oir::GlobalVariable *&global,
+                            std::vector<std::int64_t> &indices) {
+    if (auto *g = dynamic_cast<oir::GlobalVariable *>(ptr)) {
+        global = g;
+        return true;
+    }
+    auto *gep = dynamic_cast<oir::GetElementPtrInst *>(ptr);
+    if (gep == nullptr || !collect_global_indices(gep->base_ptr(), global, indices)) {
+        return false;
+    }
+    for (auto *index : gep->indices()) {
+        auto constant = int_constant(index);
+        if (!constant) {
+            return false;
+        }
+        indices.push_back(*constant);
+    }
+    return true;
+}
+
+oir::Value *constant_array_element_for_global(oir::Module &module, oir::GlobalVariable &global,
+                                              const std::vector<std::int64_t> &raw_indices,
+                                              oir::Type *load_type) {
+    if (!global.is_const() || !global.value_type()->is_array()) {
+        return nullptr;
+    }
+    std::vector<std::int64_t> indices = raw_indices;
+    if (!indices.empty() && indices.front() == 0) {
+        indices.erase(indices.begin());
+    }
+    std::size_t pos = 0;
+    auto linear = linear_index_for(global.value_type(), indices, pos);
+    if (!linear || pos != indices.size()) {
+        return nullptr;
+    }
+
+    auto *element_type = scalar_element_type(global.value_type());
+    if (element_type != load_type) {
+        return nullptr;
+    }
+    if (trim(global.initializer_literal()).empty() ||
+        trim(global.initializer_literal()) == "zero") {
+        return make_zero_constant(module, element_type);
+    }
+
+    auto tokens = scalar_initializer_tokens(global.initializer_literal());
+    if (*linear >= tokens.size()) {
+        return make_zero_constant(module, element_type);
+    }
+    if (element_type->is_integer()) {
+        std::int64_t value = 0;
+        if (!parse_i32_literal(tokens[*linear], value)) {
+            return nullptr;
+        }
+        return make_int_constant(module, element_type, value);
+    }
+    if (element_type->is_float()) {
+        float value = 0.0F;
+        if (!parse_f32_literal(tokens[*linear], value)) {
+            return nullptr;
+        }
+        return module.create_f32(value);
+    }
+    return nullptr;
 }
 
 oir::Value *constant_value_for_global(oir::Module &module, oir::GlobalVariable &global) {
@@ -98,11 +231,18 @@ bool propagate_global_constants(oir::Module &module, Stats &stats) {
                 }
 
                 auto *global = dynamic_cast<oir::GlobalVariable *>(load->ptr());
-                if (global == nullptr || global->value_type() != load->type()) {
-                    continue;
+                oir::Value *constant = nullptr;
+                if (global != nullptr && global->value_type() == load->type()) {
+                    constant = constant_value_for_global(module, *global);
+                } else {
+                    oir::GlobalVariable *indexed_global = nullptr;
+                    std::vector<std::int64_t> indices;
+                    if (collect_global_indices(load->ptr(), indexed_global, indices) &&
+                        indexed_global != nullptr) {
+                        constant = constant_array_element_for_global(module, *indexed_global,
+                                                                     indices, load->type());
+                    }
                 }
-
-                auto *constant = constant_value_for_global(module, *global);
                 if (constant != nullptr && constant->type() == load->type()) {
                     replacements[load] = constant;
                 }

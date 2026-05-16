@@ -365,6 +365,7 @@ bool inline_call(oir::Module &module, oir::Function &caller, oir::BasicBlock *bl
         replacements[call] = materialize_return_value(module, *call, continuation, returns);
         apply_replacements(module, replacements);
     }
+    (*call_it)->drop_all_operands();
     block->instructions().erase(call_it);
     return true;
 }
