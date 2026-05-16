@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -26,6 +27,8 @@ struct GEPCandidate {
     InductionInfo induction;
     std::size_t index_pos = 0;
     std::int64_t pointer_step = 0;
+    std::int64_t index_scale = 1;
+    std::int64_t index_offset = 0;
 };
 
 bool contains_block(const oir::Loop &loop, const oir::BasicBlock *block) {
@@ -203,14 +206,69 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
         return std::nullopt;
     }
 
-    std::optional<InductionInfo> induction;
+    struct AffineIndex {
+        InductionInfo induction;
+        std::int64_t scale = 1;
+        std::int64_t offset = 0;
+    };
+    std::function<std::optional<AffineIndex>(oir::Value *)> match_affine =
+        [&](oir::Value *value) -> std::optional<AffineIndex> {
+        for (const auto &info : inductions) {
+            if (value == info.phi) {
+                return AffineIndex{info, 1, 0};
+            }
+        }
+        if (auto *binary = dynamic_cast<oir::BinaryInst *>(value)) {
+            if (binary->op() == oir::Instruction::OpID::Add ||
+                binary->op() == oir::Instruction::OpID::Sub) {
+                if (auto lhs = match_affine(binary->lhs())) {
+                    auto rhs_const = constant_int(binary->rhs());
+                    if (rhs_const && binary->op() == oir::Instruction::OpID::Add) {
+                        lhs->offset += *rhs_const;
+                        return lhs;
+                    }
+                    if (rhs_const && binary->op() == oir::Instruction::OpID::Sub) {
+                        lhs->offset -= *rhs_const;
+                        return lhs;
+                    }
+                }
+                if (binary->op() == oir::Instruction::OpID::Add) {
+                    if (auto rhs = match_affine(binary->rhs())) {
+                        auto lhs_const = constant_int(binary->lhs());
+                        if (lhs_const) {
+                            rhs->offset += *lhs_const;
+                            return rhs;
+                        }
+                    }
+                }
+            }
+            if (binary->op() == oir::Instruction::OpID::Mul) {
+                if (auto lhs = match_affine(binary->lhs())) {
+                    auto rhs_const = constant_int(binary->rhs());
+                    if (rhs_const) {
+                        lhs->scale *= *rhs_const;
+                        lhs->offset *= *rhs_const;
+                        return lhs;
+                    }
+                }
+                if (auto rhs = match_affine(binary->rhs())) {
+                    auto lhs_const = constant_int(binary->lhs());
+                    if (lhs_const) {
+                        rhs->scale *= *lhs_const;
+                        rhs->offset *= *lhs_const;
+                        return rhs;
+                    }
+                }
+            }
+        }
+        return std::nullopt;
+        };
+
+    std::optional<AffineIndex> induction;
     std::size_t index_pos = 0;
     for (std::size_t i = 0; i < indices.size(); ++i) {
-        auto found = std::find_if(inductions.begin(), inductions.end(),
-                                  [&](const InductionInfo &info) {
-                                      return indices[i] == info.phi;
-                                  });
-        if (found != inductions.end()) {
+        auto found = match_affine(indices[i]);
+        if (found) {
             if (induction) {
                 return std::nullopt;
             }
@@ -229,7 +287,8 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
     }
 
     const auto step_bytes =
-        induction->step * static_cast<std::int64_t>((*strides)[index_pos]);
+        induction->induction.step * induction->scale *
+        static_cast<std::int64_t>((*strides)[index_pos]);
     if (step_bytes == 0 || step_bytes % result_elem_size != 0) {
         return std::nullopt;
     }
@@ -239,7 +298,8 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
         return std::nullopt;
     }
 
-    return GEPCandidate{&gep, *induction, index_pos, pointer_step};
+    return GEPCandidate{&gep, induction->induction, index_pos, pointer_step,
+                        induction->scale, induction->offset};
 }
 
 std::vector<GEPCandidate>
@@ -279,6 +339,24 @@ oir::PhiInst *insert_pointer_phi(oir::BasicBlock *header, oir::Type *type,
     return raw;
 }
 
+oir::Value *materialize_start_index(oir::Module &module, oir::BasicBlock *preheader,
+                                    const GEPCandidate &candidate) {
+    oir::Value *value = candidate.induction.start;
+    if (candidate.index_scale != 1) {
+        value = preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
+            value->type(), oir::Instruction::OpID::Mul, value,
+            make_int_constant(module, value->type(), candidate.index_scale), preheader,
+            "lsr.idx.scale"));
+    }
+    if (candidate.index_offset != 0) {
+        value = preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
+            value->type(), oir::Instruction::OpID::Add, value,
+            make_int_constant(module, value->type(), candidate.index_offset), preheader,
+            "lsr.idx.offset"));
+    }
+    return value;
+}
+
 bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preheader,
                oir::BasicBlock *latch, const std::vector<GEPCandidate> &candidates,
                Stats &stats) {
@@ -291,7 +369,7 @@ bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preh
     for (const auto &candidate : candidates) {
         auto *gep = candidate.gep;
         auto start_indices = gep->indices();
-        start_indices[candidate.index_pos] = candidate.induction.start;
+        start_indices[candidate.index_pos] = materialize_start_index(module, preheader, candidate);
 
         auto *start_ptr = static_cast<oir::GetElementPtrInst *>(
             preheader->insert_before_terminator(std::make_unique<oir::GetElementPtrInst>(

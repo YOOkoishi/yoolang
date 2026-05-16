@@ -160,6 +160,7 @@ class Value {
     virtual std::string print() const = 0;
 
   private:
+    void set_type(Type *type);
     void add_use(User *user, std::size_t operand_index);
     void remove_use(User *user, std::size_t operand_index);
 
@@ -168,6 +169,7 @@ class Value {
     std::vector<Use> uses_;
 
     friend class User;
+    friend class Function;
 };
 
 class ConstantInt final : public Value {
@@ -348,6 +350,7 @@ class CallInst final : public Instruction {
 
     Value *callee() const;
     std::vector<Value *> args() const;
+    void remove_arg(std::size_t arg_index);
     std::string print() const override;
 };
 
@@ -394,6 +397,7 @@ class Argument final : public Value {
 
     Function *parent() const;
     std::size_t index() const;
+    void set_index(std::size_t index);
     std::string print() const override;
 
   private:
@@ -440,8 +444,10 @@ class Function final : public Value {
     Module *parent() const;
     bool is_external() const;
     void set_external(bool is_external);
+    void set_function_type(FunctionType *type);
 
     Argument *add_argument(Type *type, const std::string &name);
+    void keep_arguments(const std::vector<bool> &keep);
     BasicBlock *create_block(const std::string &name = "");
     void erase_block(BasicBlock *block);
     BasicBlock *entry_block() const;
@@ -504,6 +510,7 @@ class Module final {
 
     std::vector<std::unique_ptr<GlobalVariable>> &globals();
     const std::vector<std::unique_ptr<GlobalVariable>> &globals() const;
+    const std::vector<std::unique_ptr<Value>> &owned_constants() const;
     std::vector<std::unique_ptr<Function>> &functions();
     const std::vector<std::unique_ptr<Function>> &functions() const;
 

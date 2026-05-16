@@ -96,6 +96,7 @@ bool simplify_single_predecessor_phis(oir::Module &module, oir::Function &functi
         auto &insts = phi->parent()->instructions();
         for (auto it = insts.begin(); it != insts.end(); ++it) {
             if (it->get() == phi) {
+                (*it)->drop_all_operands();
                 insts.erase(it);
                 ++stats.cfg;
                 break;
@@ -211,12 +212,14 @@ bool merge_with_single_predecessor_successor(oir::Module &module, oir::Function 
         auto &insts = succ->instructions();
         for (auto it = insts.begin(); it != insts.end(); ++it) {
             if (it->get() == phi) {
+                (*it)->drop_all_operands();
                 insts.erase(it);
                 break;
             }
         }
     }
 
+    block->instructions().back()->drop_all_operands();
     block->instructions().pop_back();
     oir::cfg::remove_edge_no_phi_update(block, succ);
 

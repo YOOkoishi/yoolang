@@ -16,6 +16,7 @@ bool eliminate_dead_code(oir::Module &module, Stats &stats) {
             for (auto &block : function->blocks()) {
                 for (auto it = block->instructions().begin(); it != block->instructions().end();) {
                     if (is_pure_instruction(**it) && !(*it)->has_uses()) {
+                        (*it)->drop_all_operands();
                         it = block->instructions().erase(it);
                         ++stats.dce;
                         changed = true;

@@ -125,34 +125,27 @@ bool is_speculatable_divisor(oir::Value *value) {
     return constant.has_value() && *constant != 0;
 }
 
-const oir::GlobalVariable *underlying_global(const oir::Value *value) {
-    if (auto *global = dynamic_cast<const oir::GlobalVariable *>(value)) {
-        return global;
-    }
-    if (auto *gep = dynamic_cast<const oir::GetElementPtrInst *>(value)) {
-        return underlying_global(gep->base_ptr());
-    }
-    return nullptr;
-}
-
-bool loop_has_store_or_call(const oir::Loop &loop) {
+bool loop_may_clobber(const oir::Loop &loop, oir::Value *ptr,
+                      const oir::OIRAliasAnalysis &alias_analysis) {
     for (auto *const_block : loop.blocks) {
         for (const auto &inst : const_block->instructions()) {
-            if (inst->op() == oir::Instruction::OpID::Store ||
-                inst->op() == oir::Instruction::OpID::Call) {
-                return true;
+            if (auto *store = dynamic_cast<oir::StoreInst *>(inst.get())) {
+                if (alias_analysis.alias(ptr, store->ptr()) != oir::AliasResult::NoAlias) {
+                    return true;
+                }
+                continue;
+            }
+            if (auto *call = dynamic_cast<oir::CallInst *>(inst.get())) {
+                if (alias_analysis.call_may_clobber(*call, ptr)) {
+                    return true;
+                }
             }
         }
     }
     return false;
 }
 
-bool is_global_load(const oir::Instruction &inst) {
-    auto *load = dynamic_cast<const oir::LoadInst *>(&inst);
-    return load != nullptr && underlying_global(load->ptr()) != nullptr;
-}
-
-bool is_licm_candidate(const oir::Instruction &inst, bool allow_global_loads) {
+bool is_licm_candidate(const oir::Instruction &inst) {
     switch (inst.op()) {
     case oir::Instruction::OpID::Add:
     case oir::Instruction::OpID::Sub:
@@ -181,7 +174,7 @@ bool is_licm_candidate(const oir::Instruction &inst, bool allow_global_loads) {
     case oir::Instruction::OpID::Phi:
         return false;
     case oir::Instruction::OpID::Load:
-        return allow_global_loads && is_global_load(inst);
+        return true;
     }
     return false;
 }
@@ -200,9 +193,16 @@ bool operand_is_invariant(const oir::Loop &loop, oir::Value *value,
 
 bool instruction_is_invariant(const oir::Loop &loop, const oir::Instruction &inst,
                               const std::unordered_set<oir::Instruction *> &moving,
-                              bool allow_global_loads) {
-    if (!is_licm_candidate(inst, allow_global_loads)) {
+                              const oir::OIRAliasAnalysis &alias_analysis) {
+    if (!is_licm_candidate(inst)) {
         return false;
+    }
+    if (auto *load = dynamic_cast<const oir::LoadInst *>(&inst)) {
+        if (!operand_is_invariant(loop, load->ptr(), moving)) {
+            return false;
+        }
+        return alias_analysis.points_to_constant_global(load->ptr()) ||
+               !loop_may_clobber(loop, load->ptr(), alias_analysis);
     }
     for (auto *operand : inst.operands()) {
         if (!operand_is_invariant(loop, operand, moving)) {
@@ -243,7 +243,7 @@ bool run_on_loop(oir::Function &function, const oir::Loop &loop, Stats &stats) {
 
     bool changed = false;
     bool keep_going = true;
-    const bool allow_global_loads = !loop_has_store_or_call(loop);
+    oir::OIRAliasAnalysis alias_analysis;
     std::unordered_set<oir::Instruction *> moved;
     while (keep_going) {
         keep_going = false;
@@ -254,7 +254,7 @@ bool run_on_loop(oir::Function &function, const oir::Loop &loop, Stats &stats) {
                 if (moved.find(inst.get()) != moved.end()) {
                     continue;
                 }
-                if (instruction_is_invariant(loop, *inst, moved, allow_global_loads)) {
+                if (instruction_is_invariant(loop, *inst, moved, alias_analysis)) {
                     to_move.push_back(inst.get());
                 }
             }
