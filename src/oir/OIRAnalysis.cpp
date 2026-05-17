@@ -1105,4 +1105,345 @@ bool OIRAliasAnalysis::is_distinct_object(const Value *value) const {
            dynamic_cast<const GlobalVariable *>(value) != nullptr;
 }
 
+namespace {
+
+template <typename T> bool set_equal(const std::unordered_set<T> &lhs,
+                                     const std::unordered_set<T> &rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (const auto &value : lhs) {
+        if (rhs.find(value) == rhs.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void merge_summary(FunctionMemorySummary &dst, const FunctionMemorySummary &src) {
+    dst.read_globals.insert(src.read_globals.begin(), src.read_globals.end());
+    dst.written_globals.insert(src.written_globals.begin(), src.written_globals.end());
+    dst.read_param_indices.insert(src.read_param_indices.begin(), src.read_param_indices.end());
+    dst.written_param_indices.insert(src.written_param_indices.begin(),
+                                     src.written_param_indices.end());
+    dst.reads_unknown = dst.reads_unknown || src.reads_unknown;
+    dst.writes_unknown = dst.writes_unknown || src.writes_unknown;
+    dst.reads_all = dst.reads_all || src.reads_all;
+    dst.writes_all = dst.writes_all || src.writes_all;
+    dst.has_side_effect = dst.has_side_effect || src.has_side_effect;
+}
+
+bool is_pointer_value(const Value *value) {
+    return value != nullptr && value->type() != nullptr && value->type()->is_pointer();
+}
+
+const Argument *argument_base(const Value *value) {
+    if (auto *arg = dynamic_cast<const Argument *>(value)) {
+        return arg;
+    }
+    if (auto *gep = dynamic_cast<const GetElementPtrInst *>(value)) {
+        return argument_base(gep->base_ptr());
+    }
+    return nullptr;
+}
+
+void add_pointer_effect(FunctionMemorySummary &summary, const Value *ptr,
+                        const OIRAliasAnalysis &alias_analysis, bool is_write) {
+    auto loc = alias_analysis.memory_location(ptr);
+    if (auto *global = dynamic_cast<const GlobalVariable *>(loc.base)) {
+        if (is_write) {
+            summary.written_globals.insert(global);
+        } else {
+            summary.read_globals.insert(global);
+        }
+        return;
+    }
+
+    if (auto *arg = argument_base(ptr)) {
+        if (is_write) {
+            summary.written_param_indices.insert(arg->index());
+        } else {
+            summary.read_param_indices.insert(arg->index());
+        }
+        return;
+    }
+
+    if (dynamic_cast<const AllocaInst *>(loc.base) != nullptr) {
+        return;
+    }
+
+    if (is_write) {
+        summary.writes_unknown = true;
+    } else {
+        summary.reads_unknown = true;
+    }
+}
+
+FunctionMemorySummary project_call_summary(const CallInst &call,
+                                           const FunctionMemorySummary &callee_summary,
+                                           const OIRAliasAnalysis &alias_analysis) {
+    FunctionMemorySummary out;
+    out.read_globals = callee_summary.read_globals;
+    out.written_globals = callee_summary.written_globals;
+    out.reads_unknown = callee_summary.reads_unknown;
+    out.writes_unknown = callee_summary.writes_unknown;
+    out.reads_all = callee_summary.reads_all;
+    out.writes_all = callee_summary.writes_all;
+    out.has_side_effect = callee_summary.has_side_effect;
+
+    auto args = call.args();
+    for (auto index : callee_summary.read_param_indices) {
+        if (index < args.size() && is_pointer_value(args[index])) {
+            add_pointer_effect(out, args[index], alias_analysis, false);
+        } else {
+            out.reads_unknown = true;
+        }
+    }
+    for (auto index : callee_summary.written_param_indices) {
+        if (index < args.size() && is_pointer_value(args[index])) {
+            add_pointer_effect(out, args[index], alias_analysis, true);
+        } else {
+            out.writes_unknown = true;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+bool FunctionMemorySummary::operator==(const FunctionMemorySummary &other) const {
+    return reads_unknown == other.reads_unknown && writes_unknown == other.writes_unknown &&
+           reads_all == other.reads_all && writes_all == other.writes_all &&
+           has_side_effect == other.has_side_effect &&
+           set_equal(read_globals, other.read_globals) &&
+           set_equal(written_globals, other.written_globals) &&
+           set_equal(read_param_indices, other.read_param_indices) &&
+           set_equal(written_param_indices, other.written_param_indices);
+}
+
+bool FunctionMemorySummary::operator!=(const FunctionMemorySummary &other) const {
+    return !(*this == other);
+}
+
+bool FunctionMemorySummary::may_read_memory() const {
+    return reads_all || reads_unknown || !read_globals.empty() || !read_param_indices.empty();
+}
+
+bool FunctionMemorySummary::may_write_memory() const {
+    return writes_all || writes_unknown || !written_globals.empty() ||
+           !written_param_indices.empty();
+}
+
+FunctionModRefAnalysis::FunctionModRefAnalysis(const Module &module) : module_(&module) {
+    for (const auto &function : module.functions()) {
+        if (function->is_external()) {
+            summaries_[function.get()] = external_summary(*function);
+        } else {
+            summaries_[function.get()] = {};
+        }
+    }
+
+    bool changed = true;
+    for (unsigned iteration = 0; changed && iteration < 64; ++iteration) {
+        changed = false;
+        for (const auto &function : module.functions()) {
+            FunctionMemorySummary next =
+                function->is_external() ? external_summary(*function) : scan_function(*function);
+            auto &current = summaries_[function.get()];
+            if (current != next) {
+                current = std::move(next);
+                changed = true;
+            }
+        }
+    }
+}
+
+const FunctionMemorySummary &FunctionModRefAnalysis::summary(const Function *function) const {
+    static const FunctionMemorySummary unknown = [] {
+        FunctionMemorySummary out;
+        out.reads_all = true;
+        out.writes_all = true;
+        out.has_side_effect = true;
+        return out;
+    }();
+
+    auto found = summaries_.find(function);
+    return found == summaries_.end() ? unknown : found->second;
+}
+
+FunctionMemorySummary FunctionModRefAnalysis::unknown_external_summary() const {
+    FunctionMemorySummary out;
+    out.reads_all = true;
+    out.writes_all = true;
+    out.has_side_effect = true;
+    return out;
+}
+
+FunctionMemorySummary FunctionModRefAnalysis::external_summary(const Function &function) const {
+    FunctionMemorySummary out;
+    const auto &name = function.name();
+
+    if (name == "getint" || name == "getch" || name == "getfloat") {
+        out.has_side_effect = true;
+        return out;
+    }
+    if (name == "putint" || name == "putch" || name == "putfloat" ||
+        name == "starttime" || name == "stoptime" || name == "_sysy_starttime" ||
+        name == "_sysy_stoptime") {
+        out.has_side_effect = true;
+        return out;
+    }
+    if (name == "getarray" || name == "getfarray") {
+        out.written_param_indices.insert(0);
+        out.has_side_effect = true;
+        return out;
+    }
+    if (name == "putarray" || name == "putfarray") {
+        out.read_param_indices.insert(1);
+        out.has_side_effect = true;
+        return out;
+    }
+    if (name == "putf") {
+        out.reads_unknown = true;
+        out.has_side_effect = true;
+        return out;
+    }
+
+    return unknown_external_summary();
+}
+
+FunctionMemorySummary FunctionModRefAnalysis::scan_function(const Function &function) const {
+    FunctionMemorySummary out;
+    OIRAliasAnalysis alias_analysis;
+
+    for (const auto &block : function.blocks()) {
+        for (const auto &inst : block->instructions()) {
+            if (auto *load = dynamic_cast<const LoadInst *>(inst.get())) {
+                add_pointer_effect(out, load->ptr(), alias_analysis, false);
+                continue;
+            }
+
+            if (auto *store = dynamic_cast<const StoreInst *>(inst.get())) {
+                add_pointer_effect(out, store->ptr(), alias_analysis, true);
+                continue;
+            }
+
+            if (auto *call = dynamic_cast<const CallInst *>(inst.get())) {
+                auto callee_summary =
+                    project_call_summary(*call, call_summary(*call), alias_analysis);
+                merge_summary(out, callee_summary);
+            }
+        }
+    }
+
+    return out;
+}
+
+FunctionMemorySummary FunctionModRefAnalysis::call_summary(const CallInst &call) const {
+    auto *callee = dynamic_cast<const Function *>(call.callee());
+    if (callee == nullptr) {
+        return unknown_external_summary();
+    }
+    return summary(callee);
+}
+
+namespace {
+
+bool call_param_may_alias(const CallInst &call, const std::unordered_set<std::size_t> &indices,
+                          const Value *ptr, const OIRAliasAnalysis &alias_analysis) {
+    auto args = call.args();
+    for (auto index : indices) {
+        if (index >= args.size()) {
+            return true;
+        }
+        auto *arg = args[index];
+        if (!is_pointer_value(arg)) {
+            continue;
+        }
+
+        auto arg_loc = alias_analysis.memory_location(arg);
+        auto ptr_loc = alias_analysis.memory_location(ptr);
+        if (arg_loc.base != nullptr && ptr_loc.base != nullptr) {
+            if (alias_analysis.alias(arg_loc.base, ptr_loc.base) != AliasResult::NoAlias) {
+                return true;
+            }
+            continue;
+        }
+
+        if (alias_analysis.alias(arg, ptr) != AliasResult::NoAlias) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+bool FunctionModRefAnalysis::call_may_clobber(
+    const CallInst &call, const Value *ptr, const OIRAliasAnalysis &alias_analysis) const {
+    if (ptr == nullptr || alias_analysis.points_to_constant_global(ptr)) {
+        return false;
+    }
+
+    auto info = call_summary(call);
+    if (info.writes_all) {
+        return true;
+    }
+    if (info.writes_unknown) {
+        return true;
+    }
+    if (call_param_may_alias(call, info.written_param_indices, ptr, alias_analysis)) {
+        return true;
+    }
+
+    auto loc = alias_analysis.memory_location(ptr);
+    if (auto *global = dynamic_cast<const GlobalVariable *>(loc.base)) {
+        if (info.written_globals.find(global) != info.written_globals.end()) {
+            return true;
+        }
+        return false;
+    }
+
+    if (loc.base == nullptr) {
+        return !info.written_globals.empty();
+    }
+    return false;
+}
+
+bool FunctionModRefAnalysis::call_may_read(
+    const CallInst &call, const Value *ptr, const OIRAliasAnalysis &alias_analysis) const {
+    if (ptr == nullptr) {
+        return true;
+    }
+
+    auto info = call_summary(call);
+    if (info.reads_all) {
+        return true;
+    }
+    if (info.reads_unknown) {
+        return true;
+    }
+    if (call_param_may_alias(call, info.read_param_indices, ptr, alias_analysis)) {
+        return true;
+    }
+
+    auto loc = alias_analysis.memory_location(ptr);
+    if (auto *global = dynamic_cast<const GlobalVariable *>(loc.base)) {
+        if (info.read_globals.find(global) != info.read_globals.end()) {
+            return true;
+        }
+        return false;
+    }
+
+    if (loc.base == nullptr) {
+        return !info.read_globals.empty();
+    }
+    return false;
+}
+
+bool FunctionModRefAnalysis::call_has_side_effect(const CallInst &call) const {
+    const auto info = call_summary(call);
+    return info.has_side_effect || info.may_write_memory();
+}
+
 } // namespace oir

@@ -208,6 +208,10 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\tand " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].string_value() << "\n";
         break;
+    case Opcode::AndI:
+        out_ << "\tandi " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
+        break;
     case Opcode::SllI:
         out_ << "\tslli " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";

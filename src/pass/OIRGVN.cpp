@@ -194,6 +194,17 @@ void invalidate_aliasing_memory(MemoryTable &memory, oir::Value *ptr,
                  memory.end());
 }
 
+void invalidate_call_clobbered_memory(MemoryTable &memory, const oir::CallInst &call,
+                                      const oir::OIRAliasAnalysis &alias_analysis,
+                                      const oir::FunctionModRefAnalysis &modref) {
+    memory.erase(std::remove_if(memory.begin(), memory.end(),
+                                [&](const AvailableMemoryValue &entry) {
+                                    return modref.call_may_clobber(call, entry.ptr,
+                                                                   alias_analysis);
+                                }),
+                 memory.end());
+}
+
 void rewrite_operands(oir::Instruction &inst, const ReplacementMap &replacements) {
     for (std::size_t i = 0; i < inst.operand_count(); ++i) {
         auto *old_operand = inst.operand(i);
@@ -206,7 +217,8 @@ void rewrite_operands(oir::Instruction &inst, const ReplacementMap &replacements
 
 void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *block,
                   ScopedValueTable &table, MemoryTable memory, ReplacementMap &replacements,
-                  const oir::OIRAliasAnalysis &alias_analysis) {
+                  const oir::OIRAliasAnalysis &alias_analysis,
+                  const oir::FunctionModRefAnalysis &modref) {
     auto mark = table.mark();
     for (auto &inst_ptr : const_cast<oir::BasicBlock *>(block)->instructions()) {
         auto *inst = inst_ptr.get();
@@ -228,8 +240,8 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
             continue;
         }
 
-        if (dynamic_cast<oir::CallInst *>(inst) != nullptr) {
-            memory.clear();
+        if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
+            invalidate_call_clobbered_memory(memory, *call, alias_analysis, modref);
         }
 
         if (!is_gvn_candidate(*inst) || inst->type() == nullptr || inst->type()->is_void()) {
@@ -254,7 +266,7 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
         if (child->predecessors().size() == 1 && child->predecessors().front() == block) {
             child_memory = memory;
         }
-        number_block(dom_tree, child, table, child_memory, replacements, alias_analysis);
+        number_block(dom_tree, child, table, child_memory, replacements, alias_analysis, modref);
     }
     table.pop_to(mark);
 }
@@ -274,6 +286,7 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
     if (block_count > 1000 || instruction_count > 8000) {
         ReplacementMap replacements;
         oir::OIRAliasAnalysis alias_analysis;
+        oir::FunctionModRefAnalysis modref(module);
         for (auto &block : function.blocks()) {
             ScopedValueTable table;
             MemoryTable memory;
@@ -298,8 +311,8 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
                     continue;
                 }
 
-                if (dynamic_cast<oir::CallInst *>(inst) != nullptr) {
-                    memory.clear();
+                if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
+                    invalidate_call_clobbered_memory(memory, *call, alias_analysis, modref);
                 }
 
                 if (!is_gvn_candidate(*inst) || inst->type() == nullptr ||
@@ -331,7 +344,9 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
     MemoryTable memory;
     ReplacementMap replacements;
     oir::OIRAliasAnalysis alias_analysis;
-    number_block(dom_tree, function.entry_block(), table, memory, replacements, alias_analysis);
+    oir::FunctionModRefAnalysis modref(module);
+    number_block(dom_tree, function.entry_block(), table, memory, replacements, alias_analysis,
+                 modref);
     if (apply_replacements(module, replacements) == 0) {
         return false;
     }

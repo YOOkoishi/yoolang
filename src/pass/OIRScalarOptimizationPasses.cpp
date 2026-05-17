@@ -28,6 +28,7 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::propagate_global_constants(module, stats);
     changed |= oir_opt::simplify_branches(module, stats);
     changed |= oir_opt::cleanup_cfg(module, stats);
+    changed |= oir_opt::promote_global_loads(module, stats);
     changed |= oir_opt::promote_memory_to_registers(module, stats);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
@@ -65,6 +66,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= propagate_global_constants(module, stats);
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
+    changed |= promote_global_loads(module, stats);
     changed |= promote_memory_to_registers(module, stats);
     changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
     changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
@@ -90,6 +92,8 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= cleanup_cfg(module, stats);
     changed |= reduce_gep_strength(module, stats);
     changed |= propagate_global_constants(module, stats);
+    changed |= promote_global_loads(module, stats);
+    changed |= promote_memory_to_registers(module, stats);
     changed |= eliminate_dead_loads(module, stats);
     changed |= eliminate_dead_stores(module, stats);
     changed |= aggressive_dead_code_elimination(module, stats);
@@ -360,6 +364,9 @@ PassResult OIRGlobalOptPass::run(PassContext &context) {
                                       [](oir::Module &module, oir_opt::Stats &stats) {
                                           bool changed =
                                               oir_opt::propagate_global_constants(module, stats);
+                                          changed |= oir_opt::promote_global_loads(module, stats);
+                                          changed |=
+                                              oir_opt::promote_memory_to_registers(module, stats);
                                           changed |= oir_opt::eliminate_dead_code(module, stats);
                                           return changed;
                                       });

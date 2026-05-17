@@ -126,7 +126,8 @@ bool is_speculatable_divisor(oir::Value *value) {
 }
 
 bool loop_may_clobber(const oir::Loop &loop, oir::Value *ptr,
-                      const oir::OIRAliasAnalysis &alias_analysis) {
+                      const oir::OIRAliasAnalysis &alias_analysis,
+                      const oir::FunctionModRefAnalysis &modref) {
     for (auto *const_block : loop.blocks) {
         for (const auto &inst : const_block->instructions()) {
             if (auto *store = dynamic_cast<oir::StoreInst *>(inst.get())) {
@@ -136,7 +137,7 @@ bool loop_may_clobber(const oir::Loop &loop, oir::Value *ptr,
                 continue;
             }
             if (auto *call = dynamic_cast<oir::CallInst *>(inst.get())) {
-                if (alias_analysis.call_may_clobber(*call, ptr)) {
+                if (modref.call_may_clobber(*call, ptr, alias_analysis)) {
                     return true;
                 }
             }
@@ -193,7 +194,8 @@ bool operand_is_invariant(const oir::Loop &loop, oir::Value *value,
 
 bool instruction_is_invariant(const oir::Loop &loop, const oir::Instruction &inst,
                               const std::unordered_set<oir::Instruction *> &moving,
-                              const oir::OIRAliasAnalysis &alias_analysis) {
+                              const oir::OIRAliasAnalysis &alias_analysis,
+                              const oir::FunctionModRefAnalysis &modref) {
     if (!is_licm_candidate(inst)) {
         return false;
     }
@@ -202,7 +204,7 @@ bool instruction_is_invariant(const oir::Loop &loop, const oir::Instruction &ins
             return false;
         }
         return alias_analysis.points_to_constant_global(load->ptr()) ||
-               !loop_may_clobber(loop, load->ptr(), alias_analysis);
+               !loop_may_clobber(loop, load->ptr(), alias_analysis, modref);
     }
     for (auto *operand : inst.operands()) {
         if (!operand_is_invariant(loop, operand, moving)) {
@@ -244,6 +246,7 @@ bool run_on_loop(oir::Function &function, const oir::Loop &loop, Stats &stats) {
     bool changed = false;
     bool keep_going = true;
     oir::OIRAliasAnalysis alias_analysis;
+    oir::FunctionModRefAnalysis modref(*function.parent());
     std::unordered_set<oir::Instruction *> moved;
     while (keep_going) {
         keep_going = false;
@@ -254,7 +257,7 @@ bool run_on_loop(oir::Function &function, const oir::Loop &loop, Stats &stats) {
                 if (moved.find(inst.get()) != moved.end()) {
                     continue;
                 }
-                if (instruction_is_invariant(loop, *inst, moved, alias_analysis)) {
+                if (instruction_is_invariant(loop, *inst, moved, alias_analysis, modref)) {
                     to_move.push_back(inst.get());
                 }
             }

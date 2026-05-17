@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -114,6 +115,493 @@ class VRegLowerer final {
         return dynamic_cast<const oir::ConstantInt *>(value);
     }
 
+    struct IntRange {
+        bool valid = false;
+        std::int64_t lower = 0;
+        std::int64_t upper = 0;
+
+        bool operator==(const IntRange &other) const {
+            return valid == other.valid &&
+                   (!valid || (lower == other.lower && upper == other.upper));
+        }
+
+        bool operator!=(const IntRange &other) const {
+            return !(*this == other);
+        }
+    };
+
+    using RangeMap = std::unordered_map<const oir::Value *, IntRange>;
+
+    static constexpr std::int64_t kI32Min = std::numeric_limits<std::int32_t>::min();
+    static constexpr std::int64_t kI32Max = std::numeric_limits<std::int32_t>::max();
+
+    bool is_integer_value(const oir::Value *value) const {
+        return value != nullptr && value->type() != nullptr && value->type()->is_integer();
+    }
+
+    std::pair<std::int64_t, std::int64_t> integer_bounds(const oir::Type *type) const {
+        if (auto *integer = dynamic_cast<const oir::IntegerType *>(type)) {
+            if (integer->bit_width() == 1) {
+                return {0, 1};
+            }
+        }
+        return {kI32Min, kI32Max};
+    }
+
+    IntRange full_range_for_type(const oir::Type *type) const {
+        if (type == nullptr || !type->is_integer()) {
+            return {};
+        }
+        auto [lower, upper] = integer_bounds(type);
+        return {true, lower, upper};
+    }
+
+    IntRange make_range_for_type(const oir::Type *type, std::int64_t lower,
+                                 std::int64_t upper) const {
+        if (type == nullptr || !type->is_integer()) {
+            return {};
+        }
+        auto [type_min, type_max] = integer_bounds(type);
+        lower = std::max(lower, type_min);
+        upper = std::min(upper, type_max);
+        if (lower > upper) {
+            return {};
+        }
+        return {true, lower, upper};
+    }
+
+    bool is_full_range_for_type(const IntRange &range, const oir::Type *type) const {
+        if (!range.valid || type == nullptr || !type->is_integer()) {
+            return false;
+        }
+        auto [lower, upper] = integer_bounds(type);
+        return range.lower == lower && range.upper == upper;
+    }
+
+    IntRange constant_range(const oir::ConstantInt &constant) const {
+        return make_range_for_type(constant.type(), constant.value(), constant.value());
+    }
+
+    IntRange union_ranges(const IntRange &lhs, const IntRange &rhs,
+                          const oir::Type *type) const {
+        if (!lhs.valid) {
+            return rhs;
+        }
+        if (!rhs.valid) {
+            return lhs;
+        }
+        return make_range_for_type(type, std::min(lhs.lower, rhs.lower),
+                                   std::max(lhs.upper, rhs.upper));
+    }
+
+    IntRange intersect_ranges(const IntRange &lhs, const IntRange &rhs,
+                              const oir::Type *type) const {
+        if (!lhs.valid || !rhs.valid) {
+            return {};
+        }
+        return make_range_for_type(type, std::max(lhs.lower, rhs.lower),
+                                   std::min(lhs.upper, rhs.upper));
+    }
+
+    IntRange range_for_value(const oir::Value *value, const RangeMap *local,
+                             bool bottom_for_unseen_inst) const {
+        if (!is_integer_value(value)) {
+            return {};
+        }
+        if (auto *constant = dynamic_cast<const oir::ConstantInt *>(value)) {
+            return constant_range(*constant);
+        }
+        if (dynamic_cast<const oir::ConstantZero *>(value) != nullptr) {
+            return make_range_for_type(value->type(), 0, 0);
+        }
+        if (local != nullptr) {
+            auto found = local->find(value);
+            if (found != local->end()) {
+                return found->second;
+            }
+        }
+        if (auto *inst = dynamic_cast<const oir::Instruction *>(value)) {
+            auto found = value_ranges_.find(inst);
+            if (found != value_ranges_.end()) {
+                return found->second;
+            }
+            if (bottom_for_unseen_inst) {
+                return {};
+            }
+        }
+        return full_range_for_type(value->type());
+    }
+
+    IntRange range_for_lowering(const oir::Value *value) const {
+        auto range = range_for_value(value, &current_ranges_, false);
+        return range.valid ? range : full_range_for_type(value == nullptr ? nullptr : value->type());
+    }
+
+    bool value_is_nonnegative(const oir::Value *value) const {
+        auto range = range_for_lowering(value);
+        return range.valid && range.lower >= 0;
+    }
+
+    bool exact_constant_range(const IntRange &range, std::int64_t *value = nullptr) const {
+        if (!range.valid || range.lower != range.upper) {
+            return false;
+        }
+        if (value != nullptr) {
+            *value = range.lower;
+        }
+        return true;
+    }
+
+    IntRange eval_binary_range(const oir::BinaryInst &inst, const RangeMap *local,
+                               bool bottom_for_unseen_inst) const {
+        auto lhs = range_for_value(inst.lhs(), local, bottom_for_unseen_inst);
+        auto rhs = range_for_value(inst.rhs(), local, bottom_for_unseen_inst);
+        if (!lhs.valid || !rhs.valid) {
+            return {};
+        }
+
+        switch (inst.op()) {
+        case oir::Instruction::OpID::Add:
+            return make_range_for_type(inst.type(), lhs.lower + rhs.lower,
+                                       lhs.upper + rhs.upper);
+        case oir::Instruction::OpID::Sub:
+            return make_range_for_type(inst.type(), lhs.lower - rhs.upper,
+                                       lhs.upper - rhs.lower);
+        case oir::Instruction::OpID::Mul: {
+            std::int64_t products[] = {lhs.lower * rhs.lower, lhs.lower * rhs.upper,
+                                       lhs.upper * rhs.lower, lhs.upper * rhs.upper};
+            auto [min_it, max_it] = std::minmax_element(products, products + 4);
+            return make_range_for_type(inst.type(), *min_it, *max_it);
+        }
+        case oir::Instruction::OpID::SDiv: {
+            std::int64_t divisor = 0;
+            if (!exact_constant_range(rhs, &divisor) || divisor == 0) {
+                return full_range_for_type(inst.type());
+            }
+            if (lhs.lower == kI32Min && divisor == -1) {
+                return full_range_for_type(inst.type());
+            }
+            auto first = lhs.lower / divisor;
+            auto second = lhs.upper / divisor;
+            return make_range_for_type(inst.type(), std::min(first, second),
+                                       std::max(first, second));
+        }
+        case oir::Instruction::OpID::SRem: {
+            std::int64_t divisor = 0;
+            if (!exact_constant_range(rhs, &divisor) || divisor == 0) {
+                return full_range_for_type(inst.type());
+            }
+            auto magnitude = static_cast<std::int64_t>(abs_u64(divisor));
+            if (magnitude <= 1) {
+                return make_range_for_type(inst.type(), 0, 0);
+            }
+            if (lhs.lower >= 0) {
+                return make_range_for_type(inst.type(), 0, magnitude - 1);
+            }
+            if (lhs.upper <= 0) {
+                return make_range_for_type(inst.type(), 1 - magnitude, 0);
+            }
+            return make_range_for_type(inst.type(), 1 - magnitude, magnitude - 1);
+        }
+        default:
+            return full_range_for_type(inst.type());
+        }
+    }
+
+    IntRange evaluate_instruction_range(const oir::Instruction &inst, const RangeMap *local,
+                                        bool bottom_for_unseen_inst) const {
+        if (!is_integer_value(&inst)) {
+            return {};
+        }
+
+        switch (inst.op()) {
+        case oir::Instruction::OpID::Phi: {
+            auto &phi = static_cast<const oir::PhiInst &>(inst);
+            IntRange out;
+            for (const auto &[value, pred] : phi.incoming()) {
+                (void)pred;
+                out = union_ranges(out, range_for_value(value, local, bottom_for_unseen_inst),
+                                   inst.type());
+            }
+            return out.valid ? out : full_range_for_type(inst.type());
+        }
+        case oir::Instruction::OpID::Add:
+        case oir::Instruction::OpID::Sub:
+        case oir::Instruction::OpID::Mul:
+        case oir::Instruction::OpID::SDiv:
+        case oir::Instruction::OpID::SRem:
+            return eval_binary_range(static_cast<const oir::BinaryInst &>(inst), local,
+                                     bottom_for_unseen_inst);
+        case oir::Instruction::OpID::ICmp:
+            return make_range_for_type(inst.type(), 0, 1);
+        case oir::Instruction::OpID::ZExt: {
+            auto &cast = static_cast<const oir::CastInst &>(inst);
+            auto src = range_for_value(cast.src(), local, bottom_for_unseen_inst);
+            if (!src.valid) {
+                return full_range_for_type(inst.type());
+            }
+            return make_range_for_type(inst.type(), std::max<std::int64_t>(0, src.lower),
+                                       std::max<std::int64_t>(0, src.upper));
+        }
+        case oir::Instruction::OpID::Load:
+        case oir::Instruction::OpID::Call:
+        case oir::Instruction::OpID::FPToSI:
+            return full_range_for_type(inst.type());
+        default:
+            return full_range_for_type(inst.type());
+        }
+    }
+
+    void store_range_override(RangeMap &map, const oir::Value *value, const IntRange &range) const {
+        if (!is_integer_value(value) || !range.valid) {
+            map.erase(value);
+            return;
+        }
+        auto global = range_for_value(value, nullptr, false);
+        if (range == global || is_full_range_for_type(range, value->type())) {
+            map.erase(value);
+            return;
+        }
+        map[value] = range;
+    }
+
+    void analyze_global_ranges(const oir::Function &function) {
+        value_ranges_.clear();
+        for (const auto &block : function.blocks()) {
+            for (const auto &inst : block->instructions()) {
+                if (is_integer_value(inst.get())) {
+                    value_ranges_[inst.get()] = {};
+                }
+            }
+        }
+
+        constexpr unsigned kMaxIterations = 128;
+        for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
+            bool changed = false;
+            for (const auto &block : function.blocks()) {
+                for (const auto &inst : block->instructions()) {
+                    if (!is_integer_value(inst.get())) {
+                        continue;
+                    }
+                    auto next = evaluate_instruction_range(*inst, nullptr, true);
+                    auto &slot = value_ranges_[inst.get()];
+                    if (next != slot) {
+                        slot = next;
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) {
+                break;
+            }
+        }
+    }
+
+    oir::CmpPred invert_predicate(oir::CmpPred pred) const {
+        switch (pred) {
+        case oir::CmpPred::EQ:
+            return oir::CmpPred::NE;
+        case oir::CmpPred::NE:
+            return oir::CmpPred::EQ;
+        case oir::CmpPred::LT:
+            return oir::CmpPred::GE;
+        case oir::CmpPred::LE:
+            return oir::CmpPred::GT;
+        case oir::CmpPred::GT:
+            return oir::CmpPred::LE;
+        case oir::CmpPred::GE:
+            return oir::CmpPred::LT;
+        }
+        return pred;
+    }
+
+    oir::CmpPred swap_predicate(oir::CmpPred pred) const {
+        switch (pred) {
+        case oir::CmpPred::LT:
+            return oir::CmpPred::GT;
+        case oir::CmpPred::LE:
+            return oir::CmpPred::GE;
+        case oir::CmpPred::GT:
+            return oir::CmpPred::LT;
+        case oir::CmpPred::GE:
+            return oir::CmpPred::LE;
+        case oir::CmpPred::EQ:
+        case oir::CmpPred::NE:
+            return pred;
+        }
+        return pred;
+    }
+
+    void refine_value_range(RangeMap &map, const oir::Value *value,
+                            const IntRange &constraint) const {
+        if (!is_integer_value(value) || !constraint.valid) {
+            return;
+        }
+        auto current = range_for_value(value, &map, false);
+        auto refined = intersect_ranges(current, constraint, value->type());
+        store_range_override(map, value, refined);
+    }
+
+    void apply_icmp_constraint(RangeMap &map, const oir::CmpInst &cmp,
+                               bool branch_taken) const {
+        auto pred = cmp.pred();
+        if (!branch_taken) {
+            pred = invert_predicate(pred);
+        }
+
+        const oir::Value *value = cmp.lhs();
+        auto *constant = constant_int(cmp.rhs());
+        if (constant == nullptr) {
+            constant = constant_int(cmp.lhs());
+            value = cmp.rhs();
+            pred = swap_predicate(pred);
+        }
+        if (constant == nullptr || !is_integer_value(value)) {
+            return;
+        }
+
+        auto [type_min, type_max] = integer_bounds(value->type());
+        const auto c = constant->value();
+        IntRange constraint;
+        switch (pred) {
+        case oir::CmpPred::EQ:
+            if (c < type_min || c > type_max) {
+                return;
+            }
+            constraint = make_range_for_type(value->type(), c, c);
+            break;
+        case oir::CmpPred::LT:
+            if (c <= type_min) {
+                return;
+            }
+            constraint = make_range_for_type(value->type(), type_min, c - 1);
+            break;
+        case oir::CmpPred::LE:
+            if (c < type_min) {
+                return;
+            }
+            constraint = make_range_for_type(value->type(), type_min, c);
+            break;
+        case oir::CmpPred::GT:
+            if (c >= type_max) {
+                return;
+            }
+            constraint = make_range_for_type(value->type(), c + 1, type_max);
+            break;
+        case oir::CmpPred::GE:
+            if (c > type_max) {
+                return;
+            }
+            constraint = make_range_for_type(value->type(), c, type_max);
+            break;
+        case oir::CmpPred::NE:
+            return;
+        }
+        refine_value_range(map, value, constraint);
+    }
+
+    void apply_branch_constraint(RangeMap &map, const oir::BranchInst &branch,
+                                 const oir::BasicBlock *succ) const {
+        if (!branch.is_conditional()) {
+            return;
+        }
+        auto *cmp = dynamic_cast<const oir::CmpInst *>(branch.cond());
+        if (cmp == nullptr) {
+            return;
+        }
+        if (succ == branch.true_bb()) {
+            apply_icmp_constraint(map, *cmp, true);
+        } else if (succ == branch.false_bb()) {
+            apply_icmp_constraint(map, *cmp, false);
+        }
+    }
+
+    void merge_successor_entry(
+        const oir::BasicBlock *succ, const RangeMap &candidate,
+        std::unordered_map<const oir::BasicBlock *, RangeMap> &next_entries,
+        std::unordered_set<const oir::BasicBlock *> &seen) const {
+        auto [seen_it, first] = seen.insert(succ);
+        auto &entry = next_entries[succ];
+        if (first) {
+            for (const auto &[value, range] : candidate) {
+                store_range_override(entry, value, range);
+            }
+            return;
+        }
+
+        std::unordered_set<const oir::Value *> keys;
+        for (const auto &[value, range] : entry) {
+            (void)range;
+            keys.insert(value);
+        }
+        for (const auto &[value, range] : candidate) {
+            (void)range;
+            keys.insert(value);
+        }
+
+        RangeMap merged;
+        for (auto *value : keys) {
+            auto lhs = range_for_value(value, &entry, false);
+            auto rhs = range_for_value(value, &candidate, false);
+            auto joined = union_ranges(lhs, rhs, value->type());
+            store_range_override(merged, value, joined);
+        }
+        entry = std::move(merged);
+    }
+
+    void analyze_block_ranges(const oir::Function &function) {
+        block_entry_ranges_.clear();
+        for (const auto &block : function.blocks()) {
+            block_entry_ranges_[block.get()] = {};
+        }
+
+        constexpr unsigned kMaxIterations = 64;
+        for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
+            std::unordered_map<const oir::BasicBlock *, RangeMap> next_entries;
+            std::unordered_set<const oir::BasicBlock *> seen;
+
+            for (const auto &block_ptr : function.blocks()) {
+                auto *block = block_ptr.get();
+                RangeMap local = block_entry_ranges_[block];
+                for (const auto &inst : block->instructions()) {
+                    if (!is_integer_value(inst.get())) {
+                        continue;
+                    }
+                    auto range = evaluate_instruction_range(*inst, &local, false);
+                    store_range_override(local, inst.get(), range);
+                }
+
+                auto *term = block->terminator();
+                for (auto *succ : block->successors()) {
+                    RangeMap candidate = local;
+                    if (auto *branch = dynamic_cast<const oir::BranchInst *>(term)) {
+                        apply_branch_constraint(candidate, *branch, succ);
+                    }
+                    merge_successor_entry(succ, candidate, next_entries, seen);
+                }
+            }
+
+            bool changed = false;
+            for (const auto &block : function.blocks()) {
+                auto *raw = block.get();
+                auto found = next_entries.find(raw);
+                RangeMap next = found == next_entries.end() ? RangeMap{} : std::move(found->second);
+                if (block_entry_ranges_[raw] != next) {
+                    block_entry_ranges_[raw] = std::move(next);
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                break;
+            }
+        }
+    }
+
+    void analyze_value_ranges(const oir::Function &function) {
+        analyze_global_ranges(function);
+        analyze_block_ranges(function);
+    }
+
     mir::Register zero_reg() const {
         return phys_gpr("zero");
     }
@@ -125,7 +613,12 @@ class VRegLowerer final {
         blocks_.clear();
         edge_blocks_.clear();
         pending_edge_blocks_.clear();
+        value_ranges_.clear();
+        block_entry_ranges_.clear();
+        current_ranges_.clear();
         temp_index_ = 0;
+
+        analyze_value_ranges(function);
 
         for (const auto &block : function.blocks()) {
             blocks_[block.get()] = out.create_block(block->name());
@@ -147,9 +640,14 @@ class VRegLowerer final {
 
         for (const auto &block : function.blocks()) {
             current_block_ = blocks_.at(block.get());
+            current_ranges_ = block_entry_ranges_[block.get()];
             emit_block_entry_phi_copies(*block);
             for (const auto &inst : block->instructions()) {
                 lower_instruction(*inst);
+                if (is_integer_value(inst.get())) {
+                    auto range = evaluate_instruction_range(*inst, &current_ranges_, false);
+                    store_range_override(current_ranges_, inst.get(), range);
+                }
             }
         }
 
@@ -157,6 +655,7 @@ class VRegLowerer final {
         out.rebuild_cfg();
         current_function_ = nullptr;
         current_block_ = nullptr;
+        current_ranges_.clear();
     }
 
     void preallocate_result(const oir::Instruction &inst) {
@@ -607,6 +1106,41 @@ class VRegLowerer final {
         return true;
     }
 
+    bool try_lower_nonnegative_const_div(mir::Register dst, mir::Register value,
+                                         std::int64_t constant) {
+        if (constant == 1) {
+            emit_move(dst, value);
+            return true;
+        }
+        if (constant == -1) {
+            emit(mir::Opcode::SubW,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(zero_reg()),
+                  mir::MachineOperand::reg_use(value)});
+            return true;
+        }
+
+        auto magnitude = abs_u64(constant);
+        if (!is_power_of_two(magnitude)) {
+            return false;
+        }
+
+        auto shift = log2_u64(magnitude);
+        if (shift == 0 || shift > 31) {
+            return false;
+        }
+
+        auto quotient = constant < 0 ? create_vreg(mir::ValueType::I32) : dst;
+        emit(mir::Opcode::SrliW,
+             {mir::MachineOperand::reg_def(quotient), mir::MachineOperand::reg_use(value),
+              mir::MachineOperand::imm(shift)});
+        if (constant < 0) {
+            emit(mir::Opcode::SubW,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(zero_reg()),
+                  mir::MachineOperand::reg_use(quotient)});
+        }
+        return true;
+    }
+
     bool try_lower_const_div(mir::Register dst, mir::Register value, std::int64_t constant) {
         if (constant == 1) {
             emit_move(dst, value);
@@ -629,6 +1163,44 @@ class VRegLowerer final {
         }
 
         return try_lower_magic_const_div(dst, value, constant);
+    }
+
+    bool try_lower_nonnegative_const_rem(mir::Register dst, mir::Register value,
+                                         std::int64_t constant) {
+        if (constant == 1 || constant == -1) {
+            emit_move(dst, zero_reg());
+            return true;
+        }
+
+        auto magnitude = abs_u64(constant);
+        if (!is_power_of_two(magnitude)) {
+            return false;
+        }
+
+        auto shift = log2_u64(magnitude);
+        if (shift == 0 || shift > 31) {
+            return false;
+        }
+
+        if (shift == 31) {
+            emit_move(dst, value);
+            return true;
+        }
+
+        const auto mask = static_cast<std::int64_t>(magnitude - 1);
+        if (fits_simm12(mask)) {
+            emit(mir::Opcode::AndI,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(value),
+                  mir::MachineOperand::imm(mask)});
+        } else {
+            auto mask_reg = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::LoadImm,
+                 {mir::MachineOperand::reg_def(mask_reg), mir::MachineOperand::imm(mask)});
+            emit(mir::Opcode::And,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(value),
+                  mir::MachineOperand::reg_use(mask_reg)});
+        }
+        return true;
     }
 
     bool try_lower_const_rem(mir::Register dst, mir::Register value, std::int64_t constant) {
@@ -724,14 +1296,26 @@ class VRegLowerer final {
                 return;
             }
         } else if (inst.op() == oir::Instruction::OpID::SDiv) {
-            if (rhs_const != nullptr &&
-                try_lower_const_div(dst, value_reg(inst.lhs()), rhs_const->value())) {
-                return;
+            if (rhs_const != nullptr) {
+                auto lhs = value_reg(inst.lhs());
+                if (value_is_nonnegative(inst.lhs()) &&
+                    try_lower_nonnegative_const_div(dst, lhs, rhs_const->value())) {
+                    return;
+                }
+                if (try_lower_const_div(dst, lhs, rhs_const->value())) {
+                    return;
+                }
             }
         } else if (inst.op() == oir::Instruction::OpID::SRem) {
-            if (rhs_const != nullptr &&
-                try_lower_const_rem(dst, value_reg(inst.lhs()), rhs_const->value())) {
-                return;
+            if (rhs_const != nullptr) {
+                auto lhs = value_reg(inst.lhs());
+                if (value_is_nonnegative(inst.lhs()) &&
+                    try_lower_nonnegative_const_rem(dst, lhs, rhs_const->value())) {
+                    return;
+                }
+                if (try_lower_const_rem(dst, lhs, rhs_const->value())) {
+                    return;
+                }
             }
         }
 
@@ -1025,8 +1609,12 @@ class VRegLowerer final {
     }
 
     void emit_phi_copies_for_edge(const oir::BasicBlock *pred, const oir::BasicBlock *target) {
-        std::vector<mir::Register> temps;
-        std::vector<mir::Register> phis;
+        struct ParallelCopy {
+            mir::Register dst;
+            mir::Register src;
+        };
+
+        std::vector<ParallelCopy> copies;
         for (const auto &inst : target->instructions()) {
             auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
             if (phi == nullptr) {
@@ -1034,15 +1622,30 @@ class VRegLowerer final {
             }
 
             auto *incoming = incoming_for(*phi, pred);
-            auto type = type_info(phi->type()).value_type;
-            auto temp = create_vreg(type);
-            emit_move(temp, value_reg(incoming));
-            temps.push_back(temp);
-            phis.push_back(value_regs_.at(phi));
+            auto dst = value_regs_.at(phi);
+            auto src = value_reg(incoming);
+            if (dst != src) {
+                copies.push_back({dst, src});
+            }
         }
 
-        for (std::size_t i = 0; i < temps.size(); ++i) {
-            emit_move(phis[i], temps[i]);
+        while (!copies.empty()) {
+            auto acyclic = std::find_if(copies.begin(), copies.end(), [&](const auto &copy) {
+                return std::none_of(copies.begin(), copies.end(), [&](const auto &other) {
+                    return other.src == copy.dst;
+                });
+            });
+
+            if (acyclic != copies.end()) {
+                emit_move(acyclic->dst, acyclic->src);
+                copies.erase(acyclic);
+                continue;
+            }
+
+            auto &cycle = copies.front();
+            auto temp = create_vreg(cycle.dst.value_type);
+            emit_move(temp, cycle.src);
+            cycle.src = temp;
         }
     }
 
@@ -1136,6 +1739,9 @@ class VRegLowerer final {
     std::unordered_map<const oir::BasicBlock *, mir::MachineBasicBlock *> blocks_;
     std::unordered_map<std::string, mir::MachineBasicBlock *> edge_blocks_;
     std::vector<PendingEdgeBlock> pending_edge_blocks_;
+    std::unordered_map<const oir::Instruction *, IntRange> value_ranges_;
+    std::unordered_map<const oir::BasicBlock *, RangeMap> block_entry_ranges_;
+    RangeMap current_ranges_;
     std::unordered_map<const oir::Value *, mir::Register> value_regs_;
     std::unordered_map<const oir::Instruction *, int> alloca_slots_;
 };

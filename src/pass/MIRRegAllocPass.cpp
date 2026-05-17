@@ -30,6 +30,11 @@ struct AllocationAttempt {
     std::set<VRegId> spills;
 };
 
+struct MovePreferences {
+    std::map<VRegId, std::vector<VRegId>> virtual_neighbors;
+    std::map<VRegId, std::vector<mir::Register>> physical_colors;
+};
+
 using RematMap = std::map<VRegId, mir::MachineInstr>;
 
 bool is_virtual_of_class(const mir::Register &reg, mir::RegisterClass reg_class) {
@@ -160,6 +165,11 @@ std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineIns
 bool is_rematerializable_opcode(mir::Opcode opcode) {
     return opcode == mir::Opcode::LoadImm || opcode == mir::Opcode::LoadGlobalAddr ||
            opcode == mir::Opcode::LoadStackAddr;
+}
+
+bool is_move_opcode_for_class(mir::Opcode opcode, mir::RegisterClass reg_class) {
+    return (opcode == mir::Opcode::Move && reg_class == mir::RegisterClass::GPR) ||
+           (opcode == mir::Opcode::FMove && reg_class == mir::RegisterClass::FPR32);
 }
 
 class RegAllocator {
@@ -358,6 +368,7 @@ class RegAllocator {
         std::set<VRegId> nodes;
         std::map<VRegId, std::set<VRegId>> graph;
         std::map<VRegId, std::set<std::string>> forbidden;
+        MovePreferences preferences;
 
         for (const auto &reg : function.regs().virtual_registers()) {
             if (reg.reg_class == reg_class) {
@@ -386,6 +397,30 @@ class RegAllocator {
                 forbid(id, phys);
             }
         };
+        auto note_virtual_preference = [&](VRegId lhs, VRegId rhs) {
+            if (lhs == rhs) {
+                return;
+            }
+            auto &lhs_list = preferences.virtual_neighbors[lhs];
+            if (std::find(lhs_list.begin(), lhs_list.end(), rhs) == lhs_list.end()) {
+                lhs_list.push_back(rhs);
+            }
+            auto &rhs_list = preferences.virtual_neighbors[rhs];
+            if (std::find(rhs_list.begin(), rhs_list.end(), lhs) == rhs_list.end()) {
+                rhs_list.push_back(lhs);
+            }
+        };
+        auto note_physical_preference = [&](VRegId id, const mir::Register &phys) {
+            if (phys.reg_class != reg_class) {
+                return;
+            }
+            auto &list = preferences.physical_colors[id];
+            if (std::find_if(list.begin(), list.end(), [&](const mir::Register &candidate) {
+                    return same_phys(candidate, phys);
+                }) == list.end()) {
+                list.push_back(phys);
+            }
+        };
 
         for (const auto &block_ptr : function.blocks()) {
             auto *block = block_ptr.get();
@@ -393,6 +428,23 @@ class RegAllocator {
             for (auto instr_it = block->instructions().rbegin();
                  instr_it != block->instructions().rend(); ++instr_it) {
                 const auto &instr = *instr_it;
+                if (is_move_opcode_for_class(instr.opcode(), reg_class) &&
+                    instr.operands().size() >= 2 && instr.operands()[0].is_reg() &&
+                    instr.operands()[1].is_reg()) {
+                    const auto dst = instr.operands()[0].reg_value();
+                    const auto src = instr.operands()[1].reg_value();
+                    if (is_virtual_of_class(dst, reg_class)) {
+                        if (is_virtual_of_class(src, reg_class)) {
+                            note_virtual_preference(dst.id, src.id);
+                        } else if (src.is_physical()) {
+                            note_physical_preference(dst.id, src);
+                        }
+                    }
+                    if (is_virtual_of_class(src, reg_class) && dst.is_physical()) {
+                        note_physical_preference(src.id, dst);
+                    }
+                }
+
                 std::vector<VRegId> instr_uses;
                 for (const auto &use : instr.uses()) {
                     if (is_virtual_of_class(use, reg_class) &&
@@ -450,13 +502,14 @@ class RegAllocator {
             }
         }
 
-        return color_graph(nodes, graph, forbidden, spill_costs, reg_class);
+        return color_graph(nodes, graph, forbidden, spill_costs, preferences, reg_class);
     }
 
     AllocationAttempt color_graph(const std::set<VRegId> &nodes,
                                   const std::map<VRegId, std::set<VRegId>> &graph,
                                   const std::map<VRegId, std::set<std::string>> &forbidden,
                                   const std::map<VRegId, double> &spill_costs,
+                                  const MovePreferences &preferences,
                                   mir::RegisterClass reg_class) {
         AllocationAttempt out;
         auto colors = allocatable(reg_class);
@@ -517,7 +570,43 @@ class RegAllocator {
             if (available.empty()) {
                 out.spills.insert(id);
             } else {
-                out.colors[id] = available.front();
+                auto chosen = available.front();
+                auto prefer_color = [&](const mir::Register &preferred) {
+                    auto found = std::find_if(available.begin(), available.end(),
+                                              [&](const mir::Register &candidate) {
+                                                  return same_phys(candidate, preferred);
+                                              });
+                    if (found != available.end()) {
+                        chosen = *found;
+                        return true;
+                    }
+                    return false;
+                };
+
+                bool found_preference = false;
+                if (auto found_phys = preferences.physical_colors.find(id);
+                    found_phys != preferences.physical_colors.end()) {
+                    for (const auto &preferred : found_phys->second) {
+                        if (prefer_color(preferred)) {
+                            found_preference = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found_preference) {
+                    if (auto found_virtual = preferences.virtual_neighbors.find(id);
+                        found_virtual != preferences.virtual_neighbors.end()) {
+                        for (auto neighbor : found_virtual->second) {
+                            auto found_color = out.colors.find(neighbor);
+                            if (found_color != out.colors.end() &&
+                                prefer_color(found_color->second)) {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                out.colors[id] = chosen;
             }
         }
 
