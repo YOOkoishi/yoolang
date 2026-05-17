@@ -172,10 +172,12 @@ class Analyzer final {
         summary.upper_bound = for_op->upper_bound();
         summary.step = for_op->step();
         compute_trip_count(summary);
-        collect_array_accesses(for_op->body_region(), summary);
-        compute_dependencies(summary);
         loops_.push_back(std::move(summary));
         loop_stack_.push_back(loops_.back().id);
+
+        auto &stored = loops_.back();
+        collect_array_accesses(for_op->body_region(), stored);
+        compute_dependencies(stored);
     }
 
     void enter_loop(const Operation &op, const Function &function, LoopKind kind,
@@ -190,10 +192,12 @@ class Analyzer final {
         summary.canonical = canonical_form(op, kind);
         infer_while_bounds(*while_op, summary);
         compute_trip_count(summary);
-        collect_array_accesses(while_op->body_region(), summary);
-        compute_dependencies(summary);
         loops_.push_back(std::move(summary));
         loop_stack_.push_back(loops_.back().id);
+
+        auto &stored = loops_.back();
+        collect_array_accesses(while_op->body_region(), stored);
+        compute_dependencies(stored);
     }
 
     LoopCanonicalForm canonical_form(const Operation &op, LoopKind kind) const {

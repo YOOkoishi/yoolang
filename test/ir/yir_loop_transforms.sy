@@ -1,0 +1,83 @@
+// RUN: %compiler --emit-yir -O1 %s | FileCheck %s --check-prefix=YIR
+
+int big_a[200][200];
+int big_b[200][200];
+int mid_a[32][32];
+int mid_b[32][32];
+int flat_a[64];
+int flat_b[64];
+
+int tiled_copy() {
+  int i = 0;
+  int j = 0;
+  while (i < 200) {
+    j = 0;
+    while (j < 200) {
+      big_b[i][j] = big_a[i][j];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return big_b[0][0];
+}
+
+int interchange_copy() {
+  int i = 0;
+  int j = 0;
+  while (i < 32) {
+    j = 0;
+    while (j < 32) {
+      mid_b[j][i] = mid_a[j][i];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return mid_b[0][0];
+}
+
+int unroll_jam_copy() {
+  int i = 0;
+  int j = 0;
+  while (i < 32) {
+    j = 0;
+    while (j < 32) {
+      mid_b[i][j] = mid_a[i][j];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return mid_b[0][0];
+}
+
+int lane_copy_sum() {
+  int i = 0;
+  int sum = 0;
+  while (i < 64) {
+    flat_b[i] = flat_a[i];
+    sum = sum + flat_b[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return tiled_copy() + interchange_copy() + unroll_jam_copy() + lane_copy_sum();
+}
+
+// YIR-LABEL: yir.func @tiled_copy
+// YIR: .tile.step = yir.const.i32 20
+// YIR: yir.for %i.tile
+// YIR: .tile.end = yir.addi
+// YIR: yir.for %j.tile
+
+// YIR-LABEL: yir.func @interchange_copy
+// YIR: yir.for %j =
+// YIR: yir.for %i =
+
+// YIR-LABEL: yir.func @unroll_jam_copy
+// YIR: .jam.step = yir.const.i32 2
+// YIR: .jam.iv = yir.addi
+
+// YIR-LABEL: yir.func @lane_copy_sum
+// YIR: .vec.step = yir.const.i32 4
+// YIR: .vec.iv = yir.addi
