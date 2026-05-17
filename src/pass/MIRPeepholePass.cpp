@@ -589,6 +589,31 @@ bool redirect_jump_only_blocks(mir::MachineFunction &function, Stats &stats) {
     return changed;
 }
 
+bool remove_unreachable_jump_only_blocks(mir::MachineFunction &function, Stats &stats) {
+    function.rebuild_cfg();
+
+    std::vector<std::string> dead_blocks;
+    for (std::size_t i = 1; i < function.blocks().size(); ++i) {
+        const auto &block = *function.blocks()[i];
+        if (!block.predecessors().empty() || !jump_only_target(block)) {
+            continue;
+        }
+        dead_blocks.push_back(block.name());
+    }
+
+    bool changed = false;
+    for (const auto &name : dead_blocks) {
+        if (function.erase_block(name)) {
+            ++stats.jumps;
+            changed = true;
+        }
+    }
+    if (changed) {
+        function.rebuild_cfg();
+    }
+    return changed;
+}
+
 bool fuse_compare_branches(mir::MachineFunction &function, Stats &stats) {
     auto counts = count_vregs(function);
     bool changed = false;
@@ -823,6 +848,7 @@ bool optimize_function(mir::MachineFunction &function, bool post_ra, Stats &stat
             iteration_changed |= local_cse(function, stats);
             iteration_changed |= fold_address_offsets(function, stats);
             iteration_changed |= redirect_jump_only_blocks(function, stats);
+            iteration_changed |= remove_unreachable_jump_only_blocks(function, stats);
             iteration_changed |= remove_dead_defs(function, stats);
             if (!iteration_changed) {
                 break;
@@ -832,10 +858,13 @@ bool optimize_function(mir::MachineFunction &function, bool post_ra, Stats &stat
     }
 
     changed |= redirect_jump_only_blocks(function, stats);
+    changed |= remove_unreachable_jump_only_blocks(function, stats);
     for (std::size_t i = 0; i < function.blocks().size(); ++i) {
         auto *next = i + 1 < function.blocks().size() ? function.blocks()[i + 1].get() : nullptr;
         changed |= simplify_block(*function.blocks()[i], next, post_ra, stats);
     }
+    changed |= redirect_jump_only_blocks(function, stats);
+    changed |= remove_unreachable_jump_only_blocks(function, stats);
     return changed;
 }
 

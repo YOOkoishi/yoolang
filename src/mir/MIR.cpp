@@ -431,6 +431,24 @@ MachineBasicBlock *MachineFunction::get_block(const std::string &name) const {
     return found == block_table_.end() ? nullptr : found->second;
 }
 
+bool MachineFunction::erase_block(const std::string &name) {
+    auto found = block_table_.find(name);
+    if (found == block_table_.end()) {
+        return false;
+    }
+
+    auto block_it = std::find_if(blocks_.begin(), blocks_.end(), [&](const auto &block) {
+        return block.get() == found->second;
+    });
+    if (block_it == blocks_.end() || block_it == blocks_.begin()) {
+        return false;
+    }
+
+    block_table_.erase(found);
+    blocks_.erase(block_it);
+    return true;
+}
+
 std::vector<std::unique_ptr<MachineBasicBlock>> &MachineFunction::blocks() {
     return blocks_;
 }

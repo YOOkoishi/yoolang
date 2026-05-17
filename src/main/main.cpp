@@ -3,6 +3,7 @@
 #include "../include/pass/ASTDumpPass.h"
 #include "../include/pass/ASTSemanticAnalysisPass.h"
 #include "../include/pass/ASTToYIRPass.h"
+#include "../include/pass/MIRCombinePass.h"
 #include "../include/pass/MIRPeepholePass.h"
 #include "../include/pass/MIRRegAllocPass.h"
 #include "../include/pass/MIRToAsmPass.h"
@@ -56,7 +57,7 @@ void print_help(const char *program, std::ostream &out) {
         << "  -h, --help       Show this help message\n"
         << "  -S, --emit-asm   Lower to RISC-V assembly (default)\n"
         << "  -o <file>        Write output to <file> instead of stdout\n"
-        << "  -O1/-O2/-O3      Enable OIR optimizations, vreg MIR lowering, RA, and MIR peephole "
+        << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR "
            "optimizations\n"
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
@@ -99,9 +100,13 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
             options.output_path = argv[++i];
             continue;
         }
-        if (arg == "-O1" || arg == "-O2" || arg == "-O3") {
-            options.opt_level = arg[2] - '0';
+        if (arg == "-O1") {
+            options.opt_level = 1;
             continue;
+        }
+        if (arg == "-O2" || arg == "-O3") {
+            error = "only -O1 is supported";
+            return false;
         }
         if (!arg.empty() && arg[0] == '-') {
             error = "unknown option: " + arg;
@@ -140,7 +145,7 @@ bool needs_mir(const CommandLineOptions &options) {
 }
 
 bool optimizations_enabled(const CommandLineOptions &options) {
-    return options.opt_level >= 1;
+    return options.opt_level == 1;
 }
 
 std::unique_ptr<CompUnit> parse_ast_from_file(const std::string &input_path, std::ostream &err) {
@@ -202,6 +207,7 @@ void add_mir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
     pm.add_pass<pass::OIRToMIRPass>(use_virtual_registers);
 
     if (optimizations_enabled(options)) {
+        pm.add_pass<pass::MIRCombinePass>();
         pm.add_pass<pass::MIRPeepholePass>(false);
         pm.add_pass<pass::MIRRegAllocPass>();
         pm.add_pass<pass::MIRPeepholePass>(true);

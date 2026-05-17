@@ -286,6 +286,7 @@ class MachineFunction final {
 
     MachineBasicBlock *create_block(const std::string &name);
     MachineBasicBlock *get_block(const std::string &name) const;
+    bool erase_block(const std::string &name);
     std::vector<std::unique_ptr<MachineBasicBlock>> &blocks();
     const std::vector<std::unique_ptr<MachineBasicBlock>> &blocks() const;
     MachineRegisterInfo &regs();

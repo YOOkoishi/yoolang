@@ -428,6 +428,8 @@ class RegAllocator {
             for (auto instr_it = block->instructions().rbegin();
                  instr_it != block->instructions().rend(); ++instr_it) {
                 const auto &instr = *instr_it;
+                bool suppress_move_source_interference = false;
+                VRegId move_source = 0;
                 if (is_move_opcode_for_class(instr.opcode(), reg_class) &&
                     instr.operands().size() >= 2 && instr.operands()[0].is_reg() &&
                     instr.operands()[1].is_reg()) {
@@ -442,6 +444,11 @@ class RegAllocator {
                     }
                     if (is_virtual_of_class(src, reg_class) && dst.is_physical()) {
                         note_physical_preference(src.id, dst);
+                    }
+                    if (is_virtual_of_class(dst, reg_class) &&
+                        is_virtual_of_class(src, reg_class)) {
+                        suppress_move_source_interference = true;
+                        move_source = src.id;
                     }
                 }
 
@@ -474,6 +481,11 @@ class RegAllocator {
                     }
                 }
 
+                VRegSet live_for_defs = live;
+                if (suppress_move_source_interference) {
+                    live_for_defs.erase(move_source);
+                }
+
                 for (const auto &def : instr.defs()) {
                     if (!is_virtual_of_class(def, reg_class)) {
                         continue;
@@ -484,7 +496,7 @@ class RegAllocator {
                             forbid(def.id, operand.reg_value());
                         }
                     }
-                    for (auto live_id : live) {
+                    for (auto live_id : live_for_defs) {
                         add_edge(def.id, live_id);
                     }
                 }
