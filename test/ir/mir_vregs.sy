@@ -24,6 +24,13 @@ int loop_phi(int n) {
   return sum;
 }
 
+int half_if(int x) {
+  if (x >= 0) {
+    return x / 2 + x % 16;
+  }
+  return x / 2 + x % 16;
+}
+
 float float_arith(float x, float y) {
   return x * y + x;
 }
@@ -64,6 +71,11 @@ int main() {
 // MIR: BNEZ %v{{[0-9]+}}:gpr
 // MIR: MV %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr
 // MIR-NOT: edge.
+
+// MIR-LABEL: func @half_if
+// MIR: SRLIW %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, 1
+// MIR: ANDI %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, 15
+// MIR: SRAIW %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, 1
 
 // MIR-LABEL: func @float_arith
 // MIR: virtual registers:
