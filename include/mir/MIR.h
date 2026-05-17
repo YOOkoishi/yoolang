@@ -61,6 +61,7 @@ enum class Opcode {
     DivW,
     RemW,
     And,
+    AndI,
     SllI,
     SllIW,
     SraI,

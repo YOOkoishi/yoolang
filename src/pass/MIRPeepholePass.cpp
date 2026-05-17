@@ -304,6 +304,7 @@ bool is_pure_def(mir::Opcode opcode) {
     case mir::Opcode::DivW:
     case mir::Opcode::RemW:
     case mir::Opcode::And:
+    case mir::Opcode::AndI:
     case mir::Opcode::SllI:
     case mir::Opcode::SllIW:
     case mir::Opcode::SraI:
