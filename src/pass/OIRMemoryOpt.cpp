@@ -45,7 +45,22 @@ void invalidate_aliasing(std::vector<MemoryEntry> &memory, oir::Value *ptr,
                  memory.end());
 }
 
+void invalidate_for_call(std::vector<MemoryEntry> &memory, const oir::CallInst &call,
+                         const oir::OIRAliasAnalysis &aa,
+                         const oir::FunctionModRefAnalysis &modref,
+                         bool preserve_stores_read_by_call) {
+    memory.erase(std::remove_if(memory.begin(), memory.end(), [&](const MemoryEntry &entry) {
+                     if (preserve_stores_read_by_call && entry.is_store &&
+                         modref.call_may_read(call, entry.ptr, aa)) {
+                         return true;
+                     }
+                     return modref.call_may_clobber(call, entry.ptr, aa);
+                 }),
+                 memory.end());
+}
+
 bool dse_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
+               const oir::FunctionModRefAnalysis &modref,
                std::unordered_set<oir::Instruction *> &dead) {
     bool changed = false;
     std::vector<MemoryEntry> memory;
@@ -75,15 +90,14 @@ bool dse_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
             continue;
         }
         if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
-            (void)call;
-            memory.clear();
+            invalidate_for_call(memory, *call, aa, modref, true);
         }
     }
     return changed;
 }
 
 bool dle_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
-               ReplacementMap &replacements) {
+               const oir::FunctionModRefAnalysis &modref, ReplacementMap &replacements) {
     bool changed = false;
     std::vector<MemoryEntry> memory;
     for (auto &inst_ptr : block.instructions()) {
@@ -110,8 +124,7 @@ bool dle_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
             continue;
         }
         if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
-            (void)call;
-            memory.clear();
+            invalidate_for_call(memory, *call, aa, modref, false);
         }
     }
     return changed;
@@ -119,7 +132,7 @@ bool dle_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
 
 void dle_dom_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *block,
                    const oir::OIRAliasAnalysis &aa, std::vector<MemoryEntry> memory,
-                   ReplacementMap &replacements) {
+                   const oir::FunctionModRefAnalysis &modref, ReplacementMap &replacements) {
     auto *mutable_block = const_cast<oir::BasicBlock *>(block);
     for (auto &inst_ptr : mutable_block->instructions()) {
         auto *inst = inst_ptr.get();
@@ -144,8 +157,7 @@ void dle_dom_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *bl
             continue;
         }
         if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
-            (void)call;
-            memory.clear();
+            invalidate_for_call(memory, *call, aa, modref, false);
         }
     }
 
@@ -154,7 +166,7 @@ void dle_dom_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *bl
         if (child->predecessors().size() == 1 && child->predecessors().front() == block) {
             child_memory = memory;
         }
-        dle_dom_block(dom_tree, child, aa, std::move(child_memory), replacements);
+        dle_dom_block(dom_tree, child, aa, std::move(child_memory), modref, replacements);
     }
 }
 
@@ -163,13 +175,14 @@ void dle_dom_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *bl
 bool eliminate_dead_stores(oir::Module &module, Stats &stats) {
     bool changed = false;
     oir::OIRAliasAnalysis aa;
+    oir::FunctionModRefAnalysis modref(module);
     for (auto &function : module.functions()) {
         if (function->is_external()) {
             continue;
         }
         std::unordered_set<oir::Instruction *> dead;
         for (auto &block : function->blocks()) {
-            dse_block(*block, aa, dead);
+            dse_block(*block, aa, modref, dead);
         }
         if (erase_instructions(*function, dead)) {
             stats.dse += static_cast<unsigned>(dead.size());
@@ -182,14 +195,15 @@ bool eliminate_dead_stores(oir::Module &module, Stats &stats) {
 bool eliminate_dead_loads(oir::Module &module, Stats &stats) {
     ReplacementMap replacements;
     oir::OIRAliasAnalysis aa;
+    oir::FunctionModRefAnalysis modref(module);
     for (auto &function : module.functions()) {
         if (function->is_external() || function->entry_block() == nullptr) {
             continue;
         }
         oir::DominatorTree dom_tree(*function);
-        dle_dom_block(dom_tree, function->entry_block(), aa, {}, replacements);
+        dle_dom_block(dom_tree, function->entry_block(), aa, {}, modref, replacements);
         for (auto &block : function->blocks()) {
-            dle_block(*block, aa, replacements);
+            dle_block(*block, aa, modref, replacements);
         }
     }
     const unsigned replaced = apply_replacements(module, replacements);

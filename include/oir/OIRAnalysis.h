@@ -175,4 +175,42 @@ class OIRAliasAnalysis final {
     std::uint64_t type_size(const Type *type) const;
 };
 
+struct FunctionMemorySummary {
+    std::unordered_set<const GlobalVariable *> read_globals;
+    std::unordered_set<const GlobalVariable *> written_globals;
+    std::unordered_set<std::size_t> read_param_indices;
+    std::unordered_set<std::size_t> written_param_indices;
+    bool reads_unknown = false;
+    bool writes_unknown = false;
+    bool reads_all = false;
+    bool writes_all = false;
+    bool has_side_effect = false;
+
+    bool operator==(const FunctionMemorySummary &other) const;
+    bool operator!=(const FunctionMemorySummary &other) const;
+    bool may_read_memory() const;
+    bool may_write_memory() const;
+};
+
+class FunctionModRefAnalysis final {
+  public:
+    explicit FunctionModRefAnalysis(const Module &module);
+
+    const FunctionMemorySummary &summary(const Function *function) const;
+    bool call_may_clobber(const CallInst &call, const Value *ptr,
+                          const OIRAliasAnalysis &alias_analysis) const;
+    bool call_may_read(const CallInst &call, const Value *ptr,
+                       const OIRAliasAnalysis &alias_analysis) const;
+    bool call_has_side_effect(const CallInst &call) const;
+
+  private:
+    FunctionMemorySummary external_summary(const Function &function) const;
+    FunctionMemorySummary unknown_external_summary() const;
+    FunctionMemorySummary scan_function(const Function &function) const;
+    FunctionMemorySummary call_summary(const CallInst &call) const;
+
+    const Module *module_ = nullptr;
+    std::unordered_map<const Function *, FunctionMemorySummary> summaries_;
+};
+
 } // namespace oir
