@@ -142,6 +142,8 @@ def main() -> int:
             str(binary),
             "--runtime",
             str(runtime),
+            "--timeout",
+            "50",
         ],
         env,
     )

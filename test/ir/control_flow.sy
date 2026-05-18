@@ -29,7 +29,7 @@ int main() {
 // OIR: ret i32
 
 // MIR-LABEL: func @main() -> i32
-// MIR: BNEZ
+// MIR: BNE
 // MIR: J %epilogue
 // MIR-NOT: edge.
 

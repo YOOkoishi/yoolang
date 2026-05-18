@@ -37,6 +37,14 @@ struct MovePreferences {
 
 using RematMap = std::map<VRegId, mir::MachineInstr>;
 
+struct CoalescedGraph {
+    std::set<VRegId> nodes;
+    std::map<VRegId, VRegId> representative;
+    std::map<VRegId, std::set<VRegId>> graph;
+    std::map<VRegId, std::set<std::string>> forbidden;
+    MovePreferences preferences;
+};
+
 bool is_virtual_of_class(const mir::Register &reg, mir::RegisterClass reg_class) {
     return reg.is_virtual() && reg.reg_class == reg_class;
 }
@@ -109,10 +117,8 @@ std::vector<mir::Register> caller_saved(mir::RegisterClass reg_class) {
 }
 
 std::set<std::string> reserved_scratch_names(mir::RegisterClass reg_class) {
-    if (reg_class == mir::RegisterClass::GPR) {
-        return {"t4", "t5"};
-    }
-    return {"ft9", "ft10", "ft11"};
+    (void)reg_class;
+    return {};
 }
 
 std::vector<mir::Register> spill_scratch_registers(mir::RegisterClass reg_class) {
@@ -135,8 +141,8 @@ std::vector<mir::Register> allocatable(mir::RegisterClass reg_class) {
               out.end());
     if (reg_class == mir::RegisterClass::GPR) {
         for (const std::string &name :
-             {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
-              "s11"}) {
+             {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9",
+              "s10", "s11"}) {
             out.push_back(mir::Register::physical(name, reg_class));
         }
     }
@@ -195,6 +201,7 @@ class RegAllocator {
                 apply_colors(function, colors);
                 function.layout_frame();
                 verify_no_virtual_regs(function);
+                record_call_clobber_summary(function);
                 return;
             }
             rewrite_spills(function, spills, collect_rematerializable_defs(function));
@@ -203,6 +210,61 @@ class RegAllocator {
     }
 
   private:
+    using ClobberSummary = std::map<mir::RegisterClass, std::set<std::string>>;
+
+    std::map<std::string, ClobberSummary> call_clobbers_;
+
+    std::vector<mir::Register> call_clobbers_for(const mir::MachineInstr &instr,
+                                                 mir::RegisterClass reg_class) const {
+        if (instr.opcode() != mir::Opcode::Call || instr.operands().empty() ||
+            instr.operands()[0].kind() != mir::OperandKind::Symbol) {
+            return caller_saved(reg_class);
+        }
+
+        auto found = call_clobbers_.find(instr.operands()[0].string_value());
+        if (found == call_clobbers_.end()) {
+            return caller_saved(reg_class);
+        }
+
+        std::vector<mir::Register> out;
+        auto class_found = found->second.find(reg_class);
+        if (class_found == found->second.end()) {
+            return out;
+        }
+        for (const auto &name : class_found->second) {
+            out.push_back(mir::Register::physical(name, reg_class));
+        }
+        return out;
+    }
+
+    void record_call_clobber_summary(const mir::MachineFunction &function) {
+        ClobberSummary summary;
+        for (const auto &block : function.blocks()) {
+            for (const auto &instr : block->instructions()) {
+                if (instr.opcode() == mir::Opcode::Call) {
+                    for (auto reg_class : {mir::RegisterClass::GPR, mir::RegisterClass::FPR32}) {
+                        for (const auto &reg : call_clobbers_for(instr, reg_class)) {
+                            summary[reg_class].insert(reg.name);
+                        }
+                    }
+                }
+                for (const auto &def : instr.defs()) {
+                    if (def.is_physical() && mir::is_caller_saved_register(def)) {
+                        summary[def.reg_class].insert(def.name);
+                    }
+                }
+                for (auto reg_class : {mir::RegisterClass::GPR, mir::RegisterClass::FPR32}) {
+                    for (const auto &def : physical_defs_for_special_instr(instr, reg_class)) {
+                        if (mir::is_caller_saved_register(def)) {
+                            summary[def.reg_class].insert(def.name);
+                        }
+                    }
+                }
+            }
+        }
+        call_clobbers_[function.name()] = std::move(summary);
+    }
+
     std::map<mir::MachineBasicBlock *, BlockLiveInfo>
     compute_liveness(mir::MachineFunction &function) {
         std::map<mir::MachineBasicBlock *, BlockLiveInfo> info;
@@ -294,26 +356,133 @@ class RegAllocator {
     std::map<mir::MachineBasicBlock *, unsigned>
     estimate_loop_depths(const mir::MachineFunction &function) const {
         std::map<mir::MachineBasicBlock *, unsigned> depth;
-        std::map<mir::MachineBasicBlock *, std::size_t> index;
-        for (std::size_t i = 0; i < function.blocks().size(); ++i) {
-            auto *block = function.blocks()[i].get();
+        std::vector<mir::MachineBasicBlock *> blocks;
+        blocks.reserve(function.blocks().size());
+        for (const auto &block_ptr : function.blocks()) {
+            auto *block = block_ptr.get();
+            blocks.push_back(block);
             depth[block] = 0;
-            index[block] = i;
+        }
+        if (blocks.empty()) {
+            return depth;
         }
 
-        for (std::size_t i = 0; i < function.blocks().size(); ++i) {
-            auto *block = function.blocks()[i].get();
-            for (auto *succ : block->successors()) {
-                auto found = index.find(succ);
-                if (found == index.end() || found->second > i) {
+        std::set<mir::MachineBasicBlock *> all_blocks(blocks.begin(), blocks.end());
+        std::map<mir::MachineBasicBlock *, std::set<mir::MachineBasicBlock *>> dominators;
+        for (auto *block : blocks) {
+            dominators[block] = all_blocks;
+        }
+        dominators[blocks.front()] = {blocks.front()};
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (std::size_t i = 1; i < blocks.size(); ++i) {
+                auto *block = blocks[i];
+                std::set<mir::MachineBasicBlock *> next;
+                bool first_pred = true;
+                for (auto *pred : block->predecessors()) {
+                    auto found = dominators.find(pred);
+                    if (found == dominators.end()) {
+                        continue;
+                    }
+                    if (first_pred) {
+                        next = found->second;
+                        first_pred = false;
+                    } else {
+                        std::set<mir::MachineBasicBlock *> intersection;
+                        std::set_intersection(next.begin(), next.end(), found->second.begin(),
+                                              found->second.end(),
+                                              std::inserter(intersection, intersection.begin()));
+                        next = std::move(intersection);
+                    }
+                }
+                if (first_pred) {
+                    next.clear();
+                }
+                next.insert(block);
+                if (next != dominators[block]) {
+                    dominators[block] = std::move(next);
+                    changed = true;
+                }
+            }
+        }
+
+        auto dominates = [&](mir::MachineBasicBlock *candidate,
+                             mir::MachineBasicBlock *block) {
+            auto found = dominators.find(block);
+            return found != dominators.end() && found->second.find(candidate) != found->second.end();
+        };
+
+        for (auto *latch : blocks) {
+            for (auto *header : latch->successors()) {
+                if (!dominates(header, latch)) {
                     continue;
                 }
-                for (std::size_t j = found->second; j <= i; ++j) {
-                    ++depth[function.blocks()[j].get()];
+
+                std::set<mir::MachineBasicBlock *> loop_blocks{header, latch};
+                std::vector<mir::MachineBasicBlock *> worklist{latch};
+                while (!worklist.empty()) {
+                    auto *block = worklist.back();
+                    worklist.pop_back();
+                    for (auto *pred : block->predecessors()) {
+                        if (loop_blocks.insert(pred).second && pred != header) {
+                            worklist.push_back(pred);
+                        }
+                    }
+                }
+
+                for (auto *block : loop_blocks) {
+                    ++depth[block];
                 }
             }
         }
         return depth;
+    }
+
+    bool is_memory_opcode(mir::Opcode opcode) const {
+        switch (opcode) {
+        case mir::Opcode::LoadSlot:
+        case mir::Opcode::StoreSlot:
+        case mir::Opcode::LoadMem:
+        case mir::Opcode::StoreMem:
+        case mir::Opcode::LoadMemOffset:
+        case mir::Opcode::StoreMemOffset:
+        case mir::Opcode::StoreOutgoingArg:
+        case mir::Opcode::LoadIncomingArg:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool is_branch_opcode(mir::Opcode opcode) const {
+        switch (opcode) {
+        case mir::Opcode::BranchNonZero:
+        case mir::Opcode::BranchZero:
+        case mir::Opcode::BranchEq:
+        case mir::Opcode::BranchNe:
+        case mir::Opcode::BranchLT:
+        case mir::Opcode::BranchGE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool is_address_operand(const mir::MachineInstr &instr, std::size_t index) const {
+        switch (instr.opcode()) {
+        case mir::Opcode::LoadMem:
+            return index == 1;
+        case mir::Opcode::StoreMem:
+        case mir::Opcode::LoadMemOffset:
+        case mir::Opcode::StoreMemOffset:
+            return index == 0;
+        case mir::Opcode::MemZero:
+            return index == 0;
+        default:
+            return false;
+        }
     }
 
     std::map<VRegId, double> compute_spill_costs(const mir::MachineFunction &function,
@@ -337,16 +506,48 @@ class RegAllocator {
             }
 
             for (const auto &instr : block_ptr->instructions()) {
-                for (const auto &operand : instr.operands()) {
+                double instr_weight = weight;
+                if (is_memory_opcode(instr.opcode())) {
+                    instr_weight *= 1.5;
+                } else if (instr.opcode() == mir::Opcode::Call) {
+                    instr_weight *= 3.0;
+                } else if (is_branch_opcode(instr.opcode())) {
+                    instr_weight *= 2.0;
+                }
+
+                for (std::size_t operand_index = 0; operand_index < instr.operands().size();
+                     ++operand_index) {
+                    const auto &operand = instr.operands()[operand_index];
                     if (!operand.is_reg() || !operand.reg_value().is_virtual() ||
                         operand.reg_value().reg_class != reg_class) {
                         continue;
                     }
+                    const auto id = operand.reg_value().id;
                     if (operand.is_use()) {
-                        costs[operand.reg_value().id] += weight;
+                        costs[id] += instr_weight;
                     }
                     if (operand.is_def()) {
-                        costs[operand.reg_value().id] += weight * 0.5;
+                        costs[id] += instr_weight * 0.5;
+                    }
+                    if (is_address_operand(instr, operand_index) ||
+                        operand.reg_value().value_type == mir::ValueType::Ptr) {
+                        costs[id] += weight * 8.0;
+                    }
+                }
+
+                if (depth > 0 &&
+                    (instr.opcode() == mir::Opcode::AddI ||
+                     instr.opcode() == mir::Opcode::AddIW) &&
+                    instr.operands().size() >= 3 &&
+                    instr.operands()[2].kind() == mir::OperandKind::Imm) {
+                    const auto step = instr.operands()[2].int_value();
+                    if (step >= -16 && step <= 16) {
+                        for (const auto &operand : instr.operands()) {
+                            if (operand.is_reg() && operand.reg_value().is_virtual() &&
+                                operand.reg_value().reg_class == reg_class) {
+                                costs[operand.reg_value().id] += weight * 3.0;
+                            }
+                        }
                     }
                 }
             }
@@ -467,7 +668,7 @@ class RegAllocator {
                 }
 
                 if (instr.opcode() == mir::Opcode::Call) {
-                    for (const auto &phys : caller_saved(reg_class)) {
+                    for (const auto &phys : call_clobbers_for(instr, reg_class)) {
                         forbid_live(live, phys);
                     }
                 }
@@ -517,15 +718,252 @@ class RegAllocator {
         return color_graph(nodes, graph, forbidden, spill_costs, preferences, reg_class);
     }
 
+    VRegId find_representative(std::map<VRegId, VRegId> &parent, VRegId id) const {
+        auto found = parent.find(id);
+        if (found == parent.end() || found->second == id) {
+            return id;
+        }
+        found->second = find_representative(parent, found->second);
+        return found->second;
+    }
+
+    VRegId find_representative(const std::map<VRegId, VRegId> &parent, VRegId id) const {
+        auto found = parent.find(id);
+        while (found != parent.end() && found->second != id) {
+            id = found->second;
+            found = parent.find(id);
+        }
+        return id;
+    }
+
+    void add_unique_phys_pref(std::vector<mir::Register> &list, const mir::Register &phys) const {
+        if (std::find_if(list.begin(), list.end(), [&](const mir::Register &candidate) {
+                return same_phys(candidate, phys);
+            }) == list.end()) {
+            list.push_back(phys);
+        }
+    }
+
+    bool physical_color_forbidden(const std::map<VRegId, std::set<std::string>> &forbidden,
+                                  VRegId id, const mir::Register &phys) const {
+        auto found = forbidden.find(id);
+        return found != forbidden.end() && phys_in_set(found->second, phys);
+    }
+
+    bool can_coalesce_pair(VRegId lhs, VRegId rhs,
+                           const std::map<VRegId, std::set<VRegId>> &graph,
+                           const std::map<VRegId, std::set<std::string>> &forbidden,
+                           const MovePreferences &preferences, std::size_t k) const {
+        if (lhs == rhs) {
+            return false;
+        }
+        auto lhs_graph = graph.find(lhs);
+        auto rhs_graph = graph.find(rhs);
+        if (lhs_graph == graph.end() || rhs_graph == graph.end() ||
+            lhs_graph->second.find(rhs) != lhs_graph->second.end()) {
+            return false;
+        }
+
+        std::set<VRegId> combined_neighbors = lhs_graph->second;
+        combined_neighbors.insert(rhs_graph->second.begin(), rhs_graph->second.end());
+        combined_neighbors.erase(lhs);
+        combined_neighbors.erase(rhs);
+
+        std::size_t high_degree_neighbors = 0;
+        for (auto neighbor : combined_neighbors) {
+            auto found = graph.find(neighbor);
+            if (found != graph.end() && found->second.size() >= k) {
+                ++high_degree_neighbors;
+            }
+        }
+        if (high_degree_neighbors < k) {
+            return true;
+        }
+
+        std::vector<mir::Register> physical_preferences;
+        if (auto found = preferences.physical_colors.find(lhs);
+            found != preferences.physical_colors.end()) {
+            for (const auto &phys : found->second) {
+                add_unique_phys_pref(physical_preferences, phys);
+            }
+        }
+        if (auto found = preferences.physical_colors.find(rhs);
+            found != preferences.physical_colors.end()) {
+            for (const auto &phys : found->second) {
+                add_unique_phys_pref(physical_preferences, phys);
+            }
+        }
+
+        for (const auto &phys : physical_preferences) {
+            if (physical_color_forbidden(forbidden, lhs, phys) ||
+                physical_color_forbidden(forbidden, rhs, phys)) {
+                continue;
+            }
+
+            bool george_safe = true;
+            for (auto neighbor : combined_neighbors) {
+                auto found = graph.find(neighbor);
+                if (found == graph.end() || found->second.size() < k) {
+                    continue;
+                }
+                if (!physical_color_forbidden(forbidden, neighbor, phys)) {
+                    george_safe = false;
+                    break;
+                }
+            }
+            if (george_safe) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    CoalescedGraph coalesce_graph(const std::set<VRegId> &nodes,
+                                  const std::map<VRegId, std::set<VRegId>> &input_graph,
+                                  const std::map<VRegId, std::set<std::string>> &input_forbidden,
+                                  const MovePreferences &input_preferences,
+                                  std::size_t k) const {
+        CoalescedGraph out;
+        out.nodes = nodes;
+        out.graph = input_graph;
+        out.forbidden = input_forbidden;
+        out.preferences = input_preferences;
+        for (auto id : nodes) {
+            out.representative[id] = id;
+            out.graph[id];
+            out.forbidden[id];
+        }
+
+        std::vector<std::pair<VRegId, VRegId>> copy_edges;
+        std::set<std::pair<VRegId, VRegId>> seen_edges;
+        for (const auto &[lhs, neighbors] : input_preferences.virtual_neighbors) {
+            for (auto rhs : neighbors) {
+                if (nodes.find(lhs) == nodes.end() || nodes.find(rhs) == nodes.end()) {
+                    continue;
+                }
+                auto edge = std::minmax(lhs, rhs);
+                if (seen_edges.insert(edge).second) {
+                    copy_edges.push_back(edge);
+                }
+            }
+        }
+
+        constexpr std::size_t kMaxCoalesceNodes = 1400;
+        constexpr std::size_t kMaxCoalesceCopyEdges = 5000;
+        if (nodes.size() > kMaxCoalesceNodes || copy_edges.size() > kMaxCoalesceCopyEdges) {
+            return out;
+        }
+
+        auto merge = [&](VRegId lhs, VRegId rhs) {
+            VRegId keep = lhs;
+            VRegId drop = rhs;
+            const bool lhs_has_phys =
+                out.preferences.physical_colors.find(lhs) != out.preferences.physical_colors.end();
+            const bool rhs_has_phys =
+                out.preferences.physical_colors.find(rhs) != out.preferences.physical_colors.end();
+            if ((!lhs_has_phys && rhs_has_phys) || (lhs_has_phys == rhs_has_phys && rhs < lhs)) {
+                keep = rhs;
+                drop = lhs;
+            }
+
+            for (auto &[id, parent] : out.representative) {
+                if (find_representative(out.representative, id) == drop) {
+                    parent = keep;
+                }
+            }
+            out.representative[drop] = keep;
+            out.nodes.erase(drop);
+
+            std::set<VRegId> neighbors = out.graph[keep];
+            neighbors.insert(out.graph[drop].begin(), out.graph[drop].end());
+            neighbors.erase(keep);
+            neighbors.erase(drop);
+
+            for (auto neighbor : neighbors) {
+                auto &neighbor_edges = out.graph[neighbor];
+                neighbor_edges.erase(keep);
+                neighbor_edges.erase(drop);
+                neighbor_edges.insert(keep);
+            }
+            out.graph[keep] = std::move(neighbors);
+            out.graph.erase(drop);
+
+            auto &keep_forbidden = out.forbidden[keep];
+            auto drop_forbidden = out.forbidden.find(drop);
+            if (drop_forbidden != out.forbidden.end()) {
+                keep_forbidden.insert(drop_forbidden->second.begin(), drop_forbidden->second.end());
+                out.forbidden.erase(drop_forbidden);
+            }
+
+            auto drop_phys = out.preferences.physical_colors.find(drop);
+            if (drop_phys != out.preferences.physical_colors.end()) {
+                auto &keep_phys = out.preferences.physical_colors[keep];
+                for (const auto &phys : drop_phys->second) {
+                    add_unique_phys_pref(keep_phys, phys);
+                }
+                out.preferences.physical_colors.erase(drop_phys);
+            }
+        };
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto &[orig_lhs, orig_rhs] : copy_edges) {
+                auto lhs = find_representative(out.representative, orig_lhs);
+                auto rhs = find_representative(out.representative, orig_rhs);
+                if (lhs == rhs) {
+                    continue;
+                }
+                if (!can_coalesce_pair(lhs, rhs, out.graph, out.forbidden, out.preferences, k)) {
+                    continue;
+                }
+                merge(lhs, rhs);
+                changed = true;
+            }
+        }
+
+        MovePreferences rebuilt_preferences;
+        for (const auto &[id, phys_list] : input_preferences.physical_colors) {
+            auto rep = find_representative(out.representative, id);
+            for (const auto &phys : phys_list) {
+                add_unique_phys_pref(rebuilt_preferences.physical_colors[rep], phys);
+            }
+        }
+        for (const auto &[lhs, neighbors] : input_preferences.virtual_neighbors) {
+            auto lhs_rep = find_representative(out.representative, lhs);
+            for (auto rhs : neighbors) {
+                auto rhs_rep = find_representative(out.representative, rhs);
+                if (lhs_rep == rhs_rep) {
+                    continue;
+                }
+                auto &lhs_list = rebuilt_preferences.virtual_neighbors[lhs_rep];
+                if (std::find(lhs_list.begin(), lhs_list.end(), rhs_rep) == lhs_list.end()) {
+                    lhs_list.push_back(rhs_rep);
+                }
+            }
+        }
+        out.preferences = std::move(rebuilt_preferences);
+        return out;
+    }
+
     AllocationAttempt color_graph(const std::set<VRegId> &nodes,
                                   const std::map<VRegId, std::set<VRegId>> &graph,
                                   const std::map<VRegId, std::set<std::string>> &forbidden,
                                   const std::map<VRegId, double> &spill_costs,
                                   const MovePreferences &preferences,
                                   mir::RegisterClass reg_class) {
-        AllocationAttempt out;
         auto colors = allocatable(reg_class);
-        std::set<VRegId> remaining = nodes;
+        auto coalesced = coalesce_graph(nodes, graph, forbidden, preferences, colors.size());
+        std::map<VRegId, double> coalesced_spill_costs;
+        for (auto id : nodes) {
+            auto rep = find_representative(coalesced.representative, id);
+            auto found_cost = spill_costs.find(id);
+            coalesced_spill_costs[rep] +=
+                found_cost == spill_costs.end() ? 1.0 : found_cost->second;
+        }
+        AllocationAttempt colored_reps;
+        std::set<VRegId> remaining = coalesced.nodes;
         std::vector<VRegId> stack;
         const auto k = colors.size();
 
@@ -533,7 +971,7 @@ class RegAllocator {
             auto picked = remaining.end();
             for (auto it = remaining.begin(); it != remaining.end(); ++it) {
                 std::size_t degree = 0;
-                for (auto neighbor : graph.at(*it)) {
+                for (auto neighbor : coalesced.graph.at(*it)) {
                     if (remaining.find(neighbor) != remaining.end()) {
                         ++degree;
                     }
@@ -545,9 +983,11 @@ class RegAllocator {
             }
             if (picked == remaining.end()) {
                 auto spill_priority = [&](VRegId id) {
-                    auto found_cost = spill_costs.find(id);
-                    const double cost = found_cost == spill_costs.end() ? 1.0 : found_cost->second;
-                    return cost / static_cast<double>(graph.at(id).size() + 1);
+                    auto found_cost = coalesced_spill_costs.find(id);
+                    const double cost = found_cost == coalesced_spill_costs.end()
+                                            ? 1.0
+                                            : found_cost->second;
+                    return cost / static_cast<double>(coalesced.graph.at(id).size() + 1);
                 };
                 picked = std::min_element(remaining.begin(), remaining.end(), [&](auto lhs, auto rhs) {
                     return spill_priority(lhs) < spill_priority(rhs);
@@ -562,14 +1002,16 @@ class RegAllocator {
             stack.pop_back();
             std::vector<mir::Register> available;
             for (const auto &color : colors) {
-                auto found_forbidden = forbidden.find(id);
-                if (found_forbidden != forbidden.end() && phys_in_set(found_forbidden->second, color)) {
+                auto found_forbidden = coalesced.forbidden.find(id);
+                if (found_forbidden != coalesced.forbidden.end() &&
+                    phys_in_set(found_forbidden->second, color)) {
                     continue;
                 }
                 bool used_by_neighbor = false;
-                for (auto neighbor : graph.at(id)) {
-                    auto found_color = out.colors.find(neighbor);
-                    if (found_color != out.colors.end() && same_phys(found_color->second, color)) {
+                for (auto neighbor : coalesced.graph.at(id)) {
+                    auto found_color = colored_reps.colors.find(neighbor);
+                    if (found_color != colored_reps.colors.end() &&
+                        same_phys(found_color->second, color)) {
                         used_by_neighbor = true;
                         break;
                     }
@@ -580,7 +1022,7 @@ class RegAllocator {
             }
 
             if (available.empty()) {
-                out.spills.insert(id);
+                colored_reps.spills.insert(id);
             } else {
                 auto chosen = available.front();
                 auto prefer_color = [&](const mir::Register &preferred) {
@@ -596,8 +1038,8 @@ class RegAllocator {
                 };
 
                 bool found_preference = false;
-                if (auto found_phys = preferences.physical_colors.find(id);
-                    found_phys != preferences.physical_colors.end()) {
+                if (auto found_phys = coalesced.preferences.physical_colors.find(id);
+                    found_phys != coalesced.preferences.physical_colors.end()) {
                     for (const auto &preferred : found_phys->second) {
                         if (prefer_color(preferred)) {
                             found_preference = true;
@@ -606,11 +1048,11 @@ class RegAllocator {
                     }
                 }
                 if (!found_preference) {
-                    if (auto found_virtual = preferences.virtual_neighbors.find(id);
-                        found_virtual != preferences.virtual_neighbors.end()) {
+                    if (auto found_virtual = coalesced.preferences.virtual_neighbors.find(id);
+                        found_virtual != coalesced.preferences.virtual_neighbors.end()) {
                         for (auto neighbor : found_virtual->second) {
-                            auto found_color = out.colors.find(neighbor);
-                            if (found_color != out.colors.end() &&
+                            auto found_color = colored_reps.colors.find(neighbor);
+                            if (found_color != colored_reps.colors.end() &&
                                 prefer_color(found_color->second)) {
                                 break;
                             }
@@ -618,10 +1060,22 @@ class RegAllocator {
                     }
                 }
 
-                out.colors[id] = chosen;
+                colored_reps.colors[id] = chosen;
             }
         }
 
+        AllocationAttempt out;
+        for (auto id : nodes) {
+            auto rep = find_representative(coalesced.representative, id);
+            if (colored_reps.spills.find(rep) != colored_reps.spills.end()) {
+                out.spills.insert(id);
+                continue;
+            }
+            auto color = colored_reps.colors.find(rep);
+            if (color != colored_reps.colors.end()) {
+                out.colors[id] = color->second;
+            }
+        }
         return out;
     }
 
@@ -663,6 +1117,50 @@ class RegAllocator {
 
         for (auto &block_ptr : function.blocks()) {
             std::vector<mir::MachineInstr> rewritten;
+            std::map<VRegId, unsigned> block_uses;
+            std::map<VRegId, unsigned> block_defs;
+            bool block_has_call = false;
+            for (const auto &instr : block_ptr->instructions()) {
+                if (instr.opcode() == mir::Opcode::Call) {
+                    block_has_call = true;
+                }
+                for (const auto &operand : instr.operands()) {
+                    if (!operand.is_reg() || !operand.reg_value().is_virtual() ||
+                        spills.find(operand.reg_value().id) == spills.end()) {
+                        continue;
+                    }
+                    if (operand.is_use()) {
+                        ++block_uses[operand.reg_value().id];
+                    }
+                    if (operand.is_def()) {
+                        ++block_defs[operand.reg_value().id];
+                    }
+                }
+            }
+
+            std::map<VRegId, mir::Register> block_replacements;
+            if (!block_has_call) {
+                for (const auto &[id, uses] : block_uses) {
+                    if (uses <= 1 || block_defs[id] != 0 || remat.find(id) != remat.end()) {
+                        continue;
+                    }
+                    auto found_slot = slots.find(id);
+                    const auto *old_reg = function.regs().virtual_register(id);
+                    if (found_slot == slots.end() || old_reg == nullptr) {
+                        continue;
+                    }
+                    auto replacement =
+                        function.regs().create_virtual(old_reg->reg_class, old_reg->value_type);
+                    block_replacements[id] = replacement;
+                    rewritten.emplace_back(
+                        mir::Opcode::LoadSlot,
+                        std::vector<mir::MachineOperand>{
+                            mir::MachineOperand::reg_def(replacement),
+                            mir::MachineOperand::slot(found_slot->second),
+                            mir::MachineOperand::type(old_reg->value_type)});
+                }
+            }
+
             for (auto instr : block_ptr->instructions()) {
                 bool skip_instr = false;
                 for (const auto &def : instr.defs()) {
@@ -689,6 +1187,9 @@ class RegAllocator {
                     }
                     auto id = operand.reg_value().id;
                     if (spills.find(id) == spills.end()) {
+                        continue;
+                    }
+                    if (operand.is_use() && block_replacements.find(id) != block_replacements.end()) {
                         continue;
                     }
 
@@ -783,6 +1284,13 @@ class RegAllocator {
                     if (spills.find(id) == spills.end()) {
                         continue;
                     }
+                    if (operand.is_use()) {
+                        auto block_replacement = block_replacements.find(id);
+                        if (block_replacement != block_replacements.end()) {
+                            operand.set_reg(block_replacement->second);
+                            continue;
+                        }
+                    }
                     operand.set_reg(replacements.at(id));
                 }
 
@@ -863,6 +1371,14 @@ PassResult MIRRegAllocPass::run(PassContext &context) {
     auto *module = context.machine_module();
     if (module == nullptr) {
         return PassResult::fail("MIRRegAllocPass requires MIR module in pass context");
+    }
+    if (auto *conservative = context.get_artifact<bool>("MIRConservativeLowering");
+        conservative != nullptr && *conservative) {
+        auto verify = mir::verify_module(*module, mir::MIRVerificationStage::PostRA);
+        if (!verify.ok) {
+            return PassResult::fail(verify.message);
+        }
+        return PassResult::ok(false, "skipped conservative MIR");
     }
 
     try {

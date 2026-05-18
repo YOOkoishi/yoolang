@@ -68,7 +68,7 @@ int main() {
 // MIR: FMV.S %v{{[0-9]+}}:fpr32, fa7
 
 // MIR-LABEL: func @loop_phi
-// MIR: BNEZ %v{{[0-9]+}}:gpr
+// MIR: BLT %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr
 // MIR: MV %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr
 // MIR-NOT: edge.
 

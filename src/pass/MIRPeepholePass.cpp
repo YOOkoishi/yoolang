@@ -886,6 +886,10 @@ PassResult MIRPeepholePass::run(PassContext &context) {
     if (module == nullptr) {
         return PassResult::fail("MIRPeepholePass requires MIR module in pass context");
     }
+    if (auto *conservative = context.get_artifact<bool>("MIRConservativeLowering");
+        conservative != nullptr && *conservative) {
+        return PassResult::ok(false, "skipped conservative MIR");
+    }
 
     Stats total;
     bool changed = false;

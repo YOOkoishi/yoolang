@@ -28,8 +28,9 @@ PassResult OIRToMIRPass::run(PassContext &context) {
 
     try {
         std::unique_ptr<mir::Module> lowered;
-        if (use_virtual_registers_ &&
-            !oir_to_mir::should_use_conservative_lowering_for_size(*module)) {
+        const bool conservative_lowering =
+            !use_virtual_registers_ || oir_to_mir::should_use_conservative_lowering_for_size(*module);
+        if (!conservative_lowering) {
             lowered = oir_to_mir::lower_with_vregs(*module);
         } else {
             lowered = oir_to_mir::lower_with_stack_slots(*module);
@@ -38,6 +39,7 @@ PassResult OIRToMIRPass::run(PassContext &context) {
         if (!verify.ok) {
             return PassResult::fail(verify.message);
         }
+        context.set_artifact("MIRConservativeLowering", conservative_lowering);
         context.set_machine_module(std::move(lowered));
         return PassResult::ok(true);
     } catch (const std::exception &ex) {

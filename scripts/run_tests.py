@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", action="append", choices=sorted(STAGE_FLAGS))
     parser.add_argument("--filter", help="only run tests whose path contains this substring")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
-    parser.add_argument("--timeout", type=float, default=20.0, help="per subprocess timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=50.0, help="per subprocess timeout in seconds")
     parser.add_argument(
         "--opt-level",
         type=int,

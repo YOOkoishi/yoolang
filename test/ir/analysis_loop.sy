@@ -24,7 +24,7 @@ int main() {
 // OIR: ret i32
 
 // MIR-LABEL: func @sum_to
-// MIR: BNEZ
+// MIR: BLT
 // MIR: J %while.cond
 
 // ASM-LABEL: sum_to:

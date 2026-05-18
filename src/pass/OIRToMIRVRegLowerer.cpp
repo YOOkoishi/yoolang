@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -693,6 +694,9 @@ class VRegLowerer final {
                 if (!needs_dedicated_phi_edge(pred, target)) {
                     continue;
                 }
+                if (!edge_has_phi_copies(pred, target)) {
+                    continue;
+                }
                 std::string name = "edge." + pred->name() + ".to." + target->name();
                 auto *edge = out.create_block(name);
                 edge_blocks_[edge_key(pred, target)] = edge;
@@ -707,6 +711,24 @@ class VRegLowerer final {
                 return true;
             }
             return false;
+        }
+        return false;
+    }
+
+    bool edge_has_phi_copies(const oir::BasicBlock *pred,
+                             const oir::BasicBlock *target) const {
+        for (const auto &inst : target->instructions()) {
+            auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+            if (phi == nullptr) {
+                break;
+            }
+
+            auto *incoming = incoming_for(*phi, pred);
+            auto dst = value_regs_.at(phi);
+            auto found_src = value_regs_.find(incoming);
+            if (found_src == value_regs_.end() || found_src->second != dst) {
+                return true;
+            }
         }
         return false;
     }
@@ -789,6 +811,9 @@ class VRegLowerer final {
             lower_store(static_cast<const oir::StoreInst &>(inst));
             break;
         case oir::Instruction::OpID::GetElementPtr:
+            if (is_single_memory_user_gep(static_cast<const oir::GetElementPtrInst &>(inst))) {
+                return;
+            }
             lower_gep(static_cast<const oir::GetElementPtrInst &>(inst));
             break;
         case oir::Instruction::OpID::Add:
@@ -805,6 +830,9 @@ class VRegLowerer final {
             lower_float_binary(static_cast<const oir::BinaryInst &>(inst));
             break;
         case oir::Instruction::OpID::ICmp:
+            if (is_cmp_folded_into_branch(static_cast<const oir::CmpInst &>(inst))) {
+                return;
+            }
             lower_icmp(static_cast<const oir::CmpInst &>(inst));
             break;
         case oir::Instruction::OpID::FCmp:
@@ -840,9 +868,46 @@ class VRegLowerer final {
              {mir::MachineOperand::reg_def(dst), mir::MachineOperand::slot(object_slot)});
     }
 
+    struct LoweredAddress {
+        mir::Register base;
+        std::int64_t offset = 0;
+    };
+
+    bool is_single_memory_user_gep(const oir::GetElementPtrInst &inst) const {
+        if (inst.use_count() != 1 || inst.uses().empty()) {
+            return false;
+        }
+        const auto &use = inst.uses().front();
+        if (auto *load = dynamic_cast<const oir::LoadInst *>(use.user)) {
+            return load->ptr() == &inst;
+        }
+        if (auto *store = dynamic_cast<const oir::StoreInst *>(use.user)) {
+            return store->ptr() == &inst;
+        }
+        return false;
+    }
+
+    bool is_cmp_folded_into_branch(const oir::CmpInst &inst) const {
+        if (inst.op() != oir::Instruction::OpID::ICmp || inst.use_count() != 1 ||
+            inst.uses().empty()) {
+            return false;
+        }
+        auto *branch = dynamic_cast<const oir::BranchInst *>(inst.uses().front().user);
+        return branch != nullptr && branch->is_conditional() && branch->cond() == &inst;
+    }
+
     void lower_load(const oir::LoadInst &inst) {
         auto loaded = type_info(inst.type());
         auto dst = value_regs_.at(&inst);
+        if (auto *gep = dynamic_cast<const oir::GetElementPtrInst *>(inst.ptr());
+            gep != nullptr && is_single_memory_user_gep(*gep)) {
+            auto address = lower_gep_address(*gep, true);
+            emit(mir::Opcode::LoadMemOffset,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(address.base),
+                  mir::MachineOperand::imm(address.offset),
+                  mir::MachineOperand::type(loaded.value_type)});
+            return;
+        }
         auto addr = value_reg(inst.ptr());
         emit(mir::Opcode::LoadMem,
              {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(addr),
@@ -851,10 +916,18 @@ class VRegLowerer final {
 
     void lower_store(const oir::StoreInst &inst) {
         auto stored = type_info(inst.value()->type());
-        auto addr = value_reg(inst.ptr());
+        std::optional<LoweredAddress> folded_address;
+        if (auto *gep = dynamic_cast<const oir::GetElementPtrInst *>(inst.ptr());
+            gep != nullptr && is_single_memory_user_gep(*gep)) {
+            folded_address = lower_gep_address(*gep, true);
+        }
+        auto addr = folded_address ? folded_address->base : value_reg(inst.ptr());
         if (stored.value_type == mir::ValueType::Aggregate) {
             if (dynamic_cast<const oir::ConstantZero *>(inst.value()) == nullptr) {
                 throw std::runtime_error("only zero aggregate stores are supported in MIR vreg");
+            }
+            if (folded_address) {
+                addr = materialize_address(*folded_address);
             }
             emit(mir::Opcode::MemZero,
                  {mir::MachineOperand::reg_use(addr),
@@ -863,13 +936,21 @@ class VRegLowerer final {
         }
 
         auto value = value_reg(inst.value());
+        if (folded_address) {
+            emit(mir::Opcode::StoreMemOffset,
+                 {mir::MachineOperand::reg_use(folded_address->base),
+                  mir::MachineOperand::reg_use(value),
+                  mir::MachineOperand::imm(folded_address->offset),
+                  mir::MachineOperand::type(stored.value_type)});
+            return;
+        }
         emit(mir::Opcode::StoreMem,
              {mir::MachineOperand::reg_use(addr), mir::MachineOperand::reg_use(value),
               mir::MachineOperand::type(stored.value_type)});
     }
 
-    void lower_gep(const oir::GetElementPtrInst &inst) {
-        auto dst = value_regs_.at(&inst);
+    LoweredAddress lower_gep_address(const oir::GetElementPtrInst &inst,
+                                     bool fold_simm12_offset) {
         auto acc = value_reg(inst.base_ptr());
 
         auto *ptr_type = dynamic_cast<oir::PointerType *>(inst.base_ptr()->type());
@@ -927,6 +1008,9 @@ class VRegLowerer final {
         }
 
         if (constant_offset != 0) {
+            if (fold_simm12_offset && fits_simm12(constant_offset)) {
+                return {acc, constant_offset};
+            }
             auto next = create_vreg(mir::ValueType::Ptr);
             if (fits_simm12(constant_offset)) {
                 emit(mir::Opcode::AddI,
@@ -944,6 +1028,34 @@ class VRegLowerer final {
             acc = next;
         }
 
+        return {acc, 0};
+    }
+
+    mir::Register materialize_address(const LoweredAddress &address) {
+        if (address.offset == 0) {
+            return address.base;
+        }
+        auto next = create_vreg(mir::ValueType::Ptr);
+        if (fits_simm12(address.offset)) {
+            emit(mir::Opcode::AddI,
+                 {mir::MachineOperand::reg_def(next), mir::MachineOperand::reg_use(address.base),
+                  mir::MachineOperand::imm(address.offset)});
+        } else {
+            auto offset = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::LoadImm,
+                 {mir::MachineOperand::reg_def(offset),
+                  mir::MachineOperand::imm(address.offset)});
+            emit(mir::Opcode::Add,
+                 {mir::MachineOperand::reg_def(next), mir::MachineOperand::reg_use(address.base),
+                  mir::MachineOperand::reg_use(offset)});
+        }
+        return next;
+    }
+
+    void lower_gep(const oir::GetElementPtrInst &inst) {
+        auto dst = value_regs_.at(&inst);
+        auto address = lower_gep_address(inst, true);
+        auto acc = materialize_address(address);
         emit_move(dst, acc);
     }
 
@@ -1573,6 +1685,46 @@ class VRegLowerer final {
         emit(mir::Opcode::Jump, {mir::MachineOperand::block("epilogue")});
     }
 
+    void emit_icmp_branch(const oir::CmpInst &cmp, const oir::BasicBlock *pred,
+                          const oir::BasicBlock *target) {
+        auto lhs = value_reg(cmp.lhs());
+        auto rhs = value_reg(cmp.rhs());
+        auto target_operand = mir::MachineOperand::block(branch_target(pred, target));
+
+        switch (cmp.pred()) {
+        case oir::CmpPred::EQ:
+            emit(mir::Opcode::BranchEq,
+                 {mir::MachineOperand::reg_use(lhs), mir::MachineOperand::reg_use(rhs),
+                  target_operand});
+            break;
+        case oir::CmpPred::NE:
+            emit(mir::Opcode::BranchNe,
+                 {mir::MachineOperand::reg_use(lhs), mir::MachineOperand::reg_use(rhs),
+                  target_operand});
+            break;
+        case oir::CmpPred::LT:
+            emit(mir::Opcode::BranchLT,
+                 {mir::MachineOperand::reg_use(lhs), mir::MachineOperand::reg_use(rhs),
+                  target_operand});
+            break;
+        case oir::CmpPred::LE:
+            emit(mir::Opcode::BranchGE,
+                 {mir::MachineOperand::reg_use(rhs), mir::MachineOperand::reg_use(lhs),
+                  target_operand});
+            break;
+        case oir::CmpPred::GT:
+            emit(mir::Opcode::BranchLT,
+                 {mir::MachineOperand::reg_use(rhs), mir::MachineOperand::reg_use(lhs),
+                  target_operand});
+            break;
+        case oir::CmpPred::GE:
+            emit(mir::Opcode::BranchGE,
+                 {mir::MachineOperand::reg_use(lhs), mir::MachineOperand::reg_use(rhs),
+                  target_operand});
+            break;
+        }
+    }
+
     void lower_branch(const oir::BranchInst &inst) {
         if (!inst.is_conditional()) {
             if (!has_edge_block(inst.parent(), inst.target_bb()) &&
@@ -1581,6 +1733,14 @@ class VRegLowerer final {
             }
             emit(mir::Opcode::Jump,
                  {mir::MachineOperand::block(branch_target(inst.parent(), inst.target_bb()))});
+            return;
+        }
+
+        if (auto *cmp = dynamic_cast<const oir::CmpInst *>(inst.cond());
+            cmp != nullptr && is_cmp_folded_into_branch(*cmp)) {
+            emit_icmp_branch(*cmp, inst.parent(), inst.true_bb());
+            emit(mir::Opcode::Jump,
+                 {mir::MachineOperand::block(branch_target(inst.parent(), inst.false_bb()))});
             return;
         }
 

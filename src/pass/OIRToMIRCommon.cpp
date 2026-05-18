@@ -37,7 +37,7 @@ mir::Register phys_fpr(const std::string &name) {
 
 bool should_use_conservative_lowering_for_size(const oir::Module &module) {
     constexpr std::size_t kMaxVRegBlocks = 4096;
-    constexpr std::size_t kMaxVRegInstructions = 12000;
+    constexpr std::size_t kMaxVRegInstructions = 3000;
 
     std::size_t blocks = 0;
     std::size_t instructions = 0;

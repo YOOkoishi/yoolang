@@ -22,7 +22,7 @@ int main() {
 // OIR: ret i32
 
 // MIR-LABEL: func @choose
-// MIR: BNEZ
+// MIR: BLT
 // MIR-NOT: edge.
 
 // ASM-LABEL: choose:

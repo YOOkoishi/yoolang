@@ -853,7 +853,7 @@ bool is_callee_saved_register(const Register &reg) {
     }
     const auto &name = reg.name;
     if (name.size() >= 2 && name[0] == 's' && std::isdigit(static_cast<unsigned char>(name[1]))) {
-        return name != "s0";
+        return true;
     }
     if (starts_with(name, "fs")) {
         return true;
