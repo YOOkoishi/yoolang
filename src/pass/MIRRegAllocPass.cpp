@@ -116,6 +116,18 @@ std::vector<mir::Register> caller_saved(mir::RegisterClass reg_class) {
     return out;
 }
 
+std::vector<mir::Register> callee_saved_preference(mir::RegisterClass reg_class) {
+    std::vector<mir::Register> out;
+    if (reg_class == mir::RegisterClass::GPR) {
+        for (const std::string &name :
+             {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
+              "s11", "s0"}) {
+            out.push_back(mir::Register::physical(name, reg_class));
+        }
+    }
+    return out;
+}
+
 std::set<std::string> reserved_scratch_names(mir::RegisterClass reg_class) {
     (void)reg_class;
     return {};
@@ -668,6 +680,11 @@ class RegAllocator {
                 }
 
                 if (instr.opcode() == mir::Opcode::Call) {
+                    for (auto id : live) {
+                        for (const auto &phys : callee_saved_preference(reg_class)) {
+                            note_physical_preference(id, phys);
+                        }
+                    }
                     for (const auto &phys : call_clobbers_for(instr, reg_class)) {
                         forbid_live(live, phys);
                     }
@@ -947,23 +964,15 @@ class RegAllocator {
         return out;
     }
 
-    AllocationAttempt color_graph(const std::set<VRegId> &nodes,
-                                  const std::map<VRegId, std::set<VRegId>> &graph,
-                                  const std::map<VRegId, std::set<std::string>> &forbidden,
-                                  const std::map<VRegId, double> &spill_costs,
-                                  const MovePreferences &preferences,
-                                  mir::RegisterClass reg_class) {
+    AllocationAttempt color_graph_raw(const std::set<VRegId> &nodes,
+                                      const std::map<VRegId, std::set<VRegId>> &graph,
+                                      const std::map<VRegId, std::set<std::string>> &forbidden,
+                                      const std::map<VRegId, double> &spill_costs,
+                                      const MovePreferences &preferences,
+                                      mir::RegisterClass reg_class) {
         auto colors = allocatable(reg_class);
-        auto coalesced = coalesce_graph(nodes, graph, forbidden, preferences, colors.size());
-        std::map<VRegId, double> coalesced_spill_costs;
-        for (auto id : nodes) {
-            auto rep = find_representative(coalesced.representative, id);
-            auto found_cost = spill_costs.find(id);
-            coalesced_spill_costs[rep] +=
-                found_cost == spill_costs.end() ? 1.0 : found_cost->second;
-        }
-        AllocationAttempt colored_reps;
-        std::set<VRegId> remaining = coalesced.nodes;
+        AllocationAttempt out;
+        std::set<VRegId> remaining = nodes;
         std::vector<VRegId> stack;
         const auto k = colors.size();
 
@@ -971,7 +980,7 @@ class RegAllocator {
             auto picked = remaining.end();
             for (auto it = remaining.begin(); it != remaining.end(); ++it) {
                 std::size_t degree = 0;
-                for (auto neighbor : coalesced.graph.at(*it)) {
+                for (auto neighbor : graph.at(*it)) {
                     if (remaining.find(neighbor) != remaining.end()) {
                         ++degree;
                     }
@@ -983,11 +992,9 @@ class RegAllocator {
             }
             if (picked == remaining.end()) {
                 auto spill_priority = [&](VRegId id) {
-                    auto found_cost = coalesced_spill_costs.find(id);
-                    const double cost = found_cost == coalesced_spill_costs.end()
-                                            ? 1.0
-                                            : found_cost->second;
-                    return cost / static_cast<double>(coalesced.graph.at(id).size() + 1);
+                    auto found_cost = spill_costs.find(id);
+                    const double cost = found_cost == spill_costs.end() ? 1.0 : found_cost->second;
+                    return cost / static_cast<double>(graph.at(id).size() + 1);
                 };
                 picked = std::min_element(remaining.begin(), remaining.end(), [&](auto lhs, auto rhs) {
                     return spill_priority(lhs) < spill_priority(rhs);
@@ -1002,15 +1009,15 @@ class RegAllocator {
             stack.pop_back();
             std::vector<mir::Register> available;
             for (const auto &color : colors) {
-                auto found_forbidden = coalesced.forbidden.find(id);
-                if (found_forbidden != coalesced.forbidden.end() &&
+                auto found_forbidden = forbidden.find(id);
+                if (found_forbidden != forbidden.end() &&
                     phys_in_set(found_forbidden->second, color)) {
                     continue;
                 }
                 bool used_by_neighbor = false;
-                for (auto neighbor : coalesced.graph.at(id)) {
-                    auto found_color = colored_reps.colors.find(neighbor);
-                    if (found_color != colored_reps.colors.end() &&
+                for (auto neighbor : graph.at(id)) {
+                    auto found_color = out.colors.find(neighbor);
+                    if (found_color != out.colors.end() &&
                         same_phys(found_color->second, color)) {
                         used_by_neighbor = true;
                         break;
@@ -1022,7 +1029,7 @@ class RegAllocator {
             }
 
             if (available.empty()) {
-                colored_reps.spills.insert(id);
+                out.spills.insert(id);
             } else {
                 auto chosen = available.front();
                 auto prefer_color = [&](const mir::Register &preferred) {
@@ -1038,8 +1045,8 @@ class RegAllocator {
                 };
 
                 bool found_preference = false;
-                if (auto found_phys = coalesced.preferences.physical_colors.find(id);
-                    found_phys != coalesced.preferences.physical_colors.end()) {
+                if (auto found_phys = preferences.physical_colors.find(id);
+                    found_phys != preferences.physical_colors.end()) {
                     for (const auto &preferred : found_phys->second) {
                         if (prefer_color(preferred)) {
                             found_preference = true;
@@ -1048,11 +1055,11 @@ class RegAllocator {
                     }
                 }
                 if (!found_preference) {
-                    if (auto found_virtual = coalesced.preferences.virtual_neighbors.find(id);
-                        found_virtual != coalesced.preferences.virtual_neighbors.end()) {
+                    if (auto found_virtual = preferences.virtual_neighbors.find(id);
+                        found_virtual != preferences.virtual_neighbors.end()) {
                         for (auto neighbor : found_virtual->second) {
-                            auto found_color = colored_reps.colors.find(neighbor);
-                            if (found_color != colored_reps.colors.end() &&
+                            auto found_color = out.colors.find(neighbor);
+                            if (found_color != out.colors.end() &&
                                 prefer_color(found_color->second)) {
                                 break;
                             }
@@ -1060,10 +1067,48 @@ class RegAllocator {
                     }
                 }
 
-                colored_reps.colors[id] = chosen;
+                out.colors[id] = chosen;
             }
         }
 
+        return out;
+    }
+
+    double spill_cost_total(const AllocationAttempt &attempt,
+                            const std::map<VRegId, double> &spill_costs) const {
+        double total = 0.0;
+        for (auto id : attempt.spills) {
+            auto found = spill_costs.find(id);
+            total += found == spill_costs.end() ? 1.0 : found->second;
+        }
+        return total;
+    }
+
+    AllocationAttempt color_graph(const std::set<VRegId> &nodes,
+                                  const std::map<VRegId, std::set<VRegId>> &graph,
+                                  const std::map<VRegId, std::set<std::string>> &forbidden,
+                                  const std::map<VRegId, double> &spill_costs,
+                                  const MovePreferences &preferences,
+                                  mir::RegisterClass reg_class) {
+        auto uncoalesced =
+            color_graph_raw(nodes, graph, forbidden, spill_costs, preferences, reg_class);
+        auto coalesced =
+            coalesce_graph(nodes, graph, forbidden, preferences, allocatable(reg_class).size());
+        if (coalesced.nodes.size() == nodes.size()) {
+            return uncoalesced;
+        }
+
+        std::map<VRegId, double> coalesced_spill_costs;
+        for (auto id : nodes) {
+            auto rep = find_representative(coalesced.representative, id);
+            auto found_cost = spill_costs.find(id);
+            coalesced_spill_costs[rep] +=
+                found_cost == spill_costs.end() ? 1.0 : found_cost->second;
+        }
+
+        auto colored_reps =
+            color_graph_raw(coalesced.nodes, coalesced.graph, coalesced.forbidden,
+                            coalesced_spill_costs, coalesced.preferences, reg_class);
         AllocationAttempt out;
         for (auto id : nodes) {
             auto rep = find_representative(coalesced.representative, id);
@@ -1075,6 +1120,14 @@ class RegAllocator {
             if (color != colored_reps.colors.end()) {
                 out.colors[id] = color->second;
             }
+        }
+
+        const auto out_cost = spill_cost_total(out, spill_costs);
+        const auto uncoalesced_cost = spill_cost_total(uncoalesced, spill_costs);
+        if (out.spills.size() > uncoalesced.spills.size() ||
+            (out.spills.size() == uncoalesced.spills.size() &&
+             out_cost > uncoalesced_cost)) {
+            return uncoalesced;
         }
         return out;
     }
