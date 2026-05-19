@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,13 @@ def format_speedup(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.2f}x"
 
 
+def geometric_mean(values: list[float]) -> float | None:
+    positive_values = [value for value in values if value > 0.0]
+    if not positive_values:
+        return None
+    return math.exp(sum(math.log(value) for value in positive_values) / len(positive_values))
+
+
 def md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
@@ -142,6 +150,10 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
         "baseline_meta": baseline_meta(args),
         "reason": reason,
         "comparable_cases": 0,
+        "case_speedup_geomean": None,
+        "case_wins": 0,
+        "case_losses": 0,
+        "case_ties": 0,
         "rows": [],
     }
     args.out_json.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
@@ -181,6 +193,10 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     current_total = 0.0
     baseline_total = 0.0
+    speedups: list[float] = []
+    case_wins = 0
+    case_losses = 0
+    case_ties = 0
 
     for case in sorted(set(current_rows) & set(baseline_rows)):
         current_time = parse_time(compiler_cell(current_rows[case]))
@@ -191,6 +207,14 @@ def main() -> int:
         delta_sec = current_time - baseline_time
         delta_pct = 0.0 if baseline_time == 0.0 else (delta_sec / baseline_time) * 100.0
         case_speedup = speedup_ratio(baseline_time, current_time)
+        if case_speedup is not None:
+            speedups.append(case_speedup)
+        if current_time < baseline_time:
+            case_wins += 1
+        elif current_time > baseline_time:
+            case_losses += 1
+        else:
+            case_ties += 1
         is_regression = delta_pct >= CASE_REGRESSION_DELTA_PCT and delta_sec >= CASE_REGRESSION_DELTA_SEC
         rows.append(
             {
@@ -210,10 +234,12 @@ def main() -> int:
         status = "NO BASELINE"
         total_delta_sec = 0.0
         total_delta_pct = 0.0
+        case_speedup_geomean = None
     else:
         total_delta_sec = current_total - baseline_total
         total_delta_pct = 0.0 if baseline_total == 0.0 else (total_delta_sec / baseline_total) * 100.0
         total_speedup = speedup_ratio(baseline_total, current_total)
+        case_speedup_geomean = geometric_mean(speedups)
         if total_delta_pct >= TOTAL_REGRESSION_DELTA_PCT:
             status = "REGRESSION"
         elif total_delta_pct <= TOTAL_IMPROVEMENT_DELTA_PCT:
@@ -240,6 +266,8 @@ def main() -> int:
         f"- Current compiler total: {current_total:.4f}s",
         f"- Baseline compiler total: {baseline_total:.4f}s",
         f"- Overall speedup vs baseline: {format_speedup(total_speedup)}",
+        f"- Per-case speedup geomean: {format_speedup(case_speedup_geomean)}",
+        f"- Win/loss/tie: 🚀 {case_wins} faster / ⚠️ {case_losses} slower / ✅ {case_ties} tied",
         f"- Delta: {format_signed_sec(total_delta_sec)} ({format_signed_pct(total_delta_pct)})",
         "",
     ]
@@ -287,6 +315,10 @@ def main() -> int:
         "total_delta_sec": total_delta_sec,
         "total_delta_pct": total_delta_pct,
         "total_speedup": total_speedup,
+        "case_speedup_geomean": case_speedup_geomean,
+        "case_wins": case_wins,
+        "case_losses": case_losses,
+        "case_ties": case_ties,
         "regressions": regressions,
         "rows": rows,
     }

@@ -576,6 +576,12 @@ jobs:
                   return f"{baseline_total / current_total:.2f}x"
               return "N/A"
 
+          def fmt_optional_speedup(value) -> str:
+              return f"{value:.2f}x" if isinstance(value, (int, float)) else "N/A"
+
+          def int_or_none(value):
+              return value if isinstance(value, int) else None
+
           def short_text(value: str, limit: int = 120) -> str:
               value = " ".join(value.split())
               if len(value) <= limit:
@@ -647,6 +653,9 @@ jobs:
           fast = 0
           slow = 0
           stable = 0
+          delta_fast = int_or_none(delta.get("case_wins"))
+          delta_slow = int_or_none(delta.get("case_losses"))
+          delta_stable = int_or_none(delta.get("case_ties"))
           significant_ratio = 5.0
           significant_abs_sec = 0.01
           fast_cases = []
@@ -665,6 +674,10 @@ jobs:
                       slow_cases.append(row)
               else:
                   stable += 1
+          if delta_fast is not None and delta_slow is not None and delta_stable is not None:
+              fast = delta_fast
+              slow = delta_slow
+              stable = delta_stable
           fast_cases.sort(key=lambda item: (item.get("delta_pct", 0), item.get("delta_sec", 0)))
           slow_cases.sort(key=lambda item: (item.get("delta_pct", 0), item.get("delta_sec", 0)), reverse=True)
 
@@ -702,9 +715,10 @@ jobs:
               f"⏱️ 当前 compile 总时间: {fmt_seconds(current_compile_total if isinstance(current_compile_total, (int, float)) else None)}",
               f"⏱️ 基线 compile 总时间: {fmt_seconds(baseline_compile_total if isinstance(baseline_compile_total, (int, float)) else None)}",
               f"整体: {fmt_overall(delta.get('total_delta_pct'))}, 加速比 {fmt_baseline_speedup(delta)}",
+              f"单测例: 几何平均加速比 {fmt_optional_speedup(delta.get('case_speedup_geomean'))}",
               "",
               f"📍 基线: {baseline_commit}",
-              f"⏱️ case: 🚀 {fast} 快 / ⚠️ {slow} 慢 / ✅ {stable} 持平 / ❌ {perf.get('failures', 0)} 失败",
+              f"⏱️ case 胜负: 🚀 {fast} 胜 / ⚠️ {slow} 负 / ✅ {stable} 平 / ❌ {perf.get('failures', 0)} 失败",
               "",
               "⚡ 编译器速度:",
               f"yoolang {fmt_seconds(compiler_total_value)} / GCC {fmt_seconds(gcc_total_value)} / Clang++ {fmt_seconds(clang_total_value)}",
