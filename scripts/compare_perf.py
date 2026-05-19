@@ -261,9 +261,10 @@ except Exception as exc:
 
 def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
     baseline_src = _prepare_baseline_source(src, out_dir)
+    asm = out_dir / f"{src.stem}.gcc.s"
     obj = out_dir / f"{src.stem}.gcc.o"
     exe = out_dir / f"{src.stem}.gcc.riscv"
-    cmd = [
+    compile_cmd = [
         GCC_BIN,
         "-O3",
         "-std=gnu++17",
@@ -271,21 +272,20 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
         str(RUNTIME_WRAPPER),
         "-x",
         "c++",
-        "-c",
         str(baseline_src),
-        "-o",
-        str(obj),
     ]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run([*compile_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
+    subprocess.run([*compile_cmd, "-c", "-o", str(obj)], check=True, capture_output=True, text=True)
     subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
 def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
     baseline_src = _prepare_baseline_source(src, out_dir)
+    asm = out_dir / f"{src.stem}.clang.s"
     obj = out_dir / f"{src.stem}.clang.o"
     exe = out_dir / f"{src.stem}.clang.riscv"
-    cmd = [
+    compile_cmd = [
         CLANG_BIN,
         "-O3",
         "-std=gnu++17",
@@ -295,12 +295,10 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
         str(RUNTIME_WRAPPER),
         "-x",
         "c++",
-        "-c",
         str(baseline_src),
-        "-o",
-        str(obj),
     ]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run([*compile_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
+    subprocess.run([*compile_cmd, "-c", "-o", str(obj)], check=True, capture_output=True, text=True)
     subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
