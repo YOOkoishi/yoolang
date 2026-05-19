@@ -571,11 +571,11 @@ def _compiler_vs_o3_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
         if compiler is None:
             continue
         if gcc is not None and gcc > 0.0:
-            gcc_ratios.append(compiler / gcc)
+            gcc_ratios.append(gcc / compiler)
             if compiler < gcc:
                 gcc_faster_cases += 1
         if clang is not None and clang > 0.0:
-            clang_ratios.append(compiler / clang)
+            clang_ratios.append(clang / compiler)
             if compiler < clang:
                 clang_faster_cases += 1
 
