@@ -357,7 +357,7 @@ def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, int]:
 
     for line in proc.stdout.splitlines():
         stripped = line.strip()
-        if re.match(r"^(LI|FLI\.S|LA|FI_ADDR|LOAD_SLOT|STORE_SLOT|LOAD_MEM|STORE_MEM|MEMZERO|MV|FMV\.S|ADD|ADDW|SUBW|MUL|MULW|DIVW|REMW|AND|SLLI|SRLIW|XOR|XORI|SLT|SEQZ|SNEZ|FADD\.S|FSUB\.S|FMUL\.S|FDIV\.S|FEQ\.S|FLT\.S|FLE\.S|FCVT\.S\.W|FCVT\.W\.S|FMV\.W\.X|STORE_OUT_ARG|LOAD_IN_ARG|BNEZ|J|CALL)\b", stripped):
+        if re.match(r"^(LI|FLI\.S|LA|FI_ADDR|LOAD_SLOT|STORE_SLOT|LOAD_MEM|STORE_MEM|LOAD_MEM_OFF|STORE_MEM_OFF|MEMZERO|MV|FMV\.S|ADD|ADDW|ADDI|ADDIW|SUBW|MUL|MULW|DIVW|REMW|AND|ANDI|SLLI|SLLIW|SRAI|SRAIW|SRLIW|XOR|XORI|SLT|SEQZ|SNEZ|FADD\.S|FSUB\.S|FMUL\.S|FDIV\.S|FEQ\.S|FLT\.S|FLE\.S|FCVT\.S\.W|FCVT\.W\.S|FMV\.W\.X|STORE_OUT_ARG|LOAD_IN_ARG|BNEZ|BEQZ|BEQ|BNE|BLT|BGE|J|CALL)\b", stripped):
             metrics["mir_instrs"] += 1
         if " fi#" in line or stripped.startswith("fi#"):
             metrics["stack_slots"] += 1

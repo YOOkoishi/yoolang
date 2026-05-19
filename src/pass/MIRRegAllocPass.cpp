@@ -101,8 +101,8 @@ std::vector<mir::Register> caller_saved(mir::RegisterClass reg_class) {
     std::vector<mir::Register> out;
     if (reg_class == mir::RegisterClass::GPR) {
         for (const std::string &name :
-             {"t0", "t1", "t2", "t3", "t4", "t5", "a0", "a1", "a2", "a3",
-              "a4", "a5", "a6", "a7"}) {
+             {"t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2",
+              "a3", "a4", "a5", "a6", "a7"}) {
             out.push_back(mir::Register::physical(name, reg_class));
         }
     } else {
@@ -128,8 +128,11 @@ std::vector<mir::Register> callee_saved_preference(mir::RegisterClass reg_class)
     return out;
 }
 
-std::set<std::string> reserved_scratch_names(mir::RegisterClass reg_class) {
-    (void)reg_class;
+std::set<std::string> reserved_scratch_names(mir::RegisterClass reg_class,
+                                             bool reserve_offset_scratch) {
+    if (reserve_offset_scratch && reg_class == mir::RegisterClass::GPR) {
+        return {"t6"};
+    }
     return {};
 }
 
@@ -144,9 +147,10 @@ std::vector<mir::Register> spill_scratch_registers(mir::RegisterClass reg_class)
             mir::Register::physical("ft9", reg_class)};
 }
 
-std::vector<mir::Register> allocatable(mir::RegisterClass reg_class) {
+std::vector<mir::Register> allocatable(mir::RegisterClass reg_class,
+                                       bool reserve_offset_scratch) {
     auto out = caller_saved(reg_class);
-    auto reserved = reserved_scratch_names(reg_class);
+    auto reserved = reserved_scratch_names(reg_class, reserve_offset_scratch);
     out.erase(std::remove_if(out.begin(), out.end(), [&](const mir::Register &reg) {
                   return reserved.find(reg.name) != reserved.end();
               }),
@@ -166,6 +170,10 @@ bool same_phys(const mir::Register &lhs, const mir::Register &rhs) {
            lhs.reg_class == rhs.reg_class;
 }
 
+bool fits_simm12(std::int64_t value) {
+    return value >= -2048 && value <= 2047;
+}
+
 bool phys_in_set(const std::set<std::string> &set, const mir::Register &reg) {
     return reg.is_physical() && set.find(reg.name) != set.end();
 }
@@ -173,6 +181,9 @@ bool phys_in_set(const std::set<std::string> &set, const mir::Register &reg) {
 std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineInstr &instr,
                                                            mir::RegisterClass reg_class) {
     std::vector<mir::Register> out;
+    if (instr.opcode() == mir::Opcode::LoadFloatImm && reg_class == mir::RegisterClass::GPR) {
+        out.push_back(mir::Register::physical("t6", reg_class));
+    }
     if (instr.opcode() == mir::Opcode::MemZero && reg_class == mir::RegisterClass::GPR) {
         out.push_back(mir::Register::physical("t4", reg_class));
         out.push_back(mir::Register::physical("t5", reg_class));
@@ -197,6 +208,7 @@ class RegAllocator {
         constexpr int kMaxRewriteIterations = 12;
         for (int iteration = 0; iteration < kMaxRewriteIterations; ++iteration) {
             function.rebuild_cfg();
+            reserve_offset_scratch_ = function_needs_offset_scratch(function);
             auto live = compute_liveness(function);
             std::map<VRegId, mir::Register> colors;
             std::set<VRegId> spills;
@@ -225,6 +237,47 @@ class RegAllocator {
     using ClobberSummary = std::map<mir::RegisterClass, std::set<std::string>>;
 
     std::map<std::string, ClobberSummary> call_clobbers_;
+    bool reserve_offset_scratch_ = false;
+
+    bool function_needs_offset_scratch(const mir::MachineFunction &function) const {
+        std::uint64_t offset = mir::align_to(function.outgoing_arg_bytes(), 16);
+        for (const auto &slot : function.stack_slots()) {
+            offset = mir::align_to(offset, std::max<std::uint64_t>(slot.type.align, 1));
+            offset += slot.type.size;
+        }
+
+        const std::uint64_t worst_case_saved_gprs =
+            static_cast<std::uint64_t>(callee_saved_preference(mir::RegisterClass::GPR).size()) *
+            8ULL;
+        const std::uint64_t possible_ra_slot = function.has_call() ? 8ULL : 0ULL;
+        const std::uint64_t estimated_frame =
+            mir::align_to(offset + worst_case_saved_gprs + possible_ra_slot, 16);
+        if (estimated_frame > 1800) {
+            return true;
+        }
+
+        for (const auto &block : function.blocks()) {
+            for (const auto &instr : block->instructions()) {
+                const auto &ops = instr.operands();
+                if ((instr.opcode() == mir::Opcode::LoadMemOffset ||
+                     instr.opcode() == mir::Opcode::StoreMemOffset) &&
+                    ops.size() >= 3 && !fits_simm12(ops[2].int_value())) {
+                    return true;
+                }
+                if (instr.opcode() == mir::Opcode::StoreOutgoingArg && ops.size() >= 2 &&
+                    !fits_simm12(ops[1].int_value())) {
+                    return true;
+                }
+                if (instr.opcode() == mir::Opcode::LoadIncomingArg && ops.size() >= 2 &&
+                    !fits_simm12(static_cast<std::int64_t>(estimated_frame) +
+                                 ops[1].int_value())) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
 
     std::vector<mir::Register> call_clobbers_for(const mir::MachineInstr &instr,
                                                  mir::RegisterClass reg_class) const {
@@ -970,7 +1023,7 @@ class RegAllocator {
                                       const std::map<VRegId, double> &spill_costs,
                                       const MovePreferences &preferences,
                                       mir::RegisterClass reg_class) {
-        auto colors = allocatable(reg_class);
+        auto colors = allocatable(reg_class, reserve_offset_scratch_);
         AllocationAttempt out;
         std::set<VRegId> remaining = nodes;
         std::vector<VRegId> stack;
@@ -1093,7 +1146,8 @@ class RegAllocator {
         auto uncoalesced =
             color_graph_raw(nodes, graph, forbidden, spill_costs, preferences, reg_class);
         auto coalesced =
-            coalesce_graph(nodes, graph, forbidden, preferences, allocatable(reg_class).size());
+            coalesce_graph(nodes, graph, forbidden, preferences,
+                           allocatable(reg_class, reserve_offset_scratch_).size());
         if (coalesced.nodes.size() == nodes.size()) {
             return uncoalesced;
         }
