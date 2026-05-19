@@ -59,39 +59,48 @@ void invalidate_for_call(std::vector<MemoryEntry> &memory, const oir::CallInst &
                  memory.end());
 }
 
+bool dse_instruction(oir::Instruction *inst, std::vector<MemoryEntry> &memory,
+                     const oir::OIRAliasAnalysis &aa,
+                     const oir::FunctionModRefAnalysis &modref,
+                     std::unordered_set<oir::Instruction *> &dead) {
+    if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
+        bool changed = false;
+        for (auto it = memory.rbegin(); it != memory.rend(); ++it) {
+            auto alias = aa.alias(store->ptr(), it->ptr);
+            if (alias == oir::AliasResult::NoAlias) {
+                continue;
+            }
+            if (it->is_load) {
+                break;
+            }
+            if (alias == oir::AliasResult::MustAlias && it->is_store) {
+                changed = dead.insert(it->inst).second || changed;
+            }
+            break;
+        }
+        invalidate_aliasing(memory, store->ptr(), aa);
+        memory.push_back({store->ptr(), store->value(), store, true, false});
+        return changed;
+    }
+
+    if (auto *load = dynamic_cast<oir::LoadInst *>(inst)) {
+        memory.push_back({load->ptr(), load, load, false, true});
+        return false;
+    }
+
+    if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
+        invalidate_for_call(memory, *call, aa, modref, true);
+    }
+    return false;
+}
+
 bool dse_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
                const oir::FunctionModRefAnalysis &modref,
                std::unordered_set<oir::Instruction *> &dead) {
     bool changed = false;
     std::vector<MemoryEntry> memory;
     for (auto &inst_ptr : block.instructions()) {
-        auto *inst = inst_ptr.get();
-        if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
-            for (auto it = memory.rbegin(); it != memory.rend(); ++it) {
-                auto alias = aa.alias(store->ptr(), it->ptr);
-                if (alias == oir::AliasResult::NoAlias) {
-                    continue;
-                }
-                if (it->is_load) {
-                    break;
-                }
-                if (alias == oir::AliasResult::MustAlias && it->is_store) {
-                    dead.insert(it->inst);
-                    changed = true;
-                }
-                break;
-            }
-            invalidate_aliasing(memory, store->ptr(), aa);
-            memory.push_back({store->ptr(), store->value(), store, true, false});
-            continue;
-        }
-        if (auto *load = dynamic_cast<oir::LoadInst *>(inst)) {
-            memory.push_back({load->ptr(), load, load, false, true});
-            continue;
-        }
-        if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
-            invalidate_for_call(memory, *call, aa, modref, true);
-        }
+        changed = dse_instruction(inst_ptr.get(), memory, aa, modref, dead) || changed;
     }
     return changed;
 }
@@ -170,6 +179,25 @@ void dle_dom_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *bl
     }
 }
 
+void dse_dom_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *block,
+                   const oir::OIRAliasAnalysis &aa, std::vector<MemoryEntry> memory,
+                   const oir::FunctionModRefAnalysis &modref,
+                   std::unordered_set<oir::Instruction *> &dead) {
+    auto *mutable_block = const_cast<oir::BasicBlock *>(block);
+    for (auto &inst_ptr : mutable_block->instructions()) {
+        dse_instruction(inst_ptr.get(), memory, aa, modref, dead);
+    }
+
+    for (auto *child : dom_tree.children(block)) {
+        std::vector<MemoryEntry> child_memory;
+        if (child->predecessors().size() == 1 && child->predecessors().front() == block &&
+            block->successors().size() == 1) {
+            child_memory = memory;
+        }
+        dse_dom_block(dom_tree, child, aa, std::move(child_memory), modref, dead);
+    }
+}
+
 } // namespace
 
 bool eliminate_dead_stores(oir::Module &module, Stats &stats) {
@@ -181,8 +209,18 @@ bool eliminate_dead_stores(oir::Module &module, Stats &stats) {
             continue;
         }
         std::unordered_set<oir::Instruction *> dead;
-        for (auto &block : function->blocks()) {
-            dse_block(*block, aa, modref, dead);
+        if (function->entry_block() != nullptr) {
+            oir::DominatorTree dom_tree(*function);
+            dse_dom_block(dom_tree, function->entry_block(), aa, {}, modref, dead);
+            for (auto &block : function->blocks()) {
+                if (!dom_tree.is_reachable(block.get())) {
+                    dse_block(*block, aa, modref, dead);
+                }
+            }
+        } else {
+            for (auto &block : function->blocks()) {
+                dse_block(*block, aa, modref, dead);
+            }
         }
         if (erase_instructions(*function, dead)) {
             stats.dse += static_cast<unsigned>(dead.size());

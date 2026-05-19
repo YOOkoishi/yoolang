@@ -13,6 +13,7 @@
 #include "../../include/pass/OIRMemoryOptPass.h"
 #include "../../include/pass/OIRMem2RegPass.h"
 #include "../../include/pass/OIROptimizationPipelinePass.h"
+#include "../../include/pass/OIRSROAPass.h"
 #include "../../include/pass/OIRSCCPPass.h"
 #include "../../include/pass/OIRTailRecursionEliminationPass.h"
 
@@ -29,6 +30,7 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::simplify_branches(module, stats);
     changed |= oir_opt::cleanup_cfg(module, stats);
     changed |= oir_opt::promote_global_loads(module, stats);
+    changed |= oir_opt::scalar_replacement_of_aggregates(module, stats);
     changed |= oir_opt::promote_memory_to_registers(module, stats);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
@@ -67,6 +69,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
     changed |= promote_global_loads(module, stats);
+    changed |= scalar_replacement_of_aggregates(module, stats);
     changed |= promote_memory_to_registers(module, stats);
     changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
     changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
@@ -93,6 +96,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= reduce_gep_strength(module, stats);
     changed |= propagate_global_constants(module, stats);
     changed |= promote_global_loads(module, stats);
+    changed |= scalar_replacement_of_aggregates(module, stats);
     changed |= promote_memory_to_registers(module, stats);
     changed |= eliminate_dead_loads(module, stats);
     changed |= eliminate_dead_stores(module, stats);
@@ -190,9 +194,32 @@ PassKind OIRMem2RegPass::kind() const {
 PassResult OIRMem2RegPass::run(PassContext &context) {
     return oir_opt::run_oir_transform(context, "OIRMem2RegPass requires OIR module in pass context",
                                       [](oir::Module &module, oir_opt::Stats &stats) {
-                                          bool changed =
+                                          bool changed = oir_opt::scalar_replacement_of_aggregates(
+                                              module, stats);
+                                          changed |=
                                               oir_opt::promote_memory_to_registers(module, stats);
                                           changed |= oir_opt::cleanup_cfg(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+std::string_view OIRSROAPass::name() const {
+    return "OIRSROAPass";
+}
+
+PassKind OIRSROAPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRSROAPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRSROAPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed =
+                                              oir_opt::scalar_replacement_of_aggregates(module,
+                                                                                        stats);
+                                          changed |=
+                                              oir_opt::promote_memory_to_registers(module, stats);
                                           changed |= oir_opt::eliminate_dead_code(module, stats);
                                           return changed;
                                       });
@@ -365,6 +392,9 @@ PassResult OIRGlobalOptPass::run(PassContext &context) {
                                           bool changed =
                                               oir_opt::propagate_global_constants(module, stats);
                                           changed |= oir_opt::promote_global_loads(module, stats);
+                                          changed |=
+                                              oir_opt::scalar_replacement_of_aggregates(module,
+                                                                                        stats);
                                           changed |=
                                               oir_opt::promote_memory_to_registers(module, stats);
                                           changed |= oir_opt::eliminate_dead_code(module, stats);

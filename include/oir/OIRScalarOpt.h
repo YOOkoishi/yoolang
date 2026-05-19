@@ -27,6 +27,7 @@ struct Stats {
     unsigned tail_recursion = 0;
     unsigned lsr = 0;
     unsigned loop_canonicalize = 0;
+    unsigned sroa = 0;
     unsigned dse = 0;
     unsigned dle = 0;
     unsigned adce = 0;
@@ -64,6 +65,7 @@ bool simplify_branches(oir::Module &module, Stats &stats);
 bool run_sccp(oir::Module &module, Stats &stats);
 bool eliminate_dead_code(oir::Module &module, Stats &stats);
 bool cleanup_cfg(oir::Module &module, Stats &stats);
+bool scalar_replacement_of_aggregates(oir::Module &module, Stats &stats);
 bool promote_memory_to_registers(oir::Module &module, Stats &stats);
 bool canonicalize_loops(oir::Module &module, Stats &stats);
 bool eliminate_dead_stores(oir::Module &module, Stats &stats);
