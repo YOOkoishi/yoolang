@@ -434,11 +434,11 @@ jobs:
               clang_o3_faster_cases = perf_payload.get("clang_o3_faster_cases")
               if isinstance(gcc_o3_geomean, (int, float)) or isinstance(clang_o3_geomean, (int, float)):
                   lines.append(
-                      "- 🧮 Per-case geomean vs O3: "
+                      "- 🧮 Geomean speedup: "
                       f"GCC {format_speedup(gcc_o3_geomean)} / Clang++ {format_speedup(clang_o3_geomean)}"
                   )
                   lines.append(
-                      "- 🏁 Faster cases vs O3: "
+                      "- 🏁 Faster cases: "
                       f"GCC {gcc_o3_faster_cases if isinstance(gcc_o3_faster_cases, int) else 'N/A'} / "
                       f"Clang++ {clang_o3_faster_cases if isinstance(clang_o3_faster_cases, int) else 'N/A'}"
                   )
@@ -731,16 +731,16 @@ jobs:
               "📈 基线对比:",
               f"⏱️ 当前 compile 总时间: {fmt_seconds(current_compile_total if isinstance(current_compile_total, (int, float)) else None)}",
               f"⏱️ 基线 compile 总时间: {fmt_seconds(baseline_compile_total if isinstance(baseline_compile_total, (int, float)) else None)}",
-              f"整体: {fmt_overall(delta.get('total_delta_pct'))}, 加速比 {fmt_baseline_speedup(delta)}",
+              f"整体: {fmt_overall(delta.get('total_delta_pct'))}, 总时间加速比 {fmt_baseline_speedup(delta)}",
               "",
               f"📍 基线: {baseline_commit}",
               f"⏱️ case 胜负: 🚀 {fast} 胜 / ⚠️ {slow} 负 / ✅ {stable} 平 / ❌ {perf.get('failures', 0)} 失败",
               "",
               "⚡ 编译器速度:",
               f"yoolang {fmt_seconds(compiler_total_value)} / GCC {fmt_seconds(gcc_total_value)} / Clang++ {fmt_seconds(clang_total_value)}",
-              f"📐 加速比: GCC {fmt_speedup(gcc_total_value, compiler_total_value)} / Clang++ {fmt_speedup(clang_total_value, compiler_total_value)}",
-              f"🧮 单测例几何平均: GCC O3 {fmt_optional_speedup(perf.get('gcc_o3_geomean'))} / Clang++ O3 {fmt_optional_speedup(perf.get('clang_o3_geomean'))}",
-              f"🏁 单 case 更快: GCC O3 {perf.get('gcc_o3_faster_cases', 'N/A')} / Clang++ O3 {perf.get('clang_o3_faster_cases', 'N/A')}",
+              f"📐 总时间加速比: GCC {fmt_speedup(gcc_total_value, compiler_total_value)} / Clang++ {fmt_speedup(clang_total_value, compiler_total_value)}",
+              f"🧮 几何平均加速比: GCC {fmt_optional_speedup(perf.get('gcc_o3_geomean'))} / Clang++ {fmt_optional_speedup(perf.get('clang_o3_geomean'))}",
+              f"🏁 单 case 更快: GCC {perf.get('gcc_o3_faster_cases', 'N/A')}个 / Clang++ {perf.get('clang_o3_faster_cases', 'N/A')}个",
           ]
 
           if slow_cases:
