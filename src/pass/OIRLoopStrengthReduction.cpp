@@ -29,6 +29,8 @@ struct GEPCandidate {
     std::int64_t pointer_step = 0;
     std::int64_t index_scale = 1;
     std::int64_t index_offset = 0;
+    oir::Value *index_offset_value = nullptr;
+    int index_offset_value_sign = 1;
 };
 
 bool contains_block(const oir::Loop &loop, const oir::BasicBlock *block) {
@@ -210,12 +212,25 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
         InductionInfo induction;
         std::int64_t scale = 1;
         std::int64_t offset = 0;
+        oir::Value *offset_value = nullptr;
+        int offset_value_sign = 1;
+    };
+    auto add_offset_value = [](AffineIndex &index, oir::Value *value, int sign) {
+        if (value == nullptr) {
+            return true;
+        }
+        if (index.offset_value != nullptr || value->type() != index.induction.start->type()) {
+            return false;
+        }
+        index.offset_value = value;
+        index.offset_value_sign = sign < 0 ? -1 : 1;
+        return true;
     };
     std::function<std::optional<AffineIndex>(oir::Value *)> match_affine =
         [&](oir::Value *value) -> std::optional<AffineIndex> {
         for (const auto &info : inductions) {
             if (value == info.phi) {
-                return AffineIndex{info, 1, 0};
+                return AffineIndex{info, 1, 0, nullptr, 1};
             }
         }
         if (auto *binary = dynamic_cast<oir::BinaryInst *>(value)) {
@@ -231,6 +246,11 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
                         lhs->offset -= *rhs_const;
                         return lhs;
                     }
+                    if (!rhs_const && !value_defined_in_loop(binary->rhs(), loop) &&
+                        add_offset_value(*lhs, binary->rhs(),
+                                         binary->op() == oir::Instruction::OpID::Sub ? -1 : 1)) {
+                        return lhs;
+                    }
                 }
                 if (binary->op() == oir::Instruction::OpID::Add) {
                     if (auto rhs = match_affine(binary->rhs())) {
@@ -239,13 +259,17 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
                             rhs->offset += *lhs_const;
                             return rhs;
                         }
+                        if (!value_defined_in_loop(binary->lhs(), loop) &&
+                            add_offset_value(*rhs, binary->lhs(), 1)) {
+                            return rhs;
+                        }
                     }
                 }
             }
             if (binary->op() == oir::Instruction::OpID::Mul) {
                 if (auto lhs = match_affine(binary->lhs())) {
                     auto rhs_const = constant_int(binary->rhs());
-                    if (rhs_const) {
+                    if (rhs_const && lhs->offset_value == nullptr) {
                         lhs->scale *= *rhs_const;
                         lhs->offset *= *rhs_const;
                         return lhs;
@@ -253,7 +277,7 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
                 }
                 if (auto rhs = match_affine(binary->rhs())) {
                     auto lhs_const = constant_int(binary->lhs());
-                    if (lhs_const) {
+                    if (lhs_const && rhs->offset_value == nullptr) {
                         rhs->scale *= *lhs_const;
                         rhs->offset *= *lhs_const;
                         return rhs;
@@ -298,8 +322,14 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
         return std::nullopt;
     }
 
-    return GEPCandidate{&gep, induction->induction, index_pos, pointer_step,
-                        induction->scale, induction->offset};
+    return GEPCandidate{&gep,
+                        induction->induction,
+                        index_pos,
+                        pointer_step,
+                        induction->scale,
+                        induction->offset,
+                        induction->offset_value,
+                        induction->offset_value_sign};
 }
 
 std::vector<GEPCandidate>
@@ -347,6 +377,13 @@ oir::Value *materialize_start_index(oir::Module &module, oir::BasicBlock *prehea
             value->type(), oir::Instruction::OpID::Mul, value,
             make_int_constant(module, value->type(), candidate.index_scale), preheader,
             "lsr.idx.scale"));
+    }
+    if (candidate.index_offset_value != nullptr) {
+        value = preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
+            value->type(),
+            candidate.index_offset_value_sign < 0 ? oir::Instruction::OpID::Sub
+                                                  : oir::Instruction::OpID::Add,
+            value, candidate.index_offset_value, preheader, "lsr.idx.base"));
     }
     if (candidate.index_offset != 0) {
         value = preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(

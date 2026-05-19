@@ -39,6 +39,7 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::cleanup_cfg(module, stats);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+    changed |= oir_opt::value_range_propagation(module, stats);
     changed |= oir_opt::global_value_numbering(module, stats);
     changed |= oir_opt::eliminate_dead_loads(module, stats);
     changed |= oir_opt::eliminate_dead_stores(module, stats);
@@ -75,10 +76,12 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
     changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
     changed |= eliminate_tail_recursion(module, stats);
+    changed |= lower_dense_return_chains(module, stats);
     changed |= propagate_global_constants(module, stats);
     changed |= inline_functions(module, stats);
     if (changed) {
         changed |= run_sccp(module, stats);
+        changed |= value_range_propagation(module, stats);
         changed |= global_value_numbering(module, stats);
         changed |= eliminate_dead_code(module, stats);
         changed |= cleanup_cfg(module, stats);
@@ -86,6 +89,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     if (inline_functions(module, stats)) {
         changed = true;
         changed |= run_sccp(module, stats);
+        changed |= value_range_propagation(module, stats);
         changed |= global_value_numbering(module, stats);
         changed |= eliminate_dead_code(module, stats);
         changed |= cleanup_cfg(module, stats);
@@ -102,6 +106,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
     changed |= reduce_gep_strength(module, stats);
+    changed |= value_range_propagation(module, stats);
     changed |= eliminate_overwritten_countdown_loops(module, stats);
     changed |= propagate_global_constants(module, stats);
     changed |= promote_global_loads(module, stats);

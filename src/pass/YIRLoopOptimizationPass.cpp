@@ -5,7 +5,11 @@
 #include "../../include/yir/YIRLoopAnalysis.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -31,6 +35,23 @@ std::vector<yir::Value *> map_values(const std::vector<yir::Value *> &values, co
         out.push_back(map_value(value, map));
     }
     return out;
+}
+
+std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const ValueMap &map);
+
+bool clone_region_into(const yir::Region &source, yir::Region &dest, ValueMap map) {
+    for (const auto &op : source.operations()) {
+        auto clone = clone_simple_op(*op, map);
+        if (clone == nullptr) {
+            return false;
+        }
+        clone->set_parent(&dest);
+        if (op->result() != nullptr && clone->result() != nullptr) {
+            map[op->result()] = clone->result();
+        }
+        dest.operations().push_back(std::move(clone));
+    }
+    return true;
 }
 
 std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const ValueMap &map) {
@@ -134,6 +155,19 @@ std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const 
                                                                     : op.result()->type(),
                                              op.result() == nullptr ? "" : op.result()->name());
     }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        auto clone = std::make_unique<yir::IfOp>(map_value(if_op->condition(), map));
+        if (!clone_region_into(if_op->then_region(), clone->then_region(), map)) {
+            return nullptr;
+        }
+        if (if_op->has_else()) {
+            clone->set_has_else(true);
+            if (!clone_region_into(if_op->else_region(), clone->else_region(), map)) {
+                return nullptr;
+            }
+        }
+        return clone;
+    }
     if (auto *ret = dynamic_cast<const yir::ReturnOp *>(&op)) {
         return std::make_unique<yir::ReturnOp>(ret->has_value() ? map_value(ret->value(), map)
                                                                 : nullptr);
@@ -143,13 +177,20 @@ std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const 
 
 bool is_unroll_safe(const yir::Region &region) {
     for (const auto &op : region.operations()) {
-        if (dynamic_cast<const yir::IfOp *>(op.get()) != nullptr ||
-            dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
+        if (dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
             dynamic_cast<const yir::ForOp *>(op.get()) != nullptr ||
             dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
             dynamic_cast<const yir::ContinueOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ReturnOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::CondOp *>(op.get()) != nullptr ||
             dynamic_cast<const yir::ArrayInitOp *>(op.get()) != nullptr) {
             return false;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (!is_unroll_safe(if_op->then_region()) ||
+                (if_op->has_else() && !is_unroll_safe(if_op->else_region()))) {
+                return false;
+            }
         }
         if (clone_simple_op(*op, {}) == nullptr) {
             return false;
@@ -158,10 +199,25 @@ bool is_unroll_safe(const yir::Region &region) {
     return true;
 }
 
+bool region_has_if(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::size_t operation_count(const yir::Region &region) {
     std::size_t count = 0;
     for (const auto &op : region.operations()) {
         ++count;
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            count += operation_count(if_op->then_region());
+            if (if_op->has_else()) {
+                count += operation_count(if_op->else_region());
+            }
+        }
     }
     return count;
 }
@@ -172,6 +228,32 @@ bool const_i32(const yir::Value *value, std::int64_t &out) {
         return false;
     }
     out = constant->value();
+    return true;
+}
+
+bool parse_int64_literal(const std::string &literal, std::int64_t &out) {
+    std::size_t begin = 0;
+    while (begin < literal.size() &&
+           std::isspace(static_cast<unsigned char>(literal[begin])) != 0) {
+        ++begin;
+    }
+    std::size_t end = literal.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(literal[end - 1])) != 0) {
+        --end;
+    }
+    if (begin == end || literal.compare(begin, end - begin, "zero") == 0) {
+        out = 0;
+        return begin != end;
+    }
+
+    std::string trimmed = literal.substr(begin, end - begin);
+    char *parse_end = nullptr;
+    errno = 0;
+    const long long value = std::strtoll(trimmed.c_str(), &parse_end, 0);
+    if (errno != 0 || parse_end == trimmed.c_str() || *parse_end != '\0') {
+        return false;
+    }
+    out = static_cast<std::int64_t>(value);
     return true;
 }
 
@@ -530,6 +612,7 @@ class Optimizer final {
   public:
     bool run(yir::Module &module) {
         changed_ = false;
+        collect_constant_globals(module);
         constexpr unsigned kMaxIterations = 6;
         for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
             iteration_changed_ = false;
@@ -546,6 +629,32 @@ class Optimizer final {
     }
 
   private:
+    void collect_constant_globals(const yir::Module &module) {
+        constant_globals_.clear();
+        for (const auto &global : module.globals()) {
+            if (!global->is_const() || global->storage_type() != yir::Type::get_i32()) {
+                continue;
+            }
+            std::int64_t value = 0;
+            if (parse_int64_literal(global->initializer(), value)) {
+                constant_globals_[global->address()] = value;
+            }
+        }
+    }
+
+    bool const_i32_value(const yir::Value *value, std::int64_t &out) const {
+        if (const_i32(value, out)) {
+            return true;
+        }
+        auto found = constant_globals_.find(value);
+        if (found == constant_globals_.end()) {
+            return false;
+        }
+        out = found->second;
+        return out >= std::numeric_limits<int>::min() &&
+               out <= std::numeric_limits<int>::max();
+    }
+
     void optimize_region(yir::Region &region, const yir::LoopAnalysis &analysis) {
         auto &ops = region.operations();
         for (std::size_t i = 0; i < ops.size(); ++i) {
@@ -675,11 +784,12 @@ class Optimizer final {
         std::int64_t inner_lower = 0;
         std::int64_t inner_upper = 0;
         std::int64_t inner_step = 0;
-        if (!const_i32(outer.lower_bound(), outer_lower) ||
-            !const_i32(outer.upper_bound(), outer_upper) || !const_i32(outer.step(), outer_step) ||
-            !const_i32(inner->lower_bound(), inner_lower) ||
-            !const_i32(inner->upper_bound(), inner_upper) ||
-            !const_i32(inner->step(), inner_step) || outer_step != 1 || inner_step != 1) {
+        if (!const_i32_value(outer.lower_bound(), outer_lower) ||
+            !const_i32_value(outer.upper_bound(), outer_upper) ||
+            !const_i32_value(outer.step(), outer_step) ||
+            !const_i32_value(inner->lower_bound(), inner_lower) ||
+            !const_i32_value(inner->upper_bound(), inner_upper) ||
+            !const_i32_value(inner->step(), inner_step) || outer_step != 1 || inner_step != 1) {
             return false;
         }
 
@@ -799,8 +909,9 @@ class Optimizer final {
         std::int64_t lower = 0;
         std::int64_t upper = 0;
         std::int64_t step = 0;
-        if (!const_i32(outer.lower_bound(), lower) || !const_i32(outer.upper_bound(), upper) ||
-            !const_i32(outer.step(), step) || step != 1) {
+        if (!const_i32_value(outer.lower_bound(), lower) ||
+            !const_i32_value(outer.upper_bound(), upper) ||
+            !const_i32_value(outer.step(), step) || step != 1) {
             return false;
         }
 
@@ -861,8 +972,9 @@ class Optimizer final {
         std::int64_t lower = 0;
         std::int64_t upper = 0;
         std::int64_t step = 0;
-        if (!const_i32(for_op.lower_bound(), lower) || !const_i32(for_op.upper_bound(), upper) ||
-            !const_i32(for_op.step(), step) || step != 1) {
+        if (!const_i32_value(for_op.lower_bound(), lower) ||
+            !const_i32_value(for_op.upper_bound(), upper) ||
+            !const_i32_value(for_op.step(), step) || step != 1) {
             return false;
         }
 
@@ -910,17 +1022,20 @@ class Optimizer final {
         std::int64_t lower = 0;
         std::int64_t upper = 0;
         std::int64_t step = 0;
-        if (!const_i32(for_op.lower_bound(), lower) || !const_i32(for_op.upper_bound(), upper) ||
-            !const_i32(for_op.step(), step) || step <= 0) {
+        if (!const_i32_value(for_op.lower_bound(), lower) ||
+            !const_i32_value(for_op.upper_bound(), upper) ||
+            !const_i32_value(for_op.step(), step) || step <= 0) {
             return false;
         }
         std::int64_t trip_count = upper <= lower ? 0 : (upper - lower + step - 1) / step;
-        if (trip_count < 0 || trip_count > 4 || !is_unroll_safe(for_op.body_region())) {
+        const auto body_ops = static_cast<std::int64_t>(operation_count(for_op.body_region()) + 1);
+        const std::int64_t max_trip_count = body_ops <= 12 ? 16 : 8;
+        if (trip_count < 0 || trip_count > max_trip_count ||
+            !is_unroll_safe(for_op.body_region())) {
             return false;
         }
-        constexpr std::int64_t kMaxUnrolledOps = 48;
-        const std::int64_t unrolled_ops =
-            trip_count * static_cast<std::int64_t>(operation_count(for_op.body_region()) + 1);
+        const std::int64_t kMaxUnrolledOps = region_has_if(for_op.body_region()) ? 768 : 192;
+        const std::int64_t unrolled_ops = trip_count * body_ops;
         if (unrolled_ops > kMaxUnrolledOps) {
             return false;
         }
@@ -948,6 +1063,17 @@ class Optimizer final {
                 clones.push_back(std::move(clone));
             }
         }
+        const auto final_value = static_cast<int>(lower + trip_count * step);
+        auto final_const =
+            std::make_unique<yir::ConstI32Op>(final_value, for_op.induction_var()->name());
+        final_const->set_parent(ops[index]->parent());
+        auto *final_result = final_const->result();
+        clones.push_back(std::move(final_const));
+
+        auto final_assign =
+            std::make_unique<yir::AssignOp>(for_op.induction_var(), final_result);
+        final_assign->set_parent(ops[index]->parent());
+        clones.push_back(std::move(final_assign));
 
         auto insert = ops.begin() + static_cast<std::ptrdiff_t>(index);
         insert = ops.erase(insert);
@@ -965,6 +1091,7 @@ class Optimizer final {
 
     bool changed_ = false;
     bool iteration_changed_ = false;
+    std::unordered_map<const yir::Value *, std::int64_t> constant_globals_;
 };
 
 } // namespace

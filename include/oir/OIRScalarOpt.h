@@ -61,6 +61,8 @@ bool is_pure_instruction(const oir::Instruction &inst);
 unsigned apply_replacements(oir::Module &module, const ReplacementMap &replacements);
 
 bool local_simplify(oir::Module &module, Stats &stats, SimplifyMode mode);
+bool value_range_propagation(oir::Module &module, Stats &stats);
+bool lower_dense_return_chains(oir::Module &module, Stats &stats);
 bool simplify_branches(oir::Module &module, Stats &stats);
 bool run_sccp(oir::Module &module, Stats &stats);
 bool eliminate_dead_code(oir::Module &module, Stats &stats);
