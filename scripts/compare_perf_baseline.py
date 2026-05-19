@@ -266,7 +266,6 @@ def main() -> int:
         f"- Current compiler total: {current_total:.4f}s",
         f"- Baseline compiler total: {baseline_total:.4f}s",
         f"- Overall speedup vs baseline: {format_speedup(total_speedup)}",
-        f"- Per-case speedup geomean: {format_speedup(case_speedup_geomean)}",
         f"- Win/loss/tie: 🚀 {case_wins} faster / ⚠️ {case_losses} slower / ✅ {case_ties} tied",
         f"- Delta: {format_signed_sec(total_delta_sec)} ({format_signed_pct(total_delta_pct)})",
         "",

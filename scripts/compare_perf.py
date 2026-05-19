@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import os
 import json
+import math
 import re
 import subprocess
 import sys
@@ -539,11 +542,57 @@ def _truncate_text(text: str, limit: int) -> str:
     return text[:limit] + f"\n... <truncated, {len(text) - limit} chars omitted> ..."
 
 
+def _parse_time_cell(value: object) -> Optional[float]:
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)s", str(value).strip())
+    return float(match.group(1)) if match else None
+
+
+def _geomean(values: list[float]) -> Optional[float]:
+    positive_values = [value for value in values if value > 0.0]
+    if not positive_values:
+        return None
+    return math.exp(sum(math.log(value) for value in positive_values) / len(positive_values))
+
+
+def _format_ratio(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"{value:.2f}x"
+
+
+def _compiler_vs_o3_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
+    gcc_ratios: list[float] = []
+    clang_ratios: list[float] = []
+    gcc_faster_cases = 0
+    clang_faster_cases = 0
+
+    for row in rows:
+        compiler = _parse_time_cell(row.get("compiler"))
+        gcc = _parse_time_cell(row.get("gcc"))
+        clang = _parse_time_cell(row.get("clang"))
+        if compiler is None:
+            continue
+        if gcc is not None and gcc > 0.0:
+            gcc_ratios.append(compiler / gcc)
+            if compiler < gcc:
+                gcc_faster_cases += 1
+        if clang is not None and clang > 0.0:
+            clang_ratios.append(compiler / clang)
+            if compiler < clang:
+                clang_faster_cases += 1
+
+    return {
+        "gcc_o3_geomean": _geomean(gcc_ratios),
+        "clang_o3_geomean": _geomean(clang_ratios),
+        "gcc_o3_faster_cases": gcc_faster_cases,
+        "clang_o3_faster_cases": clang_faster_cases,
+    }
+
+
 def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     status = "PASS" if failures == 0 else "FAIL"
     generated = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    o3_stats = _compiler_vs_o3_stats(rows)
 
     md_lines = [
         "# 📊 RISC-V QEMU Perf Report",
@@ -554,6 +603,9 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         f"- Failed: {failures}",
         "- Compiler opt: `-O1`",
         f"- Total runtime (s): {total_runtime:.4f}",
+        f"- 🧮 Per-case geomean vs GCC O3: {_format_ratio(o3_stats['gcc_o3_geomean'])}",
+        f"- 🧮 Per-case geomean vs Clang++ O3: {_format_ratio(o3_stats['clang_o3_geomean'])}",
+        f"- 🏁 Faster cases: GCC O3 {o3_stats['gcc_o3_faster_cases']} / Clang++ O3 {o3_stats['clang_o3_faster_cases']}",
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
         "",
@@ -596,6 +648,10 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         "cases": len(rows),
         "failures": failures,
         "total_runtime_sec": total_runtime,
+        "gcc_o3_geomean": o3_stats["gcc_o3_geomean"],
+        "clang_o3_geomean": o3_stats["clang_o3_geomean"],
+        "gcc_o3_faster_cases": o3_stats["gcc_o3_faster_cases"],
+        "clang_o3_faster_cases": o3_stats["clang_o3_faster_cases"],
         "rows": rows,
     }
     REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
