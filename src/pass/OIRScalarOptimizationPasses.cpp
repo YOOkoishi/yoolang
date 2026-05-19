@@ -46,6 +46,7 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::reduce_gep_strength(module, stats);
     changed |= oir_opt::unswitch_loops(module, stats);
     changed |= oir_opt::rotate_loops(module, stats);
+    changed |= oir_opt::eliminate_overwritten_countdown_loops(module, stats);
     changed |= oir_opt::reduce_gep_strength(module, stats);
     changed |= oir_opt::global_value_numbering(module, stats);
     changed |= oir_opt::eliminate_dead_loads(module, stats);
@@ -82,6 +83,13 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
         changed |= eliminate_dead_code(module, stats);
         changed |= cleanup_cfg(module, stats);
     }
+    if (inline_functions(module, stats)) {
+        changed = true;
+        changed |= run_sccp(module, stats);
+        changed |= global_value_numbering(module, stats);
+        changed |= eliminate_dead_code(module, stats);
+        changed |= cleanup_cfg(module, stats);
+    }
 
     constexpr unsigned kMaxIterations = 8;
     for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
@@ -94,6 +102,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
     changed |= reduce_gep_strength(module, stats);
+    changed |= eliminate_overwritten_countdown_loops(module, stats);
     changed |= propagate_global_constants(module, stats);
     changed |= promote_global_loads(module, stats);
     changed |= scalar_replacement_of_aggregates(module, stats);

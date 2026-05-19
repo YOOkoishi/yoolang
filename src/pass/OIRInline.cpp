@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pass::oir_opt {
@@ -70,23 +71,27 @@ bool contains_call_to(const oir::Function &function, const oir::Function &target
     return false;
 }
 
-bool name_starts_with(const std::string &value, const std::string &prefix) {
-    return value.size() >= prefix.size() &&
-           std::equal(prefix.begin(), prefix.end(), value.begin());
+void append_reachable_blocks(oir::BasicBlock *block, std::unordered_set<oir::BasicBlock *> &seen,
+                             std::vector<oir::BasicBlock *> &out) {
+    if (block == nullptr || !seen.insert(block).second) {
+        return;
+    }
+    out.push_back(block);
+    for (auto *succ : block->successors()) {
+        append_reachable_blocks(succ, seen, out);
+    }
 }
 
-bool contains_inlined_code(const oir::Function &function) {
+std::vector<oir::BasicBlock *> clone_order(const oir::Function &function) {
+    std::vector<oir::BasicBlock *> out;
+    std::unordered_set<oir::BasicBlock *> seen;
+    append_reachable_blocks(function.entry_block(), seen, out);
     for (const auto &block : function.blocks()) {
-        if (name_starts_with(block->name(), "inl.")) {
-            return true;
-        }
-        for (const auto &inst : block->instructions()) {
-            if (name_starts_with(inst->name(), "inl.")) {
-                return true;
-            }
+        if (seen.insert(block.get()).second) {
+            out.push_back(block.get());
         }
     }
-    return false;
+    return out;
 }
 
 bool is_eligible_call(const oir::Function &caller, const oir::CallInst &call,
@@ -102,9 +107,6 @@ bool is_eligible_call(const oir::Function &caller, const oir::CallInst &call,
         return false;
     }
     if (contains_call_to(*callee, *callee) || contains_call_to(*callee, caller)) {
-        return false;
-    }
-    if (contains_inlined_code(*callee)) {
         return false;
     }
 
@@ -268,8 +270,9 @@ void clone_callee_into_caller(oir::Module &module, oir::Function &caller, oir::F
         values[callee.args()[i].get()] = args[i];
     }
 
-    for (const auto &block : callee.blocks()) {
-        auto *out_block = blocks.at(block.get());
+    auto ordered_blocks = clone_order(callee);
+    for (auto *block : ordered_blocks) {
+        auto *out_block = blocks.at(block);
         for (const auto &inst : block->instructions()) {
             auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
             if (phi == nullptr) {
@@ -282,8 +285,8 @@ void clone_callee_into_caller(oir::Module &module, oir::Function &caller, oir::F
         }
     }
 
-    for (const auto &block : callee.blocks()) {
-        auto *out_block = blocks.at(block.get());
+    for (auto *block : ordered_blocks) {
+        auto *out_block = blocks.at(block);
         for (const auto &inst_ptr : block->instructions()) {
             auto *inst = inst_ptr.get();
             if (inst->op() == oir::Instruction::OpID::Phi) {
@@ -318,8 +321,8 @@ void clone_callee_into_caller(oir::Module &module, oir::Function &caller, oir::F
         }
     }
 
-    for (const auto &block : callee.blocks()) {
-        auto *out_block = blocks.at(block.get());
+    for (auto *block : ordered_blocks) {
+        auto *out_block = blocks.at(block);
         auto out_it = out_block->instructions().begin();
         for (const auto &inst : block->instructions()) {
             auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());

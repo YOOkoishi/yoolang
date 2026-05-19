@@ -1,4 +1,5 @@
 #include "../../include/oir/OIRCFGUtils.h"
+#include "../../include/oir/OIRAnalysis.h"
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include <algorithm>
@@ -10,24 +11,36 @@
 namespace pass::oir_opt {
 namespace {
 
-bool is_live_root(const oir::Instruction &inst) {
+bool is_live_root(const oir::Instruction &inst, const oir::FunctionModRefAnalysis &modref) {
+    if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
+        return modref.call_has_side_effect(*call);
+    }
+
     switch (inst.op()) {
     case oir::Instruction::OpID::Ret:
     case oir::Instruction::OpID::Br:
     case oir::Instruction::OpID::Store:
-    case oir::Instruction::OpID::Call:
         return true;
     default:
         return false;
     }
 }
 
-bool run_adce_on_function(oir::Function &function, Stats &stats) {
+bool is_removable_instruction(const oir::Instruction &inst,
+                              const oir::FunctionModRefAnalysis &modref) {
+    if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
+        return !modref.call_has_side_effect(*call);
+    }
+    return is_pure_instruction(inst);
+}
+
+bool run_adce_on_function(oir::Function &function, const oir::FunctionModRefAnalysis &modref,
+                          Stats &stats) {
     std::unordered_set<oir::Instruction *> live;
     std::deque<oir::Instruction *> worklist;
     for (auto &block : function.blocks()) {
         for (auto &inst : block->instructions()) {
-            if (is_live_root(*inst)) {
+            if (is_live_root(*inst, modref)) {
                 live.insert(inst.get());
                 worklist.push_back(inst.get());
             }
@@ -48,7 +61,7 @@ bool run_adce_on_function(oir::Function &function, Stats &stats) {
     std::vector<oir::Instruction *> dead;
     for (auto &block : function.blocks()) {
         for (auto &inst : block->instructions()) {
-            if (live.find(inst.get()) == live.end() && is_pure_instruction(*inst)) {
+            if (live.find(inst.get()) == live.end() && is_removable_instruction(*inst, modref)) {
                 dead.push_back(inst.get());
             }
         }
@@ -151,9 +164,10 @@ bool jump_thread_function(oir::Function &function, Stats &stats) {
 
 bool aggressive_dead_code_elimination(oir::Module &module, Stats &stats) {
     bool changed = false;
+    oir::FunctionModRefAnalysis modref(module);
     for (auto &function : module.functions()) {
         if (!function->is_external()) {
-            changed |= run_adce_on_function(*function, stats);
+            changed |= run_adce_on_function(*function, modref, stats);
         }
     }
     return changed;

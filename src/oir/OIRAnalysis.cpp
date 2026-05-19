@@ -1446,4 +1446,12 @@ bool FunctionModRefAnalysis::call_has_side_effect(const CallInst &call) const {
     return info.has_side_effect || info.may_write_memory();
 }
 
+bool FunctionModRefAnalysis::call_may_read_memory(const CallInst &call) const {
+    return call_summary(call).may_read_memory();
+}
+
+bool FunctionModRefAnalysis::call_may_write_memory(const CallInst &call) const {
+    return call_summary(call).may_write_memory();
+}
+
 } // namespace oir

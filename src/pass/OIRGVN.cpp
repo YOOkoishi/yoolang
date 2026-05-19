@@ -3,6 +3,7 @@
 #include "../../include/oir/OIRAnalysis.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -86,7 +87,14 @@ bool is_gvn_candidate(const oir::Instruction &inst) {
     return false;
 }
 
-std::string expression_key(const ReplacementMap &replacements, oir::Instruction &inst) {
+bool is_call_gvn_candidate(const oir::CallInst &call,
+                           const oir::FunctionModRefAnalysis &modref) {
+    return call.type() != nullptr && !call.type()->is_void() && !modref.call_has_side_effect(call);
+}
+
+std::string expression_key(const ReplacementMap &replacements, oir::Instruction &inst,
+                           std::uint64_t memory_epoch = 0,
+                           bool include_memory_epoch = false) {
     std::ostringstream key;
     key << static_cast<int>(inst.op()) << ":" << ptr_key(inst.type()) << ":";
 
@@ -120,6 +128,17 @@ std::string expression_key(const ReplacementMap &replacements, oir::Instruction 
         key << value_key(replacements, gep->base_ptr());
         for (auto *index : gep->indices()) {
             key << ":" << value_key(replacements, index);
+        }
+        return key.str();
+    }
+
+    if (auto *call = dynamic_cast<oir::CallInst *>(&inst)) {
+        key << value_key(replacements, call->callee());
+        for (auto *arg : call->args()) {
+            key << ":" << value_key(replacements, arg);
+        }
+        if (include_memory_epoch) {
+            key << ":mem" << memory_epoch;
         }
         return key.str();
     }
@@ -218,7 +237,7 @@ void rewrite_operands(oir::Instruction &inst, const ReplacementMap &replacements
 void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *block,
                   ScopedValueTable &table, MemoryTable memory, ReplacementMap &replacements,
                   const oir::OIRAliasAnalysis &alias_analysis,
-                  const oir::FunctionModRefAnalysis &modref) {
+                  const oir::FunctionModRefAnalysis &modref, std::uint64_t memory_epoch) {
     auto mark = table.mark();
     for (auto &inst_ptr : const_cast<oir::BasicBlock *>(block)->instructions()) {
         auto *inst = inst_ptr.get();
@@ -237,11 +256,31 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
         if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
             invalidate_aliasing_memory(memory, store->ptr(), alias_analysis);
             memory.push_back({value_key(replacements, store->ptr()), store->ptr(), store->value()});
+            ++memory_epoch;
             continue;
         }
 
         if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
             invalidate_call_clobbered_memory(memory, *call, alias_analysis, modref);
+            if (modref.call_may_write_memory(*call) || modref.call_has_side_effect(*call)) {
+                ++memory_epoch;
+            }
+            if (!is_call_gvn_candidate(*call, modref)) {
+                continue;
+            }
+
+            auto key = expression_key(replacements, *inst, memory_epoch,
+                                      modref.call_may_read_memory(*call));
+            if (key.empty()) {
+                continue;
+            }
+            auto *leader = table.find(key);
+            if (leader != nullptr && leader->type() == inst->type()) {
+                replacements[inst] = leader;
+                continue;
+            }
+            table.push(key, inst);
+            continue;
         }
 
         if (!is_gvn_candidate(*inst) || inst->type() == nullptr || inst->type()->is_void()) {
@@ -263,10 +302,13 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
 
     for (auto *child : dom_tree.children(block)) {
         MemoryTable child_memory;
+        std::uint64_t child_memory_epoch = memory_epoch + 1;
         if (child->predecessors().size() == 1 && child->predecessors().front() == block) {
             child_memory = memory;
+            child_memory_epoch = memory_epoch;
         }
-        number_block(dom_tree, child, table, child_memory, replacements, alias_analysis, modref);
+        number_block(dom_tree, child, table, child_memory, replacements, alias_analysis, modref,
+                     child_memory_epoch);
     }
     table.pop_to(mark);
 }
@@ -290,6 +332,7 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
         for (auto &block : function.blocks()) {
             ScopedValueTable table;
             MemoryTable memory;
+            std::uint64_t memory_epoch = 0;
             for (auto &inst_ptr : block->instructions()) {
                 auto *inst = inst_ptr.get();
                 rewrite_operands(*inst, replacements);
@@ -308,11 +351,31 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
                     invalidate_aliasing_memory(memory, store->ptr(), alias_analysis);
                     memory.push_back(
                         {value_key(replacements, store->ptr()), store->ptr(), store->value()});
+                    ++memory_epoch;
                     continue;
                 }
 
                 if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
                     invalidate_call_clobbered_memory(memory, *call, alias_analysis, modref);
+                    if (modref.call_may_write_memory(*call) || modref.call_has_side_effect(*call)) {
+                        ++memory_epoch;
+                    }
+                    if (!is_call_gvn_candidate(*call, modref)) {
+                        continue;
+                    }
+
+                    auto key = expression_key(replacements, *inst, memory_epoch,
+                                              modref.call_may_read_memory(*call));
+                    if (key.empty()) {
+                        continue;
+                    }
+                    auto *leader = table.find(key);
+                    if (leader != nullptr && leader->type() == inst->type()) {
+                        replacements[inst] = leader;
+                        continue;
+                    }
+                    table.push(key, inst);
+                    continue;
                 }
 
                 if (!is_gvn_candidate(*inst) || inst->type() == nullptr ||
@@ -346,7 +409,7 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
     oir::OIRAliasAnalysis alias_analysis;
     oir::FunctionModRefAnalysis modref(module);
     number_block(dom_tree, function.entry_block(), table, memory, replacements, alias_analysis,
-                 modref);
+                 modref, 0);
     if (apply_replacements(module, replacements) == 0) {
         return false;
     }

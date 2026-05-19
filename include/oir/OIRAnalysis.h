@@ -202,6 +202,8 @@ class FunctionModRefAnalysis final {
     bool call_may_read(const CallInst &call, const Value *ptr,
                        const OIRAliasAnalysis &alias_analysis) const;
     bool call_has_side_effect(const CallInst &call) const;
+    bool call_may_read_memory(const CallInst &call) const;
+    bool call_may_write_memory(const CallInst &call) const;
 
   private:
     FunctionMemorySummary external_summary(const Function &function) const;

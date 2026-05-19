@@ -48,8 +48,7 @@ void AsmPrinter::print_global_sections(const Module &module) {
 
     for (const auto &global : module.globals()) {
         const Section target_section =
-            (global.initializer == "zero" || global.initializer.empty()) ? Section::Bss
-                                                                         : Section::Data;
+            is_zero_initializer(global) ? Section::Bss : Section::Data;
         if (target_section != current_section) {
             if (target_section == Section::Bss) {
                 out_ << "\t.bss\n";
@@ -68,19 +67,13 @@ void AsmPrinter::print_global(const Global &global) {
     out_ << "\t.type " << symbol_name(global.name) << ", @object\n";
     out_ << "\t.size " << symbol_name(global.name) << ", " << global.type.size << "\n";
     out_ << symbol_name(global.name) << ":\n";
-    if (global.initializer == "zero" || global.initializer.empty()) {
+    if (is_zero_initializer(global)) {
         out_ << "\t.zero " << global.type.size << "\n";
         return;
     }
 
     auto words = initializer_words(global);
-    for (std::uint32_t word : words) {
-        out_ << "\t.word " << word << "\n";
-    }
-    std::uint64_t emitted = words.size() * 4ULL;
-    if (emitted < global.type.size) {
-        out_ << "\t.zero " << (global.type.size - emitted) << "\n";
-    }
+    print_initializer_words(global, words);
 }
 
 void AsmPrinter::print_function(const MachineFunction &function) {
@@ -500,6 +493,47 @@ std::string AsmPrinter::label_for(const std::string &function, const std::string
 
 std::string AsmPrinter::symbol_name(const std::string &name) const {
     return name;
+}
+
+bool AsmPrinter::is_zero_initializer(const Global &global) const {
+    if (global.initializer == "zero" || global.initializer.empty()) {
+        return true;
+    }
+
+    auto words = initializer_words(global);
+    for (std::uint32_t word : words) {
+        if (word != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void AsmPrinter::print_initializer_words(const Global &global,
+                                         const std::vector<std::uint32_t> &words) const {
+    std::uint64_t emitted = 0;
+    std::size_t index = 0;
+    while (index < words.size()) {
+        if (words[index] == 0) {
+            std::size_t end = index + 1;
+            while (end < words.size() && words[end] == 0) {
+                ++end;
+            }
+            std::uint64_t bytes = (end - index) * 4ULL;
+            out_ << "\t.zero " << bytes << "\n";
+            emitted += bytes;
+            index = end;
+            continue;
+        }
+
+        out_ << "\t.word " << words[index] << "\n";
+        emitted += 4;
+        ++index;
+    }
+
+    if (emitted < global.type.size) {
+        out_ << "\t.zero " << (global.type.size - emitted) << "\n";
+    }
 }
 
 std::vector<std::uint32_t> AsmPrinter::initializer_words(const Global &global) const {

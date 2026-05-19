@@ -47,6 +47,9 @@ class AsmPrinter final {
     bool fits_simm12(std::int64_t value) const;
     std::string label_for(const std::string &function, const std::string &block) const;
     std::string symbol_name(const std::string &name) const;
+    bool is_zero_initializer(const Global &global) const;
+    void print_initializer_words(const Global &global,
+                                 const std::vector<std::uint32_t> &words) const;
     std::vector<std::uint32_t> initializer_words(const Global &global) const;
 
     std::ostream &out_;

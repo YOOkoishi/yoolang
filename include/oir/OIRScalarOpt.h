@@ -73,6 +73,7 @@ bool eliminate_dead_loads(oir::Module &module, Stats &stats);
 bool loop_invariant_code_motion(oir::Module &module, Stats &stats);
 bool rotate_loops(oir::Module &module, Stats &stats);
 bool unswitch_loops(oir::Module &module, Stats &stats);
+bool eliminate_overwritten_countdown_loops(oir::Module &module, Stats &stats);
 bool global_value_numbering(oir::Module &module, Stats &stats);
 bool aggressive_dead_code_elimination(oir::Module &module, Stats &stats);
 bool jump_threading(oir::Module &module, Stats &stats);

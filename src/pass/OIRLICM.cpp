@@ -196,6 +196,19 @@ bool instruction_is_invariant(const oir::Loop &loop, const oir::Instruction &ins
                               const std::unordered_set<oir::Instruction *> &moving,
                               const oir::OIRAliasAnalysis &alias_analysis,
                               const oir::FunctionModRefAnalysis &modref) {
+    if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
+        if (modref.call_has_side_effect(*call) || modref.call_may_read_memory(*call) ||
+            call->type()->is_void()) {
+            return false;
+        }
+        for (auto *operand : call->operands()) {
+            if (!operand_is_invariant(loop, operand, moving)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     if (!is_licm_candidate(inst)) {
         return false;
     }
