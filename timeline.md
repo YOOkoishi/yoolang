@@ -61,12 +61,36 @@ summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 
 # May 9
 
-重构了main函数中的pipeline,添加了 OIR 层面的 DCE GVN LICM 等优化。 但是目前效果不是很好。
+重构了main函数中的pipeline,添加了 OIR 层面的 AA DCE GVN LICM 等优化。 但是目前效果不是很好。
 
 # May 10
 
-添加了保守的inline,效果还行，但是在板子上不行，可能需要 memory_ssa 形式好一些。
+添加了保守的inline,效果还行，但是在板子上不行。
 
 # May 11
 
 增强了后端的窥孔和图着色，修改了一些问题，加速了蛮多。
+
+# May 12
+
+添加了 yir 的 Analysis 。
+
+# May 14
+
+添加了 oir 上的 SCEV ， loop unrolling ， SCCP 。
+
+# May 16
+
+添加了 oir 上的常态化 use_list 现在可以更好的被 DCE LICM GVN 等优化利用
+
+# May 17
+
+添加了对 x/2^k 等类型的优化，现在可以被识别，最后形成位运算的形式加速。
+
+# May 18
+
+添加了 MIR 上的指令选择 PASS
+
+# May 19
+
+增强了 inline 目前进度 0.94x Clang o3
