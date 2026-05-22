@@ -17,6 +17,16 @@ struct MemoryEntry {
     bool is_load = false;
 };
 
+bool is_large_function(const oir::Function &function) {
+    std::size_t block_count = 0;
+    std::size_t instruction_count = 0;
+    for (const auto &block : function.blocks()) {
+        ++block_count;
+        instruction_count += block->instructions().size();
+    }
+    return block_count > 1000 || instruction_count > 8000;
+}
+
 bool erase_instructions(oir::Function &function,
                         const std::unordered_set<oir::Instruction *> &dead) {
     if (dead.empty()) {
@@ -198,6 +208,31 @@ void dse_dom_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *bl
     }
 }
 
+void collect_memory_ssa_load_forwards(oir::Function &function, const oir::MemorySSA &memory_ssa,
+                                      const oir::OIRAliasAnalysis &aa,
+                                      ReplacementMap &replacements) {
+    for (auto &block : function.blocks()) {
+        for (auto &inst_ptr : block->instructions()) {
+            auto *load = dynamic_cast<oir::LoadInst *>(inst_ptr.get());
+            if (load == nullptr || replacements.find(load) != replacements.end()) {
+                continue;
+            }
+
+            auto *clobber = memory_ssa.clobbering_access(*load);
+            if (clobber == nullptr) {
+                continue;
+            }
+            auto *store = dynamic_cast<oir::StoreInst *>(clobber->instruction());
+            if (store == nullptr ||
+                aa.alias(load->ptr(), store->ptr()) != oir::AliasResult::MustAlias ||
+                store->value()->type() != load->type()) {
+                continue;
+            }
+            replacements[load] = store->value();
+        }
+    }
+}
+
 } // namespace
 
 bool eliminate_dead_stores(oir::Module &module, Stats &stats) {
@@ -238,6 +273,11 @@ bool eliminate_dead_loads(oir::Module &module, Stats &stats) {
         if (function->is_external() || function->entry_block() == nullptr) {
             continue;
         }
+        if (!is_large_function(*function)) {
+            oir::MemorySSA memory_ssa(*function, aa, modref);
+            collect_memory_ssa_load_forwards(*function, memory_ssa, aa, replacements);
+        }
+
         oir::DominatorTree dom_tree(*function);
         dle_dom_block(dom_tree, function->entry_block(), aa, {}, modref, replacements);
         for (auto &block : function->blocks()) {

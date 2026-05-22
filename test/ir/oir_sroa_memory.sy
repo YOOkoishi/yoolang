@@ -34,6 +34,16 @@ int cross_block_forward(int x) {
   return x;
 }
 
+int branch_noalias_forward(int x, int c) {
+  g[0] = x;
+  if (c != 0) {
+    g[1] = 1;
+  } else {
+    g[1] = 2;
+  }
+  return g[0];
+}
+
 int dynamic_skip(int i, int x) {
   int a[4];
   a[i] = x;
@@ -64,7 +74,7 @@ int nested_sroa(int x) {
 int main() {
   return sroa_const_indices(4) + zero_init_sroa() + overwrite_same(1, 2) +
          noalias_forward(3, 4) + cross_block_forward(8) + dynamic_skip(1, 5) +
-         call_escape(6) + nested_sroa(7);
+         branch_noalias_forward(9, 1) + call_escape(6) + nested_sroa(7);
 }
 
 // OIR-LABEL: define i32 @sroa_const_indices
@@ -91,6 +101,11 @@ int main() {
 // OIR: ret i32 %x.arg
 
 // OIR-LABEL: define i32 @cross_block_forward
+// OIR: store i32 %x.arg
+// OIR-NOT: load i32
+// OIR: ret i32 %x.arg
+
+// OIR-LABEL: define i32 @branch_noalias_forward
 // OIR: store i32 %x.arg
 // OIR-NOT: load i32
 // OIR: ret i32 %x.arg

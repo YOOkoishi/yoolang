@@ -215,4 +215,88 @@ class FunctionModRefAnalysis final {
     std::unordered_map<const Function *, FunctionMemorySummary> summaries_;
 };
 
+enum class MemoryAccessKind {
+    LiveOnEntry,
+    Use,
+    Def,
+    Phi,
+};
+
+class MemoryAccess final {
+  public:
+    MemoryAccessKind kind() const;
+    unsigned id() const;
+    Instruction *instruction() const;
+    BasicBlock *block() const;
+    MemoryAccess *defining_access() const;
+    const std::vector<std::pair<BasicBlock *, MemoryAccess *>> &incoming() const;
+
+    bool is_live_on_entry() const;
+    bool is_use() const;
+    bool is_def() const;
+    bool is_phi() const;
+
+  private:
+    MemoryAccess(unsigned id, MemoryAccessKind kind, BasicBlock *block,
+                 Instruction *instruction = nullptr);
+
+    void set_defining_access(MemoryAccess *access);
+    void clear_incoming();
+    void add_incoming(BasicBlock *block, MemoryAccess *access);
+
+    unsigned id_ = 0;
+    MemoryAccessKind kind_ = MemoryAccessKind::LiveOnEntry;
+    BasicBlock *block_ = nullptr;
+    Instruction *instruction_ = nullptr;
+    MemoryAccess *defining_access_ = nullptr;
+    std::vector<std::pair<BasicBlock *, MemoryAccess *>> incoming_;
+
+    friend class MemorySSA;
+};
+
+class MemorySSA final {
+  public:
+    MemorySSA(Function &function, const OIRAliasAnalysis &alias_analysis,
+              const FunctionModRefAnalysis &modref);
+
+    MemoryAccess *live_on_entry() const;
+    MemoryAccess *access_for(const Instruction *instruction) const;
+    MemoryAccess *memory_phi(const BasicBlock *block) const;
+    const std::vector<std::unique_ptr<MemoryAccess>> &accesses() const;
+
+    MemoryAccess *clobbering_access(const LoadInst &load) const;
+    MemoryAccess *clobbering_access(const StoreInst &store) const;
+    MemoryAccess *clobbering_access(const CallInst &call) const;
+
+  private:
+    void build();
+    std::vector<BasicBlock *> reachable_reverse_postorder() const;
+    MemoryAccess *create_access(MemoryAccessKind kind, BasicBlock *block,
+                                Instruction *instruction = nullptr);
+    MemoryAccess *entry_access_for(BasicBlock *block,
+                                   const std::unordered_set<BasicBlock *> &reachable) const;
+    void scan_block(BasicBlock *block, MemoryAccess *start_access);
+    void populate_phi_incomings(const std::unordered_set<BasicBlock *> &reachable);
+
+    MemoryAccess *find_pointer_clobber(MemoryAccess *access, const Value *ptr,
+                                       std::unordered_set<const MemoryAccess *> &active,
+                                       std::unordered_map<const MemoryAccess *, MemoryAccess *>
+                                           &memo) const;
+    MemoryAccess *find_call_read_clobber(MemoryAccess *access, const CallInst &call,
+                                         std::unordered_set<const MemoryAccess *> &active,
+                                         std::unordered_map<const MemoryAccess *, MemoryAccess *>
+                                             &memo) const;
+    bool access_clobbers_pointer(const MemoryAccess &access, const Value *ptr) const;
+    bool access_clobbers_call_read(const MemoryAccess &access, const CallInst &call) const;
+
+    Function *function_ = nullptr;
+    const OIRAliasAnalysis *alias_analysis_ = nullptr;
+    const FunctionModRefAnalysis *modref_ = nullptr;
+    std::vector<std::unique_ptr<MemoryAccess>> accesses_;
+    MemoryAccess *live_on_entry_ = nullptr;
+    std::unordered_map<const Instruction *, MemoryAccess *> access_for_inst_;
+    std::unordered_map<const BasicBlock *, MemoryAccess *> phi_for_block_;
+    std::unordered_map<const BasicBlock *, MemoryAccess *> block_end_access_;
+};
+
 } // namespace oir

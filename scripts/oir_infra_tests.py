@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SOURCE = r"""
 #include "oir/OIR.h"
+#include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
 
 #include <exception>
@@ -228,6 +229,69 @@ void test_verifier_catches_stale_constant_use_list() {
     require_verify_fails(module, "stale use-list");
 }
 
+void test_memory_ssa_skips_noalias_defs() {
+    oir::Module module("memory_ssa_noalias");
+    auto *g = module.create_global("g", module.types().int32_ty(), false);
+    auto *h = module.create_global("h", module.types().int32_ty(), false);
+    auto *function = create_function(module, "f", module.types().int32_ty());
+    auto *entry = function->create_block("entry");
+
+    oir::IRBuilder builder(&module);
+    builder.set_insert_point(entry);
+    auto *store_g = builder.create_store(builder.i32(1), g);
+    auto *store_h = builder.create_store(builder.i32(2), h);
+    auto *load_g = builder.create_load(g, module.types().int32_ty(), "lg");
+    builder.create_ret(load_g);
+
+    require_verify(module);
+
+    oir::OIRAliasAnalysis aa;
+    oir::FunctionModRefAnalysis modref(module);
+    oir::MemorySSA memory_ssa(*function, aa, modref);
+
+    auto *clobber = memory_ssa.clobbering_access(*load_g);
+    REQUIRE(clobber != nullptr);
+    REQUIRE(clobber->instruction() == store_g);
+    REQUIRE(memory_ssa.access_for(store_h) != nullptr);
+    REQUIRE(memory_ssa.access_for(store_h)->is_def());
+}
+
+void test_memory_ssa_uses_phi_at_cfg_join() {
+    oir::Module module("memory_ssa_phi");
+    auto *g = module.create_global("g", module.types().int32_ty(), false);
+    auto *function =
+        create_function(module, "f", module.types().int32_ty(), {module.types().int1_ty()});
+    auto *cond = function->add_argument(module.types().int1_ty(), "cond");
+    auto *entry = function->create_block("entry");
+    auto *then_block = function->create_block("then");
+    auto *else_block = function->create_block("else");
+    auto *merge_block = function->create_block("merge");
+
+    oir::IRBuilder builder(&module);
+    builder.set_insert_point(entry);
+    builder.create_cond_br(cond, then_block, else_block);
+    builder.set_insert_point(then_block);
+    builder.create_store(builder.i32(1), g);
+    builder.create_br(merge_block);
+    builder.set_insert_point(else_block);
+    builder.create_br(merge_block);
+    builder.set_insert_point(merge_block);
+    auto *load_g = builder.create_load(g, module.types().int32_ty(), "lg");
+    builder.create_ret(load_g);
+
+    require_verify(module);
+
+    oir::OIRAliasAnalysis aa;
+    oir::FunctionModRefAnalysis modref(module);
+    oir::MemorySSA memory_ssa(*function, aa, modref);
+
+    auto *phi = memory_ssa.memory_phi(merge_block);
+    REQUIRE(phi != nullptr);
+    REQUIRE(phi->is_phi());
+    REQUIRE(phi->incoming().size() == 2);
+    REQUIRE(memory_ssa.clobbering_access(*load_g) == phi);
+}
+
 } // namespace
 
 int main() {
@@ -240,6 +304,8 @@ int main() {
          test_erasing_block_drops_instruction_operand_uses},
         {"verifier_catches_stale_constant_use_list",
          test_verifier_catches_stale_constant_use_list},
+        {"memory_ssa_skips_noalias_defs", test_memory_ssa_skips_noalias_defs},
+        {"memory_ssa_uses_phi_at_cfg_join", test_memory_ssa_uses_phi_at_cfg_join},
     };
 
     for (const auto &[name, test] : tests) {

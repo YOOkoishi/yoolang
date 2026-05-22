@@ -1454,4 +1454,413 @@ bool FunctionModRefAnalysis::call_may_write_memory(const CallInst &call) const {
     return call_summary(call).may_write_memory();
 }
 
+MemoryAccess::MemoryAccess(unsigned id, MemoryAccessKind kind, BasicBlock *block,
+                           Instruction *instruction)
+    : id_(id), kind_(kind), block_(block), instruction_(instruction) {
+}
+
+MemoryAccessKind MemoryAccess::kind() const {
+    return kind_;
+}
+
+unsigned MemoryAccess::id() const {
+    return id_;
+}
+
+Instruction *MemoryAccess::instruction() const {
+    return instruction_;
+}
+
+BasicBlock *MemoryAccess::block() const {
+    return block_;
+}
+
+MemoryAccess *MemoryAccess::defining_access() const {
+    return defining_access_;
+}
+
+const std::vector<std::pair<BasicBlock *, MemoryAccess *>> &MemoryAccess::incoming() const {
+    return incoming_;
+}
+
+bool MemoryAccess::is_live_on_entry() const {
+    return kind_ == MemoryAccessKind::LiveOnEntry;
+}
+
+bool MemoryAccess::is_use() const {
+    return kind_ == MemoryAccessKind::Use;
+}
+
+bool MemoryAccess::is_def() const {
+    return kind_ == MemoryAccessKind::Def;
+}
+
+bool MemoryAccess::is_phi() const {
+    return kind_ == MemoryAccessKind::Phi;
+}
+
+void MemoryAccess::set_defining_access(MemoryAccess *access) {
+    defining_access_ = access;
+}
+
+void MemoryAccess::clear_incoming() {
+    incoming_.clear();
+}
+
+void MemoryAccess::add_incoming(BasicBlock *block, MemoryAccess *access) {
+    incoming_.push_back({block, access});
+}
+
+MemorySSA::MemorySSA(Function &function, const OIRAliasAnalysis &alias_analysis,
+                     const FunctionModRefAnalysis &modref)
+    : function_(&function), alias_analysis_(&alias_analysis), modref_(&modref) {
+    build();
+}
+
+MemoryAccess *MemorySSA::live_on_entry() const {
+    return live_on_entry_;
+}
+
+MemoryAccess *MemorySSA::access_for(const Instruction *instruction) const {
+    auto found = access_for_inst_.find(instruction);
+    return found == access_for_inst_.end() ? nullptr : found->second;
+}
+
+MemoryAccess *MemorySSA::memory_phi(const BasicBlock *block) const {
+    auto found = phi_for_block_.find(block);
+    return found == phi_for_block_.end() ? nullptr : found->second;
+}
+
+const std::vector<std::unique_ptr<MemoryAccess>> &MemorySSA::accesses() const {
+    return accesses_;
+}
+
+void MemorySSA::build() {
+    accesses_.clear();
+    access_for_inst_.clear();
+    phi_for_block_.clear();
+    block_end_access_.clear();
+    live_on_entry_ = create_access(MemoryAccessKind::LiveOnEntry, nullptr);
+
+    auto rpo = reachable_reverse_postorder();
+    std::unordered_set<BasicBlock *> reachable(rpo.begin(), rpo.end());
+
+    for (auto *block : rpo) {
+        if (block == function_->entry_block()) {
+            continue;
+        }
+        unsigned reachable_preds = 0;
+        for (auto *pred : block->predecessors()) {
+            if (reachable.find(pred) != reachable.end()) {
+                ++reachable_preds;
+            }
+        }
+        if (reachable_preds > 1) {
+            phi_for_block_[block] = create_access(MemoryAccessKind::Phi, block);
+        }
+    }
+
+    for (auto &block : function_->blocks()) {
+        if (reachable.find(block.get()) == reachable.end() && block->predecessors().size() > 1) {
+            phi_for_block_[block.get()] = create_access(MemoryAccessKind::Phi, block.get());
+        }
+    }
+
+    for (auto *block : rpo) {
+        scan_block(block, entry_access_for(block, reachable));
+    }
+
+    for (auto &block : function_->blocks()) {
+        if (reachable.find(block.get()) != reachable.end()) {
+            continue;
+        }
+        auto *start = memory_phi(block.get());
+        scan_block(block.get(), start != nullptr ? start : live_on_entry_);
+    }
+
+    populate_phi_incomings(reachable);
+}
+
+std::vector<BasicBlock *> MemorySSA::reachable_reverse_postorder() const {
+    std::vector<BasicBlock *> postorder;
+    std::unordered_set<BasicBlock *> seen;
+    auto *entry = function_->entry_block();
+    if (entry == nullptr) {
+        return {};
+    }
+
+    std::function<void(BasicBlock *)> dfs = [&](BasicBlock *block) {
+        if (!seen.insert(block).second) {
+            return;
+        }
+        for (auto *succ : block->successors()) {
+            dfs(succ);
+        }
+        postorder.push_back(block);
+    };
+    dfs(entry);
+
+    return std::vector<BasicBlock *>(postorder.rbegin(), postorder.rend());
+}
+
+MemoryAccess *MemorySSA::create_access(MemoryAccessKind kind, BasicBlock *block,
+                                       Instruction *instruction) {
+    const auto id = static_cast<unsigned>(accesses_.size());
+    auto access = std::unique_ptr<MemoryAccess>(new MemoryAccess(id, kind, block, instruction));
+    auto *raw = access.get();
+    accesses_.push_back(std::move(access));
+    return raw;
+}
+
+MemoryAccess *
+MemorySSA::entry_access_for(BasicBlock *block,
+                            const std::unordered_set<BasicBlock *> &reachable) const {
+    if (block == function_->entry_block()) {
+        return live_on_entry_;
+    }
+    if (auto *phi = memory_phi(block)) {
+        return phi;
+    }
+
+    MemoryAccess *single_pred_access = nullptr;
+    unsigned reachable_preds = 0;
+    for (auto *pred : block->predecessors()) {
+        if (reachable.find(pred) == reachable.end()) {
+            continue;
+        }
+        ++reachable_preds;
+        auto found = block_end_access_.find(pred);
+        single_pred_access = found == block_end_access_.end() ? live_on_entry_ : found->second;
+    }
+
+    return reachable_preds == 1 ? single_pred_access : live_on_entry_;
+}
+
+void MemorySSA::scan_block(BasicBlock *block, MemoryAccess *start_access) {
+    auto *current = start_access != nullptr ? start_access : live_on_entry_;
+    for (auto &inst_ptr : block->instructions()) {
+        auto *inst = inst_ptr.get();
+        if (auto *load = dynamic_cast<LoadInst *>(inst)) {
+            auto *access = create_access(MemoryAccessKind::Use, block, load);
+            access->set_defining_access(current);
+            access_for_inst_[load] = access;
+            continue;
+        }
+
+        if (auto *store = dynamic_cast<StoreInst *>(inst)) {
+            auto *access = create_access(MemoryAccessKind::Def, block, store);
+            access->set_defining_access(current);
+            access_for_inst_[store] = access;
+            current = access;
+            continue;
+        }
+
+        if (auto *call = dynamic_cast<CallInst *>(inst)) {
+            if (modref_->call_may_write_memory(*call)) {
+                auto *access = create_access(MemoryAccessKind::Def, block, call);
+                access->set_defining_access(current);
+                access_for_inst_[call] = access;
+                current = access;
+            } else if (modref_->call_may_read_memory(*call)) {
+                auto *access = create_access(MemoryAccessKind::Use, block, call);
+                access->set_defining_access(current);
+                access_for_inst_[call] = access;
+            }
+        }
+    }
+    block_end_access_[block] = current;
+}
+
+void MemorySSA::populate_phi_incomings(const std::unordered_set<BasicBlock *> &reachable) {
+    for (auto &[block, phi] : phi_for_block_) {
+        phi->clear_incoming();
+        const bool block_reachable =
+            reachable.find(const_cast<BasicBlock *>(block)) != reachable.end();
+        for (auto *pred : block->predecessors()) {
+            if (block_reachable && reachable.find(pred) == reachable.end()) {
+                continue;
+            }
+            auto found = block_end_access_.find(pred);
+            phi->add_incoming(pred,
+                              found == block_end_access_.end() ? live_on_entry_ : found->second);
+        }
+        if (phi->incoming().empty()) {
+            phi->add_incoming(nullptr, live_on_entry_);
+        }
+    }
+}
+
+MemoryAccess *MemorySSA::clobbering_access(const LoadInst &load) const {
+    auto *access = access_for(&load);
+    if (access == nullptr) {
+        return live_on_entry_;
+    }
+    std::unordered_set<const MemoryAccess *> active;
+    std::unordered_map<const MemoryAccess *, MemoryAccess *> memo;
+    return find_pointer_clobber(access->defining_access(), load.ptr(), active, memo);
+}
+
+MemoryAccess *MemorySSA::clobbering_access(const StoreInst &store) const {
+    auto *access = access_for(&store);
+    if (access == nullptr) {
+        return live_on_entry_;
+    }
+    std::unordered_set<const MemoryAccess *> active;
+    std::unordered_map<const MemoryAccess *, MemoryAccess *> memo;
+    return find_pointer_clobber(access->defining_access(), store.ptr(), active, memo);
+}
+
+MemoryAccess *MemorySSA::clobbering_access(const CallInst &call) const {
+    auto *access = access_for(&call);
+    if (access == nullptr || !modref_->call_may_read_memory(call)) {
+        return live_on_entry_;
+    }
+    std::unordered_set<const MemoryAccess *> active;
+    std::unordered_map<const MemoryAccess *, MemoryAccess *> memo;
+    return find_call_read_clobber(access->defining_access(), call, active, memo);
+}
+
+MemoryAccess *
+MemorySSA::find_pointer_clobber(MemoryAccess *access, const Value *ptr,
+                                std::unordered_set<const MemoryAccess *> &active,
+                                std::unordered_map<const MemoryAccess *, MemoryAccess *> &memo)
+    const {
+    if (access == nullptr) {
+        return live_on_entry_;
+    }
+    if (access->is_live_on_entry()) {
+        return access;
+    }
+    auto memoized = memo.find(access);
+    if (memoized != memo.end()) {
+        return memoized->second;
+    }
+    if (!active.insert(access).second) {
+        return access;
+    }
+
+    auto finish = [&](MemoryAccess *result) {
+        memo[access] = result;
+        active.erase(access);
+        return result;
+    };
+
+    if (access->is_def()) {
+        if (access_clobbers_pointer(*access, ptr)) {
+            return finish(access);
+        }
+        return finish(find_pointer_clobber(access->defining_access(), ptr, active, memo));
+    }
+
+    if (access->is_use()) {
+        return finish(find_pointer_clobber(access->defining_access(), ptr, active, memo));
+    }
+
+    if (access->is_phi()) {
+        MemoryAccess *common = nullptr;
+        bool saw_incoming = false;
+        for (const auto &incoming : access->incoming()) {
+            auto *candidate = find_pointer_clobber(incoming.second, ptr, active, memo);
+            if (!saw_incoming) {
+                common = candidate;
+                saw_incoming = true;
+                continue;
+            }
+            if (common != candidate) {
+                return finish(access);
+            }
+        }
+        return finish(saw_incoming ? common : live_on_entry_);
+    }
+
+    return finish(live_on_entry_);
+}
+
+MemoryAccess *
+MemorySSA::find_call_read_clobber(MemoryAccess *access, const CallInst &call,
+                                  std::unordered_set<const MemoryAccess *> &active,
+                                  std::unordered_map<const MemoryAccess *, MemoryAccess *> &memo)
+    const {
+    if (access == nullptr) {
+        return live_on_entry_;
+    }
+    if (access->is_live_on_entry()) {
+        return access;
+    }
+    auto memoized = memo.find(access);
+    if (memoized != memo.end()) {
+        return memoized->second;
+    }
+    if (!active.insert(access).second) {
+        return access;
+    }
+
+    auto finish = [&](MemoryAccess *result) {
+        memo[access] = result;
+        active.erase(access);
+        return result;
+    };
+
+    if (access->is_def()) {
+        if (access_clobbers_call_read(*access, call)) {
+            return finish(access);
+        }
+        return finish(find_call_read_clobber(access->defining_access(), call, active, memo));
+    }
+
+    if (access->is_use()) {
+        return finish(find_call_read_clobber(access->defining_access(), call, active, memo));
+    }
+
+    if (access->is_phi()) {
+        MemoryAccess *common = nullptr;
+        bool saw_incoming = false;
+        for (const auto &incoming : access->incoming()) {
+            auto *candidate = find_call_read_clobber(incoming.second, call, active, memo);
+            if (!saw_incoming) {
+                common = candidate;
+                saw_incoming = true;
+                continue;
+            }
+            if (common != candidate) {
+                return finish(access);
+            }
+        }
+        return finish(saw_incoming ? common : live_on_entry_);
+    }
+
+    return finish(live_on_entry_);
+}
+
+bool MemorySSA::access_clobbers_pointer(const MemoryAccess &access, const Value *ptr) const {
+    auto *inst = access.instruction();
+    if (inst == nullptr || !access.is_def()) {
+        return false;
+    }
+
+    if (auto *store = dynamic_cast<StoreInst *>(inst)) {
+        return alias_analysis_->alias(store->ptr(), ptr) != AliasResult::NoAlias;
+    }
+    if (auto *call = dynamic_cast<CallInst *>(inst)) {
+        return modref_->call_may_clobber(*call, ptr, *alias_analysis_);
+    }
+    return false;
+}
+
+bool MemorySSA::access_clobbers_call_read(const MemoryAccess &access,
+                                          const CallInst &call) const {
+    auto *inst = access.instruction();
+    if (inst == nullptr || !access.is_def()) {
+        return false;
+    }
+
+    if (auto *store = dynamic_cast<StoreInst *>(inst)) {
+        return modref_->call_may_read(call, store->ptr(), *alias_analysis_);
+    }
+    if (auto *writer = dynamic_cast<CallInst *>(inst)) {
+        return modref_->call_may_write_memory(*writer);
+    }
+    return false;
+}
+
 } // namespace oir
