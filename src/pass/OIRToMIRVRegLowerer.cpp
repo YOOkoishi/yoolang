@@ -303,6 +303,13 @@ class VRegLowerer final {
             }
             return make_range_for_type(inst.type(), 1 - magnitude, magnitude - 1);
         }
+        case oir::Instruction::OpID::BitAnd:
+        case oir::Instruction::OpID::BitOr:
+        case oir::Instruction::OpID::BitXor:
+            if (lhs.lower >= 0 && rhs.lower >= 0) {
+                return make_range_for_type(inst.type(), 0, kI32Max);
+            }
+            return full_range_for_type(inst.type());
         default:
             return full_range_for_type(inst.type());
         }
@@ -330,6 +337,9 @@ class VRegLowerer final {
         case oir::Instruction::OpID::Mul:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
+        case oir::Instruction::OpID::BitAnd:
+        case oir::Instruction::OpID::BitOr:
+        case oir::Instruction::OpID::BitXor:
             return eval_binary_range(static_cast<const oir::BinaryInst &>(inst), local,
                                      bottom_for_unseen_inst);
         case oir::Instruction::OpID::ICmp:
@@ -796,6 +806,9 @@ class VRegLowerer final {
         case oir::Instruction::OpID::Mul:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
+        case oir::Instruction::OpID::BitAnd:
+        case oir::Instruction::OpID::BitOr:
+        case oir::Instruction::OpID::BitXor:
             lower_int_binary(static_cast<const oir::BinaryInst &>(inst));
             break;
         case oir::Instruction::OpID::FAdd:
@@ -1317,10 +1330,54 @@ class VRegLowerer final {
                     return;
                 }
             }
+        } else if (inst.op() == oir::Instruction::OpID::BitAnd) {
+            if (rhs_const != nullptr && fits_simm12(rhs_const->value())) {
+                emit(mir::Opcode::AndI,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.lhs())),
+                      mir::MachineOperand::imm(rhs_const->value())});
+                return;
+            }
+            if (lhs_const != nullptr && fits_simm12(lhs_const->value())) {
+                emit(mir::Opcode::AndI,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.rhs())),
+                      mir::MachineOperand::imm(lhs_const->value())});
+                return;
+            }
+        } else if (inst.op() == oir::Instruction::OpID::BitXor) {
+            if (rhs_const != nullptr && fits_simm12(rhs_const->value())) {
+                emit(mir::Opcode::XorI,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.lhs())),
+                      mir::MachineOperand::imm(rhs_const->value())});
+                return;
+            }
+            if (lhs_const != nullptr && fits_simm12(lhs_const->value())) {
+                emit(mir::Opcode::XorI,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.rhs())),
+                      mir::MachineOperand::imm(lhs_const->value())});
+                return;
+            }
         }
 
         auto lhs = value_reg(inst.lhs());
         auto rhs = value_reg(inst.rhs());
+        if (inst.op() == oir::Instruction::OpID::BitOr) {
+            auto common = create_vreg(mir::ValueType::I32);
+            auto different = create_vreg(mir::ValueType::I32);
+            emit(mir::Opcode::And,
+                 {mir::MachineOperand::reg_def(common), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::Xor,
+                 {mir::MachineOperand::reg_def(different), mir::MachineOperand::reg_use(lhs),
+                  mir::MachineOperand::reg_use(rhs)});
+            emit(mir::Opcode::Xor,
+                 {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(different),
+                  mir::MachineOperand::reg_use(common)});
+            return;
+        }
         mir::Opcode opcode = mir::Opcode::AddW;
         switch (inst.op()) {
         case oir::Instruction::OpID::Add:
@@ -1337,6 +1394,12 @@ class VRegLowerer final {
             break;
         case oir::Instruction::OpID::SRem:
             opcode = mir::Opcode::RemW;
+            break;
+        case oir::Instruction::OpID::BitAnd:
+            opcode = mir::Opcode::And;
+            break;
+        case oir::Instruction::OpID::BitXor:
+            opcode = mir::Opcode::Xor;
             break;
         default:
             break;

@@ -53,6 +53,9 @@ bool is_scev_speculatable(const Instruction &inst) {
     case Instruction::OpID::Mul:
     case Instruction::OpID::SDiv:
     case Instruction::OpID::SRem:
+    case Instruction::OpID::BitAnd:
+    case Instruction::OpID::BitOr:
+    case Instruction::OpID::BitXor:
     case Instruction::OpID::FAdd:
     case Instruction::OpID::FSub:
     case Instruction::OpID::FMul:

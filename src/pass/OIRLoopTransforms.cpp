@@ -63,6 +63,9 @@ bool is_cloneable_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
+    case oir::Instruction::OpID::BitAnd:
+    case oir::Instruction::OpID::BitOr:
+    case oir::Instruction::OpID::BitXor:
     case oir::Instruction::OpID::FAdd:
     case oir::Instruction::OpID::FSub:
     case oir::Instruction::OpID::FMul:

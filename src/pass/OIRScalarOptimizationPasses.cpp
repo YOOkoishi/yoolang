@@ -34,6 +34,7 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::promote_memory_to_registers(module, stats);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+    changed |= oir_opt::recognize_bitwise_accumulators(module, stats);
     changed |= oir_opt::run_sccp(module, stats);
     changed |= oir_opt::simplify_branches(module, stats);
     changed |= oir_opt::cleanup_cfg(module, stats);
@@ -75,6 +76,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= promote_memory_to_registers(module, stats);
     changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
     changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
+    changed |= recognize_bitwise_accumulators(module, stats);
     changed |= eliminate_tail_recursion(module, stats);
     changed |= lower_dense_return_chains(module, stats);
     changed |= propagate_global_constants(module, stats);

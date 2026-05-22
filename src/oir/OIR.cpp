@@ -33,6 +33,12 @@ std::string op_to_string(Instruction::OpID op) {
         return "sdiv";
     case Instruction::OpID::SRem:
         return "srem";
+    case Instruction::OpID::BitAnd:
+        return "and";
+    case Instruction::OpID::BitOr:
+        return "or";
+    case Instruction::OpID::BitXor:
+        return "xor";
     case Instruction::OpID::FAdd:
         return "fadd";
     case Instruction::OpID::FSub:
@@ -1815,6 +1821,9 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 case Instruction::OpID::Mul:
                 case Instruction::OpID::SDiv:
                 case Instruction::OpID::SRem:
+                case Instruction::OpID::BitAnd:
+                case Instruction::OpID::BitOr:
+                case Instruction::OpID::BitXor:
                 case Instruction::OpID::FAdd:
                 case Instruction::OpID::FSub:
                 case Instruction::OpID::FMul:

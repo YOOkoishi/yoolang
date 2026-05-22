@@ -96,6 +96,9 @@ std::vector<oir::BasicBlock *> clone_order(const oir::Function &function) {
 
 bool is_eligible_call(const oir::Function &caller, const oir::CallInst &call,
                       oir::Function *callee) {
+    if (call.name() == "__yo.bit.slowcall") {
+        return false;
+    }
     if (callee == nullptr || callee == &caller || callee->is_external() ||
         callee->entry_block() == nullptr || callee->name() == "main") {
         return false;
@@ -157,6 +160,9 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
+    case oir::Instruction::OpID::BitAnd:
+    case oir::Instruction::OpID::BitOr:
+    case oir::Instruction::OpID::BitXor:
     case oir::Instruction::OpID::FAdd:
     case oir::Instruction::OpID::FSub:
     case oir::Instruction::OpID::FMul:

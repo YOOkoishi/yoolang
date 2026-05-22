@@ -117,6 +117,36 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block,
                 return make_zero_constant(module, inst.type());
             }
             break;
+        case oir::Instruction::OpID::BitAnd:
+            if (is_int_value(binary->rhs(), 0) || is_int_value(binary->lhs(), 0)) {
+                return make_zero_constant(module, inst.type());
+            }
+            if (is_int_value(binary->rhs(), -1)) {
+                return binary->lhs();
+            }
+            if (is_int_value(binary->lhs(), -1)) {
+                return binary->rhs();
+            }
+            break;
+        case oir::Instruction::OpID::BitOr:
+            if (is_int_value(binary->rhs(), 0)) {
+                return binary->lhs();
+            }
+            if (is_int_value(binary->lhs(), 0)) {
+                return binary->rhs();
+            }
+            break;
+        case oir::Instruction::OpID::BitXor:
+            if (is_int_value(binary->rhs(), 0)) {
+                return binary->lhs();
+            }
+            if (is_int_value(binary->lhs(), 0)) {
+                return binary->rhs();
+            }
+            if (binary->lhs() == binary->rhs()) {
+                return make_zero_constant(module, inst.type());
+            }
+            break;
         default:
             break;
         }
