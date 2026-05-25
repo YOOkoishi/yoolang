@@ -115,6 +115,60 @@ bool dse_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
     return changed;
 }
 
+bool is_redundant_loaded_value_writeback(const oir::StoreInst &store,
+                                         const oir::OIRAliasAnalysis &aa,
+                                         const oir::FunctionModRefAnalysis &modref) {
+    auto *load = dynamic_cast<oir::LoadInst *>(store.value());
+    if (load == nullptr || load->ptr() != store.ptr() || load->parent() != store.parent()) {
+        return false;
+    }
+
+    bool after_load = false;
+    for (const auto &inst_ptr : load->parent()->instructions()) {
+        auto *inst = inst_ptr.get();
+        if (inst == load) {
+            after_load = true;
+            continue;
+        }
+        if (!after_load) {
+            continue;
+        }
+        if (inst == &store) {
+            return true;
+        }
+
+        if (auto *between_store = dynamic_cast<oir::StoreInst *>(inst)) {
+            auto alias = aa.alias(load->ptr(), between_store->ptr());
+            if (alias != oir::AliasResult::NoAlias && between_store->value() != load) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
+            if (modref.call_may_clobber(*call, load->ptr(), aa)) {
+                return false;
+            }
+        }
+    }
+
+    return false;
+}
+
+void collect_redundant_loaded_value_writebacks(
+    oir::Function &function, const oir::OIRAliasAnalysis &aa,
+    const oir::FunctionModRefAnalysis &modref, std::unordered_set<oir::Instruction *> &dead) {
+    for (auto &block : function.blocks()) {
+        for (auto &inst_ptr : block->instructions()) {
+            auto *store = dynamic_cast<oir::StoreInst *>(inst_ptr.get());
+            if (store != nullptr && dead.find(store) == dead.end() &&
+                is_redundant_loaded_value_writeback(*store, aa, modref)) {
+                dead.insert(store);
+            }
+        }
+    }
+}
+
 bool dle_block(oir::BasicBlock &block, const oir::OIRAliasAnalysis &aa,
                const oir::FunctionModRefAnalysis &modref, ReplacementMap &replacements) {
     bool changed = false;
@@ -257,6 +311,7 @@ bool eliminate_dead_stores(oir::Module &module, Stats &stats) {
                 dse_block(*block, aa, modref, dead);
             }
         }
+        collect_redundant_loaded_value_writebacks(*function, aa, modref, dead);
         if (erase_instructions(*function, dead)) {
             stats.dse += static_cast<unsigned>(dead.size());
             changed = true;

@@ -9,6 +9,7 @@
 #include <string>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pass::oir_opt {
@@ -27,7 +28,9 @@ struct GEPCandidate {
     InductionInfo induction;
     std::size_t index_pos = 0;
     std::int64_t pointer_step = 0;
+    oir::Value *pointer_step_value = nullptr;
     std::int64_t index_scale = 1;
+    oir::Value *index_scale_value = nullptr;
     std::int64_t index_offset = 0;
     oir::Value *index_offset_value = nullptr;
     int index_offset_value_sign = 1;
@@ -71,29 +74,66 @@ std::optional<std::int64_t> constant_int(oir::Value *value) {
     return int_constant(value);
 }
 
-std::optional<std::int64_t> induction_step_value(const oir::PhiInst &phi, oir::Value *back_value) {
+std::optional<std::int64_t>
+induction_step_value_impl(const oir::PhiInst &phi, oir::Value *back_value,
+                          std::unordered_set<oir::Value *> &active) {
+    if (!active.insert(back_value).second) {
+        return std::nullopt;
+    }
+
     auto *binary = dynamic_cast<oir::BinaryInst *>(back_value);
     if (binary == nullptr) {
+        if (auto *back_phi = dynamic_cast<oir::PhiInst *>(back_value)) {
+            std::optional<std::int64_t> step;
+            for (const auto &[incoming_value, pred] : back_phi->incoming()) {
+                (void)pred;
+                auto incoming_step = induction_step_value_impl(phi, incoming_value, active);
+                if (!incoming_step) {
+                    active.erase(back_value);
+                    return std::nullopt;
+                }
+                if (!step) {
+                    step = *incoming_step;
+                } else if (*step != *incoming_step) {
+                    active.erase(back_value);
+                    return std::nullopt;
+                }
+            }
+            active.erase(back_value);
+            return step;
+        }
+        active.erase(back_value);
         return std::nullopt;
     }
 
     if (binary->op() == oir::Instruction::OpID::Add) {
         if (binary->lhs() == &phi) {
-            return constant_int(binary->rhs());
+            auto step = constant_int(binary->rhs());
+            active.erase(back_value);
+            return step;
         }
         if (binary->rhs() == &phi) {
-            return constant_int(binary->lhs());
+            auto step = constant_int(binary->lhs());
+            active.erase(back_value);
+            return step;
         }
     }
 
     if (binary->op() == oir::Instruction::OpID::Sub && binary->lhs() == &phi) {
         auto step = constant_int(binary->rhs());
         if (step) {
+            active.erase(back_value);
             return -*step;
         }
     }
 
+    active.erase(back_value);
     return std::nullopt;
+}
+
+std::optional<std::int64_t> induction_step_value(const oir::PhiInst &phi, oir::Value *back_value) {
+    std::unordered_set<oir::Value *> active;
+    return induction_step_value_impl(phi, back_value, active);
 }
 
 std::vector<InductionInfo> collect_inductions(const oir::Loop &loop, oir::BasicBlock *preheader,
@@ -211,6 +251,7 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
     struct AffineIndex {
         InductionInfo induction;
         std::int64_t scale = 1;
+        oir::Value *scale_value = nullptr;
         std::int64_t offset = 0;
         oir::Value *offset_value = nullptr;
         int offset_value_sign = 1;
@@ -230,7 +271,7 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
         [&](oir::Value *value) -> std::optional<AffineIndex> {
         for (const auto &info : inductions) {
             if (value == info.phi) {
-                return AffineIndex{info, 1, 0, nullptr, 1};
+                return AffineIndex{info, 1, nullptr, 0, nullptr, 1};
             }
         }
         if (auto *binary = dynamic_cast<oir::BinaryInst *>(value)) {
@@ -274,12 +315,26 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
                         lhs->offset *= *rhs_const;
                         return lhs;
                     }
+                    if (!rhs_const && lhs->scale_value == nullptr && lhs->offset == 0 &&
+                        lhs->offset_value == nullptr &&
+                        !value_defined_in_loop(binary->rhs(), loop) &&
+                        binary->rhs()->type() == lhs->induction.start->type()) {
+                        lhs->scale_value = binary->rhs();
+                        return lhs;
+                    }
                 }
                 if (auto rhs = match_affine(binary->rhs())) {
                     auto lhs_const = constant_int(binary->lhs());
                     if (lhs_const && rhs->offset_value == nullptr) {
                         rhs->scale *= *lhs_const;
                         rhs->offset *= *lhs_const;
+                        return rhs;
+                    }
+                    if (!lhs_const && rhs->scale_value == nullptr && rhs->offset == 0 &&
+                        rhs->offset_value == nullptr &&
+                        !value_defined_in_loop(binary->lhs(), loop) &&
+                        binary->lhs()->type() == rhs->induction.start->type()) {
+                        rhs->scale_value = binary->lhs();
                         return rhs;
                     }
                 }
@@ -326,7 +381,9 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
                         induction->induction,
                         index_pos,
                         pointer_step,
+                        induction->scale_value,
                         induction->scale,
+                        induction->scale_value,
                         induction->offset,
                         induction->offset_value,
                         induction->offset_value_sign};
@@ -378,6 +435,11 @@ oir::Value *materialize_start_index(oir::Module &module, oir::BasicBlock *prehea
             make_int_constant(module, value->type(), candidate.index_scale), preheader,
             "lsr.idx.scale"));
     }
+    if (candidate.index_scale_value != nullptr) {
+        value = preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
+            value->type(), oir::Instruction::OpID::Mul, value, candidate.index_scale_value,
+            preheader, "lsr.idx.dynamic_scale"));
+    }
     if (candidate.index_offset_value != nullptr) {
         value = preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
             value->type(),
@@ -392,6 +454,28 @@ oir::Value *materialize_start_index(oir::Module &module, oir::BasicBlock *prehea
             "lsr.idx.offset"));
     }
     return value;
+}
+
+oir::Value *materialize_pointer_step(oir::Module &module, oir::BasicBlock *preheader,
+                                     const GEPCandidate &candidate) {
+    if (candidate.pointer_step_value == nullptr) {
+        return make_int_constant(module, module.types().int32_ty(), candidate.pointer_step);
+    }
+
+    auto *value = candidate.pointer_step_value;
+    if (candidate.pointer_step == 1) {
+        return value;
+    }
+    if (candidate.pointer_step == -1) {
+        return preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
+            value->type(), oir::Instruction::OpID::Sub,
+            make_int_constant(module, value->type(), 0), value, preheader,
+            "lsr.step.neg"));
+    }
+    return preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
+        value->type(), oir::Instruction::OpID::Mul, value,
+        make_int_constant(module, value->type(), candidate.pointer_step), preheader,
+        "lsr.step.scale"));
 }
 
 bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preheader,
@@ -415,7 +499,7 @@ bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preh
         auto *phi = insert_pointer_phi(header, gep->type(), lsr_name(*gep, ".ptr"));
         phi->add_incoming(start_ptr, preheader);
 
-        auto *step = make_int_constant(module, module.types().int32_ty(), candidate.pointer_step);
+        auto *step = materialize_pointer_step(module, preheader, candidate);
         auto *next = static_cast<oir::GetElementPtrInst *>(
             latch->insert_before_terminator(std::make_unique<oir::GetElementPtrInst>(
                 gep->type(), phi, std::vector<oir::Value *>{step}, latch,
