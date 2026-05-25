@@ -62,6 +62,7 @@ unsigned apply_replacements(oir::Module &module, const ReplacementMap &replaceme
 
 bool local_simplify(oir::Module &module, Stats &stats, SimplifyMode mode);
 bool value_range_propagation(oir::Module &module, Stats &stats);
+bool simplify_bitwise_accumulator_loops(oir::Module &module, Stats &stats);
 bool lower_dense_return_chains(oir::Module &module, Stats &stats);
 bool simplify_branches(oir::Module &module, Stats &stats);
 bool run_sccp(oir::Module &module, Stats &stats);

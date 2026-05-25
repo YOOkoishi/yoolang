@@ -133,6 +133,39 @@ bool is_dense(const std::map<std::int64_t, std::int64_t> &items) {
            static_cast<std::uint64_t>(max - min + 1) == static_cast<std::uint64_t>(items.size());
 }
 
+bool is_positive_power_of_two(std::int64_t value) {
+    if (value <= 0) {
+        return false;
+    }
+    auto bits = static_cast<std::uint64_t>(value);
+    return (bits & (bits - 1U)) == 0;
+}
+
+unsigned log2_u64(std::uint64_t value) {
+    unsigned out = 0;
+    while (value > 1) {
+        value >>= 1U;
+        ++out;
+    }
+    return out;
+}
+
+bool factors_are_selector_powers(const std::map<std::int64_t, std::int64_t> &items) {
+    for (const auto &[key, factor] : items) {
+        if (key < 0 || key >= 31 || !is_positive_power_of_two(factor) ||
+            log2_u64(static_cast<std::uint64_t>(factor)) != static_cast<unsigned>(key)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool should_keep_power_of_two_cases(const DenseReturnChain &chain) {
+    return (chain.op == oir::Instruction::OpID::Mul ||
+            chain.op == oir::Instruction::OpID::SDiv) &&
+           factors_are_selector_powers(chain.factors_by_key);
+}
+
 bool match_dense_return_chain(oir::Function &function, DenseReturnChain &out) {
     if (function.is_external() || function.entry_block() == nullptr ||
         !function.return_type()->is_integer()) {
@@ -269,6 +302,66 @@ bool rewrite_as_factor_table(oir::Function &function, const DenseReturnChain &ch
     return true;
 }
 
+bool rewrite_as_power_shift(oir::Function &function, const DenseReturnChain &chain) {
+    if (!should_keep_power_of_two_cases(chain)) {
+        return false;
+    }
+
+    const auto min_key = chain.factors_by_key.begin()->first;
+    const auto max_key = chain.factors_by_key.rbegin()->first;
+    if (min_key < 0 || max_key >= 31) {
+        return false;
+    }
+
+    auto &module = *function.parent();
+    auto *selector = chain.selector;
+    auto *payload = chain.payload;
+    clear_body(function);
+
+    auto *entry = function.create_block("pow2.entry");
+    auto *range_hi = function.create_block("pow2.range_hi");
+    auto *shift_block = function.create_block("pow2.shift");
+    auto *default_block = function.create_block("pow2.default");
+
+    oir::IRBuilder builder(&module);
+    builder.set_insert_point(entry);
+    auto *below_min =
+        builder.create_icmp(oir::CmpPred::LT, selector, builder.i32(min_key), "pow2.below");
+    builder.create_cond_br(below_min, default_block, range_hi);
+
+    builder.set_insert_point(range_hi);
+    auto *above_max =
+        builder.create_icmp(oir::CmpPred::GT, selector, builder.i32(max_key), "pow2.above");
+    builder.create_cond_br(above_max, default_block, shift_block);
+
+    builder.set_insert_point(shift_block);
+    oir::Value *result = nullptr;
+    if (chain.op == oir::Instruction::OpID::Mul) {
+        result = builder.create_binary(oir::Instruction::OpID::Shl, payload, selector,
+                                       "pow2.shifted");
+    } else {
+        auto *sign = builder.create_binary(oir::Instruction::OpID::AShr, payload, builder.i32(31),
+                                           "pow2.sign");
+        auto *divisor =
+            builder.create_binary(oir::Instruction::OpID::Shl, builder.i32(1), selector,
+                                  "pow2.divisor");
+        auto *mask =
+            builder.create_binary(oir::Instruction::OpID::Sub, divisor, builder.i32(1),
+                                  "pow2.mask");
+        auto *bias =
+            builder.create_binary(oir::Instruction::OpID::And, sign, mask, "pow2.bias");
+        auto *adjusted =
+            builder.create_binary(oir::Instruction::OpID::Add, payload, bias, "pow2.adjusted");
+        result = builder.create_binary(oir::Instruction::OpID::AShr, adjusted, selector,
+                                       "pow2.quotient");
+    }
+    builder.create_ret(result);
+
+    builder.set_insert_point(default_block);
+    builder.create_ret(payload);
+    return true;
+}
+
 } // namespace
 
 bool lower_dense_return_chains(oir::Module &module, Stats &stats) {
@@ -277,6 +370,11 @@ bool lower_dense_return_chains(oir::Module &module, Stats &stats) {
     for (auto &function : module.functions()) {
         DenseReturnChain chain;
         if (!match_dense_return_chain(*function, chain)) {
+            continue;
+        }
+        if (rewrite_as_power_shift(*function, chain)) {
+            changed = true;
+            ++stats.branches;
             continue;
         }
         if (rewrite_as_factor_table(*function, chain, next_table_id)) {

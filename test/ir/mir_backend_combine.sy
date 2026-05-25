@@ -29,6 +29,10 @@ int parity_branch(int x) {
   return 5;
 }
 
+int signed_pow2_divrem(int x) {
+  return x / 2 + x % 2 + x / 8 + x % 8;
+}
+
 int address_offset_fold(int x) {
   int data[8];
   data[3] = x;
@@ -51,7 +55,8 @@ int phi_shuffle(int n) {
 
 int main() {
   return cmp_lt(1, 2) + cmp_eq(3, 3) + nonnegative_divrem(32) +
-         parity_branch(9) + address_offset_fold(7) + phi_shuffle(4);
+         parity_branch(9) + signed_pow2_divrem(-17) +
+         address_offset_fold(7) + phi_shuffle(4);
 }
 
 // MIR-O1-LABEL: func @cmp_lt
@@ -71,8 +76,18 @@ int main() {
 // MIR-O1-NOT: SRAIW
 // MIR-O1: ANDI {{.*}}, 1
 // MIR-O1-NOT: SRAIW
-// MIR-O1: B{{EQ|NE}} {{.*}}, zero
+// MIR-O1: BEQZ
 // MIR-O1-NOT: SRAIW
+
+// MIR-O1-LABEL: func @signed_pow2_divrem
+// MIR-O1: SRLIW {{.*}}, 31
+// MIR-O1: SRAIW {{.*}}, 1
+// MIR-O1: ANDI {{.*}}, 1
+// MIR-O1-NOT: SLLIW {{.*}}, 1
+// MIR-O1: SRAIW {{.*}}, 31
+// MIR-O1: SRLIW {{.*}}, {{29|30}}
+// MIR-O1: ANDI {{.*}}, 7
+// MIR-O1-NOT: SLLIW {{.*}}, 3
 
 // MIR-O1-LABEL: func @address_offset_fold
 // MIR-O1: STORE_MEM_OFF {{.*}}, 12, i32
@@ -94,8 +109,15 @@ int main() {
 // ASM-NOT: sraiw
 // ASM: andi {{.*}}, 1
 // ASM-NOT: sraiw
-// ASM: b{{eq|ne}} {{.*}}, zero
+// ASM: beqz
 // ASM-NOT: sraiw
+// ASM-LABEL: signed_pow2_divrem:
+// ASM: srliw {{.*}}, 31
+// ASM: sraiw {{.*}}, 1
+// ASM: andi {{.*}}, 1
+// ASM-NOT: slliw {{.*}}, 1
+// ASM: andi {{.*}}, 7
+// ASM-NOT: slliw {{.*}}, 3
 // ASM-LABEL: address_offset_fold:
 // ASM: sw {{.*}}, 12(
 // ASM: lw {{.*}}, 12(

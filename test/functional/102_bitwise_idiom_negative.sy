@@ -1,0 +1,98 @@
+int loop_and(int a, int b) {
+  int bit_a;
+  int bit_b;
+  int len = 32;
+  int result = 0;
+  int power = 1;
+
+  while (len) {
+    bit_a = a % 2;
+    bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 && bit_b == 1) {
+      result = result + power;
+    }
+    power = power * 2;
+    len = len - 1;
+  }
+
+  return result;
+}
+
+int loop_or(int a, int b) {
+  int bit_a;
+  int bit_b;
+  int len = 32;
+  int result = 0;
+  int power = 1;
+
+  while (len) {
+    bit_a = a % 2;
+    bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 || bit_b == 1) {
+      result = result + power;
+    }
+    power = power * 2;
+    len = len - 1;
+  }
+
+  return result;
+}
+
+int loop_xor(int a, int b) {
+  int bit_a;
+  int bit_b;
+  int len = 32;
+  int result = 0;
+  int power = 1;
+
+  while (len) {
+    bit_a = a % 2;
+    bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a != bit_b) {
+      result = result + power;
+    }
+    power = power * 2;
+    len = len - 1;
+  }
+
+  return result;
+}
+
+int main() {
+  if (loop_and(7, 3) != 3) {
+    return 1;
+  }
+  if (loop_or(4, 1) != 5) {
+    return 2;
+  }
+  if (loop_and(-1, 1) != 0) {
+    return 3;
+  }
+  if (loop_or(-1, 2) != 2) {
+    return 4;
+  }
+  if (loop_xor(7, 3) != 4) {
+    return 5;
+  }
+  if (loop_xor(-1, 0) != 1) {
+    return 6;
+  }
+  if (loop_xor(-3, 1) != 3) {
+    return 7;
+  }
+  if (loop_xor(-3, -1) != 2) {
+    return 8;
+  }
+  int min = 0 - 2147483647;
+  min = min - 1;
+  if (loop_xor(min, 0) != min) {
+    return 9;
+  }
+  return 0;
+}

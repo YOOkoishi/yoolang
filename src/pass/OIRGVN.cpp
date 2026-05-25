@@ -50,7 +50,8 @@ std::string value_key(const ReplacementMap &replacements, oir::Value *value) {
 }
 
 bool is_commutative_integer_op(oir::Instruction::OpID op) {
-    return op == oir::Instruction::OpID::Add || op == oir::Instruction::OpID::Mul;
+    return op == oir::Instruction::OpID::Add || op == oir::Instruction::OpID::Mul ||
+           op == oir::Instruction::OpID::And;
 }
 
 bool is_commutative_equality(oir::CmpPred pred) {
@@ -64,6 +65,10 @@ bool is_gvn_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
+    case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Shl:
+    case oir::Instruction::OpID::LShr:
+    case oir::Instruction::OpID::AShr:
     case oir::Instruction::OpID::FAdd:
     case oir::Instruction::OpID::FSub:
     case oir::Instruction::OpID::FMul:

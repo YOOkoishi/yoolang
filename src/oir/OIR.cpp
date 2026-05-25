@@ -65,6 +65,12 @@ std::string op_to_string(Instruction::OpID op) {
         return "phi";
     case Instruction::OpID::And:
         return "and";
+    case Instruction::OpID::Shl:
+        return "shl";
+    case Instruction::OpID::LShr:
+        return "lshr";
+    case Instruction::OpID::AShr:
+        return "ashr";
     }
     return "unknown";
 }
@@ -1817,6 +1823,10 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 case Instruction::OpID::Mul:
                 case Instruction::OpID::SDiv:
                 case Instruction::OpID::SRem:
+                case Instruction::OpID::And:
+                case Instruction::OpID::Shl:
+                case Instruction::OpID::LShr:
+                case Instruction::OpID::AShr:
                 case Instruction::OpID::FAdd:
                 case Instruction::OpID::FSub:
                 case Instruction::OpID::FMul:

@@ -256,6 +256,9 @@ class Instruction : public User {
         FPToSI,
         Phi,
         And,
+        Shl,
+        LShr,
+        AShr,
     };
 
     Instruction(Type *type, OpID op, BasicBlock *parent, const std::string &name = "");

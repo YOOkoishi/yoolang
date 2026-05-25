@@ -17,9 +17,9 @@ namespace {
 
 constexpr unsigned kMaxInlineRounds = 3;
 constexpr unsigned kMaxInlineSites = 128;
-constexpr unsigned kMaxCalleeBlocks = 8;
+constexpr unsigned kMaxCalleeBlocks = 24;
 constexpr unsigned kMaxCalleeCost = 45;
-constexpr unsigned kMaxCalleeReturns = 4;
+constexpr unsigned kMaxCalleeReturns = 10;
 constexpr unsigned kMaxCalleeParams = 16;
 
 using ValueMap = std::unordered_map<oir::Value *, oir::Value *>;
@@ -157,6 +157,10 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
+    case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Shl:
+    case oir::Instruction::OpID::LShr:
+    case oir::Instruction::OpID::AShr:
     case oir::Instruction::OpID::FAdd:
     case oir::Instruction::OpID::FSub:
     case oir::Instruction::OpID::FMul:

@@ -762,6 +762,14 @@ const char *opcode_name(Opcode opcode) {
         return "AND";
     case Opcode::AndI:
         return "ANDI";
+    case Opcode::Or:
+        return "OR";
+    case Opcode::SllW:
+        return "SLLW";
+    case Opcode::SrlW:
+        return "SRLW";
+    case Opcode::SraW:
+        return "SRAW";
     case Opcode::SllI:
         return "SLLI";
     case Opcode::SllIW:

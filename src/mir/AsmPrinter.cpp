@@ -205,6 +205,22 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\tandi " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";
         break;
+    case Opcode::Or:
+        out_ << "\tor " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
+    case Opcode::SllW:
+        out_ << "\tsllw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
+    case Opcode::SrlW:
+        out_ << "\tsrlw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
+    case Opcode::SraW:
+        out_ << "\tsraw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
     case Opcode::SllI:
         out_ << "\tslli " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";

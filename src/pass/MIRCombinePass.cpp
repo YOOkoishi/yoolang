@@ -82,6 +82,35 @@ bool is_move(mir::Opcode opcode) {
     return opcode == mir::Opcode::Move || opcode == mir::Opcode::FMove;
 }
 
+bool is_conditional_branch(mir::Opcode opcode) {
+    switch (opcode) {
+    case mir::Opcode::BranchNonZero:
+    case mir::Opcode::BranchZero:
+    case mir::Opcode::BranchEq:
+    case mir::Opcode::BranchNe:
+    case mir::Opcode::BranchLT:
+    case mir::Opcode::BranchGE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::size_t branch_target_index(mir::Opcode opcode) {
+    switch (opcode) {
+    case mir::Opcode::BranchNonZero:
+    case mir::Opcode::BranchZero:
+        return 1;
+    case mir::Opcode::BranchEq:
+    case mir::Opcode::BranchNe:
+    case mir::Opcode::BranchLT:
+    case mir::Opcode::BranchGE:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
 bool is_pure_def(mir::Opcode opcode) {
     switch (opcode) {
     case mir::Opcode::LoadImm:
@@ -100,6 +129,10 @@ bool is_pure_def(mir::Opcode opcode) {
     case mir::Opcode::RemW:
     case mir::Opcode::And:
     case mir::Opcode::AndI:
+    case mir::Opcode::Or:
+    case mir::Opcode::SllW:
+    case mir::Opcode::SrlW:
+    case mir::Opcode::SraW:
     case mir::Opcode::SllI:
     case mir::Opcode::SllIW:
     case mir::Opcode::SraI:
@@ -459,6 +492,14 @@ bool combine_bit_idioms(mir::MachineFunction &function, Stats &stats) {
             }
             if (ops.size() >= 3 && instr.opcode() == mir::Opcode::And && is_zero_reg(ops[1])) {
                 replace_current(make_move_like(ops[0], zero_reg()));
+                continue;
+            }
+            if (ops.size() >= 3 && instr.opcode() == mir::Opcode::Or && is_zero_reg(ops[2])) {
+                replace_current(make_move_like(ops[0], ops[1]));
+                continue;
+            }
+            if (ops.size() >= 3 && instr.opcode() == mir::Opcode::Or && is_zero_reg(ops[1])) {
+                replace_current(make_move_like(ops[0], ops[2]));
                 continue;
             }
 
@@ -837,6 +878,537 @@ bool combine_rem_zero_branches(mir::MachineFunction &function, Stats &stats) {
     return changed;
 }
 
+mir::Register create_gpr_vreg(mir::MachineFunction &function, mir::ValueType type) {
+    return function.regs().create_virtual(mir::RegisterClass::GPR, type);
+}
+
+std::optional<std::size_t> block_index(const mir::MachineFunction &function,
+                                       const mir::MachineBasicBlock *block) {
+    const auto &blocks = function.blocks();
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        if (blocks[i].get() == block) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> successor_after_payload(const mir::MachineFunction &function,
+                                                   const mir::MachineBasicBlock &block,
+                                                   std::size_t payload_count) {
+    const auto &instrs = block.instructions();
+    if (instrs.size() == payload_count) {
+        auto index = block_index(function, &block);
+        if (index && *index + 1 < function.blocks().size()) {
+            return function.blocks()[*index + 1]->name();
+        }
+        return std::nullopt;
+    }
+    if (instrs.size() == payload_count + 1 && instrs.back().opcode() == mir::Opcode::Jump &&
+        !instrs.back().operands().empty() &&
+        instrs.back().operands()[0].kind() == mir::OperandKind::Block) {
+        return instrs.back().operands()[0].string_value();
+    }
+    return std::nullopt;
+}
+
+struct BranchTargets {
+    const mir::MachineInstr *branch = nullptr;
+    mir::MachineBasicBlock *taken = nullptr;
+    mir::MachineBasicBlock *other = nullptr;
+    std::size_t erase_from = 0;
+};
+
+std::optional<BranchTargets> branch_targets(mir::MachineFunction &function,
+                                            mir::MachineBasicBlock &pred,
+                                            std::size_t pred_index) {
+    auto &instrs = pred.instructions();
+    if (instrs.empty()) {
+        return std::nullopt;
+    }
+
+    if (instrs.size() >= 2 && instrs.back().opcode() == mir::Opcode::Jump &&
+        is_conditional_branch(instrs[instrs.size() - 2].opcode())) {
+        const auto &branch = instrs[instrs.size() - 2];
+        const auto &jump = instrs.back();
+        const auto target_index = branch_target_index(branch.opcode());
+        if (branch.operands().size() <= target_index ||
+            branch.operands()[target_index].kind() != mir::OperandKind::Block ||
+            jump.operands().empty() || jump.operands()[0].kind() != mir::OperandKind::Block) {
+            return std::nullopt;
+        }
+        auto *taken = function.get_block(branch.operands()[target_index].string_value());
+        auto *other = function.get_block(jump.operands()[0].string_value());
+        if (taken == nullptr || other == nullptr) {
+            return std::nullopt;
+        }
+        return BranchTargets{&branch, taken, other, instrs.size() - 2};
+    }
+
+    if (is_conditional_branch(instrs.back().opcode())) {
+        const auto &branch = instrs.back();
+        const auto target_index = branch_target_index(branch.opcode());
+        if (branch.operands().size() <= target_index ||
+            branch.operands()[target_index].kind() != mir::OperandKind::Block ||
+            pred_index + 1 >= function.blocks().size()) {
+            return std::nullopt;
+        }
+        auto *taken = function.get_block(branch.operands()[target_index].string_value());
+        auto *other = function.blocks()[pred_index + 1].get();
+        if (taken == nullptr || other == nullptr) {
+            return std::nullopt;
+        }
+        return BranchTargets{&branch, taken, other, instrs.size() - 1};
+    }
+
+    return std::nullopt;
+}
+
+mir::Register materialize_branch_bool(mir::MachineFunction &function,
+                                      const mir::MachineInstr &branch,
+                                      bool branch_taken_is_true,
+                                      bool force_new,
+                                      std::vector<mir::MachineInstr> &out) {
+    const auto &ops = branch.operands();
+    auto make_bool = [&]() { return create_gpr_vreg(function, mir::ValueType::I1); };
+    auto make_i32 = [&]() { return create_gpr_vreg(function, mir::ValueType::I32); };
+
+    auto copy_bool_if_needed = [&](mir::Register cond) {
+        if (!force_new) {
+            return cond;
+        }
+        auto copy = make_bool();
+        out.emplace_back(mir::Opcode::Move,
+                         std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(copy),
+                                                          mir::MachineOperand::reg_use(cond)});
+        return copy;
+    };
+
+    if ((branch.opcode() == mir::Opcode::BranchNonZero ||
+         branch.opcode() == mir::Opcode::BranchZero) &&
+        ops.size() >= 1 && ops[0].is_reg()) {
+        const bool want_nonzero =
+            (branch.opcode() == mir::Opcode::BranchNonZero) == branch_taken_is_true;
+        auto cond = ops[0].reg_value();
+        if (cond.value_type == mir::ValueType::I1) {
+            if (want_nonzero) {
+                return copy_bool_if_needed(cond);
+            }
+            auto inverted = make_bool();
+            out.emplace_back(mir::Opcode::XorI,
+                             std::vector<mir::MachineOperand>{
+                                 mir::MachineOperand::reg_def(inverted),
+                                 mir::MachineOperand::reg_use(cond),
+                                 mir::MachineOperand::imm(1)});
+            return inverted;
+        }
+
+        auto result = make_bool();
+        out.emplace_back(want_nonzero ? mir::Opcode::Snez : mir::Opcode::SeqZ,
+                         std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(result),
+                                                          mir::MachineOperand::reg_use(cond)});
+        return result;
+    }
+
+    if ((branch.opcode() == mir::Opcode::BranchEq || branch.opcode() == mir::Opcode::BranchNe) &&
+        ops.size() >= 2 && ops[0].is_reg() && ops[1].is_reg()) {
+        auto diff = make_i32();
+        out.emplace_back(mir::Opcode::Xor,
+                         std::vector<mir::MachineOperand>{
+                             mir::MachineOperand::reg_def(diff), ops[0], ops[1]});
+        auto result = make_bool();
+        const bool want_equal =
+            (branch.opcode() == mir::Opcode::BranchEq) == branch_taken_is_true;
+        out.emplace_back(want_equal ? mir::Opcode::SeqZ : mir::Opcode::Snez,
+                         std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(result),
+                                                          mir::MachineOperand::reg_use(diff)});
+        return result;
+    }
+
+    if ((branch.opcode() == mir::Opcode::BranchLT || branch.opcode() == mir::Opcode::BranchGE) &&
+        ops.size() >= 2 && ops[0].is_reg() && ops[1].is_reg()) {
+        auto lt = make_bool();
+        out.emplace_back(mir::Opcode::Slt,
+                         std::vector<mir::MachineOperand>{
+                             mir::MachineOperand::reg_def(lt), ops[0], ops[1]});
+        const bool want_lt = (branch.opcode() == mir::Opcode::BranchLT) == branch_taken_is_true;
+        if (want_lt) {
+            return lt;
+        }
+        auto inverted = make_bool();
+        out.emplace_back(mir::Opcode::XorI,
+                         std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(inverted),
+                                                          mir::MachineOperand::reg_use(lt),
+                                                          mir::MachineOperand::imm(1)});
+        return inverted;
+    }
+
+    return {};
+}
+
+struct ConditionalAddMatch {
+    mir::Register dst;
+    mir::Register base;
+    mir::MachineOperand addend;
+    std::string merge;
+    bool add_on_branch_taken = false;
+};
+
+std::optional<ConditionalAddMatch>
+match_conditional_add_blocks(const mir::MachineFunction &function,
+                             const mir::MachineBasicBlock &add_block,
+                             const mir::MachineBasicBlock &skip_block,
+                             bool add_on_branch_taken) {
+    if (add_block.predecessors().size() != 1 || skip_block.predecessors().size() != 1) {
+        return std::nullopt;
+    }
+
+    const auto &add_instrs = add_block.instructions();
+    const auto &skip_instrs = skip_block.instructions();
+    if (add_instrs.empty() || skip_instrs.empty()) {
+        return std::nullopt;
+    }
+
+    const auto &add = add_instrs.front();
+    const auto &skip_move = skip_instrs.front();
+    const auto &add_ops = add.operands();
+    const auto &skip_ops = skip_move.operands();
+    if (add.opcode() != mir::Opcode::AddW || skip_move.opcode() != mir::Opcode::Move ||
+        add_ops.size() < 3 || skip_ops.size() < 2 || !add_ops[0].is_reg() ||
+        !add_ops[1].is_reg() || !add_ops[2].is_reg() || !skip_ops[0].is_reg() ||
+        !skip_ops[1].is_reg()) {
+        return std::nullopt;
+    }
+
+    std::size_t add_payload_count = 1;
+    auto dst = add_ops[0].reg_value();
+    if (!same_reg(add_ops[0], skip_ops[0])) {
+        if (add_instrs.size() < 2 || add_instrs[1].opcode() != mir::Opcode::Move) {
+            return std::nullopt;
+        }
+        const auto &add_move_ops = add_instrs[1].operands();
+        if (add_move_ops.size() < 2 || !add_move_ops[0].is_reg() || !add_move_ops[1].is_reg() ||
+            !same_reg(add_move_ops[0], skip_ops[0]) || !same_reg(add_move_ops[1], add_ops[0])) {
+            return std::nullopt;
+        }
+        dst = add_move_ops[0].reg_value();
+        add_payload_count = 2;
+    }
+
+    auto base = skip_ops[1].reg_value();
+    std::optional<mir::MachineOperand> addend;
+    if (same_reg(add_ops[1], skip_ops[1])) {
+        addend = add_ops[2];
+    } else if (same_reg(add_ops[2], skip_ops[1])) {
+        addend = add_ops[1];
+    }
+    if (!addend) {
+        return std::nullopt;
+    }
+
+    auto add_succ = successor_after_payload(function, add_block, add_payload_count);
+    auto skip_succ = successor_after_payload(function, skip_block, 1);
+    if (!add_succ || !skip_succ || *add_succ != *skip_succ) {
+        return std::nullopt;
+    }
+
+    return ConditionalAddMatch{dst, base, *addend, *add_succ, add_on_branch_taken};
+}
+
+std::optional<ConditionalAddMatch>
+match_conditional_add(const mir::MachineFunction &function, const BranchTargets &targets) {
+    if (targets.taken == nullptr || targets.other == nullptr || targets.taken == targets.other) {
+        return std::nullopt;
+    }
+    if (auto match = match_conditional_add_blocks(function, *targets.taken, *targets.other, true)) {
+        return match;
+    }
+    return match_conditional_add_blocks(function, *targets.other, *targets.taken, false);
+}
+
+bool if_convert_conditional_add_once(mir::MachineFunction &function, Stats &stats) {
+    function.rebuild_cfg();
+    auto &blocks = function.blocks();
+
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        auto &pred = *blocks[i];
+        auto targets = branch_targets(function, pred, i);
+        if (!targets) {
+            continue;
+        }
+
+        auto match = match_conditional_add(function, *targets);
+        if (!match || targets->taken == &pred || targets->other == &pred) {
+            continue;
+        }
+
+        std::vector<mir::MachineInstr> replacement;
+        auto cond = materialize_branch_bool(function, *targets->branch, match->add_on_branch_taken,
+                                            false, replacement);
+        if (cond.value_type == mir::ValueType::Void) {
+            continue;
+        }
+
+        auto mask = create_gpr_vreg(function, mir::ValueType::I32);
+        replacement.emplace_back(
+            mir::Opcode::SubW,
+            std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(mask),
+                                             mir::MachineOperand::reg_use(zero_reg()),
+                                             mir::MachineOperand::reg_use(cond)});
+        auto masked_addend = create_gpr_vreg(function, mir::ValueType::I32);
+        replacement.emplace_back(
+            mir::Opcode::And,
+            std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(masked_addend),
+                                             match->addend,
+                                             mir::MachineOperand::reg_use(mask)});
+        replacement.emplace_back(
+            mir::Opcode::AddW,
+            std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(match->dst),
+                                             mir::MachineOperand::reg_use(match->base),
+                                             mir::MachineOperand::reg_use(masked_addend)});
+        replacement.emplace_back(
+            mir::Opcode::Jump,
+            std::vector<mir::MachineOperand>{mir::MachineOperand::block(match->merge)});
+
+        auto &instrs = pred.instructions();
+        instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(targets->erase_from),
+                     instrs.end());
+        instrs.insert(instrs.end(), replacement.begin(), replacement.end());
+
+        const auto taken_name = targets->taken->name();
+        const auto other_name = targets->other->name();
+        function.erase_block(taken_name);
+        function.erase_block(other_name);
+        function.rebuild_cfg();
+        ++stats.bit_idioms;
+        return true;
+    }
+
+    return false;
+}
+
+bool if_convert_conditional_adds(mir::MachineFunction &function, Stats &stats) {
+    bool changed = false;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        if (!if_convert_conditional_add_once(function, stats)) {
+            break;
+        }
+        changed = true;
+    }
+    return changed;
+}
+
+struct BoolConstBlock {
+    mir::Register dst;
+    int value = 0;
+    std::string merge;
+};
+
+std::optional<BoolConstBlock>
+match_bool_const_block(const mir::MachineFunction &function, const mir::MachineBasicBlock &block) {
+    if (block.predecessors().size() != 1 || block.instructions().empty()) {
+        return std::nullopt;
+    }
+
+    const auto &instr = block.instructions().front();
+    const auto &ops = instr.operands();
+    mir::Register dst;
+    std::optional<int> value;
+    std::size_t payload_count = 1;
+    if (instr.opcode() == mir::Opcode::Move && ops.size() >= 2 && ops[0].is_reg()) {
+        if (is_zero_reg(ops[1])) {
+            dst = ops[0].reg_value();
+            value = 0;
+        }
+    } else if (instr.opcode() == mir::Opcode::LoadImm && ops.size() >= 2 && ops[0].is_reg() &&
+               ops[1].kind() == mir::OperandKind::Imm &&
+               (ops[1].int_value() == 0 || ops[1].int_value() == 1)) {
+        dst = ops[0].reg_value();
+        value = static_cast<int>(ops[1].int_value());
+    } else if (instr.opcode() == mir::Opcode::LoadImm && ops.size() >= 2 && ops[0].is_reg() &&
+               ops[1].kind() == mir::OperandKind::Imm &&
+               (ops[1].int_value() == 0 || ops[1].int_value() == 1) &&
+               block.instructions().size() >= 2 &&
+               block.instructions()[1].opcode() == mir::Opcode::Move) {
+        const auto &move_ops = block.instructions()[1].operands();
+        if (move_ops.size() >= 2 && move_ops[0].is_reg() && move_ops[1].is_reg() &&
+            same_reg(move_ops[1], ops[0])) {
+            dst = move_ops[0].reg_value();
+            value = static_cast<int>(ops[1].int_value());
+            payload_count = 2;
+        }
+    }
+    if (!value) {
+        return std::nullopt;
+    }
+
+    auto succ = successor_after_payload(function, block, payload_count);
+    if (!succ) {
+        return std::nullopt;
+    }
+    return BoolConstBlock{dst, *value, *succ};
+}
+
+struct BoolComputeBlock {
+    mir::Register dst;
+    std::vector<mir::MachineInstr> payload;
+    std::string merge;
+};
+
+std::optional<BoolComputeBlock>
+match_bool_compute_block(const mir::MachineFunction &function,
+                         const mir::MachineBasicBlock &block) {
+    if (block.predecessors().size() != 1) {
+        return std::nullopt;
+    }
+
+    if (block.instructions().empty()) {
+        return std::nullopt;
+    }
+
+    std::size_t payload_count = block.instructions().size();
+    std::optional<std::string> succ;
+    if (!block.instructions().empty() && block.instructions().back().opcode() == mir::Opcode::Jump) {
+        payload_count = block.instructions().size() - 1;
+        succ = successor_after_payload(function, block, payload_count);
+    } else {
+        succ = successor_after_payload(function, block, block.instructions().size());
+    }
+    if (!succ || payload_count == 0 || payload_count > 3) {
+        return std::nullopt;
+    }
+
+    std::vector<mir::MachineInstr> payload;
+    payload.reserve(payload_count);
+    for (std::size_t i = 0; i < payload_count; ++i) {
+        const auto &instr = block.instructions()[i];
+        if (!is_pure_def(instr.opcode())) {
+            return std::nullopt;
+        }
+        payload.push_back(instr);
+    }
+
+    const auto defs = payload.back().defs();
+    if (defs.size() != 1) {
+        return std::nullopt;
+    }
+    if (defs[0].value_type != mir::ValueType::I1) {
+        return std::nullopt;
+    }
+    return BoolComputeBlock{defs[0], std::move(payload), *succ};
+}
+
+struct BoolSelectMatch {
+    BoolComputeBlock compute;
+    mir::Register result_dst;
+    int const_value = 0;
+    std::string merge;
+    bool compute_on_branch_taken = false;
+};
+
+std::optional<BoolSelectMatch>
+match_bool_select(const mir::MachineFunction &function, const BranchTargets &targets) {
+    auto taken_const = match_bool_const_block(function, *targets.taken);
+    if (taken_const) {
+        auto compute = match_bool_compute_block(function, *targets.other);
+        if (compute && compute->merge == taken_const->merge) {
+            return BoolSelectMatch{std::move(*compute), taken_const->dst, taken_const->value,
+                                   taken_const->merge, false};
+        }
+    }
+
+    auto other_const = match_bool_const_block(function, *targets.other);
+    if (other_const) {
+        auto compute = match_bool_compute_block(function, *targets.taken);
+        if (compute && compute->merge == other_const->merge) {
+            return BoolSelectMatch{std::move(*compute), other_const->dst, other_const->value,
+                                   other_const->merge, true};
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool if_convert_bool_select_once(mir::MachineFunction &function, Stats &stats) {
+    function.rebuild_cfg();
+    auto &blocks = function.blocks();
+
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        auto &pred = *blocks[i];
+        auto targets = branch_targets(function, pred, i);
+        if (!targets || targets->taken == &pred || targets->other == &pred ||
+            targets->taken == targets->other) {
+            continue;
+        }
+
+        auto match = match_bool_select(function, *targets);
+        if (!match) {
+            continue;
+        }
+
+        std::vector<mir::MachineInstr> replacement;
+        auto compute_cond = materialize_branch_bool(function, *targets->branch,
+                                                    match->compute_on_branch_taken, true,
+                                                    replacement);
+        if (compute_cond.value_type == mir::ValueType::Void) {
+            continue;
+        }
+
+        replacement.insert(replacement.end(), match->compute.payload.begin(),
+                           match->compute.payload.end());
+        if (match->const_value == 0) {
+            replacement.emplace_back(
+                mir::Opcode::And,
+                std::vector<mir::MachineOperand>{
+                    mir::MachineOperand::reg_def(match->result_dst),
+                    mir::MachineOperand::reg_use(match->compute.dst),
+                    mir::MachineOperand::reg_use(compute_cond)});
+        } else {
+            auto not_compute_cond = create_gpr_vreg(function, mir::ValueType::I1);
+            replacement.emplace_back(
+                mir::Opcode::XorI,
+                std::vector<mir::MachineOperand>{mir::MachineOperand::reg_def(not_compute_cond),
+                                                 mir::MachineOperand::reg_use(compute_cond),
+                                                 mir::MachineOperand::imm(1)});
+            replacement.emplace_back(
+                mir::Opcode::Or,
+                std::vector<mir::MachineOperand>{
+                    mir::MachineOperand::reg_def(match->result_dst),
+                    mir::MachineOperand::reg_use(match->compute.dst),
+                    mir::MachineOperand::reg_use(not_compute_cond)});
+        }
+        replacement.emplace_back(mir::Opcode::Jump,
+                                 std::vector<mir::MachineOperand>{
+                                     mir::MachineOperand::block(match->merge)});
+
+        auto &instrs = pred.instructions();
+        instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(targets->erase_from),
+                     instrs.end());
+        instrs.insert(instrs.end(), replacement.begin(), replacement.end());
+
+        const auto taken_name = targets->taken->name();
+        const auto other_name = targets->other->name();
+        function.erase_block(taken_name);
+        function.erase_block(other_name);
+        function.rebuild_cfg();
+        ++stats.bit_idioms;
+        return true;
+    }
+
+    return false;
+}
+
+bool if_convert_bool_selects(mir::MachineFunction &function, Stats &stats) {
+    bool changed = false;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        if (!if_convert_bool_select_once(function, stats)) {
+            break;
+        }
+        changed = true;
+    }
+    return changed;
+}
+
 bool remove_dead_defs_once(mir::MachineFunction &function, Stats &stats) {
     auto counts = count_vregs(function);
     bool changed = false;
@@ -876,6 +1448,8 @@ bool optimize_function(mir::MachineFunction &function, Stats &stats) {
         iteration_changed |= combine_address_modes(function, stats);
         iteration_changed |= combine_compare_branches(function, stats);
         iteration_changed |= combine_rem_zero_branches(function, stats);
+        iteration_changed |= if_convert_bool_selects(function, stats);
+        iteration_changed |= if_convert_conditional_adds(function, stats);
         iteration_changed |= combine_bit_idioms(function, stats);
         iteration_changed |= remove_dead_defs(function, stats);
         if (!iteration_changed) {
