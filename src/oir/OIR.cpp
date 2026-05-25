@@ -63,6 +63,8 @@ std::string op_to_string(Instruction::OpID op) {
         return "fptosi";
     case Instruction::OpID::Phi:
         return "phi";
+    case Instruction::OpID::And:
+        return "and";
     }
     return "unknown";
 }

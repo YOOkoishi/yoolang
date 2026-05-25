@@ -22,6 +22,13 @@ int nonnegative_divrem(int x) {
   return x / 8 + x % 16;
 }
 
+int parity_branch(int x) {
+  if (x % 2 == 0) {
+    return 3;
+  }
+  return 5;
+}
+
 int address_offset_fold(int x) {
   int data[8];
   data[3] = x;
@@ -44,7 +51,7 @@ int phi_shuffle(int n) {
 
 int main() {
   return cmp_lt(1, 2) + cmp_eq(3, 3) + nonnegative_divrem(32) +
-         address_offset_fold(7) + phi_shuffle(4);
+         parity_branch(9) + address_offset_fold(7) + phi_shuffle(4);
 }
 
 // MIR-O1-LABEL: func @cmp_lt
@@ -59,6 +66,13 @@ int main() {
 // MIR-O1: SRLIW {{.*}}, 3
 // MIR-O1: ANDI {{.*}}, 15
 // MIR-O1: SRAIW {{.*}}, 3
+
+// MIR-O1-LABEL: func @parity_branch
+// MIR-O1-NOT: SRAIW
+// MIR-O1: ANDI {{.*}}, 1
+// MIR-O1-NOT: SRAIW
+// MIR-O1: B{{EQ|NE}} {{.*}}, zero
+// MIR-O1-NOT: SRAIW
 
 // MIR-O1-LABEL: func @address_offset_fold
 // MIR-O1: STORE_MEM_OFF {{.*}}, 12, i32
@@ -76,6 +90,12 @@ int main() {
 // ASM-LABEL: nonnegative_divrem:
 // ASM: srliw {{.*}}, 3
 // ASM: andi {{.*}}, 15
+// ASM-LABEL: parity_branch:
+// ASM-NOT: sraiw
+// ASM: andi {{.*}}, 1
+// ASM-NOT: sraiw
+// ASM: b{{eq|ne}} {{.*}}, zero
+// ASM-NOT: sraiw
 // ASM-LABEL: address_offset_fold:
 // ASM: sw {{.*}}, 12(
 // ASM: lw {{.*}}, 12(
