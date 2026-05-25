@@ -868,7 +868,7 @@ int choose_tile_size(std::int64_t outer_trip_count, std::int64_t inner_trip_coun
     if (trip < 64) {
         return 0;
     }
-    for (int candidate : {32, 24, 20, 16, 12, 10, 8}) {
+    for (int candidate : {20, 16, 10, 8}) {
         if (outer_trip_count % candidate == 0 && inner_trip_count % candidate == 0) {
             return candidate;
         }
@@ -961,10 +961,6 @@ class Optimizer final {
             } else if (auto *while_op = dynamic_cast<yir::WhileOp *>(ops[i].get())) {
                 optimize_region(while_op->cond_region(), analysis);
                 optimize_region(while_op->body_region(), analysis);
-                if (try_unroll_countdown_while(ops, i, *while_op)) {
-                    mark_changed(true);
-                    continue;
-                }
                 mark_changed(hoist_loop_invariants(ops, i, while_op->body_region(), nullptr));
             } else if (auto *for_op = dynamic_cast<yir::ForOp *>(ops[i].get())) {
                 if (hoist_loop_invariants(ops, i, for_op->body_region(),
@@ -975,7 +971,6 @@ class Optimizer final {
                 if (try_interchange(ops, i, *for_op, analysis) ||
                     try_tile_perfect_nest(ops, i, *for_op, analysis) ||
                     try_unroll_jam(ops, i, *for_op, analysis) ||
-                    try_reduction_register_unroll(ops, i, *for_op, analysis) ||
                     try_vectorize_inner_loop(ops, i, *for_op, analysis) ||
                     try_unroll_for(ops, i, *for_op)) {
                     mark_changed(true);
@@ -1447,25 +1442,25 @@ class Optimizer final {
             return false;
         }
 
+        constexpr int kFactor = 2;
         const auto count = trip_count(lower, upper, step);
+        if (count < 16 || count % kFactor != 0) {
+            return false;
+        }
+
         auto &outer_ops = outer.body_region().operations();
         auto &inner_ops = inner->body_region().operations();
         const std::size_t original_inner_count = inner_ops.size();
         if (original_inner_count == 0 || original_inner_count > 48) {
             return false;
         }
-        const int factor =
-            choose_unroll_factor(count, operation_count(inner->body_region()), 4, 192, false);
-        if (factor == 0) {
-            return false;
-        }
 
         auto *new_step =
-            insert_const_i32_before(ops, index, static_cast<int>(step * factor),
+            insert_const_i32_before(ops, index, static_cast<int>(step * kFactor),
                                     derived_name(outer.induction_var(), ".jam.step", "jam.step"));
         outer.operands()[3] = new_step;
 
-        for (int lane = 1; lane < factor; ++lane) {
+        for (int lane = 1; lane < kFactor; ++lane) {
             auto lane_const = std::make_unique<yir::ConstI32Op>(
                 static_cast<int>(step * lane),
                 derived_name(outer.induction_var(), ".jam.lane", "jam.lane"));
@@ -1510,25 +1505,24 @@ class Optimizer final {
             return false;
         }
 
+        constexpr int kFactor = 4;
         const auto count = trip_count(lower, upper, step);
+        if (count < 16 || count % kFactor != 0) {
+            return false;
+        }
+
         auto &body_ops = for_op.body_region().operations();
         const std::size_t original_count = body_ops.size();
         if (original_count == 0 || original_count > 64) {
             return false;
         }
-        const int factor =
-            choose_unroll_factor(count, operation_count(for_op.body_region()), 4, 192,
-                                 region_has_if(for_op.body_region()));
-        if (factor == 0) {
-            return false;
-        }
 
         auto *new_step =
-            insert_const_i32_before(ops, index, static_cast<int>(step * factor),
+            insert_const_i32_before(ops, index, static_cast<int>(step * kFactor),
                                     derived_name(for_op.induction_var(), ".vec.step", "vec.step"));
         for_op.operands()[3] = new_step;
 
-        for (int lane = 1; lane < factor; ++lane) {
+        for (int lane = 1; lane < kFactor; ++lane) {
             auto lane_const = std::make_unique<yir::ConstI32Op>(
                 static_cast<int>(step * lane),
                 derived_name(for_op.induction_var(), ".vec.lane", "vec.lane"));
