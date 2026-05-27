@@ -10,7 +10,6 @@ namespace pass {
 
 namespace {
 
-// Simplistic evaluator to extract affine expressions from standard YIR operations
 class AffineExtractor {
 public:
     PolyAffineExpr extract(const yir::Value* val) {
@@ -25,8 +24,6 @@ public:
             return expr;
         }
 
-        // Just basic mapping to variables for now if complex analysis is skipped.
-        // A complete version would traverse Add/Sub/Mul.
         if (auto* add = dynamic_cast<const yir::AddIOp*>(val->defining_op())) {
             auto lhs = extract(add->lhs());
             auto rhs = extract(add->rhs());
@@ -37,7 +34,7 @@ public:
                 return expr;
             }
         }
-
+        
         expr.terms.push_back({val, 1});
         return expr;
     }
@@ -53,20 +50,25 @@ public:
         for (const auto& scop : scop_info_.scops) {
             PolyScop poly_scop;
             poly_scop.id = scop.id;
-
+            
             for (auto* sym : scop.symbols) {
                 poly_scop.params.push_back(sym);
             }
+
+            // O(N) single-pass Traversal for the whole SCoP Region mapping each Operation -> enclosing loops
+            std::unordered_map<const yir::Operation*, std::vector<const yir::ForOp*>> enclosing_loops;
+            std::vector<const yir::ForOp*> loop_stack;
+            build_loop_context(scop.region, loop_stack, enclosing_loops);
 
             for (const auto& stmt : scop.statements) {
                 PolyStmt poly_stmt;
                 poly_stmt.id = stmt.id;
                 poly_stmt.op = stmt.op;
                 poly_stmt.lexical_id = stmt.id;
-
-                extract_domain(poly_stmt, stmt.op);
+                
+                extract_domain(poly_stmt, enclosing_loops[stmt.op]);
                 extract_accesses(*stmt.op, poly_stmt.reads, poly_stmt.writes);
-
+                
                 poly_scop.statements.push_back(std::move(poly_stmt));
             }
             model_info.models.push_back(std::move(poly_scop));
@@ -75,38 +77,36 @@ public:
     }
 
 private:
-    void extract_domain(PolyStmt& poly_stmt, const yir::Operation* op) {
-        AffineExtractor extractor;
-        // In this customized scheme A, we rely on the canonical_info which already recorded loops
-        // that surround statements. We find which loops in canonical_info enclose the statement.
-        for (const auto& loop_seq : canonical_info_.loops) {
-            if (is_descendant(&loop_seq.loop->body_region(), op)) {
-                poly_stmt.dims.insert(poly_stmt.dims.begin(), loop_seq.loop->induction_var());
-                poly_stmt.schedule_dims.insert(poly_stmt.schedule_dims.begin(), loop_seq.loop->induction_var());
-
-                PolyLoopBound bound;
-                bound.iv = loop_seq.loop->induction_var();
-                bound.lower = extractor.extract(loop_seq.loop->lower_bound());
-                bound.upper = extractor.extract(loop_seq.loop->upper_bound());
-                poly_stmt.domain.insert(poly_stmt.domain.begin(), std::move(bound));
+    void build_loop_context(const yir::Region* region, std::vector<const yir::ForOp*>& stack,
+                            std::unordered_map<const yir::Operation*, std::vector<const yir::ForOp*>>& map) {
+        for (const auto& op : region->operations()) {
+            map[op.get()] = stack;
+            if (auto* for_op = dynamic_cast<const yir::ForOp*>(op.get())) {
+                stack.push_back(for_op);
+                build_loop_context(&for_op->body_region(), stack, map);
+                stack.pop_back();
+            } else if (auto* while_op = dynamic_cast<const yir::WhileOp*>(op.get())) {
+                build_loop_context(&while_op->cond_region(), stack, map);
+                build_loop_context(&while_op->body_region(), stack, map);
+            } else if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
+                build_loop_context(&if_op->then_region(), stack, map);
+                if (if_op->has_else()) build_loop_context(&if_op->else_region(), stack, map);
             }
         }
     }
 
-    bool is_descendant(const yir::Region* region, const yir::Operation* target) const {
-        for (const auto& op : region->operations()) {
-            if (op.get() == target) return true;
-            if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
-                if (is_descendant(&if_op->then_region(), target)) return true;
-                if (if_op->has_else() && is_descendant(&if_op->else_region(), target)) return true;
-            } else if (auto* while_op = dynamic_cast<const yir::WhileOp*>(op.get())) {
-                if (is_descendant(&while_op->cond_region(), target)) return true;
-                if (is_descendant(&while_op->body_region(), target)) return true;
-            } else if (auto* for_op = dynamic_cast<const yir::ForOp*>(op.get())) {
-                if (is_descendant(&for_op->body_region(), target)) return true;
-            }
+    void extract_domain(PolyStmt& poly_stmt, const std::vector<const yir::ForOp*>& enclosing_loops) {
+        AffineExtractor extractor;
+        for (const auto* for_op : enclosing_loops) {
+            poly_stmt.dims.push_back(for_op->induction_var());
+            poly_stmt.schedule_dims.push_back(for_op->induction_var());
+            
+            PolyLoopBound bound;
+            bound.iv = for_op->induction_var();
+            bound.lower = extractor.extract(for_op->lower_bound());
+            bound.upper = extractor.extract(for_op->upper_bound());
+            poly_stmt.domain.push_back(std::move(bound));
         }
-        return false;
     }
 
     void extract_accesses(const yir::Operation& op, std::vector<PolyAccess>& reads, std::vector<PolyAccess>& writes) {
@@ -149,7 +149,7 @@ PassResult YIRPolyhedralModelBuildPass::run(PassContext &context) {
     if (!scop_info) {
         return PassResult::fail("YIRPolyhedralModelBuildPass requires YIRSCoPInfo.");
     }
-
+    
     auto *canonical_info = context.get_artifact<YIRPolyhedralCanonicalInfo>(
         std::string(YIRPolyhedralCanonicalizePass::kArtifactKey));
     if (!canonical_info) {
@@ -158,7 +158,7 @@ PassResult YIRPolyhedralModelBuildPass::run(PassContext &context) {
 
     PolyhedralBuilder builder(*scop_info, *canonical_info);
     PolyModelInfo info = builder.build();
-
+    
     std::size_t num_models = info.models.size();
     context.set_artifact<PolyModelInfo>(std::string(kArtifactKey), std::move(info));
 

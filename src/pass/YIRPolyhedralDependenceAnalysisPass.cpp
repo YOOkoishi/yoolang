@@ -21,7 +21,6 @@ public:
 
 private:
     void analyze_scop(const PolyScop& scop, std::vector<PolyDependence>& deps) {
-        // Collect all accesses
         for (std::size_t i = 0; i < scop.statements.size(); ++i) {
             for (std::size_t j = i; j < scop.statements.size(); ++j) {
                 const auto& source = scop.statements[i];
@@ -41,54 +40,47 @@ private:
                         std::vector<PolyDependence>& deps) {
         for (const auto& src_acc : source_accesses) {
             for (const auto& tgt_acc : target_accesses) {
-                if (src_acc.memory == tgt_acc.memory) {
-                    bool dependent = test_dependence(src_acc, tgt_acc);
-                    if (dependent) {
-                        PolyDependence dep;
-                        dep.kind = kind;
-                        dep.source_stmt_id = source.id;
-                        dep.target_stmt_id = target.id;
-                        dep.memory = src_acc.memory;
-                        dep.is_dependent = true;
-                        deps.push_back(dep);
-                    }
+                // VERY IMPORTANT OPTIMIZATION:
+                // Only test dependence if they access the same array memory!
+                if (src_acc.memory != tgt_acc.memory) {
+                    continue;
+                }
+                
+                if (test_gcd(src_acc, tgt_acc)) {
+                    PolyDependence dep;
+                    dep.source_stmt_id = source.id;
+                    dep.target_stmt_id = target.id;
+                    dep.kind = kind;
+                    deps.push_back(dep);
                 }
             }
         }
     }
 
-    bool test_dependence(const PolyAccess& src, const PolyAccess& tgt) {
-        // If dimensionality differs, assume dependent/unsafe
-        if (src.indices.size() != tgt.indices.size()) return true;
-        
-        // Simple GCD Test:
-        // For f(i) = a*i + c1, g(j) = b*j + c2
-        // If a and b are both constants, gcd(a, b) must divide (c2 - c1)
-        for (std::size_t i = 0; i < src.indices.size(); ++i) {
-            const auto& src_idx = src.indices[i];
-            const auto& tgt_idx = tgt.indices[i];
+    bool test_gcd(const PolyAccess& src, const PolyAccess& tgt) {
+        if (src.indices.size() != tgt.indices.size()) return false;
+
+        for (size_t i = 0; i < src.indices.size(); ++i) {
+            const auto& src_expr = src.indices[i];
+            const auto& tgt_expr = tgt.indices[i];
+
+            if (!src_expr.valid || !tgt_expr.valid) return true; // Conservative
             
-            if (!src_idx.valid || !tgt_idx.valid) return true;
+            int diff = std::abs(src_expr.constant - tgt_expr.constant);
+            int g = 0;
             
-            // Collect all coefficients
-            std::int64_t gcd_val = 0;
-            for (const auto& term : src_idx.terms) {
-                gcd_val = std::gcd(gcd_val, term.second);
+            for (const auto& term : src_expr.terms) {
+                g = std::gcd(g, std::abs(term.second));
             }
-            for (const auto& term : tgt_idx.terms) {
-                gcd_val = std::gcd(gcd_val, term.second);
+            for (const auto& term : tgt_expr.terms) {
+                g = std::gcd(g, std::abs(term.second));
             }
             
-            if (gcd_val > 0) {
-                std::int64_t c_diff = tgt_idx.constant - src_idx.constant;
-                if (c_diff % gcd_val != 0) {
-                    // Independence proven!
-                    return false;
-                }
+            if (g != 0 && diff % g != 0) {
+                return false; // Independent
             }
         }
-        
-        return true;
+        return true; // Dependent
     }
 
     const PolyModelInfo& model_info_;
@@ -105,19 +97,21 @@ PassKind YIRPolyhedralDependenceAnalysisPass::kind() const {
 }
 
 PassResult YIRPolyhedralDependenceAnalysisPass::run(PassContext &context) {
-    auto *model_info = context.get_artifact<PolyModelInfo>(std::string(YIRPolyhedralModelBuildPass::kArtifactKey));
+    auto *model_info = context.get_artifact<PolyModelInfo>(
+        std::string(YIRPolyhedralModelBuildPass::kArtifactKey));
+        
     if (!model_info) {
         return PassResult::fail("YIRPolyhedralDependenceAnalysisPass requires PolyModelInfo.");
     }
 
     GCDDependenceTester tester(*model_info);
-    PolyDependenceInfo info = tester.analyze();
+    PolyDependenceInfo dep_info = tester.analyze();
     
-    std::size_t num_deps = info.dependences.size();
-    context.set_artifact<PolyDependenceInfo>(std::string(kArtifactKey), std::move(info));
+    std::size_t num_deps = dep_info.dependences.size();
+    context.set_artifact<PolyDependenceInfo>(std::string(kArtifactKey), std::move(dep_info));
 
     std::ostringstream oss;
-    oss << "Analyzed " << num_deps << " data dependences.";
+    oss << "Generated " << num_deps << " Data Dependences.";
     return PassResult::ok(false, oss.str());
 }
 
