@@ -3,8 +3,8 @@
 #include "../include/pass/ASTDumpPass.h"
 #include "../include/pass/ASTSemanticAnalysisPass.h"
 #include "../include/pass/ASTToYIRPass.h"
-#include "../include/pass/MIRCombinePass.h"
-#include "../include/pass/MIRPeepholePass.h"
+#include "../include/pass/MIRCombinePipelinePass.h"
+#include "../include/pass/MIRPeepholePipelinePass.h"
 #include "../include/pass/MIRRegAllocPass.h"
 #include "../include/pass/MIRToAsmPass.h"
 #include "../include/pass/OIRAlgebraicSimplifyPass.h"
@@ -207,10 +207,10 @@ void add_mir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
     pm.add_pass<pass::OIRToMIRPass>(use_virtual_registers);
 
     if (optimizations_enabled(options)) {
-        pm.add_pass<pass::MIRCombinePass>();
-        pm.add_pass<pass::MIRPeepholePass>(false);
+        pm.add_pass<pass::MIRCombinePipelinePass>();
+        pm.add_pass<pass::MIRPeepholePipelinePass>(false);
         pm.add_pass<pass::MIRRegAllocPass>();
-        pm.add_pass<pass::MIRPeepholePass>(true);
+        pm.add_pass<pass::MIRPeepholePipelinePass>(true);
     }
 }
 

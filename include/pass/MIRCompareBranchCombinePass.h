@@ -4,7 +4,7 @@
 
 namespace pass {
 
-class MIRCombinePass final : public Pass {
+class MIRCompareBranchCombinePass final : public Pass {
   public:
     std::string_view name() const override;
     PassKind kind() const override;
