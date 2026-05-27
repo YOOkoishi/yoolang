@@ -4,6 +4,7 @@ import os
 import json
 import math
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -22,6 +23,10 @@ class RunResult:
     exit_code: Optional[int] = None
     detail: str = ""
     metrics: dict[str, int] | None = None
+    exe_path: Path | None = None
+    instruction_count: int | None = None
+    instruction_count_status: str = "DISABLED"
+    instruction_count_detail: str = ""
 
 
 WORKSPACE = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[1])).resolve()
@@ -30,11 +35,15 @@ RUNTIME_SOURCE = WORKSPACE / "runtime" / "sylib.c"
 DEFAULT_RUNTIME_LIB = WORKSPACE / "runtime" / "libsysy_riscv.a"
 DEFAULT_RUNTIME_LIB_ALT = WORKSPACE / "runtime" / "libsysy.a"
 QEMU_BIN = os.environ.get("QEMU_BIN", "qemu-riscv64")
+QEMU_RISCV64 = os.environ.get("QEMU_RISCV64", QEMU_BIN)
 GCC_BIN = os.environ.get("RISCV_GCC", "riscv64-linux-gnu-g++")
 CLANG_BIN = os.environ.get("RISCV_CLANGXX", "clang++")
 AR_BIN = os.environ.get("RISCV_AR", "riscv64-linux-gnu-ar")
 RANLIB_BIN = os.environ.get("RISCV_RANLIB", "riscv64-linux-gnu-ranlib")
 TIMEOUT_SEC = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
+QEMU_INSN_TIMEOUT = int(os.environ.get("QEMU_INSN_TIMEOUT", "30"))
+ENABLE_QEMU_INSN_COUNT = os.environ.get("ENABLE_QEMU_INSN_COUNT", "0").strip().lower() in {"1", "true", "yes", "on"}
+QEMU_INSN_STRICT = os.environ.get("QEMU_INSN_STRICT", "0").strip().lower() in {"1", "true", "yes", "on"}
 REPORT_DIR = WORKSPACE / "build" / "perf-ci"
 REPORT_MD = REPORT_DIR / "perf-report.md"
 REPORT_JSON = REPORT_DIR / "perf-report.json"
@@ -46,6 +55,139 @@ STATUS_EMOJI = {
     "CFAIL": "🛠️",
     "TIMEOUT": "⏱️",
 }
+INSN_RE = re.compile(r"QEMU_INSN_COUNT\s+total_instructions=(\d+)")
+
+
+@dataclass
+class InstructionCountResult:
+    status: str
+    count: int | None = None
+    detail: str = ""
+
+
+class QemuInstructionCounter:
+    def __init__(self) -> None:
+        self.enabled = ENABLE_QEMU_INSN_COUNT
+        self.strict = QEMU_INSN_STRICT
+        self.qemu = QEMU_RISCV64
+        env_plugin = os.environ.get("QEMU_INSN_PLUGIN", "").strip()
+        self.plugin = Path(env_plugin) if env_plugin else REPORT_DIR / "qemu-plugin" / "libinsn_count.so"
+        if env_plugin and not self.plugin.is_absolute():
+            self.plugin = WORKSPACE / self.plugin
+        self._ready: bool | None = None
+        self._reason = "disabled"
+
+    def ensure_ready(self) -> bool:
+        if not self.enabled:
+            self._ready = False
+            self._reason = "ENABLE_QEMU_INSN_COUNT is not enabled"
+            return False
+        if self._ready is not None:
+            return self._ready
+
+        qemu_path = shutil.which(self.qemu) if not Path(self.qemu).is_absolute() else self.qemu
+        if not qemu_path:
+            self._ready = False
+            self._reason = f"QEMU_RISCV64 not found: {self.qemu}"
+            return False
+
+        if not self.plugin.exists():
+            try:
+                self._build_plugin()
+            except Exception as exc:
+                self._ready = False
+                self._reason = f"failed to build QEMU instruction-count plugin: {exc}"
+                return False
+
+        help_proc = subprocess.run(
+            [self.qemu, "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        help_text = (help_proc.stdout or "") + (help_proc.stderr or "")
+        if "-plugin" not in help_text:
+            self._ready = False
+            self._reason = f"{self.qemu} does not advertise -plugin support"
+            return False
+
+        self._ready = self.plugin.exists()
+        if not self._ready:
+            self._reason = f"QEMU instruction-count plugin not found: {self.plugin}"
+        return self._ready
+
+    @property
+    def reason(self) -> str:
+        self.ensure_ready()
+        return self._reason
+
+    def _build_plugin(self) -> None:
+        src = WORKSPACE / "tools" / "qemu-insn-count" / "insn_count.c"
+        include_dir = WORKSPACE / "tools" / "qemu-insn-count"
+        if not src.exists():
+            raise FileNotFoundError(src)
+        self.plugin.parent.mkdir(parents=True, exist_ok=True)
+        cc = os.environ.get("CC", "cc")
+        subprocess.run(
+            [
+                cc,
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-std=c11",
+                "-I",
+                str(include_dir),
+                str(src),
+                "-o",
+                str(self.plugin),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def count(self, exe: Path, input_file: Optional[Path]) -> InstructionCountResult:
+        if not self.enabled:
+            return InstructionCountResult("DISABLED", detail="ENABLE_QEMU_INSN_COUNT is not enabled")
+        if not self.ensure_ready():
+            return InstructionCountResult("SKIPPED", detail=self._reason)
+
+        stdin_data = input_file.read_bytes() if input_file and input_file.exists() else None
+        try:
+            result = subprocess.run(
+                [
+                    self.qemu,
+                    "-L",
+                    "/usr/riscv64-linux-gnu",
+                    "-plugin",
+                    str(self.plugin),
+                    str(exe),
+                ],
+                input=stdin_data,
+                capture_output=True,
+                text=False,
+                timeout=QEMU_INSN_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return InstructionCountResult("FAILED", detail=f"TIMEOUT after {QEMU_INSN_TIMEOUT}s")
+        except Exception as exc:
+            return InstructionCountResult("FAILED", detail=f"ERR: {exc}")
+
+        stdout = result.stdout.decode(errors="replace") if result.stdout else ""
+        stderr = result.stderr.decode(errors="replace") if result.stderr else ""
+        match = INSN_RE.search(stdout + "\n" + stderr)
+        if result.returncode != 0:
+            detail = f"qemu exited with {result.returncode}"
+            if stderr.strip():
+                detail += f": {stderr.strip().splitlines()[-1]}"
+            return InstructionCountResult("FAILED", detail=detail)
+        if not match:
+            return InstructionCountResult("FAILED", detail="QEMU_INSN_COUNT marker not found")
+        return InstructionCountResult("OK", count=int(match.group(1)), detail="OK")
+
+
+INSN_COUNTER = QemuInstructionCounter()
 
 
 def _resolve_compiler_binary() -> Path:
@@ -478,10 +620,15 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
             continue
 
         run_ok, elapsed, stdout, stderr, exit_code, detail = _run_qemu(exe, input_file)
-        results[name] = RunResult(True, run_ok, elapsed, stdout, stderr, exit_code, detail)
+        results[name] = RunResult(True, run_ok, elapsed, stdout, stderr, exit_code, detail, exe_path=exe)
 
     if "compiler" in results and results["compiler"].compile_ok:
         results["compiler"].metrics = _collect_codegen_metrics(src, case_dir)
+    if "compiler" in results and results["compiler"].compile_ok and results["compiler"].run_ok:
+        insn_result = INSN_COUNTER.count(results["compiler"].exe_path or Path(), input_file)
+        results["compiler"].instruction_count = insn_result.count
+        results["compiler"].instruction_count_status = insn_result.status
+        results["compiler"].instruction_count_detail = insn_result.detail
 
     gcc = results["gcc"]
     clang = results["clang++"]
@@ -587,12 +734,47 @@ def _compiler_vs_o3_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
     }
 
 
+def _instruction_count_summary(rows: list[dict]) -> dict[str, object]:
+    counts = [
+        row.get("instruction_count")
+        for row in rows
+        if isinstance(row.get("instruction_count"), int)
+    ]
+    statuses = [str(row.get("instruction_count_status", "DISABLED")) for row in rows]
+    failed = sum(1 for status in statuses if status == "FAILED")
+    skipped = sum(1 for status in statuses if status == "SKIPPED")
+    disabled = sum(1 for status in statuses if status == "DISABLED")
+    if counts:
+        status = "OK" if failed == 0 else "FAILED"
+        reason = ""
+    elif ENABLE_QEMU_INSN_COUNT:
+        status = "FAILED" if failed else "SKIPPED"
+        reason = INSN_COUNTER.reason
+    else:
+        status = "DISABLED"
+        reason = "ENABLE_QEMU_INSN_COUNT is not enabled"
+    return {
+        "enabled": ENABLE_QEMU_INSN_COUNT,
+        "strict": QEMU_INSN_STRICT,
+        "status": status,
+        "reason": reason,
+        "qemu": QEMU_RISCV64,
+        "plugin": str(INSN_COUNTER.plugin),
+        "total_instructions": sum(counts) if counts else None,
+        "counted_cases": len(counts),
+        "failed_cases": failed,
+        "skipped_cases": skipped,
+        "disabled_cases": disabled,
+    }
+
+
 def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     status = "PASS" if failures == 0 else "FAIL"
     generated = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     o3_stats = _compiler_vs_o3_stats(rows)
+    insn_summary = _instruction_count_summary(rows)
 
     md_lines = [
         "# 📊 RISC-V QEMU Perf Report",
@@ -605,6 +787,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         f"- Total runtime (s): {total_runtime:.4f}",
         f"- 🧮 Geomean speedup: GCC {_format_ratio(o3_stats['gcc_o3_geomean'])} / Clang++ {_format_ratio(o3_stats['clang_o3_geomean'])}",
         f"- 🏁 Faster cases: GCC {o3_stats['gcc_o3_faster_cases']} / Clang++ {o3_stats['clang_o3_faster_cases']}",
+        f"- QEMU dynamic instruction count: {insn_summary['status']}",
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
         "",
@@ -651,6 +834,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         "clang_o3_geomean": o3_stats["clang_o3_geomean"],
         "gcc_o3_faster_cases": o3_stats["gcc_o3_faster_cases"],
         "clang_o3_faster_cases": o3_stats["clang_o3_faster_cases"],
+        "instruction_count_summary": insn_summary,
         "rows": rows,
     }
     REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
@@ -710,6 +894,9 @@ def main() -> int:
                 "status": detail,
                 "detail": error_detail,
                 "codegen_metrics": compiler.metrics or {},
+                "instruction_count": compiler.instruction_count,
+                "instruction_count_status": compiler.instruction_count_status,
+                "instruction_count_detail": compiler.instruction_count_detail,
             }
         )
         if not ok:
@@ -717,6 +904,9 @@ def main() -> int:
             print(f"❌ [FAIL] {rel}: {detail}")
             if error_detail:
                 print(error_detail)
+        if compiler.instruction_count_status == "FAILED" and QEMU_INSN_STRICT:
+            failures += 1
+            print(f"❌ [FAIL] {rel}: qemu instruction count failed: {compiler.instruction_count_detail}")
 
     print("-" * 140)
     print(f"📌 Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")

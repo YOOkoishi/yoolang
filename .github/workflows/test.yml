@@ -95,6 +95,10 @@ jobs:
             test/bsb-final/2025-Z8N-28.sy
           PERF_TIMEOUT_SEC: "20"
           SYSY_RUNTIME_LIB: runtime/libsysy_riscv.a
+          ENABLE_QEMU_INSN_COUNT: "1"
+          QEMU_RISCV64: /home/cjj/.local/yoolang-ci/qemu-plugin/bin/qemu-riscv64
+          QEMU_INSN_TIMEOUT: "30"
+          QEMU_INSN_STRICT: "0"
         run: |
           set -o pipefail
           mkdir -p build/github-actions
@@ -115,6 +119,7 @@ jobs:
           current_json="build/perf-ci/perf-report.json"
           delta_md="build/perf-ci/perf-delta.md"
           delta_json="build/perf-ci/perf-delta.json"
+          insn_delta_json="build/perf-ci/instruction-count-compare.json"
 
           baseline_label="local ${BASELINE_BRANCH} baseline"
           baseline_commit_sha=""
@@ -174,6 +179,7 @@ jobs:
               echo "- Reason: current perf report unavailable"
             } > "$delta_md"
             printf '{"status":"NO BASELINE","baseline":"%s","reason":"current perf report unavailable"}\n' "$baseline_label" > "$delta_json"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"current perf report unavailable","current_total_instructions":null,"baseline_total_instructions":null,"rows":[]}\n' "$baseline_label" > "$insn_delta_json"
             exit 0
           fi
 
@@ -190,6 +196,7 @@ jobs:
               echo "\`$baseline_json\`"
             } > "$delta_md"
             printf '{"status":"NO BASELINE","baseline":"%s","reason":"local main baseline not found yet"}\n' "$baseline_label" > "$delta_json"
+            printf '{"status":"NO BASELINE","baseline":"%s","reason":"local main baseline not found yet","current_total_instructions":null,"baseline_total_instructions":null,"rows":[]}\n' "$baseline_label" > "$insn_delta_json"
             exit 0
           fi
 
@@ -198,6 +205,7 @@ jobs:
             --baseline "$baseline_json" \
             --out-md "$delta_md" \
             --out-json "$delta_json" \
+            --out-insn-json "$insn_delta_json" \
             --baseline-label "$baseline_label" \
             --baseline-branch "$BASELINE_BRANCH" \
             --baseline-run-id "" \
@@ -289,6 +297,7 @@ jobs:
           functional_log = root / "build/github-actions/functional-tests.log"
           perf_log = root / "build/github-actions/perf-tests.log"
           perf_json = root / "build/perf-ci/perf-report.json"
+          insn_delta_json = root / "build/perf-ci/instruction-count-compare.json"
           perf_delta_md = root / "build/perf-ci/perf-delta.md"
           summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
 
@@ -428,6 +437,9 @@ jobs:
               perf_failures = perf_payload.get('failures', 'unknown')
               lines.append(f"- Failed: {'✅' if perf_failures == 0 else '❌'} {perf_failures}")
               lines.append(f"- Total runtime (s): {float(total_runtime):.4f}")
+              insn_summary = perf_payload.get("instruction_count_summary", {})
+              if isinstance(insn_summary, dict):
+                  lines.append(f"- QEMU dynamic instruction count: {insn_summary.get('status', 'UNKNOWN')}")
               gcc_o3_geomean = perf_payload.get("gcc_o3_geomean")
               clang_o3_geomean = perf_payload.get("clang_o3_geomean")
               gcc_o3_faster_cases = perf_payload.get("gcc_o3_faster_cases")
@@ -467,6 +479,13 @@ jobs:
 
           if perf_delta_md.exists():
               lines.extend(["", perf_delta_md.read_text(errors="replace").strip(), ""])
+          elif insn_delta_json.exists():
+              try:
+                  insn_delta = json.loads(insn_delta_json.read_text(errors="replace"))
+              except Exception:
+                  insn_delta = {}
+              if insn_delta:
+                  lines.extend(["", "## 🧮 QEMU Dynamic Instruction Count", "", f"- Status: {insn_delta.get('status', 'UNKNOWN')}"])
 
           summary_path.write_text("\n".join(lines) + "\n")
           PY
@@ -483,6 +502,7 @@ jobs:
             build/perf-ci/perf-report.json
             build/perf-ci/perf-delta.md
             build/perf-ci/perf-delta.json
+            build/perf-ci/instruction-count-compare.json
           if-no-files-found: warn
 
       - name: Fail job if functional tests failed
@@ -593,6 +613,23 @@ jobs:
                   return f"{baseline_total / current_total:.2f}x"
               return "N/A"
 
+          def fmt_insn(value) -> str:
+              return f"{value:,}" if isinstance(value, int) else "N/A"
+
+          def fmt_insn_overall(delta: dict) -> str:
+              delta_pct = delta.get("total_delta_pct")
+              if not isinstance(delta_pct, (int, float)):
+                  return "ℹ️ N/A"
+              if delta_pct > 0:
+                  return f"⚠️ 多 {delta_pct:.1f}%"
+              if delta_pct < 0:
+                  return f"🚀 少 {abs(delta_pct):.1f}%"
+              return "✅ 持平 0.0%"
+
+          def fmt_insn_speedup(delta: dict) -> str:
+              speedup = delta.get("total_speedup")
+              return f"{speedup:.2f}x" if isinstance(speedup, (int, float)) else "N/A"
+
           def fmt_optional_speedup(value) -> str:
               return f"{value:.2f}x" if isinstance(value, (int, float)) else "N/A"
 
@@ -642,6 +679,9 @@ jobs:
 
           perf = read_json("build/perf-ci/perf-report.json")
           delta = read_json("build/perf-ci/perf-delta.json")
+          insn_delta = read_json("build/perf-ci/instruction-count-compare.json")
+          if not insn_delta and isinstance(delta.get("instruction_count"), dict):
+              insn_delta = delta.get("instruction_count")
           rows = perf.get("rows", []) if isinstance(perf.get("rows"), list) else []
           delta_rows = delta.get("rows", []) if isinstance(delta.get("rows"), list) else []
 
@@ -742,6 +782,35 @@ jobs:
               f"🧮 几何平均加速比: GCC {fmt_optional_speedup(perf.get('gcc_o3_geomean'))} / Clang++ {fmt_optional_speedup(perf.get('clang_o3_geomean'))}",
               f"🏁 单 case 更快: GCC {perf.get('gcc_o3_faster_cases', 'N/A')}个 / Clang++ {perf.get('clang_o3_faster_cases', 'N/A')}个",
           ]
+
+          if insn_delta.get("status") == "OK":
+              lines.extend(
+                  [
+                      "",
+                      "🧮 QEMU 动态指令数:",
+                      f"当前: {fmt_insn(insn_delta.get('current_total_instructions'))}",
+                      f"基线: {fmt_insn(insn_delta.get('baseline_total_instructions'))}",
+                      f"整体: {fmt_insn_overall(insn_delta)}, 指令数加速比 {fmt_insn_speedup(insn_delta)}",
+                      (
+                          "case 胜负: "
+                          f"🚀 {insn_delta.get('case_wins', 0)} 胜 / "
+                          f"⚠️ {insn_delta.get('case_losses', 0)} 负 / "
+                          f"✅ {insn_delta.get('case_ties', 0)} 平 / "
+                          f"❌ {insn_delta.get('case_failed', 0)} 失败"
+                      ),
+                  ]
+              )
+          else:
+              insn_summary = perf.get("instruction_count_summary", {}) if isinstance(perf.get("instruction_count_summary"), dict) else {}
+              reason = insn_delta.get("reason") or insn_summary.get("reason") or "instruction count data unavailable"
+              status_text = insn_delta.get("status") or insn_summary.get("status") or "SKIPPED"
+              lines.extend(
+                  [
+                      "",
+                      f"🧮 QEMU 动态指令数: ⚠️ {status_text}",
+                      f"原因: {reason}",
+                  ]
+              )
 
           if slow_cases:
               lines.extend(["", "⚠️ 最慢变化:"])

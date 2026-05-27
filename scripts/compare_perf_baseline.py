@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--out-md", required=True, type=Path)
     parser.add_argument("--out-json", required=True, type=Path)
+    parser.add_argument("--out-insn-json", type=Path)
     parser.add_argument("--baseline-label", default="main latest successful run")
     parser.add_argument("--baseline-branch", default="")
     parser.add_argument("--baseline-run-id", default="")
@@ -66,6 +67,11 @@ def rows_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def compiler_cell(row: dict[str, Any]) -> Any:
     return row.get("compiler", row.get("yoolang"))
+
+
+def instruction_count(row: dict[str, Any]) -> int | None:
+    value = row.get("instruction_count")
+    return value if isinstance(value, int) else None
 
 
 def format_signed_sec(value: float) -> str:
@@ -157,6 +163,22 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
         "rows": [],
     }
     args.out_json.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+    if args.out_insn_json:
+        args.out_insn_json.parent.mkdir(parents=True, exist_ok=True)
+        args.out_insn_json.write_text(
+            json.dumps(
+                {
+                    "status": "NO BASELINE",
+                    "reason": reason,
+                    "current_total_instructions": None,
+                    "baseline_total_instructions": None,
+                    "rows": [],
+                },
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n"
+        )
     args.out_md.write_text(
         "\n".join(
             [
@@ -170,6 +192,101 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
             ]
         )
     )
+
+
+def compare_instruction_counts(
+    args: argparse.Namespace,
+    current_rows: dict[str, dict[str, Any]],
+    baseline_rows: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    current_total = 0
+    baseline_total = 0
+    wins = 0
+    losses = 0
+    ties = 0
+    failed = 0
+
+    comparable_cases = sorted(set(current_rows) & set(baseline_rows))
+    for case in comparable_cases:
+        current_count = instruction_count(current_rows[case])
+        baseline_count = instruction_count(baseline_rows[case])
+        if current_count is None or baseline_count is None:
+            failed += 1
+            rows.append(
+                {
+                    "case": case,
+                    "current": current_count,
+                    "baseline": baseline_count,
+                    "status": "FAILED",
+                    "reason": "missing current or baseline instruction count",
+                }
+            )
+            continue
+        delta = current_count - baseline_count
+        delta_pct = 0.0 if baseline_count == 0 else (delta / baseline_count) * 100.0
+        speedup = (baseline_count / current_count) if current_count > 0 else None
+        if current_count < baseline_count:
+            wins += 1
+            row_status = "WIN"
+        elif current_count > baseline_count:
+            losses += 1
+            row_status = "LOSS"
+        else:
+            ties += 1
+            row_status = "TIE"
+        current_total += current_count
+        baseline_total += baseline_count
+        rows.append(
+            {
+                "case": case,
+                "current": current_count,
+                "baseline": baseline_count,
+                "delta": delta,
+                "delta_pct": delta_pct,
+                "speedup": speedup,
+                "status": row_status,
+            }
+        )
+
+    if not comparable_cases:
+        status = "SKIPPED"
+        reason = "no comparable cases"
+    elif current_total == 0 or baseline_total == 0:
+        status = "SKIPPED" if failed else "OK"
+        reason = "no comparable instruction counts" if failed else ""
+    else:
+        status = "OK"
+        reason = ""
+
+    total_delta = current_total - baseline_total
+    total_delta_pct = 0.0 if baseline_total == 0 else (total_delta / baseline_total) * 100.0
+    total_speedup = (baseline_total / current_total) if current_total > 0 else None
+    payload: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "baseline": args.baseline_label,
+        "baseline_branch": args.baseline_branch,
+        "baseline_commit_sha": args.baseline_commit_sha,
+        "baseline_commit_time": args.baseline_commit_time,
+        "baseline_commit_title": args.baseline_commit_title,
+        "baseline_commit_author": args.baseline_commit_author,
+        "comparable_cases": wins + losses + ties,
+        "current_total_instructions": current_total if wins + losses + ties else None,
+        "baseline_total_instructions": baseline_total if wins + losses + ties else None,
+        "total_delta": total_delta if wins + losses + ties else None,
+        "total_delta_pct": total_delta_pct if wins + losses + ties else None,
+        "total_speedup": total_speedup,
+        "case_wins": wins,
+        "case_losses": losses,
+        "case_ties": ties,
+        "case_failed": failed,
+        "rows": rows,
+    }
+    if args.out_insn_json:
+        args.out_insn_json.parent.mkdir(parents=True, exist_ok=True)
+        args.out_insn_json.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+    return payload
 
 
 def main() -> int:
@@ -189,6 +306,7 @@ def main() -> int:
 
     current_rows = rows_by_case(current)
     baseline_rows = rows_by_case(baseline)
+    insn_compare = compare_instruction_counts(args, current_rows, baseline_rows)
 
     rows: list[dict[str, Any]] = []
     current_total = 0.0
@@ -271,6 +389,40 @@ def main() -> int:
         "",
     ]
 
+    if insn_compare.get("status") == "OK":
+        current_insn = insn_compare.get("current_total_instructions")
+        baseline_insn = insn_compare.get("baseline_total_instructions")
+        total_speedup_insn = insn_compare.get("total_speedup")
+        total_delta_pct_insn = insn_compare.get("total_delta_pct")
+        md_lines.extend(
+            [
+                "## 🧮 QEMU Dynamic Instruction Count",
+                "",
+                f"- Current total instructions: {current_insn}",
+                f"- Baseline total instructions: {baseline_insn}",
+                f"- Overall speedup vs baseline: {format_speedup(total_speedup_insn if isinstance(total_speedup_insn, (int, float)) else None)}",
+                f"- Delta: {format_signed_pct(total_delta_pct_insn if isinstance(total_delta_pct_insn, (int, float)) else 0.0)}",
+                (
+                    "- Case win/loss/tie: "
+                    f"🚀 {insn_compare.get('case_wins', 0)} fewer / "
+                    f"⚠️ {insn_compare.get('case_losses', 0)} more / "
+                    f"✅ {insn_compare.get('case_ties', 0)} tied / "
+                    f"❌ {insn_compare.get('case_failed', 0)} failed"
+                ),
+                "",
+            ]
+        )
+    else:
+        md_lines.extend(
+            [
+                "## 🧮 QEMU Dynamic Instruction Count",
+                "",
+                f"- Status: ⚠️ {insn_compare.get('status', 'SKIPPED')}",
+                f"- Reason: {insn_compare.get('reason', 'unknown')}",
+                "",
+            ]
+        )
+
     if shown_regressions:
         md_lines.extend(
             [
@@ -318,6 +470,7 @@ def main() -> int:
         "case_wins": case_wins,
         "case_losses": case_losses,
         "case_ties": case_ties,
+        "instruction_count": insn_compare,
         "regressions": regressions,
         "rows": rows,
     }
