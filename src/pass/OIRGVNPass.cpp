@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRGVNPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
@@ -448,3 +450,25 @@ bool global_value_numbering(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRGVNPass::name() const {
+    return "OIRGVNPass";
+}
+
+PassKind OIRGVNPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRGVNPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRGVNPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed =
+                                              oir_opt::global_value_numbering(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+} // namespace pass

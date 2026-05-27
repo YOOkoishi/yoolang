@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRLoopCanonicalizePass.h"
+
 #include "../../include/oir/OIRAnalysis.h"
 #include "../../include/oir/OIRCFGUtils.h"
 #include "../../include/oir/OIRScalarOpt.h"
@@ -414,3 +416,25 @@ bool canonicalize_loops(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRLoopCanonicalizePass::name() const {
+    return "OIRLoopCanonicalizePass";
+}
+
+PassKind OIRLoopCanonicalizePass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRLoopCanonicalizePass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIRLoopCanonicalizePass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            bool changed = oir_opt::canonicalize_loops(module, stats);
+            changed |= oir_opt::cleanup_cfg(module, stats);
+            return changed;
+        });
+}
+
+} // namespace pass

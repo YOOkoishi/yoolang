@@ -4,7 +4,7 @@
 
 namespace pass {
 
-class OIRADCEPass final : public Pass {
+class OIRDeadStoreEliminationPass final : public Pass {
   public:
     std::string_view name() const override;
     PassKind kind() const override;

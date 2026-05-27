@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRMem2RegPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
@@ -360,3 +362,28 @@ bool promote_memory_to_registers(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRMem2RegPass::name() const {
+    return "OIRMem2RegPass";
+}
+
+PassKind OIRMem2RegPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRMem2RegPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRMem2RegPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed = oir_opt::scalar_replacement_of_aggregates(
+                                              module, stats);
+                                          changed |=
+                                              oir_opt::promote_memory_to_registers(module, stats);
+                                          changed |= oir_opt::cleanup_cfg(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+} // namespace pass

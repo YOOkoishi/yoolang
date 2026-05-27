@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRCFGCleanupPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRCFGUtils.h"
@@ -301,3 +303,26 @@ bool cleanup_cfg(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRCFGCleanupPass::name() const {
+    return "OIRCFGCleanupPass";
+}
+
+PassKind OIRCFGCleanupPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRCFGCleanupPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context,
+                                      "OIRCFGCleanupPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed = oir_opt::simplify_branches(module, stats);
+                                          changed |= oir_opt::cleanup_cfg(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+} // namespace pass

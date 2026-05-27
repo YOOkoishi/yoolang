@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRDeadCodeEliminationPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
@@ -49,3 +51,23 @@ bool verify_oir(oir::Module &module, std::string &message) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRDeadCodeEliminationPass::name() const {
+    return "OIRDeadCodeEliminationPass";
+}
+
+PassKind OIRDeadCodeEliminationPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRDeadCodeEliminationPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIRDeadCodeEliminationPass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            return oir_opt::eliminate_dead_code(module, stats);
+        });
+}
+
+} // namespace pass

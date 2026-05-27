@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRLICMPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
@@ -317,3 +319,25 @@ bool loop_invariant_code_motion(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRLICMPass::name() const {
+    return "OIRLICMPass";
+}
+
+PassKind OIRLICMPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRLICMPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRLICMPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed =
+                                              oir_opt::loop_invariant_code_motion(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+} // namespace pass

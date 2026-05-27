@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRSCCPPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
@@ -360,3 +362,26 @@ bool run_sccp(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRSCCPPass::name() const {
+    return "OIRSCCPPass";
+}
+
+PassKind OIRSCCPPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRSCCPPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRSCCPPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed = oir_opt::run_sccp(module, stats);
+                                          changed |= oir_opt::simplify_branches(module, stats);
+                                          changed |= oir_opt::cleanup_cfg(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+} // namespace pass

@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRSROAPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include <algorithm>
@@ -385,3 +387,28 @@ bool scalar_replacement_of_aggregates(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRSROAPass::name() const {
+    return "OIRSROAPass";
+}
+
+PassKind OIRSROAPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRSROAPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRSROAPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          bool changed =
+                                              oir_opt::scalar_replacement_of_aggregates(module,
+                                                                                        stats);
+                                          changed |=
+                                              oir_opt::promote_memory_to_registers(module, stats);
+                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          return changed;
+                                      });
+}
+
+} // namespace pass

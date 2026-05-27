@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRInlinePass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include "../../include/oir/OIRAnalysis.h"
@@ -605,3 +607,31 @@ bool inline_functions(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRInlinePass::name() const {
+    return "OIRInlinePass";
+}
+
+PassKind OIRInlinePass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRInlinePass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIRInlinePass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            bool changed = oir_opt::inline_functions(module, stats);
+            if (changed) {
+                changed |= oir_opt::run_sccp(module, stats);
+                changed |= oir_opt::global_value_numbering(module, stats);
+            }
+            changed |= oir_opt::simplify_branches(module, stats);
+            changed |= oir_opt::cleanup_cfg(module, stats);
+            changed |= oir_opt::eliminate_dead_code(module, stats);
+            return changed;
+        });
+}
+
+} // namespace pass

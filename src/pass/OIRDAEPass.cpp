@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRDAEPass.h"
+
 #include "../../include/oir/OIRScalarOpt.h"
 
 #include <algorithm>
@@ -98,3 +100,22 @@ bool eliminate_dead_arguments(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRDAEPass::name() const {
+    return "OIRDAEPass";
+}
+
+PassKind OIRDAEPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRDAEPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(context, "OIRDAEPass requires OIR module in pass context",
+                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                          return oir_opt::eliminate_dead_arguments(module, stats);
+                                      });
+}
+
+} // namespace pass

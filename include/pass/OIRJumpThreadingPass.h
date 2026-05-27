@@ -4,7 +4,7 @@
 
 namespace pass {
 
-class OIRADCEPass final : public Pass {
+class OIRJumpThreadingPass final : public Pass {
   public:
     std::string_view name() const override;
     PassKind kind() const override;

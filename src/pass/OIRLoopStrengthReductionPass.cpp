@@ -1,3 +1,5 @@
+#include "../../include/pass/OIRLoopStrengthReductionPass.h"
+
 #include "../../include/oir/OIRAnalysis.h"
 #include "../../include/oir/OIRScalarOpt.h"
 
@@ -559,3 +561,26 @@ bool reduce_gep_strength(oir::Module &module, Stats &stats) {
 }
 
 } // namespace pass::oir_opt
+
+namespace pass {
+
+std::string_view OIRLoopStrengthReductionPass::name() const {
+    return "OIRLoopStrengthReductionPass";
+}
+
+PassKind OIRLoopStrengthReductionPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult OIRLoopStrengthReductionPass::run(PassContext &context) {
+    return oir_opt::run_oir_transform(
+        context, "OIRLoopStrengthReductionPass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            bool changed = oir_opt::reduce_gep_strength(module, stats);
+            changed |= oir_opt::global_value_numbering(module, stats);
+            changed |= oir_opt::eliminate_dead_code(module, stats);
+            return changed;
+        });
+}
+
+} // namespace pass
