@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 namespace yir {
+class ForOp;
 class Operation;
 class Region;
 class Value;
@@ -16,6 +17,7 @@ namespace pass {
 struct YIRSCoPStatement {
     std::size_t id;
     const yir::Operation *op;
+    std::vector<const yir::ForOp *> enclosing_loops;
 };
 
 struct YIRSCoP {

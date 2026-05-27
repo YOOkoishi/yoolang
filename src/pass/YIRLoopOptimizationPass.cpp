@@ -822,12 +822,45 @@ yir::Value *truthy_while_condition_value(const yir::WhileOp &op) {
     return cond->condition();
 }
 
-yir::ForOp *only_nested_for(yir::ForOp &loop) {
-    auto &ops = loop.body_region().operations();
-    if (ops.size() != 1) {
-        return nullptr;
+struct NestedForCandidate {
+    yir::ForOp *inner = nullptr;
+    std::size_t inner_index = 0;
+    bool has_redundant_reset = false;
+};
+
+bool same_int_constant_value(const yir::Value *lhs, const yir::Value *rhs) {
+    std::int64_t lhs_value = 0;
+    std::int64_t rhs_value = 0;
+    return const_i32(lhs, lhs_value) && const_i32(rhs, rhs_value) && lhs_value == rhs_value;
+}
+
+bool is_redundant_inner_iv_reset(const yir::Operation &op, const yir::ForOp &inner) {
+    auto *assign = dynamic_cast<const yir::AssignOp *>(&op);
+    return assign != nullptr && assign->target() == inner.induction_var() &&
+           (assign->value() == inner.lower_bound() ||
+            same_int_constant_value(assign->value(), inner.lower_bound()));
+}
+
+NestedForCandidate nested_for_with_optional_reset(yir::ForOp &outer) {
+    auto &ops = outer.body_region().operations();
+    if (ops.size() == 1) {
+        return {dynamic_cast<yir::ForOp *>(ops.front().get()), 0, false};
     }
-    return dynamic_cast<yir::ForOp *>(ops.front().get());
+    if (ops.size() == 2) {
+        auto *inner = dynamic_cast<yir::ForOp *>(ops[1].get());
+        if (inner != nullptr && is_redundant_inner_iv_reset(*ops[0], *inner)) {
+            return {inner, 1, true};
+        }
+    }
+    return {};
+}
+
+void erase_redundant_reset(yir::ForOp &outer, const NestedForCandidate &nest) {
+    if (!nest.has_redundant_reset || nest.inner_index == 0) {
+        return;
+    }
+    auto &ops = outer.body_region().operations();
+    ops.erase(ops.begin() + static_cast<std::ptrdiff_t>(nest.inner_index - 1));
 }
 
 std::int64_t trip_count(std::int64_t lower, std::int64_t upper, std::int64_t step) {
@@ -1258,7 +1291,8 @@ class Optimizer final {
 
     bool try_interchange(OpList &, std::size_t &, yir::ForOp &outer,
                          const yir::LoopAnalysis &analysis) {
-        auto *inner = only_nested_for(outer);
+        auto nest = nested_for_with_optional_reset(outer);
+        auto *inner = nest.inner;
         if (inner == nullptr || !region_is_straight_line_cloneable(inner->body_region())) {
             return false;
         }
@@ -1280,6 +1314,7 @@ class Optimizer final {
             return false;
         }
 
+        erase_redundant_reset(outer, nest);
         std::swap(outer.operands()[0], inner->operands()[0]);
         std::swap(outer.operands()[1], inner->operands()[1]);
         std::swap(outer.operands()[2], inner->operands()[2]);
@@ -1289,7 +1324,8 @@ class Optimizer final {
 
     bool try_tile_perfect_nest(OpList &ops, std::size_t &index, yir::ForOp &outer,
                                const yir::LoopAnalysis &analysis) {
-        auto *inner = only_nested_for(outer);
+        auto nest = nested_for_with_optional_reset(outer);
+        auto *inner = nest.inner;
         if (inner == nullptr || !region_is_straight_line_cloneable(inner->body_region())) {
             return false;
         }
@@ -1419,7 +1455,8 @@ class Optimizer final {
 
     bool try_unroll_jam(OpList &ops, std::size_t &index, yir::ForOp &outer,
                         const yir::LoopAnalysis &analysis) {
-        auto *inner = only_nested_for(outer);
+        auto nest = nested_for_with_optional_reset(outer);
+        auto *inner = nest.inner;
         if (inner == nullptr || !region_is_straight_line_cloneable(inner->body_region())) {
             return false;
         }
