@@ -52,7 +52,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", action="append", choices=sorted(STAGE_FLAGS))
     parser.add_argument("--filter", help="only run tests whose path contains this substring")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
-    parser.add_argument("--timeout", type=float, default=20.0, help="per subprocess timeout in seconds")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        help="default per subprocess timeout in seconds"
+    )
+    parser.add_argument(
+        "--compile-timeout",
+        type=float,
+        default=60.0,
+        help="compiler subprocess timeout in seconds",
+    )
+    parser.add_argument(
+        "--link-timeout",
+        type=float,
+        default=20.0,
+        help="linker subprocess timeout in seconds",
+    )
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=20.0,
+        help="program execution timeout in seconds",
+    )
+    parser.add_argument(
+        "--filecheck-timeout",
+        type=float,
+        default=20.0,
+        help="FileCheck RUN line timeout in seconds",
+    )
+    parser.add_argument(
+        "--infra-timeout",
+        type=float,
+        default=20.0,
+        help="infra test subprocess timeout in seconds",
+    )
     parser.add_argument(
         "--opt-level",
         type=int,
@@ -87,6 +122,10 @@ def expand_suites(values: list[str] | None) -> list[str]:
         if value not in out:
             out.append(value)
     return out
+
+
+def resolve_timeout(value: float | None, fallback: float) -> float:
+    return fallback if value is None else value
 
 
 def rel(path: Path) -> str:
@@ -270,7 +309,7 @@ def compiler_opt_flags(opt_level: int) -> list[str]:
     return [f"-O{opt_level}"]
 
 
-def run_stage(source: Path, stage: str, binary: Path, timeout: float, opt_level: int) -> TestResult:
+def run_stage(source: Path, stage: str, binary: Path, compile_timeout: float, opt_level: int) -> TestResult:
     suffix = f", -O{opt_level}" if opt_level else ""
     name = f"{rel(source)} [{stage}{suffix}]"
     start = time.monotonic()
@@ -278,7 +317,7 @@ def run_stage(source: Path, stage: str, binary: Path, timeout: float, opt_level:
         proc = run_process(
             [str(binary), STAGE_FLAGS[stage], *compiler_opt_flags(opt_level), str(source)],
             stdout_target=subprocess.DEVNULL,
-            timeout=timeout,
+            timeout=compile_timeout,
         )
     except subprocess.TimeoutExpired:
         return TestResult("stage", name, "FAIL", time.monotonic() - start, "compiler timed out")
@@ -320,7 +359,9 @@ def run_e2e(
     runtime: Path,
     gcc: str | None,
     qemu: str | None,
-    timeout: float,
+    compile_timeout: float,
+    link_timeout: float,
+    run_timeout: float,
     max_input_bytes: int,
     opt_level: int,
 ) -> TestResult:
@@ -348,7 +389,7 @@ def run_e2e(
         compile_proc = run_process(
             [str(binary), str(source), "-S", *compiler_opt_flags(opt_level), "-o", str(asm_path)],
             stdout_target=subprocess.DEVNULL,
-            timeout=timeout,
+            timeout=compile_timeout,
         )
     except subprocess.TimeoutExpired:
         return TestResult("e2e", name, "FAIL", time.monotonic() - start, "compiler timed out")
@@ -358,7 +399,7 @@ def run_e2e(
     try:
         link_proc = run_process(
             [gcc, "-static", str(asm_path), str(runtime), "-o", str(exe_path)],
-            timeout=timeout,
+            timeout=link_timeout,
         )
     except subprocess.TimeoutExpired:
         return TestResult("e2e", name, "FAIL", time.monotonic() - start, "linker timed out")
@@ -368,7 +409,7 @@ def run_e2e(
 
     input_bytes = input_path.read_bytes() if input_path.exists() else b""
     try:
-        run_proc = run_process([qemu, str(exe_path)], input_bytes=input_bytes, timeout=timeout)
+        run_proc = run_process([qemu, str(exe_path)], input_bytes=input_bytes, timeout=run_timeout)
     except subprocess.TimeoutExpired:
         return TestResult("e2e", name, "FAIL", time.monotonic() - start, "program timed out")
 
@@ -438,6 +479,11 @@ def main() -> int:
     args.work_dir = (ROOT / args.work_dir).resolve() if not args.work_dir.is_absolute() else args.work_dir
     args.runtime = (ROOT / args.runtime).resolve() if not args.runtime.is_absolute() else args.runtime
     ensure_ready(args)
+    compile_timeout = resolve_timeout(args.compile_timeout, args.timeout)
+    link_timeout = resolve_timeout(args.link_timeout, args.timeout)
+    run_timeout = resolve_timeout(args.run_timeout, args.timeout)
+    filecheck_timeout = resolve_timeout(args.filecheck_timeout, args.timeout)
+    infra_timeout = resolve_timeout(args.infra_timeout, args.timeout)
 
     suites = expand_suites(args.suite)
     stages = args.stage or sorted(STAGE_FLAGS)
@@ -445,7 +491,7 @@ def main() -> int:
     results: list[TestResult] = []
 
     if "infra" in suites:
-        result = apply_xfail(run_infra(args.timeout), xfails)
+        result = apply_xfail(run_infra(infra_timeout), xfails)
         results.append(result)
         print(f"{result.status:4} {result.suite:9} {result.name} ({result.elapsed:.2f}s)")
         if result.status == "FAIL" and result.detail:
@@ -458,7 +504,7 @@ def main() -> int:
                 "filecheck",
                 args.jobs,
                 tests,
-                lambda path: run_filecheck(path, args.binary, args.work_dir, args.timeout),
+                lambda path: run_filecheck(path, args.binary, args.work_dir, filecheck_timeout),
                 xfails,
             )
         )
@@ -471,7 +517,7 @@ def main() -> int:
                 "stage",
                 args.jobs,
                 stage_items,
-                lambda item: run_stage(item[0], item[1], args.binary, args.timeout, args.opt_level),
+                lambda item: run_stage(item[0], item[1], args.binary, compile_timeout, args.opt_level),
                 xfails,
             )
         )
@@ -492,7 +538,9 @@ def main() -> int:
                     args.runtime,
                     gcc,
                     qemu,
-                    args.timeout,
+                    compile_timeout,
+                    link_timeout,
+                    run_timeout,
                     args.max_input_bytes,
                     args.opt_level,
                 ),

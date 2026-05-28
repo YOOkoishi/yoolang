@@ -80,7 +80,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build/github-actions
-          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 2>&1 | tee build/github-actions/functional-tests.log
+          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --compile-timeout 60 2>&1 | tee build/github-actions/functional-tests.log
 
       - name: Run performance tests
         id: perf_tests
@@ -387,7 +387,7 @@ jobs:
               f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
               "",
               "## ✅ Functional Tests",
-              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1`",
+              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --compile-timeout 60`",
               f"- Status: {'✅' if functional_status == 'PASS' else '❌'} {functional_status}",
           ]
 
