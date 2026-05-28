@@ -64,12 +64,56 @@ bool LinearConstraint::is_satisfied_by(const std::vector<std::int64_t> &point) c
     return equality ? value == 0 : value >= 0;
 }
 
-IntegerRelation::IntegerRelation(unsigned num_vars) : num_vars_(num_vars) {}
+IntegerRelation::IntegerRelation(unsigned num_vars)
+    : num_vars_(num_vars), num_domain_vars_(num_vars) {}
+
+IntegerRelation::IntegerRelation(unsigned num_domain_vars, unsigned num_range_vars,
+                                 unsigned num_symbol_vars, unsigned num_local_vars)
+    : num_vars_(num_domain_vars + num_range_vars + num_symbol_vars + num_local_vars),
+      num_domain_vars_(num_domain_vars), num_range_vars_(num_range_vars),
+      num_symbol_vars_(num_symbol_vars), num_local_vars_(num_local_vars) {}
+
+unsigned IntegerRelation::num_vars(VarKind kind) const {
+    switch (kind) {
+    case VarKind::Domain:
+        return num_domain_vars_;
+    case VarKind::Range:
+        return num_range_vars_;
+    case VarKind::Symbol:
+        return num_symbol_vars_;
+    case VarKind::Local:
+        return num_local_vars_;
+    }
+    return 0;
+}
 
 void IntegerRelation::add_vars(unsigned count) {
+    add_vars(VarKind::Domain, count);
+}
+
+void IntegerRelation::add_vars(VarKind kind, unsigned count) {
+    if (count == 0) {
+        return;
+    }
+    const unsigned pos = insert_pos(kind);
     num_vars_ += count;
+    switch (kind) {
+    case VarKind::Domain:
+        num_domain_vars_ += count;
+        break;
+    case VarKind::Range:
+        num_range_vars_ += count;
+        break;
+    case VarKind::Symbol:
+        num_symbol_vars_ += count;
+        break;
+    case VarKind::Local:
+        num_local_vars_ += count;
+        break;
+    }
     for (auto &constraint : constraints_) {
-        constraint.coefficients.resize(num_vars_, 0);
+        constraint.coefficients.insert(constraint.coefficients.begin() + static_cast<std::ptrdiff_t>(pos),
+                                       count, 0);
     }
 }
 
@@ -93,6 +137,19 @@ void IntegerRelation::append(const IntegerRelation &other) {
         normalize_coefficients(constraint.coefficients);
         constraints_.push_back(std::move(constraint));
     }
+}
+
+bool IntegerRelation::has_compatible_space(const IntegerRelation &other) const {
+    return num_domain_vars_ == other.num_domain_vars_ &&
+           num_range_vars_ == other.num_range_vars_ &&
+           num_symbol_vars_ == other.num_symbol_vars_ &&
+           num_local_vars_ == other.num_local_vars_;
+}
+
+IntegerRelation IntegerRelation::intersect(const IntegerRelation &other) const {
+    IntegerRelation result = *this;
+    result.append(other);
+    return result;
 }
 
 bool IntegerRelation::contains(const std::vector<std::int64_t> &point) const {
@@ -121,6 +178,20 @@ void IntegerRelation::normalize_coefficients(std::vector<std::int64_t> &coeffici
     coefficients.resize(num_vars_, 0);
 }
 
+unsigned IntegerRelation::insert_pos(VarKind kind) const {
+    switch (kind) {
+    case VarKind::Domain:
+        return num_domain_vars_;
+    case VarKind::Range:
+        return num_domain_vars_ + num_range_vars_;
+    case VarKind::Symbol:
+        return num_domain_vars_ + num_range_vars_ + num_symbol_vars_;
+    case VarKind::Local:
+        return num_vars_;
+    }
+    return num_vars_;
+}
+
 PresburgerRelation::PresburgerRelation(IntegerRelation relation) {
     disjuncts_.push_back(std::move(relation));
 }
@@ -131,6 +202,16 @@ void PresburgerRelation::union_in_place(IntegerRelation relation) {
 
 void PresburgerRelation::union_in_place(const PresburgerRelation &relation) {
     disjuncts_.insert(disjuncts_.end(), relation.disjuncts().begin(), relation.disjuncts().end());
+}
+
+PresburgerRelation PresburgerRelation::intersect(const PresburgerRelation &relation) const {
+    PresburgerRelation out;
+    for (const auto &lhs : disjuncts_) {
+        for (const auto &rhs : relation.disjuncts()) {
+            out.union_in_place(lhs.intersect(rhs));
+        }
+    }
+    return out;
 }
 
 bool PresburgerRelation::is_integer_empty() const {

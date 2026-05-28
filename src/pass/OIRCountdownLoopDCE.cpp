@@ -30,6 +30,11 @@ bool is_one(oir::Value *value) {
     return constant.has_value() && *constant == 1;
 }
 
+bool is_minus_one(oir::Value *value) {
+    auto constant = int_constant(value);
+    return constant.has_value() && *constant == -1;
+}
+
 bool is_known_nonnegative_count(oir::Value *value) {
     if (auto constant = int_constant(value)) {
         return *constant >= 0;
@@ -90,6 +95,17 @@ std::pair<oir::Value *, oir::Value *> incoming_pair(const oir::PhiInst &phi,
     return {start, back};
 }
 
+bool is_decrement_by_one(const oir::BinaryInst &next, const oir::PhiInst &phi) {
+    if (next.op() == oir::Instruction::OpID::Sub && next.lhs() == &phi && is_one(next.rhs())) {
+        return true;
+    }
+    if (next.op() != oir::Instruction::OpID::Add) {
+        return false;
+    }
+    return (next.lhs() == &phi && is_minus_one(next.rhs())) ||
+           (next.rhs() == &phi && is_minus_one(next.lhs()));
+}
+
 CountdownLoop match_countdown_loop(const oir::Loop &loop) {
     CountdownLoop out;
     if (loop.blocks.size() != 1 || loop.header == nullptr) {
@@ -122,8 +138,8 @@ CountdownLoop match_countdown_loop(const oir::Loop &loop) {
 
         auto [start, back] = incoming_pair(*phi, preheader, header);
         auto *next = dynamic_cast<oir::BinaryInst *>(back);
-        if (start == nullptr || next == nullptr || next->op() != oir::Instruction::OpID::Sub ||
-            next->lhs() != phi || !is_one(next->rhs()) || !is_known_nonnegative_count(start)) {
+        if (start == nullptr || next == nullptr || !is_decrement_by_one(*next, *phi) ||
+            !is_known_nonnegative_count(start)) {
             continue;
         }
         if (!cmp_ne_value_zero(preheader_branch->cond(), start) ||
