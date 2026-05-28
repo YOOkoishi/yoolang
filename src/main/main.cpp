@@ -24,11 +24,7 @@
 #include "../include/pass/PassManager.h"
 #include "../include/pass/YIRLoopAnalysisPass.h"
 #include "../include/pass/YIRLoopOptimizationPass.h"
-#include "../include/pass/YIRPolyhedralCanonicalizePass.h"
-#include "../include/pass/YIRSCoPDetectPass.h"
-#include "../include/pass/YIRPolyhedralModelBuildPass.h"
-#include "../include/pass/YIRPolyhedralDependenceAnalysisPass.h"
-#include "../include/pass/YIRPolyhedralTransformPass.h"
+#include "../include/pass/YIRPolyhedralPipelinePass.h"
 #include "../include/pass/YIRToOIRPass.h"
 #include "../include/yir/YIRPrinter.h"
 
@@ -51,6 +47,7 @@ struct CommandLineOptions {
     bool emit_oir = false;
     bool emit_mir = false;
     bool emit_asm = false;
+    bool enable_polyhedral = false;
     bool show_help = false;
 };
 
@@ -63,6 +60,7 @@ void print_help(const char *program, std::ostream &out) {
         << "  -o <file>        Write output to <file> instead of stdout\n"
         << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR "
            "optimizations\n"
+        << "  --polyhedral     Enable the YIR polyhedral pipeline under -O1\n"
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
         << "  --emit-oir       Lower the parsed AST to SSA OIR, verify it, and dump it\n"
@@ -94,6 +92,10 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         }
         if (arg == "-S" || arg == "--emit-asm") {
             options.emit_asm = true;
+            continue;
+        }
+        if (arg == "--polyhedral") {
+            options.enable_polyhedral = true;
             continue;
         }
         if (arg == "-o") {
@@ -152,6 +154,10 @@ bool optimizations_enabled(const CommandLineOptions &options) {
     return options.opt_level == 1;
 }
 
+bool polyhedral_enabled(const CommandLineOptions &options) {
+    return optimizations_enabled(options) && options.enable_polyhedral;
+}
+
 std::unique_ptr<CompUnit> parse_ast_from_file(const std::string &input_path, std::ostream &err) {
     FILE *input = std::fopen(input_path.c_str(), "r");
     if (input == nullptr) {
@@ -183,11 +189,9 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
         pm.add_pass<pass::ASTSemanticAnalysisPass>();
         pm.add_pass<pass::ASTToYIRPass>();
         if (optimizations_enabled(options)) {
-            pm.add_pass<pass::YIRPolyhedralCanonicalizePass>();
-            pm.add_pass<pass::YIRSCoPDetectPass>();
-            pm.add_pass<pass::YIRPolyhedralModelBuildPass>();
-            pm.add_pass<pass::YIRPolyhedralDependenceAnalysisPass>();
-            pm.add_pass<pass::YIRPolyhedralTransformPass>();
+            if (polyhedral_enabled(options)) {
+                pm.add_pass<pass::YIRPolyhedralPipelinePass>();
+            }
             pm.add_pass<pass::YIRLoopOptimizationPass>();
             pm.add_pass<pass::YIRLoopAnalysisPass>();
         }

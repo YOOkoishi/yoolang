@@ -1,4 +1,4 @@
-// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-oir -O1 --polyhedral %s | FileCheck %s --check-prefix=OIR
 
 int store_load_forward(int x) {
   int a[2];

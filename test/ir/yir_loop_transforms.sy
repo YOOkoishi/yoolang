@@ -1,4 +1,4 @@
-// RUN: %compiler --emit-yir -O1 %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
 
 int big_a[200][200];
 int big_b[200][200];
