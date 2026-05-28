@@ -624,11 +624,13 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
 
     if "compiler" in results and results["compiler"].compile_ok:
         results["compiler"].metrics = _collect_codegen_metrics(src, case_dir)
-    if "compiler" in results and results["compiler"].compile_ok and results["compiler"].run_ok:
-        insn_result = INSN_COUNTER.count(results["compiler"].exe_path or Path(), input_file)
-        results["compiler"].instruction_count = insn_result.count
-        results["compiler"].instruction_count_status = insn_result.status
-        results["compiler"].instruction_count_detail = insn_result.detail
+
+    for result in results.values():
+        if result.compile_ok and result.run_ok:
+            insn_result = INSN_COUNTER.count(result.exe_path or Path(), input_file)
+            result.instruction_count = insn_result.count
+            result.instruction_count_status = insn_result.status
+            result.instruction_count_detail = insn_result.detail
 
     gcc = results["gcc"]
     clang = results["clang++"]
@@ -736,9 +738,9 @@ def _compiler_vs_o3_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
 
 def _instruction_count_summary(rows: list[dict]) -> dict[str, object]:
     counts = [
-        row.get("instruction_count")
+        row.get("instruction_counts", {}).get("compiler")
         for row in rows
-        if isinstance(row.get("instruction_count"), int)
+        if isinstance(row.get("instruction_counts", {}).get("compiler"), int)
     ]
     statuses = [str(row.get("instruction_count_status", "DISABLED")) for row in rows]
     failed = sum(1 for status in statuses if status == "FAILED")
@@ -897,6 +899,21 @@ def main() -> int:
                 "instruction_count": compiler.instruction_count,
                 "instruction_count_status": compiler.instruction_count_status,
                 "instruction_count_detail": compiler.instruction_count_detail,
+                "instruction_counts": {
+                    "gcc": gcc.instruction_count,
+                    "clang": clang.instruction_count,
+                    "compiler": compiler.instruction_count,
+                },
+                "instruction_count_statuses": {
+                    "gcc": gcc.instruction_count_status,
+                    "clang": clang.instruction_count_status,
+                    "compiler": compiler.instruction_count_status,
+                },
+                "instruction_count_details": {
+                    "gcc": gcc.instruction_count_detail,
+                    "clang": clang.instruction_count_detail,
+                    "compiler": compiler.instruction_count_detail,
+                },
             }
         )
         if not ok:
@@ -904,9 +921,17 @@ def main() -> int:
             print(f"❌ [FAIL] {rel}: {detail}")
             if error_detail:
                 print(error_detail)
-        if compiler.instruction_count_status == "FAILED" and QEMU_INSN_STRICT:
+        if (
+            QEMU_INSN_STRICT
+            and "FAILED"
+            in {
+                gcc.instruction_count_status,
+                clang.instruction_count_status,
+                compiler.instruction_count_status,
+            }
+        ):
             failures += 1
-            print(f"❌ [FAIL] {rel}: qemu instruction count failed: {compiler.instruction_count_detail}")
+            print(f"❌ [FAIL] {rel}: qemu instruction count failed")
 
     print("-" * 140)
     print(f"📌 Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")

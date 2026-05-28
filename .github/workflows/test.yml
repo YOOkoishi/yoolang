@@ -9,6 +9,8 @@ on:
 permissions:
   contents: read
   actions: read
+  pages: write
+  id-token: write
 
 jobs:
   functional-and-perf:
@@ -214,6 +216,15 @@ jobs:
             --baseline-commit-time "$baseline_commit_time" \
             --baseline-commit-title "$baseline_commit_title" \
             --baseline-commit-author "$baseline_commit_author" || true
+
+      - name: Generate instruction count report page
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 scripts/generate_instruction_report.py \
+            --perf-report build/perf-ci/perf-report.json \
+            --out-json ci-result/instruction_count_compare.json \
+            --out-html public/instruction-report/index.html
 
       - name: Save local main perf baseline
         if: always()
@@ -503,7 +514,28 @@ jobs:
             build/perf-ci/perf-delta.md
             build/perf-ci/perf-delta.json
             build/perf-ci/instruction-count-compare.json
+            ci-result/instruction_count_compare.json
+            public/instruction-report/index.html
           if-no-files-found: warn
+
+      - name: Configure GitHub Pages
+        if: always() && github.ref_name == github.event.repository.default_branch
+        continue-on-error: true
+        uses: actions/configure-pages@v5
+
+      - name: Upload instruction report to Pages
+        if: always() && github.ref_name == github.event.repository.default_branch
+        id: upload_instruction_pages
+        continue-on-error: true
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy instruction report to Pages
+        if: always() && github.ref_name == github.event.repository.default_branch
+        id: deploy_instruction_pages
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
 
       - name: Fail job if functional tests failed
         if: always()
@@ -551,6 +583,8 @@ jobs:
           ACTOR: ${{ github.actor }}
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           HEAD_COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+          PAGES_BASE_URL: ${{ steps.deploy_instruction_pages.outputs.page_url }}
+          PAGES_DEPLOY_OUTCOME: ${{ steps.deploy_instruction_pages.outcome }}
         run: |
           python3 - <<'PY'
           import json
@@ -629,6 +663,13 @@ jobs:
           def fmt_insn_speedup(delta: dict) -> str:
               speedup = delta.get("total_speedup")
               return f"{speedup:.2f}x" if isinstance(speedup, (int, float)) else "N/A"
+
+          def instruction_report_line() -> str:
+              base_url = os.environ.get("PAGES_BASE_URL", "").strip()
+              outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
+              if base_url and outcome == "success":
+                  return f"🔗 指令数详细报告: {base_url.rstrip('/')}/instruction-report/"
+              return "🔗 指令数详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/instruction-report/index.html`"
 
           def fmt_optional_speedup(value) -> str:
               return f"{value:.2f}x" if isinstance(value, (int, float)) else "N/A"
@@ -791,6 +832,7 @@ jobs:
                       f"当前: {fmt_insn(insn_delta.get('current_total_instructions'))}",
                       f"基线: {fmt_insn(insn_delta.get('baseline_total_instructions'))}",
                       f"整体: {fmt_insn_overall(insn_delta)}, 指令数加速比 {fmt_insn_speedup(insn_delta)}",
+                      instruction_report_line(),
                       (
                           "case 胜负: "
                           f"🚀 {insn_delta.get('case_wins', 0)} 胜 / "
@@ -809,6 +851,7 @@ jobs:
                       "",
                       f"🧮 QEMU 动态指令数: ⚠️ {status_text}",
                       f"原因: {reason}",
+                      instruction_report_line(),
                   ]
               )
 

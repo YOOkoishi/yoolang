@@ -70,6 +70,9 @@ def compiler_cell(row: dict[str, Any]) -> Any:
 
 
 def instruction_count(row: dict[str, Any]) -> int | None:
+    counts = row.get("instruction_counts")
+    if isinstance(counts, dict) and isinstance(counts.get("compiler"), int):
+        return counts["compiler"]
     value = row.get("instruction_count")
     return value if isinstance(value, int) else None
 
