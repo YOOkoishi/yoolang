@@ -220,11 +220,18 @@ jobs:
       - name: Generate instruction count report page
         if: always()
         continue-on-error: true
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           python3 scripts/generate_instruction_report.py \
             --perf-report build/perf-ci/perf-report.json \
             --out-json ci-result/instruction_count_compare.json \
             --out-html public/instruction-report/index.html
+          python3 scripts/generate_perf_report.py \
+            --perf-report build/perf-ci/perf-report.json \
+            --delta-report build/perf-ci/perf-delta.json \
+            --out-json ci-result/perf_compare.json \
+            --out-html public/perf-report/index.html
 
       - name: Save local main perf baseline
         if: always()
@@ -515,7 +522,11 @@ jobs:
             build/perf-ci/perf-delta.json
             build/perf-ci/instruction-count-compare.json
             ci-result/instruction_count_compare.json
+            ci-result/perf_compare.json
             public/instruction-report/index.html
+            public/instruction-report/instruction_count_compare.json
+            public/perf-report/index.html
+            public/perf-report/perf_compare.json
           if-no-files-found: warn
 
       - name: Configure GitHub Pages
@@ -671,6 +682,13 @@ jobs:
                   return f"🔗 指令数详细报告: {base_url.rstrip('/')}/instruction-report/"
               return "🔗 指令数详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/instruction-report/index.html`"
 
+          def perf_report_line() -> str:
+              base_url = os.environ.get("PAGES_BASE_URL", "").strip()
+              outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
+              if base_url and outcome == "success":
+                  return f"🔗 性能详细报告: {base_url.rstrip('/')}/perf-report/"
+              return "🔗 性能详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/perf-report/index.html`"
+
           def fmt_optional_speedup(value) -> str:
               return f"{value:.2f}x" if isinstance(value, (int, float)) else "N/A"
 
@@ -808,6 +826,7 @@ jobs:
               "",
               f"🧪 功能测试: {fmt_status(functional)}",
               f"📊 性能测试: {fmt_status(perf_outcome)}",
+              perf_report_line(),
               "",
               "📈 基线对比:",
               f"⏱️ 当前 compile 总时间: {fmt_seconds(current_compile_total if isinstance(current_compile_total, (int, float)) else None)}",
