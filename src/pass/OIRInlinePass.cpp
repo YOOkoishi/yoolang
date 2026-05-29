@@ -19,7 +19,7 @@ namespace {
 
 constexpr unsigned kMaxInlineRounds = 3;
 constexpr unsigned kMaxInlineSites = 128;
-constexpr unsigned kMaxCalleeBlocks = 8;
+constexpr unsigned kMaxCalleeBlocks = 12;
 constexpr unsigned kMaxCalleeCost = 45;
 constexpr unsigned kMaxCalleeReturns = 4;
 constexpr unsigned kMaxCalleeParams = 16;

@@ -23,6 +23,7 @@ struct Stats {
     unsigned branches = 0;
     unsigned address_folds = 0;
     unsigned cse = 0;
+    unsigned licm = 0;
     unsigned dead = 0;
 
     bool changed() const;
@@ -60,6 +61,7 @@ PassResult run_transform(PassContext &context, std::string_view pass_name, bool 
 bool coalesce_copies(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool fuse_compare_branches(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool local_cse(mir::MachineFunction &function, bool post_ra, Stats &stats);
+bool hoist_loop_invariants(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool fold_address_offsets(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool cleanup_jumps(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool remove_dead_defs(mir::MachineFunction &function, bool post_ra, Stats &stats);

@@ -1,0 +1,29 @@
+// RUN: %compiler --emit-mir -O1 %s | FileCheck %s --check-prefix=MIR
+
+int hoist_stride(int rows, int cols, int a[]) {
+  int i = 0;
+  int sum = 0;
+  while (i < rows) {
+    int j = 0;
+    while (j < cols) {
+      sum = sum + a[j * rows + i];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return 0;
+}
+
+// MIR-LABEL: func @hoist_stride
+// MIR: SLLI {{.*}}, {{.*}}, 2
+// MIR: while.cond.4:
+// MIR-NOT: SLLI
+// MIR: while.body.5:
+// MIR-NOT: SLLI
+// MIR: ADD {{.*}}
+// MIR-NOT: SLLI
+// MIR: while.end.6:

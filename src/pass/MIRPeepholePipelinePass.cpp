@@ -10,25 +10,27 @@ bool optimize_function(mir::MachineFunction &function, bool post_ra,
                        mir_peephole::Stats &stats) {
     bool changed = false;
 
-    if (!post_ra) {
-        for (int iteration = 0; iteration < 6; ++iteration) {
-            bool iteration_changed = false;
-            iteration_changed |= mir_peephole::coalesce_copies(function, post_ra, stats);
+    for (int iteration = 0; iteration < 6; ++iteration) {
+        bool iteration_changed = false;
+        iteration_changed |= mir_peephole::coalesce_copies(function, post_ra, stats);
+        if (!post_ra) {
             iteration_changed |= mir_peephole::fuse_compare_branches(function, post_ra, stats);
             iteration_changed |= mir_peephole::local_cse(function, post_ra, stats);
             iteration_changed |= mir_peephole::fold_address_offsets(function, post_ra, stats);
-            iteration_changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
-            iteration_changed |= mir_peephole::remove_dead_defs(function, post_ra, stats);
-            if (!iteration_changed) {
-                break;
-            }
-            changed = true;
+            iteration_changed |= mir_peephole::hoist_loop_invariants(function, post_ra, stats);
         }
+        iteration_changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
+        iteration_changed |= mir_peephole::remove_dead_defs(function, post_ra, stats);
+        if (!iteration_changed) {
+            break;
+        }
+        changed = true;
     }
 
     changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
     changed |= mir_peephole::simplify_blocks(function, post_ra, stats);
     changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
+    changed |= mir_peephole::remove_dead_defs(function, post_ra, stats);
     return changed;
 }
 

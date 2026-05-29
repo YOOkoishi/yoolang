@@ -8,14 +8,15 @@ namespace pass::mir_peephole {
 
 bool Stats::changed() const {
     return copies != 0 || loads != 0 || stores != 0 || jumps != 0 || arithmetic != 0 ||
-           branches != 0 || address_folds != 0 || cse != 0 || dead != 0;
+           branches != 0 || address_folds != 0 || cse != 0 || licm != 0 || dead != 0;
 }
 
 std::string Stats::message() const {
     std::ostringstream oss;
     oss << "removed copy=" << copies << " load=" << loads << " store=" << stores
         << " jump=" << jumps << " arith=" << arithmetic << " branch=" << branches
-        << " addr-fold=" << address_folds << " cse=" << cse << " dead=" << dead;
+        << " addr-fold=" << address_folds << " cse=" << cse << " licm=" << licm
+        << " dead=" << dead;
     return oss.str();
 }
 
@@ -160,8 +161,10 @@ bool defines_reg(const mir::MachineInstr &instr, const mir::Register &reg) {
 bool is_pure_def(mir::Opcode opcode) {
     switch (opcode) {
     case mir::Opcode::LoadImm:
+    case mir::Opcode::LoadFloatImm:
     case mir::Opcode::LoadGlobalAddr:
     case mir::Opcode::LoadStackAddr:
+    case mir::Opcode::LoadSlot:
     case mir::Opcode::Move:
     case mir::Opcode::FMove:
     case mir::Opcode::Add:
@@ -185,12 +188,17 @@ bool is_pure_def(mir::Opcode opcode) {
     case mir::Opcode::Slt:
     case mir::Opcode::SeqZ:
     case mir::Opcode::Snez:
+    case mir::Opcode::FAddS:
+    case mir::Opcode::FSubS:
+    case mir::Opcode::FMulS:
+    case mir::Opcode::FDivS:
     case mir::Opcode::FeqS:
     case mir::Opcode::FltS:
     case mir::Opcode::FleS:
     case mir::Opcode::FcvtSW:
     case mir::Opcode::FcvtWS:
     case mir::Opcode::FmvWX:
+    case mir::Opcode::LoadIncomingArg:
         return true;
     default:
         return false;
