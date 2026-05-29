@@ -135,8 +135,14 @@ std::vector<mir::Register> allocatable(mir::RegisterClass reg_class) {
               out.end());
     if (reg_class == mir::RegisterClass::GPR) {
         for (const std::string &name :
-             {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
+             {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
               "s11"}) {
+            out.push_back(mir::Register::physical(name, reg_class));
+        }
+    } else {
+        for (const std::string &name :
+             {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
+              "fs10", "fs11"}) {
             out.push_back(mir::Register::physical(name, reg_class));
         }
     }

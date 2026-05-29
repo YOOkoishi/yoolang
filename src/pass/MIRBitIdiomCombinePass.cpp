@@ -40,6 +40,15 @@ bool combine_bit_idioms(mir::MachineFunction &function, Stats &stats) {
                 continue;
             }
 
+            if (ops.size() >= 3 && instr.opcode() == mir::Opcode::Xor && is_zero_reg(ops[2])) {
+                replace_current(make_move_like(ops[0], ops[1]));
+                continue;
+            }
+            if (ops.size() >= 3 && instr.opcode() == mir::Opcode::Xor && is_zero_reg(ops[1])) {
+                replace_current(make_move_like(ops[0], ops[2]));
+                continue;
+            }
+
             if (ops.size() >= 3 && instr.opcode() == mir::Opcode::And && is_zero_reg(ops[2])) {
                 replace_current(make_move_like(ops[0], zero_reg()));
                 continue;
