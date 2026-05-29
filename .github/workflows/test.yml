@@ -222,7 +222,14 @@ jobs:
         continue-on-error: true
         env:
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          pages_history_dir="$HOME/.cache/yoolang-ci/pages-history"
+          if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ] && [ -d "$pages_history_dir" ]; then
+            mkdir -p public
+            cp -a "$pages_history_dir/." public/
+          fi
+
           python3 scripts/generate_instruction_report.py \
             --perf-report build/perf-ci/perf-report.json \
             --out-json ci-result/instruction_count_compare.json \
@@ -232,6 +239,24 @@ jobs:
             --delta-report build/perf-ci/perf-delta.json \
             --out-json ci-result/perf_compare.json \
             --out-html public/perf-report/index.html
+
+          run_id="${GITHUB_RUN_ID:-local}"
+          mkdir -p "public/instruction-report/runs/$run_id" "public/perf-report/runs/$run_id"
+          cp public/instruction-report/index.html "public/instruction-report/runs/$run_id/index.html"
+          cp public/instruction-report/instruction_count_compare.json "public/instruction-report/runs/$run_id/instruction_count_compare.json"
+          cp public/perf-report/index.html "public/perf-report/runs/$run_id/index.html"
+          cp public/perf-report/perf_compare.json "public/perf-report/runs/$run_id/perf_compare.json"
+
+          if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            python3 scripts/update_report_history.py \
+              --public-dir public \
+              --run-id "$run_id" \
+              --run-number "${GITHUB_RUN_NUMBER:-}" \
+              --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+            rm -rf "$pages_history_dir"
+            mkdir -p "$pages_history_dir"
+            cp -a public/. "$pages_history_dir/"
+          fi
 
       - name: Save local main perf baseline
         if: always()
@@ -525,8 +550,15 @@ jobs:
             ci-result/perf_compare.json
             public/instruction-report/index.html
             public/instruction-report/instruction_count_compare.json
+            public/instruction-report/history.html
+            public/instruction-report/runs
             public/perf-report/index.html
             public/perf-report/perf_compare.json
+            public/perf-report/history.html
+            public/perf-report/runs
+            public/index.html
+            public/history.html
+            public/report-history.json
           if-no-files-found: warn
 
       - name: Configure GitHub Pages
@@ -688,6 +720,13 @@ jobs:
               if base_url and outcome == "success":
                   return f"🔗 性能详细报告: {base_url.rstrip('/')}/perf-report/"
               return "🔗 性能详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/perf-report/index.html`"
+
+          def history_report_line() -> str:
+              base_url = os.environ.get("PAGES_BASE_URL", "").strip()
+              outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
+              if base_url and outcome == "success":
+                  return f"🔗 历史报告索引: {base_url.rstrip('/')}/history.html"
+              return "🔗 历史报告索引: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/history.html`"
 
           def fmt_optional_speedup(value) -> str:
               return f"{value:.2f}x" if isinstance(value, (int, float)) else "N/A"
@@ -886,9 +925,11 @@ jobs:
                   case = str(row.get("case", "unknown")).rsplit("/", 1)[-1]
                   lines.append(f"{case} 🚀 快 {abs(float(row.get('delta_pct', 0))):.1f}%")
 
-          message = "\n".join(lines)
+          history_line = history_report_line()
+          message = "\n".join([*lines, "", history_line])
           if len(message) > 1900:
-              message = message[:1900] + "\n... <truncated>"
+              suffix = f"\n... <truncated>\n{history_line}"
+              message = "\n".join(lines)[: 1900 - len(suffix)].rstrip() + suffix
 
           payload = {"content": message}
           req = urllib.request.Request(

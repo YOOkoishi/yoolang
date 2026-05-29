@@ -454,7 +454,10 @@ def write_html(payload: dict[str, Any], out_html: Path) -> None:
       <div id="meta"></div>
       <div id="baseline"></div>
       <div class="measure"><strong>测量方式:</strong> RISC-V 可执行文件在 qemu-riscv64 下运行的 case 级耗时；数值越小代表生成代码运行越快。</div>
-      <div class="downloads"><a href="./perf_compare.json" download>下载 perf_compare.json</a></div>
+      <div class="downloads">
+        <a href="./perf_compare.json" download>下载 perf_compare.json</a>
+        <a href="./history.html">查看历史报告索引</a>
+      </div>
       <div class="chips" id="chips"></div>
     </div>
   </header>

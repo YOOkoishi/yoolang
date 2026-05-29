@@ -436,7 +436,10 @@ def write_html(payload: dict[str, Any], out_html: Path) -> None:
     <div class="meta">
       <div id="meta"></div>
       <div class="measure"><strong>测量方式:</strong> RISC-V 可执行文件通过 qemu-riscv64 TCG plugin 统计动态执行指令数；数值越小代表生成代码执行指令更少。</div>
-      <div class="downloads"><a href="./instruction_count_compare.json" download>下载 instruction_count_compare.json</a></div>
+      <div class="downloads">
+        <a href="./instruction_count_compare.json" download>下载 instruction_count_compare.json</a>
+        <a href="./history.html">查看历史报告索引</a>
+      </div>
       <div class="status-line" id="status-line"></div>
     </div>
   </header>
