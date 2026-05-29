@@ -59,3 +59,5 @@ $RECYCLE.BIN/
 .codex
 
 tmp/*
+
+tools/*
