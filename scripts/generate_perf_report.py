@@ -253,6 +253,21 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
             "computed_clang_geomean_speedup": geometric_mean(
                 [row["yoolang_vs_clang_speedup"] for row in ok_rows if isinstance(row["yoolang_vs_clang_speedup"], float)]
             ),
+            "baseline_current_total_sec": delta.get("current_compiler_total")
+            if isinstance(delta.get("current_compiler_total"), (int, float))
+            else None,
+            "baseline_total_sec": delta.get("baseline_compiler_total")
+            if isinstance(delta.get("baseline_compiler_total"), (int, float))
+            else None,
+            "baseline_total_delta_pct": delta.get("total_delta_pct")
+            if isinstance(delta.get("total_delta_pct"), (int, float))
+            else None,
+            "baseline_total_speedup": delta.get("total_speedup")
+            if isinstance(delta.get("total_speedup"), (int, float))
+            else None,
+            "baseline_geomean_speedup": delta.get("case_speedup_geomean")
+            if isinstance(delta.get("case_speedup_geomean"), (int, float))
+            else None,
         },
         "failure_reasons": [{"reason": key, "count": value} for key, value in sorted(failure_reasons.items(), key=lambda item: item[1], reverse=True)],
         "top": {
@@ -566,6 +581,7 @@ def write_html(payload: dict[str, Any], out_html: Path) -> None:
           <div class="metric"><strong>总运行时间</strong><div class="muted">Yoolang ${{fmtSec(stats.total_yoolang_sec)}} / GCC ${{fmtSec(stats.total_gcc_sec)}} / Clang++ ${{fmtSec(stats.total_clang_sec)}}</div></div>
           <div class="metric"><strong>总时间加速比</strong><div class="muted">vs GCC ${{fmtSpeedup(stats.total_yoolang_vs_gcc_speedup)}} / vs Clang++ ${{fmtSpeedup(stats.total_yoolang_vs_clang_speedup)}}</div></div>
           <div class="metric"><strong>几何平均加速比</strong><div class="muted">vs GCC ${{fmtSpeedup(stats.gcc_geomean_speedup || stats.computed_gcc_geomean_speedup)}} / vs Clang++ ${{fmtSpeedup(stats.clang_geomean_speedup || stats.computed_clang_geomean_speedup)}}</div></div>
+          <div class="metric"><strong>相对 baseline</strong><div class="muted">当前 ${{fmtSec(stats.baseline_current_total_sec)}} / baseline ${{fmtSec(stats.baseline_total_sec)}} / 总加速比 ${{fmtSpeedup(stats.baseline_total_speedup)}} / 几何平均 ${{fmtSpeedup(stats.baseline_geomean_speedup)}} / 变化 ${{fmtPct(stats.baseline_total_delta_pct)}}</div></div>
         </div>
       `;
       renderTopLists();
