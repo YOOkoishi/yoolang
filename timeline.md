@@ -94,3 +94,7 @@ summary: 1380 passed, 6 failed, 1 skipped, 0 xfailed, 0 xpassed
 # May 19
 
 增强了 inline 目前进度 0.94x Clang o3
+
+# May 31
+
+重构了几次代码，主要规范化了pass pipeline中的结构。目前时间加速比达到1.1x clang o3 ，但几何加速比还是差一些。
