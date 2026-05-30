@@ -14,7 +14,7 @@ TIME_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)s$")
 CASE_REGRESSION_DELTA_PCT = 20.0
 CASE_REGRESSION_DELTA_SEC = 0.05
 TOTAL_REGRESSION_DELTA_PCT = 10.0
-TOTAL_IMPROVEMENT_DELTA_PCT = -10.0
+TOTAL_IMPROVEMENT_DELTA_PCT = 10.0
 MAX_REGRESSION_ROWS = 10
 
 
@@ -326,7 +326,8 @@ def main() -> int:
             continue
 
         delta_sec = current_time - baseline_time
-        delta_pct = 0.0 if baseline_time == 0.0 else (delta_sec / baseline_time) * 100.0
+        # Speed-based: positive = yoolang faster (comparing speed, not time)
+        delta_pct = 0.0 if baseline_time == 0.0 else ((baseline_time - current_time) / baseline_time) * 100.0
         case_speedup = speedup_ratio(baseline_time, current_time)
         if case_speedup is not None:
             speedups.append(case_speedup)
@@ -336,7 +337,7 @@ def main() -> int:
             case_losses += 1
         else:
             case_ties += 1
-        is_regression = delta_pct >= CASE_REGRESSION_DELTA_PCT and delta_sec >= CASE_REGRESSION_DELTA_SEC
+        is_regression = delta_pct <= -CASE_REGRESSION_DELTA_PCT and delta_sec >= CASE_REGRESSION_DELTA_SEC
         rows.append(
             {
                 "case": case,
@@ -358,12 +359,12 @@ def main() -> int:
         case_speedup_geomean = None
     else:
         total_delta_sec = current_total - baseline_total
-        total_delta_pct = 0.0 if baseline_total == 0.0 else (total_delta_sec / baseline_total) * 100.0
+        total_delta_pct = 0.0 if baseline_total == 0.0 else ((baseline_total - current_total) / baseline_total) * 100.0
         total_speedup = speedup_ratio(baseline_total, current_total)
         case_speedup_geomean = geometric_mean(speedups)
-        if total_delta_pct >= TOTAL_REGRESSION_DELTA_PCT:
+        if total_delta_pct <= -TOTAL_REGRESSION_DELTA_PCT:
             status = "REGRESSION"
-        elif total_delta_pct <= TOTAL_IMPROVEMENT_DELTA_PCT:
+        elif total_delta_pct >= TOTAL_IMPROVEMENT_DELTA_PCT:
             status = "IMPROVEMENT"
         else:
             status = "OK"
@@ -371,7 +372,7 @@ def main() -> int:
         total_speedup = None
 
     regressions = [row for row in rows if row["status"] == "REGRESSION"]
-    regressions.sort(key=lambda row: (row["delta_pct"], row["delta_sec"]), reverse=True)
+    regressions.sort(key=lambda row: (row["delta_pct"], -row["delta_sec"]))
     shown_regressions = regressions[:MAX_REGRESSION_ROWS]
 
     args.out_md.parent.mkdir(parents=True, exist_ok=True)

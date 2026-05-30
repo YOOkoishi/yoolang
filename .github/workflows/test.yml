@@ -217,46 +217,90 @@ jobs:
             --baseline-commit-title "$baseline_commit_title" \
             --baseline-commit-author "$baseline_commit_author" || true
 
+      - name: Configure GitHub Pages
+        if: always()
+        continue-on-error: true
+        id: configure_pages
+        uses: actions/configure-pages@v5
+
       - name: Generate instruction count report page
         if: always()
         continue-on-error: true
         env:
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          PAGES_BASE_URL: ${{ steps.configure_pages.outputs.base_url }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           pages_history_dir="$HOME/.cache/yoolang-ci/pages-history"
-          if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ] && [ -d "$pages_history_dir" ]; then
+          if [ -d "$pages_history_dir" ]; then
             mkdir -p public
             cp -a "$pages_history_dir/." public/
+          fi
+
+          is_main="false"
+          if [ "${GITHUB_REF_NAME}" = "${DEFAULT_BRANCH}" ]; then
+            is_main="true"
+          fi
+
+          # Merge remote history to reduce staleness across runners
+          if [ "$is_main" != "true" ] && [ -n "${PAGES_BASE_URL:-}" ]; then
+            curl -sSf "${PAGES_BASE_URL}/report-history.json" -o /tmp/remote-history.json 2>/dev/null || true
+            if [ -f /tmp/remote-history.json ]; then
+              python3 scripts/merge_report_history.py public /tmp/remote-history.json || true
+              rm -f /tmp/remote-history.json
+            fi
+          fi
+
+          safe_branch=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+
+          if [ "$is_main" = "true" ]; then
+            perf_html="public/perf-report/index.html"
+            insn_html="public/instruction-report/index.html"
+            perf_runs="public/perf-report/runs"
+            insn_runs="public/instruction-report/runs"
+            is_main_flag="--is-main-branch"
+          else
+            branch_dir="public/branches/${safe_branch}"
+            perf_html="${branch_dir}/perf-report/index.html"
+            insn_html="${branch_dir}/instruction-report/index.html"
+            perf_runs="${branch_dir}/perf-report/runs"
+            insn_runs="${branch_dir}/instruction-report/runs"
+            is_main_flag=""
           fi
 
           python3 scripts/generate_instruction_report.py \
             --perf-report build/perf-ci/perf-report.json \
             --out-json ci-result/instruction_count_compare.json \
-            --out-html public/instruction-report/index.html
+            --out-html "$insn_html" \
+            --pages-base-url "${PAGES_BASE_URL:-}"
+
           python3 scripts/generate_perf_report.py \
             --perf-report build/perf-ci/perf-report.json \
             --delta-report build/perf-ci/perf-delta.json \
             --out-json ci-result/perf_compare.json \
-            --out-html public/perf-report/index.html
+            --out-html "$perf_html" \
+            --pages-base-url "${PAGES_BASE_URL:-}"
 
           run_id="${GITHUB_RUN_ID:-local}"
-          mkdir -p "public/instruction-report/runs/$run_id" "public/perf-report/runs/$run_id"
-          cp public/instruction-report/index.html "public/instruction-report/runs/$run_id/index.html"
-          cp public/instruction-report/instruction_count_compare.json "public/instruction-report/runs/$run_id/instruction_count_compare.json"
-          cp public/perf-report/index.html "public/perf-report/runs/$run_id/index.html"
-          cp public/perf-report/perf_compare.json "public/perf-report/runs/$run_id/perf_compare.json"
+          mkdir -p "$insn_runs/$run_id" "$perf_runs/$run_id"
+          cp "$insn_html" "$insn_runs/$run_id/index.html"
+          cp ci-result/instruction_count_compare.json "$insn_runs/$run_id/instruction_count_compare.json"
+          cp "$perf_html" "$perf_runs/$run_id/index.html"
+          cp ci-result/perf_compare.json "$perf_runs/$run_id/perf_compare.json"
 
-          if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
-            python3 scripts/update_report_history.py \
-              --public-dir public \
-              --run-id "$run_id" \
-              --run-number "${GITHUB_RUN_NUMBER:-}" \
-              --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
-            rm -rf "$pages_history_dir"
-            mkdir -p "$pages_history_dir"
-            cp -a public/. "$pages_history_dir/"
-          fi
+          python3 scripts/update_report_history.py \
+            --public-dir public \
+            --run-id "$run_id" \
+            --run-number "${GITHUB_RUN_NUMBER:-}" \
+            --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
+            --perf-report build/perf-ci/perf-report.json \
+            --pages-base-url "${PAGES_BASE_URL:-}" \
+            --branch "${GITHUB_REF_NAME}" \
+            $is_main_flag
+
+          rm -rf "$pages_history_dir"
+          mkdir -p "$pages_history_dir"
+          cp -a public/. "$pages_history_dir/"
 
       - name: Save local main perf baseline
         if: always()
@@ -493,9 +537,9 @@ jobs:
                       f"GCC {format_speedup(gcc_o3_geomean)} / Clang++ {format_speedup(clang_o3_geomean)}"
                   )
                   lines.append(
-                      "- 🏁 Faster cases: "
-                      f"GCC {gcc_o3_faster_cases if isinstance(gcc_o3_faster_cases, int) else 'N/A'} / "
-                      f"Clang++ {clang_o3_faster_cases if isinstance(clang_o3_faster_cases, int) else 'N/A'}"
+                      "- 🏁 Beats GCC: "
+                      f"{gcc_o3_faster_cases if isinstance(gcc_o3_faster_cases, int) else 'N/A'} / "
+                      f"Clang++: {clang_o3_faster_cases if isinstance(clang_o3_faster_cases, int) else 'N/A'}"
                   )
               lines.extend(["", "| Case | GCC | Clang++ | Compiler | Status |", "| --- | --- | --- | --- | --- |"])
 
@@ -559,15 +603,11 @@ jobs:
             public/index.html
             public/history.html
             public/report-history.json
+            public/branches
           if-no-files-found: warn
 
-      - name: Configure GitHub Pages
-        if: always() && github.ref_name == github.event.repository.default_branch
-        continue-on-error: true
-        uses: actions/configure-pages@v5
-
       - name: Upload instruction report to Pages
-        if: always() && github.ref_name == github.event.repository.default_branch
+        if: always()
         id: upload_instruction_pages
         continue-on-error: true
         uses: actions/upload-pages-artifact@v3
@@ -575,7 +615,7 @@ jobs:
           path: public
 
       - name: Deploy instruction report to Pages
-        if: always() && github.ref_name == github.event.repository.default_branch
+        if: always()
         id: deploy_instruction_pages
         continue-on-error: true
         uses: actions/deploy-pages@v4
@@ -628,6 +668,7 @@ jobs:
           HEAD_COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
           PAGES_BASE_URL: ${{ steps.deploy_instruction_pages.outputs.page_url }}
           PAGES_DEPLOY_OUTCOME: ${{ steps.deploy_instruction_pages.outcome }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           python3 - <<'PY'
           import json
@@ -707,18 +748,26 @@ jobs:
               speedup = delta.get("total_speedup")
               return f"{speedup:.2f}x" if isinstance(speedup, (int, float)) else "N/A"
 
+          def _branch_path() -> str:
+              ref_name = os.environ.get("REF_NAME", "")
+              default_branch = os.environ.get("DEFAULT_BRANCH", "main")
+              if not ref_name or ref_name == default_branch:
+                  return ""
+              safe = ref_name.replace("/", "-")
+              return f"/branches/{safe}"
+
           def instruction_report_line() -> str:
               base_url = os.environ.get("PAGES_BASE_URL", "").strip()
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
               if base_url and outcome == "success":
-                  return f"🔗 指令数详细报告: {base_url.rstrip('/')}/instruction-report/"
+                  return f"🔗 指令数详细报告: {base_url.rstrip('/')}{_branch_path()}/instruction-report/"
               return "🔗 指令数详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/instruction-report/index.html`"
 
           def perf_report_line() -> str:
               base_url = os.environ.get("PAGES_BASE_URL", "").strip()
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
               if base_url and outcome == "success":
-                  return f"🔗 性能详细报告: {base_url.rstrip('/')}/perf-report/"
+                  return f"🔗 性能详细报告: {base_url.rstrip('/')}{_branch_path()}/perf-report/"
               return "🔗 性能详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/perf-report/index.html`"
 
           def history_report_line() -> str:

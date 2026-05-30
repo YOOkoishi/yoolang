@@ -71,9 +71,12 @@ class QemuInstructionCounter:
         self.strict = QEMU_INSN_STRICT
         self.qemu = QEMU_RISCV64
         env_plugin = os.environ.get("QEMU_INSN_PLUGIN", "").strip()
-        self.plugin = Path(env_plugin) if env_plugin else REPORT_DIR / "qemu-plugin" / "libinsn_count.so"
-        if env_plugin and not self.plugin.is_absolute():
-            self.plugin = WORKSPACE / self.plugin
+        if env_plugin:
+            self.plugin = Path(env_plugin)
+            if not self.plugin.is_absolute():
+                self.plugin = WORKSPACE / self.plugin
+        else:
+            self.plugin = WORKSPACE / "tools" / "qemu-insn-count" / "count_insn.py"
         self._ready: bool | None = None
         self._reason = "disabled"
 
@@ -91,14 +94,6 @@ class QemuInstructionCounter:
             self._reason = f"QEMU_RISCV64 not found: {self.qemu}"
             return False
 
-        if not self.plugin.exists():
-            try:
-                self._build_plugin()
-            except Exception as exc:
-                self._ready = False
-                self._reason = f"failed to build QEMU instruction-count plugin: {exc}"
-                return False
-
         help_proc = subprocess.run(
             [self.qemu, "--help"],
             capture_output=True,
@@ -111,40 +106,33 @@ class QemuInstructionCounter:
             self._reason = f"{self.qemu} does not advertise -plugin support"
             return False
 
-        self._ready = self.plugin.exists()
-        if not self._ready:
-            self._reason = f"QEMU instruction-count plugin not found: {self.plugin}"
-        return self._ready
+        # If user provided a pre-built plugin, check it exists.
+        if os.environ.get("QEMU_INSN_PLUGIN", "").strip():
+            if not self.plugin.exists():
+                self._ready = False
+                self._reason = f"QEMU_INSN_PLUGIN not found: {self.plugin}"
+                return False
+            self._ready = True
+            return True
+
+        # Otherwise, verify the on-the-fly build tooling is available.
+        if not self.plugin.exists():
+            self._ready = False
+            self._reason = f"count_insn.py not found: {self.plugin}"
+            return False
+
+        if not shutil.which("gcc"):
+            self._ready = False
+            self._reason = "gcc not found on PATH (required for plugin compilation)"
+            return False
+
+        self._ready = True
+        return True
 
     @property
     def reason(self) -> str:
         self.ensure_ready()
         return self._reason
-
-    def _build_plugin(self) -> None:
-        src = WORKSPACE / "tools" / "qemu-insn-count" / "insn_count.c"
-        include_dir = WORKSPACE / "tools" / "qemu-insn-count"
-        if not src.exists():
-            raise FileNotFoundError(src)
-        self.plugin.parent.mkdir(parents=True, exist_ok=True)
-        cc = os.environ.get("CC", "cc")
-        subprocess.run(
-            [
-                cc,
-                "-shared",
-                "-fPIC",
-                "-O2",
-                "-std=c11",
-                "-I",
-                str(include_dir),
-                str(src),
-                "-o",
-                str(self.plugin),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
 
     def count(self, exe: Path, input_file: Optional[Path]) -> InstructionCountResult:
         if not self.enabled:
@@ -152,15 +140,18 @@ class QemuInstructionCounter:
         if not self.ensure_ready():
             return InstructionCountResult("SKIPPED", detail=self._reason)
 
+        count_script = WORKSPACE / "tools" / "qemu-insn-count" / "count_insn.py"
+        if not count_script.exists():
+             return InstructionCountResult("FAILED", detail=f"Count script not found: {count_script}")
         stdin_data = input_file.read_bytes() if input_file and input_file.exists() else None
         try:
             result = subprocess.run(
                 [
+                    sys.executable,
+                    str(count_script),
                     self.qemu,
                     "-L",
                     "/usr/riscv64-linux-gnu",
-                    "-plugin",
-                    str(self.plugin),
                     str(exe),
                 ],
                 input=stdin_data,
@@ -770,7 +761,7 @@ def _instruction_count_summary(rows: list[dict]) -> dict[str, object]:
     }
 
 
-def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> None:
+def _write_reports(rows: list[dict], failures: int, total_runtime: float, compiler_total_runtime: float) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     status = "PASS" if failures == 0 else "FAIL"
@@ -832,6 +823,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float) -> Non
         "cases": len(rows),
         "failures": failures,
         "total_runtime_sec": total_runtime,
+        "compiler_total_sec": compiler_total_runtime,
         "gcc_o3_geomean": o3_stats["gcc_o3_geomean"],
         "clang_o3_geomean": o3_stats["clang_o3_geomean"],
         "gcc_o3_faster_cases": o3_stats["gcc_o3_faster_cases"],
@@ -867,11 +859,13 @@ def main() -> int:
     _print_header()
     failures = 0
     total_runtime = 0.0
+    compiler_total_runtime = 0.0
     report_rows: list[dict] = []
 
     for case in CASES:
         gcc, clang, compiler, ok, detail = _compile_and_run(case)
         total_runtime += gcc.elapsed_sec + clang.elapsed_sec + compiler.elapsed_sec
+        compiler_total_runtime += compiler.elapsed_sec
         rel = str(case.relative_to(WORKSPACE))
         error_detail = ""
         if not ok:
@@ -936,7 +930,7 @@ def main() -> int:
     print("-" * 140)
     print(f"📌 Summary: cases={len(CASES)} failed={failures} total_run_time={total_runtime:.4f}s")
 
-    _write_reports(report_rows, failures, total_runtime)
+    _write_reports(report_rows, failures, total_runtime, compiler_total_runtime)
     print(f"📄 Report markdown: {REPORT_MD}")
     print(f"🧾 Report json: {REPORT_JSON}")
 

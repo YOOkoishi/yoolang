@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-report", type=Path)
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--out-html", required=True, type=Path)
+    parser.add_argument("--pages-base-url", default="")
     parser.add_argument("--branch", default="")
     parser.add_argument("--commit-sha", default="")
     parser.add_argument("--commit-title", default="")
@@ -284,8 +285,12 @@ def html_escape_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=True, indent=2).replace("</", "<\\/")
 
 
-def write_html(payload: dict[str, Any], out_html: Path) -> None:
+def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = "") -> None:
     data = html_escape_json(payload)
+    base_url = pages_base_url.rstrip("/") if pages_base_url else ""
+    main_perf_href = f"{base_url}/perf-report/" if base_url else "../perf-report/"
+    main_insn_href = f"{base_url}/instruction-report/" if base_url else "../instruction-report/"
+    history_href = f"{base_url}/history.html" if base_url else "../history.html"
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -470,8 +475,10 @@ def write_html(payload: dict[str, Any], out_html: Path) -> None:
       <div id="baseline"></div>
       <div class="measure"><strong>测量方式:</strong> RISC-V 可执行文件在 qemu-riscv64 下运行的 case 级耗时；数值越小代表生成代码运行越快。</div>
       <div class="downloads">
+        <a href="{main_perf_href}">最新性能报告 (main)</a>
+        <a href="{main_insn_href}">最新指令数报告 (main)</a>
+        <a href="{history_href}">历史报告索引</a>
         <a href="./perf_compare.json" download>下载 perf_compare.json</a>
-        <a href="./history.html">查看历史报告索引</a>
       </div>
       <div class="chips" id="chips"></div>
     </div>
@@ -543,8 +550,9 @@ def write_html(payload: dict[str, Any], out_html: Path) -> None:
     }};
     const baselineClass = (delta) => {{
       if (!isNumber(delta)) return '';
-      if (delta < 0) return 'better';
-      if (delta > 0) return 'worse';
+      // Speed-based: positive = yoolang faster
+      if (delta > 0) return 'better';
+      if (delta < 0) return 'worse';
       return 'warn';
     }};
 
@@ -714,7 +722,7 @@ def main() -> int:
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     json_text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
     args.out_json.write_text(json_text)
-    write_html(payload, args.out_html)
+    write_html(payload, args.out_html, args.pages_base_url)
     page_json = args.out_html.parent / args.out_json.name
     if page_json != args.out_json:
         page_json.write_text(json_text)
