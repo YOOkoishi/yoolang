@@ -39,13 +39,7 @@ bool is_known_nonnegative_count(oir::Value *value) {
     if (auto constant = int_constant(value)) {
         return *constant >= 0;
     }
-
-    auto *call = dynamic_cast<oir::CallInst *>(value);
-    auto *callee = call == nullptr ? nullptr : dynamic_cast<oir::Function *>(call->callee());
-    if (callee == nullptr) {
-        return false;
-    }
-    return callee->name() == "getarray" || callee->name() == "getfarray";
+    return false;
 }
 
 bool cmp_ne_value_zero(oir::Value *cond, oir::Value *value) {

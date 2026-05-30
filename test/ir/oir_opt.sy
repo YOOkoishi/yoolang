@@ -40,6 +40,17 @@ int tail_sum(int n, int acc) {
   return tail_sum(n - 1, acc + n);
 }
 
+int getarray_countdown_not_proven() {
+  int data[8];
+  int n = getarray(data);
+  int ans = 0;
+  while (n) {
+    ans = n;
+    n = n - 1;
+  }
+  return ans;
+}
+
 int main() {
   return algebra(42) + folded_branch() + zext_cmp(3) + global_const(99) + tail_sum(4, 0);
 }
@@ -68,6 +79,11 @@ int main() {
 // OIR-NOT: load i32, i32* @C
 
 // OIR-LABEL: define i32 @tail_sum
+// OIR: ret i32
 // OIR: %n.arg.tail = phi
 // OIR-NOT: call i32 @tail_sum
-// OIR: ret i32
+
+// OIR-LABEL: define i32 @getarray_countdown_not_proven
+// OIR: call i32 @getarray
+// OIR-NOT: countdown.final
+// OIR-LABEL: define i32 @main
