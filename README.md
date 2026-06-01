@@ -36,6 +36,9 @@ compiler --help #查看额外参数
 # 构建并运行全部测试套件
 scripts/run_tests.py --build --suite all
 
+# 构建并运行全部测试套件(启用优化)
+scripts/run_tests.py --build --suite all --o1
+
 # 只检查三层 IR / ASM 是否可生成
 scripts/run_tests.py --suite stage
 
