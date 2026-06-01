@@ -1,0 +1,54 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+
+int x[250][250][250];
+int y[250][250][250];
+
+int main() {
+  int i;
+  int j;
+  int k;
+  int N;
+
+  N = getint();
+
+  i = 0;
+  while (i < N) {
+    j = 0;
+    k = 0;
+    while (j < N) {
+      k = 0;
+      while (k < N) {
+        x[i][j][k] = 1;
+        y[i][j][k] = 0;
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  return 0;
+}
+
+// POLY: polyhedral {
+// POLY: canonical_loops: 3
+// POLY: scops: 1
+// POLY: symbols: [%N]
+// POLY: statements: 2
+// POLY-DAG: stmt #0 op=yir.array_store loops=[%i, %j, %k]
+// POLY-DAG: stmt #1 op=yir.array_store loops=[%i, %j, %k]
+// POLY: models: 1
+// POLY: model #0 {
+// POLY: params: [%N]
+// POLY: stmt #0 op=yir.array_store
+// POLY: schedule: [%i, %j, %k]
+// POLY: domain: %i in [0, %N); %j in [0, %N); %k in [0, %N)
+// POLY: write @x[%i, %j, %k]
+// POLY: stmt #1 op=yir.array_store
+// POLY: schedule: [%i, %j, %k]
+// POLY: domain: %i in [0, %N); %j in [0, %N); %k in [0, %N)
+// POLY: write @y[%i, %j, %k]
+// POLY: dependences: 2
+// POLY-DAG: dependence WAW stmt #0 -> stmt #0 memory=@x dependent=true
+// POLY-DAG: dependence WAW stmt #1 -> stmt #1 memory=@y dependent=true
+// POLY: }

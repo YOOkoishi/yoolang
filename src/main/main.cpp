@@ -24,6 +24,7 @@
 #include "../include/pass/PassManager.h"
 #include "../include/pass/YIRLoopAnalysisPass.h"
 #include "../include/pass/YIRLoopOptimizationPass.h"
+#include "../include/pass/YIRPolyhedralDumpPass.h"
 #include "../include/pass/YIRPolyhedralPipelinePass.h"
 #include "../include/pass/YIRToOIRPass.h"
 #include "../include/yir/YIRPrinter.h"
@@ -47,6 +48,7 @@ struct CommandLineOptions {
     bool emit_oir = false;
     bool emit_mir = false;
     bool emit_asm = false;
+    bool emit_poly = false;
     bool enable_polyhedral = false;
     bool show_help = false;
 };
@@ -64,7 +66,8 @@ void print_help(const char *program, std::ostream &out) {
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
         << "  --emit-oir       Lower the parsed AST to SSA OIR, verify it, and dump it\n"
-        << "  --emit-mir       Lower OIR to the RISC-V MIR and dump it\n";
+        << "  --emit-mir       Lower OIR to the RISC-V MIR and dump it\n"
+        << "  --emit-poly      Dump YIR polyhedral SCoP/model/dependence artifacts\n";
 }
 
 bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std::string &error) {
@@ -88,6 +91,10 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         }
         if (arg == "--emit-mir") {
             options.emit_mir = true;
+            continue;
+        }
+        if (arg == "--emit-poly") {
+            options.emit_poly = true;
             continue;
         }
         if (arg == "-S" || arg == "--emit-asm") {
@@ -130,8 +137,14 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         return false;
     }
 
+    if (!options.show_help && options.emit_poly &&
+        (!options.enable_polyhedral || options.opt_level != 1)) {
+        error = "--emit-poly requires -O1 --polyhedral";
+        return false;
+    }
+
     if (!options.show_help && !options.emit_ast && !options.emit_yir && !options.emit_oir &&
-        !options.emit_mir && !options.emit_asm) {
+        !options.emit_mir && !options.emit_asm && !options.emit_poly) {
         options.emit_asm = true;
     }
 
@@ -139,11 +152,16 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
 }
 
 bool needs_yir(const CommandLineOptions &options) {
-    return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm;
+    return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm ||
+           options.emit_poly;
 }
 
 bool needs_oir(const CommandLineOptions &options) {
     return options.emit_oir || options.emit_mir || options.emit_asm;
+}
+
+bool needs_post_poly_yir_pipeline(const CommandLineOptions &options) {
+    return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm;
 }
 
 bool needs_mir(const CommandLineOptions &options) {
@@ -191,9 +209,14 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
         if (optimizations_enabled(options)) {
             if (polyhedral_enabled(options)) {
                 pm.add_pass<pass::YIRPolyhedralPipelinePass>();
+                if (options.emit_poly) {
+                    pm.add_pass<pass::YIRPolyhedralDumpPass>(out);
+                }
             }
-            pm.add_pass<pass::YIRLoopOptimizationPass>();
-            pm.add_pass<pass::YIRLoopAnalysisPass>();
+            if (needs_post_poly_yir_pipeline(options)) {
+                pm.add_pass<pass::YIRLoopOptimizationPass>();
+                pm.add_pass<pass::YIRLoopAnalysisPass>();
+            }
         }
     }
 }

@@ -47,7 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
     parser.add_argument("--xfail-file", type=Path, default=ROOT / "test/xfail.txt")
     parser.add_argument(
-        "--suite", action="append", choices=["all", "infra", "filecheck", "stage", "e2e"]
+        "--suite",
+        action="append",
+        choices=["all", "infra", "filecheck", "poly", "stage", "e2e"],
     )
     parser.add_argument("--stage", action="append", choices=sorted(STAGE_FLAGS))
     parser.add_argument("--filter", help="only run tests whose path contains this substring")
@@ -116,7 +118,7 @@ def parse_args() -> argparse.Namespace:
 
 def expand_suites(values: list[str] | None) -> list[str]:
     if not values or "all" in values:
-        return ["infra", "filecheck", "stage", "e2e"]
+        return ["infra", "filecheck", "poly", "stage", "e2e"]
     out: list[str] = []
     for value in values:
         if value not in out:
@@ -168,7 +170,8 @@ def discover_sources(test_root: Path, pattern: str | None) -> list[Path]:
     sources = sorted(test_root.rglob("*.sy"))
     out = []
     for source in sources:
-        if "/test/ir/" in f"/{rel(source.parent)}/":
+        parent = f"/{rel(source.parent)}/"
+        if "/test/ir/" in parent or "/test/poly/" in parent:
             continue
         if pattern and pattern not in rel(source):
             continue
@@ -194,6 +197,19 @@ def discover_filecheck_tests(test_root: Path, pattern: str | None) -> list[Path]
     return tests
 
 
+def discover_poly_tests(test_root: Path, pattern: str | None) -> list[Path]:
+    root = test_root / "poly"
+    tests: list[Path] = []
+    if not root.exists():
+        return tests
+    for source in sorted(root.rglob("*.sy")):
+        if pattern and pattern not in rel(source):
+            continue
+        if any(line.lstrip().startswith("// RUN:") for line in source.read_text().splitlines()):
+            tests.append(source)
+    return tests
+
+
 def load_xfails(path: Path) -> list[tuple[str, str]]:
     if not path.exists():
         return []
@@ -203,7 +219,7 @@ def load_xfails(path: Path) -> list[tuple[str, str]]:
         if not line:
             continue
         parts = line.split(maxsplit=1)
-        if len(parts) == 2 and parts[0] in {"*", "filecheck", "stage", "e2e"}:
+        if len(parts) == 2 and parts[0] in {"*", "filecheck", "poly", "stage", "e2e"}:
             out.append((parts[0], parts[1]))
         else:
             out.append(("*", line))
@@ -231,7 +247,9 @@ def apply_xfail(result: TestResult, xfails: list[tuple[str, str]]) -> TestResult
     return result
 
 
-def run_filecheck(source: Path, binary: Path, work_dir: Path, timeout: float) -> TestResult:
+def run_filecheck(
+    source: Path, binary: Path, work_dir: Path, timeout: float, suite: str = "filecheck"
+) -> TestResult:
     start = time.monotonic()
     commands = [
         line.split("RUN:", 1)[1].strip()
@@ -239,7 +257,7 @@ def run_filecheck(source: Path, binary: Path, work_dir: Path, timeout: float) ->
         if line.lstrip().startswith("// RUN:")
     ]
     if not commands:
-        return TestResult("filecheck", rel(source), "SKIP", detail="no RUN lines")
+        return TestResult(suite, rel(source), "SKIP", detail="no RUN lines")
 
     tmp_dir = work_dir / "filecheck" / safe_name(source)
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -269,7 +287,7 @@ def run_filecheck(source: Path, binary: Path, work_dir: Path, timeout: float) ->
             )
         except subprocess.TimeoutExpired:
             return TestResult(
-                "filecheck",
+                suite,
                 rel(source),
                 "FAIL",
                 time.monotonic() - start,
@@ -281,9 +299,9 @@ def run_filecheck(source: Path, binary: Path, work_dir: Path, timeout: float) ->
                 detail += "\nstdout:\n" + short_output(proc.stdout)
             if proc.stderr:
                 detail += "\nstderr:\n" + short_output(proc.stderr)
-            return TestResult("filecheck", rel(source), "FAIL", time.monotonic() - start, detail)
+            return TestResult(suite, rel(source), "FAIL", time.monotonic() - start, detail)
 
-    return TestResult("filecheck", rel(source), "PASS", time.monotonic() - start)
+    return TestResult(suite, rel(source), "PASS", time.monotonic() - start)
 
 
 def run_infra(timeout: float) -> TestResult:
@@ -505,6 +523,20 @@ def main() -> int:
                 args.jobs,
                 tests,
                 lambda path: run_filecheck(path, args.binary, args.work_dir, filecheck_timeout),
+                xfails,
+            )
+        )
+
+    if "poly" in suites:
+        tests = discover_poly_tests(args.test_root, args.filter)
+        results.extend(
+            run_many(
+                "poly",
+                args.jobs,
+                tests,
+                lambda path: run_filecheck(
+                    path, args.binary, args.work_dir, filecheck_timeout, suite="poly"
+                ),
                 xfails,
             )
         )
