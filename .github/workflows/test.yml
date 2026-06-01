@@ -715,9 +715,9 @@ jobs:
           def fmt_overall(delta_pct) -> str:
               if not isinstance(delta_pct, (int, float)):
                   return "ℹ️ N/A"
-              if delta_pct > 0:
-                  return f"⚠️ 慢 {delta_pct:.1f}%"
               if delta_pct < 0:
+                  return f"⚠️ 慢 {delta_pct:.1f}%"
+              if delta_pct > 0:
                   return f"🚀 快 {abs(delta_pct):.1f}%"
               return "✅ 持平 0.0%"
 
