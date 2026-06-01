@@ -159,6 +159,157 @@ bool presburger_proves_identical_add(const yir::AddIOp &previous, const yir::Add
     return !equality.is_integer_empty() && equality.find_lexicographic_maximum().has_value();
 }
 
+bool poly_affine_expr_equal(const PolyAffineExpr &lhs, const PolyAffineExpr &rhs) {
+    return lhs.valid == rhs.valid && lhs.constant == rhs.constant && lhs.terms == rhs.terms;
+}
+
+std::size_t poly_affine_expr_hash(const PolyAffineExpr &expr) {
+    std::size_t hash = std::hash<bool>{}(expr.valid);
+    hash ^= std::hash<std::int64_t>{}(expr.constant) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    for (const auto &[value, coefficient] : expr.terms) {
+        hash ^= std::hash<const yir::Value *>{}(value) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::int64_t>{}(coefficient) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    }
+    return hash;
+}
+
+struct PolyAccessKey {
+    const yir::Value *memory = nullptr;
+    std::vector<PolyAffineExpr> indices;
+
+    bool operator==(const PolyAccessKey &other) const {
+        return memory == other.memory && indices.size() == other.indices.size() &&
+               std::equal(indices.begin(), indices.end(), other.indices.begin(), poly_affine_expr_equal);
+    }
+};
+
+struct PolyAccessKeyHash {
+    std::size_t operator()(const PolyAccessKey &key) const {
+        std::size_t hash = std::hash<const yir::Value *>{}(key.memory);
+        for (const auto &index : key.indices) {
+            hash ^= poly_affine_expr_hash(index) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        }
+        return hash;
+    }
+};
+
+struct NearestWrite {
+    const PolyStmt *stmt = nullptr;
+    std::size_t write_index = 0;
+};
+
+struct SameIterationReload {
+    yir::ArrayLoadOp *load = nullptr;
+    yir::ArrayStoreOp *store = nullptr;
+};
+
+bool is_valid_affine_access(const PolyAccess &access) {
+    return access.memory != nullptr && std::all_of(access.indices.begin(), access.indices.end(),
+                                                   [](const PolyAffineExpr &expr) {
+                                                       return expr.valid;
+                                                   });
+}
+
+PolyAccessKey access_key(const PolyAccess &access) {
+    PolyAccessKey key;
+    key.memory = access.memory;
+    key.indices = access.indices;
+    return key;
+}
+
+bool presburger_proves_identical_affine(const PolyAffineExpr &lhs, const PolyAffineExpr &rhs) {
+    if (!lhs.valid || !rhs.valid) {
+        return false;
+    }
+
+    std::vector<const yir::Value *> symbols;
+    for (const auto &term : lhs.terms) {
+        symbol_index(symbols, term.first);
+    }
+    for (const auto &term : rhs.terms) {
+        symbol_index(symbols, term.first);
+    }
+
+    std::vector<std::int64_t> diff(symbols.size(), 0);
+    for (const auto &term : lhs.terms) {
+        diff[symbol_index(symbols, term.first)] += term.second;
+    }
+    for (const auto &term : rhs.terms) {
+        diff[symbol_index(symbols, term.first)] -= term.second;
+    }
+    const std::int64_t constant_diff = lhs.constant - rhs.constant;
+
+    const bool identity = constant_diff == 0 &&
+                          std::all_of(diff.begin(), diff.end(),
+                                      [](std::int64_t coefficient) { return coefficient == 0; });
+    if (!identity) {
+        return false;
+    }
+
+    yir::presburger::IntegerRelation equality(static_cast<unsigned>(diff.size()));
+    equality.add_equality(diff, constant_diff);
+    return !equality.is_integer_empty() && equality.find_lexicographic_maximum().has_value();
+}
+
+bool presburger_proves_same_access(const PolyAccess &write, const PolyAccess &read) {
+    if (write.memory != read.memory || write.indices.size() != read.indices.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < write.indices.size(); ++i) {
+        if (!presburger_proves_identical_affine(write.indices[i], read.indices[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_schedule_dims(const PolyStmt &lhs, const PolyStmt &rhs) {
+    return lhs.schedule_dims == rhs.schedule_dims;
+}
+
+bool same_iteration_domain(const PolyStmt &write_stmt, const PolyStmt &read_stmt) {
+    if (!same_schedule_dims(write_stmt, read_stmt) ||
+        write_stmt.domain.size() != read_stmt.domain.size()) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < write_stmt.domain.size(); ++i) {
+        const auto &write_bound = write_stmt.domain[i];
+        const auto &read_bound = read_stmt.domain[i];
+        if (write_bound.iv != read_bound.iv) {
+            return false;
+        }
+        if (!presburger_proves_identical_affine(write_bound.lower, read_bound.lower) ||
+            !presburger_proves_identical_affine(write_bound.upper, read_bound.upper)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool find_operation_index(yir::Region &region, const yir::Operation &target, std::size_t &index) {
+    auto &ops = region.operations();
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        if (ops[i].get() == &target) {
+            index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+void erase_nearest_writes_for_memory(
+    std::unordered_map<PolyAccessKey, NearestWrite, PolyAccessKeyHash> &nearest_writes,
+    const yir::Value *memory) {
+    for (auto it = nearest_writes.begin(); it != nearest_writes.end();) {
+        if (it->first.memory == memory) {
+            it = nearest_writes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void replace_operands(yir::Operation &op, yir::Value *old_value, yir::Value *new_value) {
     for (auto *&operand : op.operands()) {
         if (operand == old_value) {
@@ -227,7 +378,8 @@ public:
                                    const YIRPolyhedralCanonicalInfo& canonical_info)
         : module_(module), model_info_(model_info), dep_info_(dep_info),
           canonical_info_(canonical_info), num_interchanged_(0), num_tiled_(0),
-          num_affine_replacements_(0), num_nearest_queries_(0) {}
+          num_same_iteration_reloads_(0), num_affine_replacements_(0),
+          num_nearest_write_queries_(0), num_nearest_queries_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -236,13 +388,16 @@ public:
             changed |= try_interchange_or_tile(scop);
         }
 
+        changed |= replace_same_iteration_reloads();
         changed |= replace_equivalent_affine_scalars();
         return changed;
     }
 
     std::size_t num_interchanged() const { return num_interchanged_; }
     std::size_t num_tiled() const { return num_tiled_; }
+    std::size_t num_same_iteration_reloads() const { return num_same_iteration_reloads_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
+    std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
 
 private:
@@ -252,6 +407,94 @@ private:
         (void)canonical_info_;
         // TODO(polyhedral): use dependence directions to legalize schedule transforms.
         return false;
+    }
+
+    std::vector<SameIterationReload> find_same_iteration_reloads(const PolyScop &scop) {
+        std::unordered_map<PolyAccessKey, NearestWrite, PolyAccessKeyHash> nearest_writes;
+        std::vector<SameIterationReload> reloads;
+
+        for (const auto &stmt : scop.statements) {
+            for (const auto &read : stmt.reads) {
+                if (!is_valid_affine_access(read)) {
+                    continue;
+                }
+                auto found = nearest_writes.find(access_key(read));
+                if (found == nearest_writes.end()) {
+                    continue;
+                }
+
+                ++num_nearest_write_queries_;
+                const auto &nearest = found->second;
+                if (nearest.stmt == nullptr || nearest.write_index >= nearest.stmt->writes.size()) {
+                    continue;
+                }
+                const auto &write_stmt = *nearest.stmt;
+                const auto &write = write_stmt.writes[nearest.write_index];
+                if (write_stmt.lexical_id >= stmt.lexical_id ||
+                    !same_iteration_domain(write_stmt, stmt) ||
+                    !presburger_proves_same_access(write, read)) {
+                    continue;
+                }
+
+                auto *load = dynamic_cast<yir::ArrayLoadOp *>(const_cast<yir::Operation *>(stmt.op));
+                auto *store = dynamic_cast<yir::ArrayStoreOp *>(
+                    const_cast<yir::Operation *>(write_stmt.op));
+                if (load == nullptr || store == nullptr || load->parent() != store->parent()) {
+                    continue;
+                }
+                reloads.push_back({load, store});
+            }
+
+            for (std::size_t write_index = 0; write_index < stmt.writes.size(); ++write_index) {
+                const auto &write = stmt.writes[write_index];
+                if (write.memory == nullptr) {
+                    continue;
+                }
+
+                // Any intervening write to the same memory object may alias this simple model.
+                // Keep only the current exact write as a candidate for later same-iteration reads.
+                erase_nearest_writes_for_memory(nearest_writes, write.memory);
+                if (is_valid_affine_access(write)) {
+                    nearest_writes[access_key(write)] = NearestWrite{&stmt, write_index};
+                }
+            }
+        }
+
+        return reloads;
+    }
+
+    bool replace_load_with_store_value(yir::ArrayLoadOp &load, yir::ArrayStoreOp &store) {
+        auto *parent = load.parent();
+        if (parent == nullptr || parent != store.parent() || load.result() == nullptr ||
+            store.value() == nullptr || store.value() == load.result()) {
+            return false;
+        }
+
+        std::size_t load_index = 0;
+        std::size_t store_index = 0;
+        if (!find_operation_index(*parent, load, load_index) ||
+            !find_operation_index(*parent, store, store_index) || store_index >= load_index) {
+            return false;
+        }
+
+        auto *replacement = store.value();
+        auto *old_value = load.result();
+        replace_value_after(*parent, load_index + 1, old_value, replacement);
+        parent->operations().erase(parent->operations().begin() + static_cast<std::ptrdiff_t>(load_index));
+        ++num_same_iteration_reloads_;
+        return true;
+    }
+
+    bool replace_same_iteration_reloads() {
+        bool changed = false;
+        for (const auto &scop : model_info_.models) {
+            for (const auto &reload : find_same_iteration_reloads(scop)) {
+                if (reload.load != nullptr && reload.store != nullptr) {
+                    changed = replace_load_with_store_value(*reload.load, *reload.store) || changed;
+                }
+            }
+        }
+        return changed;
     }
 
     bool replace_equivalent_affine_scalars() {
@@ -329,7 +572,9 @@ private:
 
     std::size_t num_interchanged_;
     std::size_t num_tiled_;
+    std::size_t num_same_iteration_reloads_;
     std::size_t num_affine_replacements_;
+    std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
 };
 
@@ -377,7 +622,9 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
     std::ostringstream oss;
     oss << "interchange=" << transformer.num_interchanged()
         << ", tiling=" << transformer.num_tiled()
+        << ", same_iteration_reloads=" << transformer.num_same_iteration_reloads()
         << ", affine_replacements=" << transformer.num_affine_replacements()
+        << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
         << ", nearest_queries=" << transformer.num_nearest_queries();
 
     return PassResult::ok(changed, oss.str());

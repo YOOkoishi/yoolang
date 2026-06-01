@@ -124,6 +124,7 @@ private:
                 YIRSCoPStatement stmt;
                 stmt.id = next_stmt_id_++;
                 stmt.op = op.get();
+                stmt.op_name = op->op_name();
                 stmt.enclosing_loops = loop_stack;
                 scop.statements.push_back(std::move(stmt));
             }

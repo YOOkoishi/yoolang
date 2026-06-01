@@ -1,0 +1,41 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+
+int a[128];
+int b[128];
+
+int main() {
+  int i;
+  int N;
+  int t;
+
+  N = getint();
+  i = 0;
+  while (i < N) {
+    a[i] = i + 1;
+    a[0] = i + 2;
+    t = a[i];
+    b[i] = t;
+    i = i + 1;
+  }
+
+  return t;
+}
+
+// POLY: polyhedral {
+// POLY: canonical_loops: 1
+// POLY: scops: 1
+// POLY: statements: 4
+// POLY: models: 1
+// POLY: statements: 4
+// POLY-DAG: write @a[%i]
+// POLY-DAG: write @a[0]
+// POLY-DAG: read @a[%i]
+// POLY-DAG: write @b[%i]
+// POLY: }
+
+// YIR: yir.for %i =
+// YIR: yir.array_store %v{{[0-9]+}}, @a, [%i]
+// YIR: yir.array_store %v{{[0-9]+}}, @a, [%v{{[0-9]+}}]
+// YIR: yir.array_load @a, [%i]
+// YIR: yir.assign %t,

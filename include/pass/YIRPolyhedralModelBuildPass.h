@@ -37,6 +37,7 @@ struct PolyAccess {
 struct PolyStmt {
     std::size_t id;
     const yir::Operation *op;
+    std::string op_name;
     std::vector<const yir::Value *> dims; // The nested loops surrounding this stmt
     
     std::vector<PolyLoopBound> domain;

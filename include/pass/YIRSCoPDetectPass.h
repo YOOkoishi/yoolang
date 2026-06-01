@@ -2,6 +2,7 @@
 
 #include "PassManager.h"
 #include <string_view>
+#include <string>
 #include <vector>
 #include <unordered_set>
 
@@ -17,6 +18,7 @@ namespace pass {
 struct YIRSCoPStatement {
     std::size_t id;
     const yir::Operation *op;
+    std::string op_name;
     std::vector<const yir::ForOp *> enclosing_loops;
 };
 

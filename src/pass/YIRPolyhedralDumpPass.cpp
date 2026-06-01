@@ -147,8 +147,7 @@ void dump_scops(std::ostream &out, const YIRSCoPInfo &scop_info) {
         out << "    symbols: " << value_list(sorted_values_from_set(scop.symbols)) << '\n';
         out << "    statements: " << scop.statements.size() << '\n';
         for (const auto &stmt : scop.statements) {
-            out << "    stmt #" << stmt.id << " op=";
-            out << (stmt.op == nullptr ? "<null>" : stmt.op->op_name());
+            out << "    stmt #" << stmt.id << " op=" << stmt.op_name;
             out << " loops=";
             std::vector<const yir::Value *> loops;
             for (const auto *loop : stmt.enclosing_loops) {
@@ -167,8 +166,7 @@ void dump_models(std::ostream &out, const PolyModelInfo &model_info) {
         out << "    params: " << value_list(sorted_values(model.params)) << '\n';
         out << "    statements: " << model.statements.size() << '\n';
         for (const auto &stmt : model.statements) {
-            out << "    stmt #" << stmt.id << " op=";
-            out << (stmt.op == nullptr ? "<null>" : stmt.op->op_name()) << '\n';
+            out << "    stmt #" << stmt.id << " op=" << stmt.op_name << '\n';
             out << "      schedule: " << value_list(stmt.schedule_dims) << '\n';
             out << "      domain: " << domain_string(stmt) << '\n';
             for (const auto &read : stmt.reads) {

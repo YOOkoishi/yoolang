@@ -140,6 +140,7 @@ public:
                 PolyStmt poly_stmt;
                 poly_stmt.id = stmt.id;
                 poly_stmt.op = stmt.op;
+                poly_stmt.op_name = stmt.op == nullptr ? "<null>" : stmt.op->op_name();
                 poly_stmt.lexical_id = stmt.id;
 
                 extract_domain(poly_stmt, stmt.enclosing_loops);
