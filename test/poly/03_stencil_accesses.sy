@@ -52,7 +52,7 @@ int main() {
 // POLY-DAG: read @x[%i, %j, %k + 1]
 // POLY-DAG: read @x[%i - 1, %j - 1, %k - 1]
 // POLY: write @x[%i, %j, %k]
-// POLY: dependences: 8
+// POLY: dependences: 12
 // POLY-DAG: dependence WAR stmt #0 -> stmt #7 memory=@x dependent=true
 // POLY-DAG: dependence WAR stmt #1 -> stmt #7 memory=@x dependent=true
 // POLY-DAG: dependence WAR stmt #2 -> stmt #7 memory=@x dependent=true
@@ -60,5 +60,9 @@ int main() {
 // POLY-DAG: dependence WAR stmt #4 -> stmt #7 memory=@x dependent=true
 // POLY-DAG: dependence WAR stmt #5 -> stmt #7 memory=@x dependent=true
 // POLY-DAG: dependence WAR stmt #6 -> stmt #7 memory=@x dependent=true
+// POLY-DAG: dependence RAW stmt #7 -> stmt #0 memory=@x dependent=true distance=loop-carried [1, 0, 0]
+// POLY-DAG: dependence RAW stmt #7 -> stmt #2 memory=@x dependent=true distance=loop-carried [0, 1, 0]
+// POLY-DAG: dependence RAW stmt #7 -> stmt #4 memory=@x dependent=true distance=loop-carried [0, 0, 1]
+// POLY-DAG: dependence RAW stmt #7 -> stmt #6 memory=@x dependent=true distance=loop-carried [1, 1, 1]
 // POLY-DAG: dependence WAW stmt #7 -> stmt #7 memory=@x dependent=true
 // POLY: }

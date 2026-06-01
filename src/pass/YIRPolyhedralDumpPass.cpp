@@ -7,6 +7,7 @@
 #include "../../include/yir/YIR.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -140,6 +141,40 @@ std::string dependence_kind(PolyDependence::Kind kind) {
     return "unknown";
 }
 
+std::string distance_kind(PolyDependence::DistanceKind kind) {
+    switch (kind) {
+    case PolyDependence::DistanceKind::SameIteration:
+        return "same-iteration";
+    case PolyDependence::DistanceKind::LoopCarriedConstant:
+        return "loop-carried";
+    case PolyDependence::DistanceKind::Unknown:
+        return "unknown";
+    }
+    return "unknown";
+}
+
+std::string distance_vector(const std::vector<std::int64_t> &distance) {
+    std::ostringstream out;
+    out << '[';
+    for (std::size_t i = 0; i < distance.size(); ++i) {
+        if (i != 0) {
+            out << ", ";
+        }
+        out << distance[i];
+    }
+    out << ']';
+    return out.str();
+}
+
+std::string dependence_distance(const PolyDependence &dep) {
+    std::ostringstream out;
+    out << " distance=" << distance_kind(dep.distance_kind);
+    if (!dep.distance.empty()) {
+        out << ' ' << distance_vector(dep.distance);
+    }
+    return out.str();
+}
+
 void dump_scops(std::ostream &out, const YIRSCoPInfo &scop_info) {
     out << "  scops: " << scop_info.scops.size() << '\n';
     for (const auto &scop : scop_info.scops) {
@@ -199,7 +234,8 @@ void dump_dependences(std::ostream &out, const PolyDependenceInfo &dep_info) {
     for (const auto &dep : deps) {
         out << "  dependence " << dependence_kind(dep.kind) << " stmt #" << dep.source_stmt_id
             << " -> stmt #" << dep.target_stmt_id << " memory=" << value_name(dep.memory)
-            << " dependent=" << (dep.is_dependent ? "true" : "false") << '\n';
+            << " dependent=" << (dep.is_dependent ? "true" : "false")
+            << dependence_distance(dep) << '\n';
     }
 }
 
