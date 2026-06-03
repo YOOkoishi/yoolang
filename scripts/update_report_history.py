@@ -77,13 +77,13 @@ def read_perf_summary(perf_path: Path | None) -> tuple[float | None, int | None]
         payload = json.loads(perf_path.read_text(errors="replace"))
     except Exception:
         return None, None
-    compile_time = payload.get("compiler_total_sec")
-    if not isinstance(compile_time, (int, float)):
-        compile_time = None
+    yoolang_runtime = payload.get("compiler_total_sec")
+    if not isinstance(yoolang_runtime, (int, float)):
+        yoolang_runtime = None
     failures = payload.get("failures")
     if not isinstance(failures, int):
         failures = None
-    return compile_time, failures
+    return yoolang_runtime, failures
 
 
 def safe_branch_name(branch: str) -> str:
@@ -127,7 +127,7 @@ def report_links(row: dict[str, Any], scope: str) -> tuple[str, str]:
 
 
 def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str = "root", pages_base_url: str = "") -> str:
-    def _fmt_compile_time(row: dict[str, Any]) -> str:
+    def _fmt_yoolang_runtime(row: dict[str, Any]) -> str:
         t = row.get("compiler_total_sec")
         if isinstance(t, (int, float)):
             return f"{t:.4f}s"
@@ -150,7 +150,7 @@ def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str 
           <td>{escape_html(row.get('branch', ''))}</td>
           <td><code>{escape_html(short_sha(str(row.get('commit_sha', ''))))}</code><div class="muted">{escape_html(row.get('commit_title', ''))}</div></td>
           <td>{escape_html(row.get('actor', ''))}</td>
-          <td>{_fmt_compile_time(row)}</td>
+          <td>{_fmt_yoolang_runtime(row)}</td>
           <td>{_fmt_failures(row)}</td>
           <td><a href="{escape_html(row.get('run_url', '#'))}">#{escape_html(row.get('run_number') or row.get('run_id', ''))}</a></td>
         </tr>
@@ -246,7 +246,7 @@ def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str 
             <th>Branch</th>
             <th>Commit</th>
             <th>提交人</th>
-            <th>编译时间</th>
+            <th>Yoolang 运行总耗时</th>
             <th>失败</th>
             <th>CI Run</th>
           </tr>
@@ -283,7 +283,7 @@ def main() -> int:
     runs = load_history(history_path)
     meta = env_or_git(args)
     run_id = meta["run_id"] or datetime.now(CHINA_TZ).strftime("%Y%m%d%H%M%S")
-    compile_time, failure_count = read_perf_summary(args.perf_report)
+    yoolang_runtime, failure_count = read_perf_summary(args.perf_report)
     branch = meta["branch"]
     is_main = args.is_main_branch or branch == os.environ.get("GITHUB_REPOSITORY_DEFAULT_BRANCH", "main")
     if is_main:
@@ -299,7 +299,7 @@ def main() -> int:
         "generated_china": datetime.now(CHINA_TZ).strftime("%Y-%m-%d %H:%M:%S CST"),
         "perf_url": perf_url,
         "instruction_url": instruction_url,
-        "compiler_total_sec": compile_time,
+        "compiler_total_sec": yoolang_runtime,
         "failure_count": failure_count,
         "is_main_branch": is_main,
     }

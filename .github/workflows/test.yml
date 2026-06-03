@@ -47,6 +47,10 @@ jobs:
 
           git checkout --force "$GITHUB_SHA"
 
+      - name: Clean CI outputs
+        run: |
+          rm -rf build/perf-ci build/github-actions ci-result public
+
       - name: Ensure xmake in PATH
         run: |
           if command -v xmake >/dev/null 2>&1; then
@@ -388,7 +392,7 @@ jobs:
           perf_delta_md = root / "build/perf-ci/perf-delta.md"
           summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
 
-          def parse_functional_summary(text: str) -> dict[str, int] | None:
+          def parse_functional_summary(text: str):
               match = re.search(
                   r"summary:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+(\d+) xfailed,\s+(\d+) xpassed",
                   text,
@@ -416,7 +420,7 @@ jobs:
 
           def parse_failed_cases(text: str) -> list[dict[str, str]]:
               cases: list[dict[str, str]] = []
-              current: dict[str, object] | None = None
+              current = None
 
               def flush_current() -> None:
                   nonlocal current
@@ -652,6 +656,54 @@ jobs:
           print("Functional tests passed.")
           PY
 
+      - name: Fail job if performance tests failed
+        if: always()
+        env:
+          PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
+          report_path = Path("build/perf-ci/perf-report.json")
+
+          if perf_outcome != "success":
+              print(f"Performance test step did not complete successfully: {perf_outcome}")
+              sys.exit(1)
+
+          if not report_path.exists():
+              print(f"Performance report is missing: {report_path}")
+              sys.exit(1)
+
+          try:
+              report = json.loads(report_path.read_text(errors="replace"))
+          except Exception as exc:
+              print(f"Performance report is not valid JSON: {exc}")
+              sys.exit(1)
+
+          status = str(report.get("status", "UNKNOWN"))
+          failures = report.get("failures")
+          if status != "PASS":
+              print(f"Performance report status is {status}, expected PASS")
+              sys.exit(1)
+          if failures != 0:
+              print(f"Performance report failures is {failures}, expected 0")
+              sys.exit(1)
+
+          insn_summary = report.get("instruction_count_summary", {})
+          if isinstance(insn_summary, dict) and insn_summary.get("status") == "FAILED":
+              print("QEMU dynamic instruction count failed")
+              reason = insn_summary.get("reason")
+              if reason:
+                  print(f"Reason: {reason}")
+              sys.exit(1)
+
+          print("Performance tests passed.")
+          PY
+
       - name: Notify Discord
         if: always()
         env:
@@ -695,16 +747,16 @@ jobs:
                   print(f"failed to read {path}: {exc}")
                   return {}
 
-          def parse_seconds(value) -> float | None:
+          def parse_seconds(value):
               if isinstance(value, (int, float)):
                   return float(value)
               match = re.search(r"([0-9]+(?:\.[0-9]+)?)s?", str(value))
               return float(match.group(1)) if match else None
 
-          def fmt_seconds(value: float | None) -> str:
+          def fmt_seconds(value):
               return "N/A" if value is None else f"{value:.2f}s"
 
-          def fmt_speedup(reference_time: float | None, current_time: float | None) -> str:
+          def fmt_speedup(reference_time, current_time):
               if reference_time is None or current_time is None or current_time <= 0:
                   return "N/A"
               return f"{reference_time / current_time:.2f}x"
@@ -716,9 +768,9 @@ jobs:
               if not isinstance(delta_pct, (int, float)):
                   return "ℹ️ N/A"
               if delta_pct < 0:
-                  return f"⚠️ 慢 {delta_pct:.1f}%"
+                  return f"⚠️ 慢 {abs(delta_pct):.1f}%"
               if delta_pct > 0:
-                  return f"🚀 快 {abs(delta_pct):.1f}%"
+                  return f"🚀 快 {delta_pct:.1f}%"
               return "✅ 持平 0.0%"
 
           def fmt_baseline_speedup(delta: dict) -> str:
@@ -902,8 +954,8 @@ jobs:
           baseline_commit = f"{baseline_branch} @ {baseline_sha[:7] or 'unknown'} 🕒 {baseline_time}"
           if baseline_title:
               baseline_commit += f" {baseline_title}"
-          current_compile_total = delta.get("current_compiler_total")
-          baseline_compile_total = delta.get("baseline_compiler_total")
+          current_yoolang_runtime_total = delta.get("current_compiler_total")
+          baseline_yoolang_runtime_total = delta.get("baseline_compiler_total")
 
           lines = [
               f"{status_emoji} 🚀 提交者：{os.environ.get('ACTOR', 'unknown')}",
@@ -917,14 +969,14 @@ jobs:
               perf_report_line(),
               "",
               "📈 基线对比:",
-              f"⏱️ 当前 compile 总时间: {fmt_seconds(current_compile_total if isinstance(current_compile_total, (int, float)) else None)}",
-              f"⏱️ 基线 compile 总时间: {fmt_seconds(baseline_compile_total if isinstance(baseline_compile_total, (int, float)) else None)}",
+              f"⏱️ 当前 Yoolang 运行总耗时: {fmt_seconds(current_yoolang_runtime_total if isinstance(current_yoolang_runtime_total, (int, float)) else None)}",
+              f"⏱️ 基线 Yoolang 运行总耗时: {fmt_seconds(baseline_yoolang_runtime_total if isinstance(baseline_yoolang_runtime_total, (int, float)) else None)}",
               f"整体: {fmt_overall(delta.get('total_delta_pct'))}, 总时间加速比 {fmt_baseline_speedup(delta)}",
               "",
               f"📍 基线: {baseline_commit}",
               f"⏱️ case 胜负: 🚀 {fast} 胜 / ⚠️ {slow} 负 / ✅ {stable} 平 / ❌ {perf.get('failures', 0)} 失败",
               "",
-              "⚡ 编译器速度:",
+              "⚡ 目标程序运行速度:",
               f"yoolang {fmt_seconds(compiler_total_value)} / GCC {fmt_seconds(gcc_total_value)} / Clang++ {fmt_seconds(clang_total_value)}",
               f"📐 总时间加速比: GCC {fmt_speedup(gcc_total_value, compiler_total_value)} / Clang++ {fmt_speedup(clang_total_value, compiler_total_value)}",
               f"🧮 几何平均加速比: GCC {fmt_optional_speedup(perf.get('gcc_o3_geomean'))} / Clang++ {fmt_optional_speedup(perf.get('clang_o3_geomean'))}",
