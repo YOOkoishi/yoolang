@@ -1,6 +1,6 @@
-#include "../../include/oir/OIR.h"
+#include "oir/OIR.h"
 
-#include "../../include/oir/OIRAnalysis.h"
+#include "oir/OIRAnalysis.h"
 
 #include <algorithm>
 #include <functional>

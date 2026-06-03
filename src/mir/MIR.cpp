@@ -1,4 +1,4 @@
-#include "../../include/mir/MIR.h"
+#include "mir/MIR.h"
 
 #include <algorithm>
 #include <cctype>

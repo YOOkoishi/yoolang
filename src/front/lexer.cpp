@@ -1,4 +1,4 @@
-#include "../../include/front/parser_tokens.h"
+#include "front/parser_tokens.h"
 
 #include <cctype>
 #include <cstdio>

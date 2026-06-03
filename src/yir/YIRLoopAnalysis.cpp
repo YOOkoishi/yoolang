@@ -1,4 +1,4 @@
-#include "../../include/yir/YIRLoopAnalysis.h"
+#include "yir/YIRLoopAnalysis.h"
 
 #include <algorithm>
 #include <sstream>

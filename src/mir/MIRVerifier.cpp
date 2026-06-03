@@ -1,4 +1,4 @@
-#include "../../include/mir/MIRVerifier.h"
+#include "mir/MIRVerifier.h"
 
 #include <sstream>
 #include <stdexcept>

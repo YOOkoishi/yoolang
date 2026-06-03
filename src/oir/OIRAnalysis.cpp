@@ -1,4 +1,4 @@
-#include "../../include/oir/OIRAnalysis.h"
+#include "oir/OIRAnalysis.h"
 
 #include <algorithm>
 #include <cstdint>

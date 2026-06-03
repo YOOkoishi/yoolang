@@ -1,4 +1,4 @@
-#include "../../include/yir/Presburger.h"
+#include "yir/Presburger.h"
 
 #include <algorithm>
 #include <utility>

@@ -1,4 +1,4 @@
-#include "../../include/yir/YIR.h"
+#include "yir/YIR.h"
 
 #include <sstream>
 #include <stdexcept>

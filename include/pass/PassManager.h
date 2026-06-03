@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../ast/ast.h"
-#include "../mir/MIR.h"
-#include "../oir/OIR.h"
+#include "ast/ast.h"
+#include "mir/MIR.h"
+#include "oir/OIR.h"
 
 #include <memory>
 #include <stdexcept>

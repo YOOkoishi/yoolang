@@ -1,4 +1,4 @@
-#include "../../include/front/parser.h"
+#include "front/parser.h"
 
 int nextToken();
 

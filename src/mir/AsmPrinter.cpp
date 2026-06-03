@@ -1,4 +1,4 @@
-#include "../../include/mir/AsmPrinter.h"
+#include "mir/AsmPrinter.h"
 
 #include <cctype>
 #include <cstring>

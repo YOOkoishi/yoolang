@@ -1,4 +1,4 @@
-#include "../../include/mir/MIRPrinter.h"
+#include "mir/MIRPrinter.h"
 
 #include <iomanip>
 #include <ostream>

@@ -1,4 +1,4 @@
-#include "../../include/ast/ast.h"
+#include "ast/ast.h"
 
 void IntLiteral::accept(ASTVisitor &visitor) {
     visitor.visit(*this);

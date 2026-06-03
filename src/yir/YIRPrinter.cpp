@@ -1,4 +1,4 @@
-#include "../../include/yir/YIRPrinter.h"
+#include "yir/YIRPrinter.h"
 
 #include <iomanip>
 #include <ostream>

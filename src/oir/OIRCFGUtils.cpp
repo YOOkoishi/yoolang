@@ -1,4 +1,4 @@
-#include "../../include/oir/OIRCFGUtils.h"
+#include "oir/OIRCFGUtils.h"
 
 #include <memory>
 

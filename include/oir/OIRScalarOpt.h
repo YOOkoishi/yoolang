@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../include/pass/PassManager.h"
+#include "pass/PassManager.h"
 
 #include <cstdint>
 #include <list>

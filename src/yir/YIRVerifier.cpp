@@ -1,4 +1,4 @@
-#include "../../include/yir/YIRVerifier.h"
+#include "yir/YIRVerifier.h"
 
 #include <set>
 #include <sstream>

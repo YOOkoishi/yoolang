@@ -572,15 +572,15 @@ src/mir/MIRPrinter.cpp
 src/mir/MIRVerifier.cpp
 src/mir/RISCV.cpp
 
-include/pass/OIRToMIRPass.h
-include/pass/MIRRegAllocPass.h
-include/pass/MIRFramePass.h
-include/pass/MIRToAsmPass.h
+include/pass/oir/OIRToMIRPass.h
+include/pass/mir/MIRRegAllocPass.h
+include/pass/mir/MIRFramePass.h
+include/pass/mir/MIRToAsmPass.h
 
-src/pass/OIRToMIRPass.cpp
-src/pass/MIRRegAllocPass.cpp
-src/pass/MIRFramePass.cpp
-src/pass/MIRToAsmPass.cpp
+src/pass/oir/OIRToMIRPass.cpp
+src/pass/mir/MIRRegAllocPass.cpp
+src/pass/mir/MIRFramePass.cpp
+src/pass/mir/MIRToAsmPass.cpp
 ```
 
 `PassContext` 增加：
