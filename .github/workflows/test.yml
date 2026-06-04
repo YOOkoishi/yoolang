@@ -49,7 +49,7 @@ jobs:
 
       - name: Clean CI outputs
         run: |
-          rm -rf build/perf-ci build/github-actions ci-result public
+          rm -rf build/perf-ci build/fuzz-ci build/github-actions ci-result public
 
       - name: Ensure xmake in PATH
         run: |
@@ -87,6 +87,20 @@ jobs:
           set -o pipefail
           mkdir -p build/github-actions
           python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --compile-timeout 60 2>&1 | tee build/github-actions/functional-tests.log
+
+      - name: Run fuzz differential tests
+        id: fuzz_tests
+        if: always()
+        continue-on-error: true
+        env:
+          FUZZ_CASES: "40"
+          FUZZ_SEED: ${{ github.sha }}
+          SYSY_RUNTIME_LIB: runtime/libsysy_riscv.a
+          QEMU_BIN: qemu-riscv64
+        run: |
+          set -o pipefail
+          mkdir -p build/github-actions
+          python3 scripts/fuzz_compare.py --cases "$FUZZ_CASES" --seed "$FUZZ_SEED" --runtime "$SYSY_RUNTIME_LIB" --keep-going 2>&1 | tee build/github-actions/fuzz-tests.log
 
       - name: Run performance tests
         id: perf_tests
@@ -376,6 +390,7 @@ jobs:
         if: always()
         env:
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
+          FUZZ_OUTCOME: ${{ steps.fuzz_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
         run: |
           python3 - <<'PY'
@@ -386,6 +401,8 @@ jobs:
 
           root = Path.cwd()
           functional_log = root / "build/github-actions/functional-tests.log"
+          fuzz_log = root / "build/github-actions/fuzz-tests.log"
+          fuzz_json = root / "build/fuzz-ci/fuzz-report.json"
           perf_log = root / "build/github-actions/perf-tests.log"
           perf_json = root / "build/perf-ci/perf-report.json"
           insn_delta_json = root / "build/perf-ci/instruction-count-compare.json"
@@ -457,6 +474,15 @@ jobs:
           else:
               functional_status = "PASS" if functional["failed"] == 0 else "FAIL"
 
+          fuzz_payload = None
+          if fuzz_json.exists():
+              fuzz_payload = json.loads(fuzz_json.read_text(errors="replace"))
+
+          if fuzz_payload is None:
+              fuzz_status = "PASS" if os.environ["FUZZ_OUTCOME"] == "success" else "FAIL"
+          else:
+              fuzz_status = str(fuzz_payload.get("status", os.environ["FUZZ_OUTCOME"].upper()))
+
           perf_payload = None
           if perf_json.exists():
               perf_payload = json.loads(perf_json.read_text())
@@ -465,7 +491,7 @@ jobs:
               perf_status = "PASS" if os.environ["PERF_OUTCOME"] == "success" else "FAIL"
           else:
               perf_status = str(perf_payload.get("status", os.environ["PERF_OUTCOME"].upper()))
-          overall_status = "PASS" if functional_status == "PASS" and perf_status == "PASS" else "FAIL"
+          overall_status = "PASS" if functional_status == "PASS" and fuzz_status == "PASS" and perf_status == "PASS" else "FAIL"
 
           lines = [
               "# 🧪 CI Summary",
@@ -473,6 +499,7 @@ jobs:
               "## 📌 Overall",
               f"- Status: {'✅' if overall_status == 'PASS' else '❌'} {overall_status}",
               f"- Functional: {'✅' if functional_status == 'PASS' else '❌'} {functional_status}",
+              f"- Fuzz: {'✅' if fuzz_status == 'PASS' else '❌'} {fuzz_status}",
               f"- Perf: {'✅' if perf_status == 'PASS' else '❌'} {perf_status}",
               f"- Branch: `{os.environ.get('GITHUB_REF_NAME', 'unknown')}`",
               f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
@@ -507,6 +534,40 @@ jobs:
               if len(functional_failed_cases) > 20:
                   lines.append(f"- ... and {len(functional_failed_cases) - 20} more")
               lines.extend(["", "</details>"])
+
+          lines.extend(["", "## 🎲 Fuzz Differential Tests"])
+          if fuzz_payload is None:
+              lines.append(f"- Status: {'✅' if os.environ['FUZZ_OUTCOME'] == 'success' else '❌'} {os.environ['FUZZ_OUTCOME'].upper()}")
+              lines.append("- Result: fuzz report was not generated")
+              if fuzz_log.exists():
+                  tail = "\n".join(fuzz_log.read_text(errors="replace").splitlines()[-20:])
+                  if tail:
+                      lines.extend(["", "<details><summary>📄 Fuzz log tail</summary>", "", "```text", tail, "```", "", "</details>"])
+          else:
+              rows = fuzz_payload.get("rows", [])
+              failures = fuzz_payload.get("failures", "unknown")
+              lines.append(f"- Status: {'✅' if fuzz_status == 'PASS' else '❌'} {fuzz_status}")
+              lines.append(f"- Seed: `{fuzz_payload.get('seed', 'unknown')}`")
+              lines.append(f"- Cases: {fuzz_payload.get('cases', len(rows))}")
+              lines.append(f"- Loops: {fuzz_payload.get('loops', False)}")
+              lines.append(f"- Executed: {fuzz_payload.get('executed_cases', len(rows))}")
+              lines.append(f"- Failed: {'✅' if failures == 0 else '❌'} {failures}")
+              failed_rows = [row for row in rows if isinstance(row, dict) and row.get("status") not in {"OK", "GENERATED"}]
+              if failed_rows:
+                  lines.extend(["", "| Case | Status | Detail |", "| --- | --- | --- |"])
+                  for row in failed_rows[:10]:
+                      detail = truncate_text(str(row.get("detail", "")), 300)
+                      lines.append(
+                          "| "
+                          + " | ".join(
+                              [
+                                  md_escape(str(row.get("case", ""))),
+                                  md_escape(str(row.get("status", ""))),
+                                  md_escape(detail),
+                              ]
+                          )
+                          + " |"
+                      )
 
           lines.extend(["", "## 📊 Performance Tests"])
 
@@ -581,14 +642,18 @@ jobs:
           summary_path.write_text("\n".join(lines) + "\n")
           PY
 
-      - name: Upload perf artifacts
+      - name: Upload CI report artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: perf-report
+          name: ci-report
           path: |
             build/github-actions/functional-tests.log
+            build/github-actions/fuzz-tests.log
             build/github-actions/perf-tests.log
+            build/fuzz-ci/fuzz-report.md
+            build/fuzz-ci/fuzz-report.json
+            build/fuzz-ci/cases
             build/perf-ci/perf-report.md
             build/perf-ci/perf-report.json
             build/perf-ci/perf-delta.md
@@ -656,6 +721,46 @@ jobs:
           print("Functional tests passed.")
           PY
 
+      - name: Fail job if fuzz tests failed
+        if: always()
+        env:
+          FUZZ_OUTCOME: ${{ steps.fuzz_tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          fuzz_outcome = os.environ.get("FUZZ_OUTCOME", "unknown")
+          report_path = Path("build/fuzz-ci/fuzz-report.json")
+
+          if fuzz_outcome != "success":
+              print(f"Fuzz test step did not complete successfully: {fuzz_outcome}")
+              sys.exit(1)
+
+          if not report_path.exists():
+              print(f"Fuzz report is missing: {report_path}")
+              sys.exit(1)
+
+          try:
+              report = json.loads(report_path.read_text(errors="replace"))
+          except Exception as exc:
+              print(f"Fuzz report is not valid JSON: {exc}")
+              sys.exit(1)
+
+          status = str(report.get("status", "UNKNOWN"))
+          failures = report.get("failures")
+          if status != "PASS":
+              print(f"Fuzz report status is {status}, expected PASS")
+              sys.exit(1)
+          if failures != 0:
+              print(f"Fuzz report failures is {failures}, expected 0")
+              sys.exit(1)
+
+          print("Fuzz tests passed.")
+          PY
+
       - name: Fail job if performance tests failed
         if: always()
         env:
@@ -712,6 +817,7 @@ jobs:
           HTTP_PROXY: http://127.0.0.1:7890
           NO_PROXY: localhost,127.0.0.1,::1
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
+          FUZZ_OUTCOME: ${{ steps.fuzz_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
@@ -813,21 +919,21 @@ jobs:
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
               if base_url and outcome == "success":
                   return f"🔗 指令数详细报告: {base_url.rstrip('/')}{_branch_path()}/instruction-report/"
-              return "🔗 指令数详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/instruction-report/index.html`"
+              return "🔗 指令数详细报告: GitHub Pages 暂不可用，请查看 CI artifact `ci-report` 中的 `public/instruction-report/index.html`"
 
           def perf_report_line() -> str:
               base_url = os.environ.get("PAGES_BASE_URL", "").strip()
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
               if base_url and outcome == "success":
                   return f"🔗 性能详细报告: {base_url.rstrip('/')}{_branch_path()}/perf-report/"
-              return "🔗 性能详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/perf-report/index.html`"
+              return "🔗 性能详细报告: GitHub Pages 暂不可用，请查看 CI artifact `ci-report` 中的 `public/perf-report/index.html`"
 
           def history_report_line() -> str:
               base_url = os.environ.get("PAGES_BASE_URL", "").strip()
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
               if base_url and outcome == "success":
                   return f"🔗 历史报告索引: {base_url.rstrip('/')}/history.html"
-              return "🔗 历史报告索引: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/history.html`"
+              return "🔗 历史报告索引: GitHub Pages 暂不可用，请查看 CI artifact `ci-report` 中的 `public/history.html`"
 
           def fmt_optional_speedup(value) -> str:
               return f"{value:.2f}x" if isinstance(value, (int, float)) else "N/A"
@@ -938,8 +1044,9 @@ jobs:
           slow_cases.sort(key=lambda item: (item.get("delta_pct", 0), item.get("delta_sec", 0)), reverse=True)
 
           functional = os.environ.get("FUNCTIONAL_OUTCOME", "unknown")
+          fuzz_outcome = os.environ.get("FUZZ_OUTCOME", "unknown")
           perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
-          status = "PASS" if functional == "success" and perf_outcome == "success" else "FAIL"
+          status = "PASS" if functional == "success" and fuzz_outcome == "success" and perf_outcome == "success" else "FAIL"
           status_emoji = "✅" if status == "PASS" else "❌"
           sha = os.environ.get("SHA", "")
           commit_title = short_text(first_line(os.environ.get("HEAD_COMMIT_MESSAGE", "")))
@@ -965,6 +1072,7 @@ jobs:
               f"📄 {commit_title}",
               "",
               f"🧪 功能测试: {fmt_status(functional)}",
+              f"🎲 Fuzz 差分测试: {fmt_status(fuzz_outcome)}",
               f"📊 性能测试: {fmt_status(perf_outcome)}",
               perf_report_line(),
               "",
