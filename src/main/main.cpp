@@ -50,7 +50,7 @@ struct CommandLineOptions {
     bool emit_mir = false;
     bool emit_asm = false;
     bool emit_poly = false;
-    bool enable_polyhedral = false;
+    bool enable_polyhedral = true;
     bool show_help = false;
 };
 
