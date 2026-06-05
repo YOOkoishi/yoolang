@@ -12,9 +12,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -203,6 +205,13 @@ struct SameIterationReload {
     yir::ArrayStoreOp *store = nullptr;
 };
 
+struct StencilCarryCandidate {
+    yir::ArrayLoadOp *load = nullptr;
+    yir::ArrayStoreOp *store = nullptr;
+    const PolyAccess *read = nullptr;
+    yir::ForOp *loop = nullptr;
+};
+
 bool is_valid_affine_access(const PolyAccess &access) {
     return access.memory != nullptr && std::all_of(access.indices.begin(), access.indices.end(),
                                                    [](const PolyAffineExpr &expr) {
@@ -287,6 +296,51 @@ bool same_iteration_domain(const PolyStmt &write_stmt, const PolyStmt &read_stmt
     return true;
 }
 
+PolyAffineExpr affine_expr_after_step(PolyAffineExpr expr, const yir::Value *iv,
+                                      std::int64_t step) {
+    if (!expr.valid) {
+        return expr;
+    }
+    for (const auto &term : expr.terms) {
+        if (term.first == iv) {
+            expr.constant += term.second * step;
+        }
+    }
+    return expr;
+}
+
+bool access_matches_next_iteration_write(const PolyAccess &write, const PolyAccess &read,
+                                         const yir::Value *iv, std::int64_t step) {
+    if (write.memory != read.memory || write.indices.size() != read.indices.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < write.indices.size(); ++i) {
+        auto next_read = affine_expr_after_step(read.indices[i], iv, step);
+        if (!presburger_proves_identical_affine(write.indices[i], next_read)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_innermost_unit_distance(const std::vector<std::int64_t> &distance) {
+    if (distance.empty() || distance.back() != 1) {
+        return false;
+    }
+    return std::all_of(distance.begin(), std::prev(distance.end()), [](std::int64_t value) {
+        return value == 0;
+    });
+}
+
+const PolyStmt *find_stmt_by_id(const PolyScop &scop, std::size_t id) {
+    for (const auto &stmt : scop.statements) {
+        if (stmt.id == id) {
+            return &stmt;
+        }
+    }
+    return nullptr;
+}
+
 bool find_operation_index(yir::Region &region, const yir::Operation &target, std::size_t &index) {
     auto &ops = region.operations();
     for (std::size_t i = 0; i < ops.size(); ++i) {
@@ -320,6 +374,85 @@ void replace_operands(yir::Operation &op, yir::Value *old_value, yir::Value *new
 
 void replace_value_in_region(yir::Region &region, yir::Value *old_value, yir::Value *new_value);
 
+bool operation_uses_value(const yir::Operation &op, const yir::Value *value);
+
+bool region_uses_value(const yir::Region &region, const yir::Value *value) {
+    return std::any_of(region.operations().begin(), region.operations().end(),
+                       [value](const auto &op) { return operation_uses_value(*op, value); });
+}
+
+bool operation_uses_value(const yir::Operation &op, const yir::Value *value) {
+    if (std::find(op.operands().begin(), op.operands().end(), value) != op.operands().end()) {
+        return true;
+    }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        return region_uses_value(if_op->then_region(), value) ||
+               (if_op->has_else() && region_uses_value(if_op->else_region(), value));
+    }
+    if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        return region_uses_value(while_op->cond_region(), value) ||
+               region_uses_value(while_op->body_region(), value);
+    }
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        return region_uses_value(for_op->body_region(), value);
+    }
+    return false;
+}
+
+bool value_used_outside_range(const yir::Region &region, const yir::Value *value,
+                              std::size_t first_in_range, std::size_t last_in_range) {
+    const auto &ops = region.operations();
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        if (i >= first_in_range && i <= last_in_range) {
+            continue;
+        }
+        if (operation_uses_value(*ops[i], value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool operation_writes_memory(const yir::Operation &op, const yir::Value *memory);
+
+bool region_writes_memory(const yir::Region &region, const yir::Value *memory) {
+    return std::any_of(region.operations().begin(), region.operations().end(),
+                       [memory](const auto &op) { return operation_writes_memory(*op, memory); });
+}
+
+bool operation_writes_memory(const yir::Operation &op, const yir::Value *memory) {
+    if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(&op)) {
+        return store->array() == memory;
+    }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        return region_writes_memory(if_op->then_region(), memory) ||
+               (if_op->has_else() && region_writes_memory(if_op->else_region(), memory));
+    }
+    if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        return region_writes_memory(while_op->cond_region(), memory) ||
+               region_writes_memory(while_op->body_region(), memory);
+    }
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        return region_writes_memory(for_op->body_region(), memory);
+    }
+    return false;
+}
+
+bool has_intervening_write_to_memory(const yir::Region &region, const yir::Value *memory,
+                                     std::size_t first, std::size_t last) {
+    const auto &ops = region.operations();
+    if (first > last || first >= ops.size()) {
+        return false;
+    }
+    last = std::min(last, ops.size() - 1);
+    for (std::size_t i = first; i <= last; ++i) {
+        if (operation_writes_memory(*ops[i], memory)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void replace_value_in_nested_regions(yir::Operation &op, yir::Value *old_value,
                                      yir::Value *new_value) {
     if (auto *if_op = dynamic_cast<yir::IfOp *>(&op)) {
@@ -347,6 +480,19 @@ void replace_value_in_region(yir::Region &region, yir::Value *old_value, yir::Va
     }
 }
 
+void replace_value_in_range(yir::Region &region, std::size_t first_op, std::size_t last_op,
+                            yir::Value *old_value, yir::Value *new_value) {
+    auto &ops = region.operations();
+    if (ops.empty() || first_op >= ops.size()) {
+        return;
+    }
+    last_op = std::min(last_op, ops.size() - 1);
+    for (std::size_t i = first_op; i <= last_op; ++i) {
+        replace_operands(*ops[i], old_value, new_value);
+        replace_value_in_nested_regions(*ops[i], old_value, new_value);
+    }
+}
+
 void replace_value_after(yir::Region &region, std::size_t first_op, yir::Value *old_value,
                          yir::Value *new_value) {
     auto &ops = region.operations();
@@ -371,6 +517,135 @@ std::string verify_message(const yir::VerifyResult &result) {
     return oss.str();
 }
 
+bool fits_i32(std::int64_t value) {
+    return value >= std::numeric_limits<int>::min() &&
+           value <= std::numeric_limits<int>::max();
+}
+
+struct AffineMaterializedComponent {
+    bool is_constant = false;
+    std::int64_t value = 0;
+    yir::Value *term = nullptr;
+};
+
+bool can_materialize_affine_expr(const PolyAffineExpr &expr) {
+    if (!expr.valid || !fits_i32(expr.constant)) {
+        return false;
+    }
+    return std::all_of(expr.terms.begin(), expr.terms.end(), [](const auto &term) {
+        return fits_i32(term.second);
+    });
+}
+
+std::vector<AffineMaterializedComponent>
+materialized_components_for(const PolyAffineExpr &expr, yir::Value *iv,
+                            yir::Value *iv_replacement) {
+    std::vector<AffineMaterializedComponent> components;
+    components.reserve(expr.terms.size() + (expr.constant == 0 ? 0 : 1));
+    for (const auto &[value, coefficient] : expr.terms) {
+        auto *term = const_cast<yir::Value *>(value);
+        if (value == iv) {
+            term = iv_replacement;
+        }
+        components.push_back({false, coefficient, term});
+    }
+    if (expr.constant != 0 || components.empty()) {
+        components.push_back({true, expr.constant, nullptr});
+    }
+    return components;
+}
+
+template <typename OpT, typename... Args>
+OpT *insert_op_before(yir::Region &region, std::size_t &insert_pos, Args &&...args) {
+    auto op = std::make_unique<OpT>(std::forward<Args>(args)...);
+    auto *raw = op.get();
+    raw->set_parent(&region);
+    region.operations().insert(region.operations().begin() + static_cast<std::ptrdiff_t>(insert_pos),
+                               std::move(op));
+    ++insert_pos;
+    return raw;
+}
+
+std::string stencil_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.stencil.") + stem + std::to_string(id);
+}
+
+yir::Value *materialize_component(yir::Region &region, std::size_t &insert_pos,
+                                  const AffineMaterializedComponent &component,
+                                  std::size_t &next_temp) {
+    if (component.is_constant) {
+        auto *constant = insert_op_before<yir::ConstI32Op>(
+            region, insert_pos, static_cast<int>(component.value), stencil_temp_name("c", next_temp++));
+        return constant->result();
+    }
+    if (component.term == nullptr) {
+        return nullptr;
+    }
+    if (component.value == 1) {
+        return component.term;
+    }
+
+    auto *coefficient = insert_op_before<yir::ConstI32Op>(
+        region, insert_pos, static_cast<int>(component.value), stencil_temp_name("c", next_temp++));
+    auto *product = insert_op_before<yir::MulIOp>(
+        region, insert_pos, coefficient->result(), component.term, stencil_temp_name("mul", next_temp++));
+    return product->result();
+}
+
+yir::Value *materialize_affine_expr(yir::Region &region, std::size_t &insert_pos,
+                                    const PolyAffineExpr &expr, yir::Value *iv,
+                                    yir::Value *iv_replacement, std::size_t &next_temp) {
+    if (!can_materialize_affine_expr(expr)) {
+        return nullptr;
+    }
+
+    auto components = materialized_components_for(expr, iv, iv_replacement);
+    yir::Value *value = materialize_component(region, insert_pos, components.front(), next_temp);
+    if (value == nullptr) {
+        return nullptr;
+    }
+    for (std::size_t i = 1; i < components.size(); ++i) {
+        auto *rhs = materialize_component(region, insert_pos, components[i], next_temp);
+        if (rhs == nullptr) {
+            return nullptr;
+        }
+        auto *sum = insert_op_before<yir::AddIOp>(
+            region, insert_pos, value, rhs, stencil_temp_name("add", next_temp++));
+        value = sum->result();
+    }
+    return value;
+}
+
+void collect_for_body_owners(yir::Region &region,
+                             std::unordered_map<const yir::Region *, yir::ForOp *> &owners) {
+    for (auto &op : region.operations()) {
+        if (auto *for_op = dynamic_cast<yir::ForOp *>(op.get())) {
+            owners[&for_op->body_region()] = for_op;
+            collect_for_body_owners(for_op->body_region(), owners);
+            continue;
+        }
+        if (auto *if_op = dynamic_cast<yir::IfOp *>(op.get())) {
+            collect_for_body_owners(if_op->then_region(), owners);
+            if (if_op->has_else()) {
+                collect_for_body_owners(if_op->else_region(), owners);
+            }
+            continue;
+        }
+        if (auto *while_op = dynamic_cast<yir::WhileOp *>(op.get())) {
+            collect_for_body_owners(while_op->cond_region(), owners);
+            collect_for_body_owners(while_op->body_region(), owners);
+        }
+    }
+}
+
+std::unordered_map<const yir::Region *, yir::ForOp *> collect_for_body_owners(yir::Module &module) {
+    std::unordered_map<const yir::Region *, yir::ForOp *> owners;
+    for (auto &function : module.functions()) {
+        collect_for_body_owners(function->body(), owners);
+    }
+    return owners;
+}
+
 class PolyhedralTransformer {
 public:
     explicit PolyhedralTransformer(yir::Module &module, const PolyModelInfo& model_info,
@@ -378,7 +653,7 @@ public:
                                    const YIRPolyhedralCanonicalInfo& canonical_info)
         : module_(module), model_info_(model_info), dep_info_(dep_info),
           canonical_info_(canonical_info), num_interchanged_(0), num_tiled_(0),
-          num_same_iteration_reloads_(0), num_affine_replacements_(0),
+          num_same_iteration_reloads_(0), num_stencil_carries_(0), num_affine_replacements_(0),
           num_nearest_write_queries_(0), num_nearest_queries_(0) {}
 
     bool transform() {
@@ -388,7 +663,20 @@ public:
             changed |= try_interchange_or_tile(scop);
         }
 
-        changed |= replace_same_iteration_reloads();
+        std::vector<SameIterationReload> same_iteration_reloads;
+        std::vector<StencilCarryCandidate> stencil_carries;
+        auto for_body_owners = collect_for_body_owners(module_);
+        for (const auto &scop : model_info_.models) {
+            auto reloads = find_same_iteration_reloads(scop);
+            same_iteration_reloads.insert(same_iteration_reloads.end(), reloads.begin(), reloads.end());
+
+            auto carries = find_stencil_carry_candidates(scop, for_body_owners);
+            stencil_carries.insert(stencil_carries.end(), carries.begin(), carries.end());
+        }
+
+        std::unordered_set<yir::ArrayLoadOp *> erased_loads;
+        changed |= apply_stencil_carries(stencil_carries, erased_loads);
+        changed |= replace_same_iteration_reloads(same_iteration_reloads, erased_loads);
         changed |= replace_equivalent_affine_scalars();
         return changed;
     }
@@ -396,6 +684,7 @@ public:
     std::size_t num_interchanged() const { return num_interchanged_; }
     std::size_t num_tiled() const { return num_tiled_; }
     std::size_t num_same_iteration_reloads() const { return num_same_iteration_reloads_; }
+    std::size_t num_stencil_carries() const { return num_stencil_carries_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
     std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
@@ -407,6 +696,164 @@ private:
         (void)canonical_info_;
         // TODO(polyhedral): use dependence directions to legalize schedule transforms.
         return false;
+    }
+
+    std::vector<StencilCarryCandidate> find_stencil_carry_candidates(
+        const PolyScop &scop,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners) {
+        std::vector<StencilCarryCandidate> candidates;
+        std::unordered_set<yir::ArrayLoadOp *> seen_loads;
+
+        for (const auto &dep : dep_info_.dependences) {
+            if (dep.kind != PolyDependence::Kind::RAW ||
+                dep.distance_kind != PolyDependence::DistanceKind::LoopCarriedConstant ||
+                !is_innermost_unit_distance(dep.distance)) {
+                continue;
+            }
+
+            const auto *write_stmt = find_stmt_by_id(scop, dep.source_stmt_id);
+            const auto *read_stmt = find_stmt_by_id(scop, dep.target_stmt_id);
+            if (write_stmt == nullptr || read_stmt == nullptr || write_stmt->writes.size() != 1 ||
+                read_stmt->reads.size() != 1 || !same_iteration_domain(*write_stmt, *read_stmt)) {
+                continue;
+            }
+
+            const auto &write = write_stmt->writes.front();
+            const auto &read = read_stmt->reads.front();
+            if (!is_valid_affine_access(write) || !is_valid_affine_access(read) ||
+                write.memory != dep.memory || read.memory != dep.memory) {
+                continue;
+            }
+
+            auto *load = dynamic_cast<yir::ArrayLoadOp *>(
+                const_cast<yir::Operation *>(read_stmt->op));
+            auto *store = dynamic_cast<yir::ArrayStoreOp *>(
+                const_cast<yir::Operation *>(write_stmt->op));
+            if (load == nullptr || store == nullptr || load->parent() == nullptr ||
+                load->parent() != store->parent()) {
+                continue;
+            }
+
+            auto owner = for_body_owners.find(load->parent());
+            if (owner == for_body_owners.end() || owner->second == nullptr) {
+                continue;
+            }
+            auto *loop = owner->second;
+            if (read_stmt->schedule_dims.empty() ||
+                read_stmt->schedule_dims.back() != loop->induction_var()) {
+                continue;
+            }
+
+            std::int64_t step = 0;
+            if (!const_i32_value(loop->step(), step) || step != 1) {
+                continue;
+            }
+
+            if (!access_matches_next_iteration_write(write, read, loop->induction_var(), step)) {
+                continue;
+            }
+            if (!seen_loads.insert(load).second) {
+                continue;
+            }
+
+            candidates.push_back({load, store, &read, loop});
+        }
+
+        return candidates;
+    }
+
+    bool apply_stencil_carries(const std::vector<StencilCarryCandidate> &candidates,
+                               std::unordered_set<yir::ArrayLoadOp *> &erased_loads) {
+        bool changed = false;
+        for (const auto &candidate : candidates) {
+            if (candidate.load == nullptr || candidate.store == nullptr ||
+                erased_loads.find(candidate.load) != erased_loads.end()) {
+                continue;
+            }
+            if (apply_stencil_carry(candidate)) {
+                erased_loads.insert(candidate.load);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    bool apply_stencil_carry(const StencilCarryCandidate &candidate) {
+        auto *load = candidate.load;
+        auto *store = candidate.store;
+        auto *loop = candidate.loop;
+        if (load == nullptr || store == nullptr || loop == nullptr || candidate.read == nullptr ||
+            load->parent() == nullptr || store->parent() != load->parent() ||
+            loop->parent() == nullptr || load->result() == nullptr || store->value() == nullptr) {
+            return false;
+        }
+
+        auto *body = load->parent();
+        std::size_t load_index = 0;
+        std::size_t store_index = 0;
+        if (!find_operation_index(*body, *load, load_index) ||
+            !find_operation_index(*body, *store, store_index) || load_index >= store_index) {
+            return false;
+        }
+
+        if (value_used_outside_range(*body, load->result(), load_index + 1, store_index)) {
+            return false;
+        }
+        if (has_intervening_write_to_memory(*body, load->array(), load_index + 1,
+                                            store_index == 0 ? 0 : store_index - 1)) {
+            return false;
+        }
+
+        auto *preheader = loop->parent();
+        std::size_t loop_index = 0;
+        if (!find_operation_index(*preheader, *loop, loop_index)) {
+            return false;
+        }
+        if (std::any_of(candidate.read->indices.begin(), candidate.read->indices.end(),
+                        [](const PolyAffineExpr &expr) {
+                            return !can_materialize_affine_expr(expr);
+                        })) {
+            return false;
+        }
+
+        std::size_t next_temp = next_stencil_temp_;
+        std::size_t insert_pos = loop_index;
+        std::vector<yir::Value *> initial_indices;
+        initial_indices.reserve(candidate.read->indices.size());
+        for (const auto &index : candidate.read->indices) {
+            auto *materialized =
+                materialize_affine_expr(*preheader, insert_pos, index, loop->induction_var(),
+                                        loop->lower_bound(), next_temp);
+            if (materialized == nullptr) {
+                next_stencil_temp_ = next_temp;
+                return false;
+            }
+            initial_indices.push_back(materialized);
+        }
+
+        auto *initial_load = insert_op_before<yir::ArrayLoadOp>(
+            *preheader, insert_pos, load->array(), std::move(initial_indices),
+            load->result()->type(), stencil_temp_name("init", next_temp++));
+        auto *carry_var = insert_op_before<yir::VarOp>(
+            *preheader, insert_pos, load->result()->type(), initial_load->result(),
+            stencil_temp_name("carry", next_temp++));
+        next_stencil_temp_ = next_temp;
+
+        replace_value_in_range(*body, load_index + 1, store_index, load->result(),
+                               carry_var->result());
+        auto &body_ops = body->operations();
+        body_ops.erase(body_ops.begin() + static_cast<std::ptrdiff_t>(load_index));
+        if (load_index < store_index) {
+            --store_index;
+        }
+
+        auto assign = std::make_unique<yir::AssignOp>(carry_var->result(), store->value());
+        assign->set_parent(body);
+        body_ops.insert(body_ops.begin() + static_cast<std::ptrdiff_t>(store_index + 1),
+                        std::move(assign));
+
+        ++num_stencil_carries_;
+        return true;
     }
 
     std::vector<SameIterationReload> find_same_iteration_reloads(const PolyScop &scop) {
@@ -485,13 +932,17 @@ private:
         return true;
     }
 
-    bool replace_same_iteration_reloads() {
+    bool replace_same_iteration_reloads(
+        const std::vector<SameIterationReload> &reloads,
+        const std::unordered_set<yir::ArrayLoadOp *> &unavailable_loads) {
         bool changed = false;
-        for (const auto &scop : model_info_.models) {
-            for (const auto &reload : find_same_iteration_reloads(scop)) {
-                if (reload.load != nullptr && reload.store != nullptr) {
-                    changed = replace_load_with_store_value(*reload.load, *reload.store) || changed;
-                }
+        std::unordered_set<yir::ArrayLoadOp *> erased_loads = unavailable_loads;
+        for (const auto &reload : reloads) {
+            if (reload.load != nullptr && reload.store != nullptr &&
+                erased_loads.find(reload.load) == erased_loads.end() &&
+                replace_load_with_store_value(*reload.load, *reload.store)) {
+                erased_loads.insert(reload.load);
+                changed = true;
             }
         }
         return changed;
@@ -573,9 +1024,11 @@ private:
     std::size_t num_interchanged_;
     std::size_t num_tiled_;
     std::size_t num_same_iteration_reloads_;
+    std::size_t num_stencil_carries_;
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
+    std::size_t next_stencil_temp_ = 0;
 };
 
 } // namespace
@@ -623,6 +1076,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
     oss << "interchange=" << transformer.num_interchanged()
         << ", tiling=" << transformer.num_tiled()
         << ", same_iteration_reloads=" << transformer.num_same_iteration_reloads()
+        << ", stencil_carries=" << transformer.num_stencil_carries()
         << ", affine_replacements=" << transformer.num_affine_replacements()
         << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
         << ", nearest_queries=" << transformer.num_nearest_queries();

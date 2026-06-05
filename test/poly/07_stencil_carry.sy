@@ -1,0 +1,42 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+
+int x[32][32][32];
+
+int main() {
+  int i;
+  int j;
+  int k;
+  int N;
+
+  N = getint();
+
+  i = 1;
+  j = 1;
+  k = 1;
+  while (i < N - 1) {
+    j = 1;
+    k = 1;
+    while (j < N - 1) {
+      k = 1;
+      while (k < N - 1) {
+        x[i][j][k] = x[i][j][k - 1] + x[i][j][k + 1];
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  return 0;
+}
+
+// POLY: dependence RAW stmt #2 -> stmt #0 memory=@x dependent=true distance=loop-carried [0, 0, 1]
+
+// YIR: [[INIT:%poly.stencil.init[0-9]+]] = yir.array_load @x, [%i, %j,
+// YIR: [[CARRY:%poly.stencil.carry[0-9]+]] = yir.var : i32 = [[INIT]]
+// YIR: yir.for %k =
+// YIR-NOT: yir.array_load @x, [%i, %j, %poly.add
+// YIR: yir.addi [[CARRY]],
+// YIR: yir.array_store {{.*}}, @x, [%i, %j, %k]
+// YIR-NEXT: yir.assign [[CARRY]],
