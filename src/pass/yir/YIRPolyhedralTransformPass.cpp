@@ -212,6 +212,12 @@ struct StencilCarryCandidate {
     yir::ForOp *loop = nullptr;
 };
 
+struct SerialWavefrontCandidate {
+    yir::ForOp *i_loop = nullptr;
+    yir::ForOp *j_loop = nullptr;
+    yir::ForOp *k_loop = nullptr;
+};
+
 bool is_valid_affine_access(const PolyAccess &access) {
     return access.memory != nullptr && std::all_of(access.indices.begin(), access.indices.end(),
                                                    [](const PolyAffineExpr &expr) {
@@ -320,6 +326,33 @@ bool access_matches_next_iteration_write(const PolyAccess &write, const PolyAcce
             return false;
         }
     }
+    return true;
+}
+
+bool is_dim_plus_constant(const PolyAffineExpr &expr, const yir::Value *dim,
+                          std::int64_t &constant) {
+    if (!expr.valid) {
+        return false;
+    }
+
+    bool saw_dim = false;
+    for (const auto &[value, coefficient] : expr.terms) {
+        if (value == dim) {
+            if (coefficient != 1 || saw_dim) {
+                return false;
+            }
+            saw_dim = true;
+            continue;
+        }
+        if (coefficient != 0) {
+            return false;
+        }
+    }
+
+    if (!saw_dim) {
+        return false;
+    }
+    constant = expr.constant;
     return true;
 }
 
@@ -570,6 +603,10 @@ std::string stencil_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.stencil.") + stem + std::to_string(id);
 }
 
+std::string wave_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.wave.") + stem + std::to_string(id);
+}
+
 yir::Value *materialize_component(yir::Region &region, std::size_t &insert_pos,
                                   const AffineMaterializedComponent &component,
                                   std::size_t &next_temp) {
@@ -653,8 +690,8 @@ public:
                                    const YIRPolyhedralCanonicalInfo& canonical_info)
         : module_(module), model_info_(model_info), dep_info_(dep_info),
           canonical_info_(canonical_info), num_interchanged_(0), num_tiled_(0),
-          num_same_iteration_reloads_(0), num_stencil_carries_(0), num_affine_replacements_(0),
-          num_nearest_write_queries_(0), num_nearest_queries_(0) {}
+          num_serial_wavefronts_(0), num_same_iteration_reloads_(0), num_stencil_carries_(0),
+          num_affine_replacements_(0), num_nearest_write_queries_(0), num_nearest_queries_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -663,9 +700,15 @@ public:
             changed |= try_interchange_or_tile(scop);
         }
 
+        auto for_body_owners = collect_for_body_owners(module_);
+        if (apply_first_serial_wavefront(for_body_owners)) {
+            changed = true;
+            changed |= replace_equivalent_affine_scalars();
+            return changed;
+        }
+
         std::vector<SameIterationReload> same_iteration_reloads;
         std::vector<StencilCarryCandidate> stencil_carries;
-        auto for_body_owners = collect_for_body_owners(module_);
         for (const auto &scop : model_info_.models) {
             auto reloads = find_same_iteration_reloads(scop);
             same_iteration_reloads.insert(same_iteration_reloads.end(), reloads.begin(), reloads.end());
@@ -683,6 +726,7 @@ public:
 
     std::size_t num_interchanged() const { return num_interchanged_; }
     std::size_t num_tiled() const { return num_tiled_; }
+    std::size_t num_serial_wavefronts() const { return num_serial_wavefronts_; }
     std::size_t num_same_iteration_reloads() const { return num_same_iteration_reloads_; }
     std::size_t num_stencil_carries() const { return num_stencil_carries_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
@@ -696,6 +740,259 @@ private:
         (void)canonical_info_;
         // TODO(polyhedral): use dependence directions to legalize schedule transforms.
         return false;
+    }
+
+    bool apply_first_serial_wavefront(
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners) {
+        for (const auto &scop : model_info_.models) {
+            SerialWavefrontCandidate candidate;
+            if (find_serial_wavefront_candidate(scop, for_body_owners, candidate) &&
+                apply_serial_wavefront(candidate)) {
+                ++num_serial_wavefronts_;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool find_serial_wavefront_candidate(
+        const PolyScop &scop,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
+        SerialWavefrontCandidate &candidate) const {
+        const PolyStmt *write_stmt = nullptr;
+        std::size_t num_reads = 0;
+        for (const auto &stmt : scop.statements) {
+            if (!stmt.reads.empty()) {
+                num_reads += stmt.reads.size();
+            }
+            if (!stmt.writes.empty()) {
+                if (stmt.writes.size() != 1 || write_stmt != nullptr) {
+                    return false;
+                }
+                write_stmt = &stmt;
+            }
+        }
+
+        if (write_stmt == nullptr || num_reads < 6 || write_stmt->schedule_dims.size() != 3 ||
+            write_stmt->domain.size() != 3 || write_stmt->writes.front().indices.size() != 3) {
+            return false;
+        }
+
+        const auto &dims = write_stmt->schedule_dims;
+        const auto &write = write_stmt->writes.front();
+        if (!is_valid_affine_access(write)) {
+            return false;
+        }
+        for (std::size_t dim = 0; dim < 3; ++dim) {
+            std::int64_t offset = 0;
+            if (!is_dim_plus_constant(write.indices[dim], dims[dim], offset) || offset != 0) {
+                return false;
+            }
+        }
+
+        auto *store = dynamic_cast<yir::ArrayStoreOp *>(
+            const_cast<yir::Operation *>(write_stmt->op));
+        if (store == nullptr || store->parent() == nullptr) {
+            return false;
+        }
+
+        auto k_owner = for_body_owners.find(store->parent());
+        if (k_owner == for_body_owners.end() || k_owner->second == nullptr ||
+            k_owner->second->induction_var() != dims[2]) {
+            return false;
+        }
+        auto *k_loop = k_owner->second;
+        auto *j_region = k_loop->parent();
+        auto j_owner = for_body_owners.find(j_region);
+        if (j_owner == for_body_owners.end() || j_owner->second == nullptr ||
+            j_owner->second->induction_var() != dims[1]) {
+            return false;
+        }
+        auto *j_loop = j_owner->second;
+        auto *i_region = j_loop->parent();
+        auto i_owner = for_body_owners.find(i_region);
+        if (i_owner == for_body_owners.end() || i_owner->second == nullptr ||
+            i_owner->second->induction_var() != dims[0]) {
+            return false;
+        }
+        auto *i_loop = i_owner->second;
+
+        if (!loop_has_unit_step(*i_loop) || !loop_has_unit_step(*j_loop) ||
+            !loop_has_unit_step(*k_loop)) {
+            return false;
+        }
+
+        for (const auto &stmt : scop.statements) {
+            if (stmt.schedule_dims != dims) {
+                return false;
+            }
+            if (stmt.op == nullptr || const_cast<yir::Operation *>(stmt.op)->parent() != store->parent()) {
+                return false;
+            }
+            for (const auto &read : stmt.reads) {
+                if (!read_is_wavefront_compatible(read, write.memory, dims)) {
+                    return false;
+                }
+            }
+        }
+
+        candidate = {i_loop, j_loop, k_loop};
+        return true;
+    }
+
+    static bool loop_has_unit_step(const yir::ForOp &loop) {
+        std::int64_t step = 0;
+        return const_i32_value(loop.step(), step) && step == 1;
+    }
+
+    static bool read_is_wavefront_compatible(const PolyAccess &read, const yir::Value *memory,
+                                             const std::vector<const yir::Value *> &dims) {
+        if (read.memory != memory || read.indices.size() != 3 || !is_valid_affine_access(read)) {
+            return false;
+        }
+        std::int64_t offset_sum = 0;
+        for (std::size_t dim = 0; dim < 3; ++dim) {
+            std::int64_t offset = 0;
+            if (!is_dim_plus_constant(read.indices[dim], dims[dim], offset)) {
+                return false;
+            }
+            offset_sum += offset;
+        }
+        return offset_sum != 0;
+    }
+
+    bool apply_serial_wavefront(const SerialWavefrontCandidate &candidate) {
+        if (candidate.i_loop == nullptr || candidate.j_loop == nullptr ||
+            candidate.k_loop == nullptr || candidate.i_loop->parent() == nullptr ||
+            candidate.j_loop->parent() == nullptr || candidate.k_loop->parent() == nullptr) {
+            return false;
+        }
+
+        auto *outer_parent = candidate.i_loop->parent();
+        std::size_t i_loop_index = 0;
+        if (!find_operation_index(*outer_parent, *candidate.i_loop, i_loop_index)) {
+            return false;
+        }
+
+        auto *w_lower = materialize_wave_lower(*outer_parent, i_loop_index, *candidate.i_loop,
+                                               *candidate.j_loop, *candidate.k_loop);
+        auto *w_upper = materialize_wave_upper(*outer_parent, i_loop_index, *candidate.i_loop,
+                                               *candidate.j_loop, *candidate.k_loop);
+        if (w_lower == nullptr || w_upper == nullptr) {
+            return false;
+        }
+
+        auto *w_var = insert_op_before<yir::VarOp>(
+            *outer_parent, i_loop_index, yir::Type::get_i32(), w_lower,
+            wave_temp_name("w", next_wave_temp_++));
+
+        auto w_loop = std::make_unique<yir::ForOp>(w_var->result(), w_lower, w_upper,
+                                                   candidate.i_loop->step());
+        w_loop->set_parent(outer_parent);
+
+        auto &outer_ops = outer_parent->operations();
+        auto moved_i_loop = std::move(outer_ops[i_loop_index]);
+        moved_i_loop->set_parent(&w_loop->body_region());
+        w_loop->body_region().operations().push_back(std::move(moved_i_loop));
+        outer_ops[i_loop_index] = std::move(w_loop);
+
+        return rewrite_k_loop_as_wave_guard(candidate, w_var->result());
+    }
+
+    yir::Value *materialize_wave_lower(yir::Region &region, std::size_t &insert_pos,
+                                       const yir::ForOp &i_loop, const yir::ForOp &j_loop,
+                                       const yir::ForOp &k_loop) {
+        auto *ij = insert_op_before<yir::AddIOp>(
+            region, insert_pos, i_loop.lower_bound(), j_loop.lower_bound(),
+            wave_temp_name("lb", next_wave_temp_++));
+        auto *ijk = insert_op_before<yir::AddIOp>(
+            region, insert_pos, ij->result(), k_loop.lower_bound(),
+            wave_temp_name("lb", next_wave_temp_++));
+        return ijk->result();
+    }
+
+    yir::Value *materialize_wave_upper(yir::Region &region, std::size_t &insert_pos,
+                                       const yir::ForOp &i_loop, const yir::ForOp &j_loop,
+                                       const yir::ForOp &k_loop) {
+        auto *ij = insert_op_before<yir::AddIOp>(
+            region, insert_pos, i_loop.upper_bound(), j_loop.upper_bound(),
+            wave_temp_name("ub", next_wave_temp_++));
+        auto *ijk = insert_op_before<yir::AddIOp>(
+            region, insert_pos, ij->result(), k_loop.upper_bound(),
+            wave_temp_name("ub", next_wave_temp_++));
+        auto *minus_two = insert_op_before<yir::ConstI32Op>(
+            region, insert_pos, -2, wave_temp_name("c", next_wave_temp_++));
+        auto *upper = insert_op_before<yir::AddIOp>(
+            region, insert_pos, ijk->result(), minus_two->result(),
+            wave_temp_name("ub", next_wave_temp_++));
+        return upper->result();
+    }
+
+    bool rewrite_k_loop_as_wave_guard(const SerialWavefrontCandidate &candidate,
+                                      yir::Value *wave_iv) {
+        auto *j_body = candidate.k_loop->parent();
+        std::size_t k_loop_index = 0;
+        if (j_body == nullptr || !find_operation_index(*j_body, *candidate.k_loop, k_loop_index)) {
+            return false;
+        }
+
+        auto *i_iv = candidate.i_loop->induction_var();
+        auto *j_iv = candidate.j_loop->induction_var();
+        auto *k_iv = candidate.k_loop->induction_var();
+        auto *k_lower = candidate.k_loop->lower_bound();
+        auto *k_upper = candidate.k_loop->upper_bound();
+
+        auto sub_wave_i = make_parented_op<yir::SubIOp>(
+            *j_body, wave_iv, i_iv, wave_temp_name("sub", next_wave_temp_++));
+        auto *wave_minus_i = sub_wave_i->result();
+        auto sub_wave_i_j = make_parented_op<yir::SubIOp>(
+            *j_body, wave_minus_i, j_iv, wave_temp_name("k", next_wave_temp_++));
+        auto *computed_k = sub_wave_i_j->result();
+        auto assign_k = make_parented_op<yir::AssignOp>(*j_body, k_iv, computed_k);
+        auto cmp_ge = make_parented_op<yir::ICmpOp>(
+            *j_body, yir::ICmpOp::Predicate::Ge, k_iv, k_lower,
+            wave_temp_name("ge", next_wave_temp_++));
+
+        auto outer_if = make_parented_op<yir::IfOp>(*j_body, cmp_ge->result());
+        auto cmp_lt = make_parented_op<yir::ICmpOp>(
+            outer_if->then_region(), yir::ICmpOp::Predicate::Lt, k_iv, k_upper,
+            wave_temp_name("lt", next_wave_temp_++));
+        auto inner_if = make_parented_op<yir::IfOp>(outer_if->then_region(), cmp_lt->result());
+
+        auto &old_body = candidate.k_loop->body_region().operations();
+        auto &new_body = inner_if->then_region().operations();
+        for (auto &op : old_body) {
+            op->set_parent(&inner_if->then_region());
+            new_body.push_back(std::move(op));
+        }
+        old_body.clear();
+
+        outer_if->then_region().operations().push_back(std::move(cmp_lt));
+        outer_if->then_region().operations().push_back(std::move(inner_if));
+        auto finish_k = make_parented_op<yir::AssignOp>(*j_body, k_iv, k_upper);
+
+        std::vector<std::unique_ptr<yir::Operation>> replacements;
+        replacements.push_back(std::move(sub_wave_i));
+        replacements.push_back(std::move(sub_wave_i_j));
+        replacements.push_back(std::move(assign_k));
+        replacements.push_back(std::move(cmp_ge));
+        replacements.push_back(std::move(outer_if));
+        replacements.push_back(std::move(finish_k));
+
+        auto &j_ops = j_body->operations();
+        j_ops.erase(j_ops.begin() + static_cast<std::ptrdiff_t>(k_loop_index));
+        for (std::size_t i = 0; i < replacements.size(); ++i) {
+            j_ops.insert(j_ops.begin() + static_cast<std::ptrdiff_t>(k_loop_index + i),
+                         std::move(replacements[i]));
+        }
+        return true;
+    }
+
+    template <typename OpT, typename... Args>
+    std::unique_ptr<OpT> make_parented_op(yir::Region &parent, Args &&...args) {
+        auto op = std::make_unique<OpT>(std::forward<Args>(args)...);
+        op->set_parent(&parent);
+        return op;
     }
 
     std::vector<StencilCarryCandidate> find_stencil_carry_candidates(
@@ -1023,12 +1320,14 @@ private:
 
     std::size_t num_interchanged_;
     std::size_t num_tiled_;
+    std::size_t num_serial_wavefronts_;
     std::size_t num_same_iteration_reloads_;
     std::size_t num_stencil_carries_;
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
     std::size_t next_stencil_temp_ = 0;
+    std::size_t next_wave_temp_ = 0;
 };
 
 } // namespace
@@ -1075,6 +1374,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
     std::ostringstream oss;
     oss << "interchange=" << transformer.num_interchanged()
         << ", tiling=" << transformer.num_tiled()
+        << ", serial_wavefronts=" << transformer.num_serial_wavefronts()
         << ", same_iteration_reloads=" << transformer.num_same_iteration_reloads()
         << ", stencil_carries=" << transformer.num_stencil_carries()
         << ", affine_replacements=" << transformer.num_affine_replacements()

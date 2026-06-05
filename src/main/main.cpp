@@ -26,6 +26,7 @@
 #include "pass/yir/YIRLoopOptimizationPass.h"
 #include "pass/yir/YIRPolyhedralDumpPass.h"
 #include "pass/yir/YIRPolyhedralPipelinePass.h"
+#include "pass/yir/YIRPolyhedralTransformPass.h"
 #include "pass/yir/YIRToOIRPass.h"
 #include "yir/YIRPrinter.h"
 
@@ -208,9 +209,14 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
         pm.add_pass<pass::ASTToYIRPass>();
         if (optimizations_enabled(options)) {
             if (polyhedral_enabled(options)) {
-                pm.add_pass<pass::YIRPolyhedralPipelinePass>();
                 if (options.emit_poly) {
+                    pm.add_pass<pass::YIRPolyhedralPipelinePass>(false);
                     pm.add_pass<pass::YIRPolyhedralDumpPass>(out);
+                    if (needs_post_poly_yir_pipeline(options)) {
+                        pm.add_pass<pass::YIRPolyhedralTransformPass>();
+                    }
+                } else {
+                    pm.add_pass<pass::YIRPolyhedralPipelinePass>();
                 }
             }
             if (needs_post_poly_yir_pipeline(options)) {

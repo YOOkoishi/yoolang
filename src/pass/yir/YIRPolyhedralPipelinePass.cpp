@@ -11,6 +11,9 @@
 
 namespace pass {
 
+YIRPolyhedralPipelinePass::YIRPolyhedralPipelinePass(bool run_transform)
+    : run_transform_(run_transform) {}
+
 std::string_view YIRPolyhedralPipelinePass::name() const {
     return "YIRPolyhedralPipelinePass";
 }
@@ -25,7 +28,9 @@ PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
     pm.add_pass<YIRSCoPDetectPass>();
     pm.add_pass<YIRPolyhedralModelBuildPass>();
     pm.add_pass<YIRPolyhedralDependenceAnalysisPass>();
-    pm.add_pass<YIRPolyhedralTransformPass>();
+    if (run_transform_) {
+        pm.add_pass<YIRPolyhedralTransformPass>();
+    }
 
     auto result = pm.run(context);
     if (!result.success) {

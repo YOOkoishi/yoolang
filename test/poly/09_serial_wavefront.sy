@@ -1,0 +1,50 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+
+int x[32][32][32];
+
+int main() {
+  int i;
+  int j;
+  int k;
+  int f;
+  int N;
+
+  N = getint();
+  f = getint();
+
+  i = 1;
+  j = 1;
+  k = 1;
+  while (i < N - 1) {
+    j = 1;
+    k = 1;
+    while (j < N - 1) {
+      k = 1;
+      while (k < N - 1) {
+        x[i][j][k] = (x[i - 1][j][k] + x[i + 1][j][k] + x[i][j - 1][k]
+                    + x[i][j + 1][k] + x[i][j][k - 1] + x[i][j][k + 1]
+                    + x[i - 1][j - 1][k - 1]) / f;
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  return 0;
+}
+
+// YIR: [[WLB:%poly.wave.lb[0-9]+]] = yir.addi {{%poly.wave.lb[0-9]+}},
+// YIR: [[W:%poly.wave.w[0-9]+]] = yir.var : i32 = [[WLB]]
+// YIR: yir.for [[W]] = [[WLB]] to {{%poly.wave.ub[0-9]+}} step
+// YIR: yir.for %i =
+// YIR: yir.for %j =
+// YIR-NOT: yir.for %k =
+// YIR: [[WK:%poly.wave.k[0-9]+]] = yir.subi
+// YIR: yir.assign %k, [[WK]]
+// YIR: [[GE:%poly.wave.ge[0-9]+]] = yir.icmp ge %k,
+// YIR: yir.if [[GE]]
+// YIR: [[LT:%poly.wave.lt[0-9]+]] = yir.icmp lt %k,
+// YIR: yir.if [[LT]]
+// YIR: yir.array_store {{.*}}, @x, [%i, %j, %k]
+// YIR: yir.assign %k, {{%poly.add[0-9]+}}
