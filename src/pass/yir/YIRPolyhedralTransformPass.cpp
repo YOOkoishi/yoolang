@@ -907,6 +907,9 @@ private:
             candidate.i_loop->set_parallel(true);
             ++num_parallel_wavefronts_;
         }
+        if (apply_wavefront_plane_tiling(candidate)) {
+            ++num_tiled_;
+        }
         return true;
     }
 
@@ -946,6 +949,11 @@ private:
         if (j_body == nullptr || !find_operation_index(*j_body, *candidate.k_loop, k_loop_index)) {
             return false;
         }
+        auto *i_body = candidate.j_loop->parent();
+        std::size_t j_loop_index = 0;
+        if (i_body == nullptr || !find_operation_index(*i_body, *candidate.j_loop, j_loop_index)) {
+            return false;
+        }
 
         auto *i_iv = candidate.i_loop->induction_var();
         auto *j_iv = candidate.j_loop->induction_var();
@@ -954,7 +962,7 @@ private:
         auto *k_upper = candidate.k_loop->upper_bound();
 
         auto sub_wave_i = make_parented_op<yir::SubIOp>(
-            *j_body, wave_iv, i_iv, wave_temp_name("sub", next_wave_temp_++));
+            *i_body, wave_iv, i_iv, wave_temp_name("sub", next_wave_temp_++));
         auto *wave_minus_i = sub_wave_i->result();
         auto sub_wave_i_j = make_parented_op<yir::SubIOp>(
             *j_body, wave_minus_i, j_iv, wave_temp_name("k", next_wave_temp_++));
@@ -982,8 +990,11 @@ private:
         outer_if->then_region().operations().push_back(std::move(inner_if));
         auto finish_k = make_parented_op<yir::AssignOp>(*j_body, k_iv, k_upper);
 
+        auto &i_ops = i_body->operations();
+        i_ops.insert(i_ops.begin() + static_cast<std::ptrdiff_t>(j_loop_index),
+                     std::move(sub_wave_i));
+
         std::vector<std::unique_ptr<yir::Operation>> replacements;
-        replacements.push_back(std::move(sub_wave_i));
         replacements.push_back(std::move(sub_wave_i_j));
         replacements.push_back(std::move(assign_k));
         replacements.push_back(std::move(cmp_ge));
@@ -997,6 +1008,137 @@ private:
                          std::move(replacements[i]));
         }
         return true;
+    }
+
+    bool apply_wavefront_plane_tiling(const SerialWavefrontCandidate &candidate) {
+        constexpr int kWaveTileSize = 8;
+        if (!candidate.inner_wave_parallel || candidate.i_loop == nullptr ||
+            candidate.j_loop == nullptr || candidate.i_loop->parent() == nullptr ||
+            candidate.j_loop->parent() == nullptr ||
+            candidate.j_loop->parent() != &candidate.i_loop->body_region()) {
+            return false;
+        }
+        if (!loop_has_unit_step(*candidate.i_loop) || !loop_has_unit_step(*candidate.j_loop)) {
+            return false;
+        }
+
+        auto *w_body = candidate.i_loop->parent();
+        auto *i_body = candidate.j_loop->parent();
+        std::size_t i_loop_index = 0;
+        std::size_t j_loop_index = 0;
+        if (!find_operation_index(*w_body, *candidate.i_loop, i_loop_index) ||
+            !find_operation_index(*i_body, *candidate.j_loop, j_loop_index)) {
+            return false;
+        }
+
+        auto *i_lower = candidate.i_loop->lower_bound();
+        auto *i_upper = candidate.i_loop->upper_bound();
+        auto *i_step = candidate.i_loop->step();
+        auto *j_lower = candidate.j_loop->lower_bound();
+        auto *j_upper = candidate.j_loop->upper_bound();
+        auto *j_step = candidate.j_loop->step();
+
+        std::size_t insert_pos = i_loop_index;
+        auto *tile_step_op = insert_op_before<yir::ConstI32Op>(
+            *w_body, insert_pos, kWaveTileSize, wave_temp_name("tile", next_wave_temp_++));
+        auto *tile_step = tile_step_op->result();
+        auto *i_tile_var = insert_op_before<yir::VarOp>(
+            *w_body, insert_pos, yir::Type::get_i32(), i_lower,
+            wave_temp_name("it", next_wave_temp_++));
+
+        auto i_tile_loop =
+            std::make_unique<yir::ForOp>(i_tile_var->result(), i_lower, i_upper, tile_step);
+        i_tile_loop->set_parent(w_body);
+        auto i_tile_end = make_parented_op<yir::AddIOp>(
+            i_tile_loop->body_region(), i_tile_var->result(), tile_step,
+            wave_temp_name("iend", next_wave_temp_++));
+        auto *i_tile_end_value = i_tile_end->result();
+        i_tile_loop->body_region().operations().push_back(std::move(i_tile_end));
+        auto *i_tile_limit = append_clamped_tile_upper(
+            i_tile_loop->body_region(), i_tile_end_value, i_upper, "ilim", "igt");
+
+        candidate.i_loop->operands()[1] = i_tile_var->result();
+        candidate.i_loop->operands()[2] = i_tile_limit;
+        candidate.i_loop->operands()[3] = i_step;
+
+        auto &w_ops = w_body->operations();
+        auto moved_i_loop = std::move(w_ops[insert_pos]);
+        moved_i_loop->set_parent(&i_tile_loop->body_region());
+        i_tile_loop->body_region().operations().push_back(std::move(moved_i_loop));
+        w_ops[insert_pos] = std::move(i_tile_loop);
+
+        if (!tile_wavefront_j_loop(*candidate.j_loop, tile_step, j_lower, j_upper, j_step)) {
+            return false;
+        }
+
+        auto finish_i =
+            make_parented_op<yir::AssignOp>(*w_body, candidate.i_loop->induction_var(), i_upper);
+        w_ops.insert(w_ops.begin() + static_cast<std::ptrdiff_t>(insert_pos + 1),
+                     std::move(finish_i));
+        return true;
+    }
+
+    bool tile_wavefront_j_loop(yir::ForOp &j_loop, yir::Value *tile_step,
+                               yir::Value *j_lower, yir::Value *j_upper,
+                               yir::Value *j_step) {
+        auto *i_body = j_loop.parent();
+        std::size_t j_loop_index = 0;
+        if (i_body == nullptr || tile_step == nullptr ||
+            !find_operation_index(*i_body, j_loop, j_loop_index)) {
+            return false;
+        }
+
+        std::size_t insert_pos = j_loop_index;
+        auto *j_tile_var = insert_op_before<yir::VarOp>(
+            *i_body, insert_pos, yir::Type::get_i32(), j_lower,
+            wave_temp_name("jt", next_wave_temp_++));
+
+        auto j_tile_loop =
+            std::make_unique<yir::ForOp>(j_tile_var->result(), j_lower, j_upper, tile_step);
+        j_tile_loop->set_parent(i_body);
+        auto j_tile_end = make_parented_op<yir::AddIOp>(
+            j_tile_loop->body_region(), j_tile_var->result(), tile_step,
+            wave_temp_name("jend", next_wave_temp_++));
+        auto *j_tile_end_value = j_tile_end->result();
+        j_tile_loop->body_region().operations().push_back(std::move(j_tile_end));
+        auto *j_tile_limit = append_clamped_tile_upper(
+            j_tile_loop->body_region(), j_tile_end_value, j_upper, "jlim", "jgt");
+
+        j_loop.operands()[1] = j_tile_var->result();
+        j_loop.operands()[2] = j_tile_limit;
+        j_loop.operands()[3] = j_step;
+
+        auto &i_ops = i_body->operations();
+        auto moved_j_loop = std::move(i_ops[insert_pos]);
+        moved_j_loop->set_parent(&j_tile_loop->body_region());
+        j_tile_loop->body_region().operations().push_back(std::move(moved_j_loop));
+        i_ops[insert_pos] = std::move(j_tile_loop);
+
+        auto finish_j =
+            make_parented_op<yir::AssignOp>(*i_body, j_loop.induction_var(), j_upper);
+        i_ops.insert(i_ops.begin() + static_cast<std::ptrdiff_t>(insert_pos + 1),
+                     std::move(finish_j));
+        return true;
+    }
+
+    yir::Value *append_clamped_tile_upper(yir::Region &region, yir::Value *tile_end,
+                                          yir::Value *upper, const char *limit_name,
+                                          const char *cmp_name) {
+        auto limit = make_parented_op<yir::VarOp>(
+            region, yir::Type::get_i32(), tile_end, wave_temp_name(limit_name, next_wave_temp_++));
+        auto *limit_value = limit->result();
+        region.operations().push_back(std::move(limit));
+
+        auto cmp = make_parented_op<yir::ICmpOp>(
+            region, yir::ICmpOp::Predicate::Gt, limit_value, upper,
+            wave_temp_name(cmp_name, next_wave_temp_++));
+        auto clamp = make_parented_op<yir::IfOp>(region, cmp->result());
+        auto assign = make_parented_op<yir::AssignOp>(clamp->then_region(), limit_value, upper);
+        clamp->then_region().operations().push_back(std::move(assign));
+
+        region.operations().push_back(std::move(cmp));
+        region.operations().push_back(std::move(clamp));
+        return limit_value;
     }
 
     template <typename OpT, typename... Args>
