@@ -466,6 +466,11 @@ struct StencilCarryCandidate {
     yir::ForOp *loop = nullptr;
 };
 
+struct DeadMemoryWrite {
+    yir::ArrayStoreOp *store = nullptr;
+    const yir::Value *memory = nullptr;
+};
+
 struct SerialWavefrontCandidate {
     yir::ForOp *i_loop = nullptr;
     yir::ForOp *j_loop = nullptr;
@@ -741,6 +746,89 @@ bool has_intervening_write_to_memory(const yir::Region &region, const yir::Value
     return false;
 }
 
+bool value_list_contains(const std::vector<yir::Value *> &values, const yir::Value *target) {
+    return std::find(values.begin(), values.end(), target) != values.end();
+}
+
+bool array_init_entries_use_memory(const yir::ArrayInitOp &init, const yir::Value *memory) {
+    return std::any_of(init.entries().begin(), init.entries().end(),
+                       [memory](const yir::ArrayInitEntry &entry) {
+                           return entry.value == memory;
+                       });
+}
+
+bool region_observes_memory_except_writes(const yir::Region &region, const yir::Value *memory);
+
+bool operation_observes_memory_except_writes(const yir::Operation &op,
+                                             const yir::Value *memory) {
+    if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(&op)) {
+        return load->array() == memory || value_list_contains(load->indices(), memory);
+    }
+
+    if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(&op)) {
+        return store->value() == memory || value_list_contains(store->indices(), memory);
+    }
+
+    if (auto *init = dynamic_cast<const yir::ArrayInitOp *>(&op)) {
+        return (init->array() != memory && value_list_contains(init->operands(), memory)) ||
+               array_init_entries_use_memory(*init, memory);
+    }
+
+    if (auto *elem_addr = dynamic_cast<const yir::ElemAddrOp *>(&op)) {
+        return elem_addr->base() == memory || value_list_contains(elem_addr->indices(), memory);
+    }
+
+    if (auto *decay = dynamic_cast<const yir::DecayOp *>(&op)) {
+        return decay->array_address() == memory;
+    }
+
+    if (value_list_contains(op.operands(), memory)) {
+        return true;
+    }
+
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        return region_observes_memory_except_writes(if_op->then_region(), memory) ||
+               (if_op->has_else() &&
+                region_observes_memory_except_writes(if_op->else_region(), memory));
+    }
+
+    if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        return region_observes_memory_except_writes(while_op->cond_region(), memory) ||
+               region_observes_memory_except_writes(while_op->body_region(), memory);
+    }
+
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        return region_observes_memory_except_writes(for_op->body_region(), memory);
+    }
+
+    return false;
+}
+
+bool region_observes_memory_except_writes(const yir::Region &region, const yir::Value *memory) {
+    return std::any_of(region.operations().begin(), region.operations().end(),
+                       [memory](const auto &op) {
+                           return operation_observes_memory_except_writes(*op, memory);
+                       });
+}
+
+bool module_observes_memory_except_writes(const yir::Module &module, const yir::Value *memory) {
+    for (const auto &function : module.functions()) {
+        if (region_observes_memory_except_writes(function->body(), memory)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_zero_value(const yir::Value *value) {
+    std::int64_t constant = 0;
+    if (const_i32_value(value, constant)) {
+        return constant == 0;
+    }
+    return value != nullptr &&
+           dynamic_cast<const yir::ZeroOp *>(value->defining_op()) != nullptr;
+}
+
 void replace_value_in_nested_regions(yir::Operation &op, yir::Value *old_value,
                                      yir::Value *new_value) {
     if (auto *if_op = dynamic_cast<yir::IfOp *>(&op)) {
@@ -948,7 +1036,7 @@ public:
           num_serial_wavefronts_(0), num_parallel_wavefronts_(0), num_wave_unrolls_(0),
           num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
           num_stencil_carries_(0), num_affine_replacements_(0), num_nearest_write_queries_(0),
-          num_nearest_queries_(0) {}
+          num_nearest_queries_(0), num_dead_memory_writes_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -958,11 +1046,6 @@ public:
         }
 
         auto for_body_owners = collect_for_body_owners(module_);
-        if (apply_first_serial_wavefront(for_body_owners)) {
-            changed = true;
-            changed |= replace_equivalent_affine_scalars();
-            return changed;
-        }
 
         std::vector<SameIterationReload> same_iteration_reloads;
         std::vector<StencilCarryCandidate> stencil_carries;
@@ -978,6 +1061,7 @@ public:
         changed |= apply_stencil_carries(stencil_carries, erased_loads);
         changed |= replace_same_iteration_reloads(same_iteration_reloads, erased_loads);
         changed |= replace_equivalent_affine_scalars();
+        changed |= eliminate_dead_memory_writes();
         return changed;
     }
 
@@ -992,6 +1076,7 @@ public:
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
     std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
+    std::size_t num_dead_memory_writes() const { return num_dead_memory_writes_; }
 
 private:
     bool try_interchange_or_tile(const PolyScop& scop) {
@@ -1867,6 +1952,94 @@ private:
         return changed;
     }
 
+    std::vector<DeadMemoryWrite> find_dead_memory_writes() const {
+        std::unordered_map<const yir::Value *, bool> observed_cache;
+        std::unordered_map<const yir::Value *, bool> model_read_cache;
+        std::vector<DeadMemoryWrite> writes;
+        std::unordered_set<yir::ArrayStoreOp *> seen_stores;
+
+        for (const auto &scop : model_info_.models) {
+            for (const auto &stmt : scop.statements) {
+                if (stmt.writes.empty()) {
+                    continue;
+                }
+
+                auto *store =
+                    dynamic_cast<yir::ArrayStoreOp *>(const_cast<yir::Operation *>(stmt.op));
+                if (store == nullptr || !is_zero_value(store->value())) {
+                    continue;
+                }
+
+                for (const auto &write : stmt.writes) {
+                    if (write.memory == nullptr || write.memory != store->array()) {
+                        continue;
+                    }
+
+                    auto model_read = model_read_cache.find(write.memory);
+                    if (model_read == model_read_cache.end()) {
+                        model_read =
+                            model_read_cache.emplace(write.memory, model_reads_memory(write.memory))
+                                .first;
+                    }
+                    if (model_read->second) {
+                        continue;
+                    }
+
+                    auto observed = observed_cache.find(write.memory);
+                    if (observed == observed_cache.end()) {
+                        observed = observed_cache
+                                       .emplace(write.memory,
+                                                module_observes_memory_except_writes(module_,
+                                                                                    write.memory))
+                                       .first;
+                    }
+                    if (observed->second || !seen_stores.insert(store).second) {
+                        continue;
+                    }
+
+                    writes.push_back({store, write.memory});
+                }
+            }
+        }
+
+        return writes;
+    }
+
+    bool model_reads_memory(const yir::Value *memory) const {
+        for (const auto &scop : model_info_.models) {
+            for (const auto &stmt : scop.statements) {
+                for (const auto &read : stmt.reads) {
+                    if (read.memory == memory) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    bool eliminate_dead_memory_writes() {
+        bool changed = false;
+        for (const auto &write : find_dead_memory_writes()) {
+            auto *store = write.store;
+            if (store == nullptr || store->parent() == nullptr) {
+                continue;
+            }
+
+            std::size_t store_index = 0;
+            auto *parent = store->parent();
+            if (!find_operation_index(*parent, *store, store_index)) {
+                continue;
+            }
+
+            parent->operations().erase(parent->operations().begin() +
+                                       static_cast<std::ptrdiff_t>(store_index));
+            ++num_dead_memory_writes_;
+            changed = true;
+        }
+        return changed;
+    }
+
     bool replace_equivalent_affine_scalars() {
         bool changed = false;
         for (auto &function : module_.functions()) {
@@ -1951,6 +2124,7 @@ private:
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
+    std::size_t num_dead_memory_writes_;
     std::size_t next_stencil_temp_ = 0;
     std::size_t next_wave_temp_ = 0;
 };
@@ -2007,7 +2181,8 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", stencil_carries=" << transformer.num_stencil_carries()
         << ", affine_replacements=" << transformer.num_affine_replacements()
         << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
-        << ", nearest_queries=" << transformer.num_nearest_queries();
+        << ", nearest_queries=" << transformer.num_nearest_queries()
+        << ", dead_memory_writes=" << transformer.num_dead_memory_writes();
 
     return PassResult::ok(changed, oss.str());
 }

@@ -1,0 +1,29 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+
+int live[64];
+int dead[64];
+int read_after_write[64];
+
+int main() {
+  int i;
+  int N;
+  int sum;
+
+  N = getint();
+  sum = 0;
+  i = 0;
+  while (i < N) {
+    live[i] = 1;
+    dead[i] = 0;
+    read_after_write[i] = 0;
+    sum = sum + read_after_write[i];
+    i = i + 1;
+  }
+
+  return sum;
+}
+
+// YIR: yir.array_store {{.*}}, @live, [%i]
+// YIR-NOT: yir.array_store {{.*}}, @dead, [%i]
+// YIR: yir.array_store {{.*}}, @read_after_write, [%i]
+// YIR-NOT: yir.array_load @read_after_write, [%i]
