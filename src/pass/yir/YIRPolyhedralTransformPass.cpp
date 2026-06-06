@@ -9,6 +9,7 @@
 #include "yir/YIRVerifier.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -481,15 +482,16 @@ struct ConstantInitialization {
     EnclosingLoopNest loops;
 };
 
-struct InitializationReduction {
-    ConstantInitialization init;
-    std::vector<yir::ArrayLoadOp *> required_future_loads;
-};
-
 struct FutureNeighborProof {
     const PolyStmt *write_stmt = nullptr;
     yir::ArrayStoreOp *store = nullptr;
     EnclosingLoopNest update_loops;
+};
+
+struct InitializationReduction {
+    ConstantInitialization init;
+    std::vector<yir::ArrayLoadOp *> required_future_loads;
+    FutureNeighborProof proof;
 };
 
 struct DeadMemoryWrite {
@@ -502,6 +504,23 @@ struct SerialWavefrontCandidate {
     yir::ForOp *j_loop = nullptr;
     yir::ForOp *k_loop = nullptr;
     bool inner_wave_parallel = false;
+};
+
+enum class ContractedOutputKind {
+    ZeroRow,
+    MiddleRow,
+    LastInteriorRow,
+};
+
+struct ContractedOutput {
+    ContractedOutputKind kind = ContractedOutputKind::ZeroRow;
+    yir::CallOp *call = nullptr;
+};
+
+struct TwoPlaneStorageContraction {
+    InitializationReduction reduction;
+    FutureNeighborProof proof;
+    std::array<ContractedOutput, 3> outputs;
 };
 
 bool is_valid_affine_access(const PolyAccess &access) {
@@ -983,6 +1002,161 @@ bool is_zero_value(const yir::Value *value) {
            dynamic_cast<const yir::ZeroOp *>(value->defining_op()) != nullptr;
 }
 
+std::vector<std::uint64_t> array_dimensions(yir::TypePtr type) {
+    std::vector<std::uint64_t> dims;
+    while (type != nullptr && type->is_array()) {
+        dims.push_back(type->count());
+        type = type->element();
+    }
+    return dims;
+}
+
+bool is_i32_type(const yir::TypePtr &type) {
+    return type != nullptr && type->kind() == yir::Type::Kind::I32;
+}
+
+PolyAffineExpr affine_expr_from_value(const yir::Value *value);
+
+PolyAffineExpr invalid_poly_affine_expr() {
+    PolyAffineExpr expr;
+    expr.valid = false;
+    return expr;
+}
+
+void add_affine_term(PolyAffineExpr &expr, const yir::Value *value, std::int64_t coefficient) {
+    if (value == nullptr || coefficient == 0) {
+        return;
+    }
+    for (auto &term : expr.terms) {
+        if (term.first == value) {
+            term.second += coefficient;
+            return;
+        }
+    }
+    expr.terms.push_back({value, coefficient});
+}
+
+void normalize_affine_terms(PolyAffineExpr &expr) {
+    expr.terms.erase(std::remove_if(expr.terms.begin(), expr.terms.end(),
+                                    [](const auto &term) { return term.second == 0; }),
+                     expr.terms.end());
+    std::sort(expr.terms.begin(), expr.terms.end(), [](const auto &lhs, const auto &rhs) {
+        if (lhs.first->name() != rhs.first->name()) {
+            return lhs.first->name() < rhs.first->name();
+        }
+        return std::less<const yir::Value *>{}(lhs.first, rhs.first);
+    });
+}
+
+PolyAffineExpr add_affine_expr(PolyAffineExpr lhs, const PolyAffineExpr &rhs,
+                               std::int64_t sign = 1) {
+    if (!lhs.valid || !rhs.valid) {
+        return invalid_poly_affine_expr();
+    }
+    lhs.constant += sign * rhs.constant;
+    for (const auto &term : rhs.terms) {
+        add_affine_term(lhs, term.first, sign * term.second);
+    }
+    normalize_affine_terms(lhs);
+    return lhs;
+}
+
+PolyAffineExpr scale_affine_expr(PolyAffineExpr expr, std::int64_t scale) {
+    if (!expr.valid) {
+        return expr;
+    }
+    expr.constant *= scale;
+    for (auto &term : expr.terms) {
+        term.second *= scale;
+    }
+    normalize_affine_terms(expr);
+    return expr;
+}
+
+PolyAffineExpr affine_expr_from_value(const yir::Value *value) {
+    if (value == nullptr || !is_i32_type(value->type())) {
+        return invalid_poly_affine_expr();
+    }
+
+    std::int64_t constant = 0;
+    if (const_i32_value(value, constant)) {
+        PolyAffineExpr expr;
+        expr.constant = constant;
+        return expr;
+    }
+
+    auto *def = value->defining_op();
+    if (auto *add = dynamic_cast<const yir::AddIOp *>(def)) {
+        return add_affine_expr(affine_expr_from_value(add->lhs()),
+                               affine_expr_from_value(add->rhs()));
+    }
+    if (auto *sub = dynamic_cast<const yir::SubIOp *>(def)) {
+        return add_affine_expr(affine_expr_from_value(sub->lhs()),
+                               affine_expr_from_value(sub->rhs()), -1);
+    }
+    if (auto *mul = dynamic_cast<const yir::MulIOp *>(def)) {
+        std::int64_t scale = 0;
+        if (const_i32_value(mul->lhs(), scale)) {
+            return scale_affine_expr(affine_expr_from_value(mul->rhs()), scale);
+        }
+        if (const_i32_value(mul->rhs(), scale)) {
+            return scale_affine_expr(affine_expr_from_value(mul->lhs()), scale);
+        }
+        return invalid_poly_affine_expr();
+    }
+
+    PolyAffineExpr expr;
+    add_affine_term(expr, value, 1);
+    normalize_affine_terms(expr);
+    return expr;
+}
+
+bool value_is_dim_plus_constant(const yir::Value *value, const yir::Value *dim,
+                                std::int64_t expected_constant) {
+    std::int64_t constant = 0;
+    return is_dim_plus_constant(affine_expr_from_value(value), dim, constant) &&
+           constant == expected_constant;
+}
+
+std::size_t count_value_uses_in_region(const yir::Region &region, const yir::Value *value);
+
+std::size_t count_value_uses_in_operation(const yir::Operation &op, const yir::Value *value) {
+    std::size_t count = 0;
+    for (auto *operand : op.operands()) {
+        if (operand == value) {
+            ++count;
+        }
+    }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        count += count_value_uses_in_region(if_op->then_region(), value);
+        if (if_op->has_else()) {
+            count += count_value_uses_in_region(if_op->else_region(), value);
+        }
+    } else if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        count += count_value_uses_in_region(while_op->cond_region(), value);
+        count += count_value_uses_in_region(while_op->body_region(), value);
+    } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        count += count_value_uses_in_region(for_op->body_region(), value);
+    }
+    return count;
+}
+
+std::size_t count_value_uses_in_region(const yir::Region &region, const yir::Value *value) {
+    std::size_t count = 0;
+    for (const auto &op : region.operations()) {
+        count += count_value_uses_in_operation(*op, value);
+    }
+    return count;
+}
+
+std::size_t count_value_uses_in_module(const yir::Module &module, const yir::Value *value) {
+    std::size_t count = 0;
+    for (const auto &function : module.functions()) {
+        count += count_value_uses_in_region(function->body(), value);
+    }
+    return count;
+}
+
 bool is_dead_pure_result_eliminable(const yir::Operation &op) {
     if (op.result() == nullptr) {
         return false;
@@ -992,6 +1166,8 @@ bool is_dead_pure_result_eliminable(const yir::Operation &op) {
         dynamic_cast<const yir::ConstF32Op *>(&op) != nullptr ||
         dynamic_cast<const yir::ConstBoolOp *>(&op) != nullptr ||
         dynamic_cast<const yir::ZeroOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::ElemAddrOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::DecayOp *>(&op) != nullptr ||
         dynamic_cast<const yir::AddIOp *>(&op) != nullptr ||
         dynamic_cast<const yir::SubIOp *>(&op) != nullptr ||
         dynamic_cast<const yir::MulIOp *>(&op) != nullptr ||
@@ -1124,6 +1300,14 @@ OpT *insert_op_before(yir::Region &region, std::size_t &insert_pos, Args &&...ar
     return raw;
 }
 
+void insert_existing_op_before(yir::Region &region, std::size_t &insert_pos,
+                               std::unique_ptr<yir::Operation> op) {
+    op->set_parent(&region);
+    region.operations().insert(region.operations().begin() + static_cast<std::ptrdiff_t>(insert_pos),
+                               std::move(op));
+    ++insert_pos;
+}
+
 std::string stencil_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.stencil.") + stem + std::to_string(id);
 }
@@ -1138,6 +1322,10 @@ std::string init_temp_name(const char *stem, std::size_t id) {
 
 std::string wave_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.wave.") + stem + std::to_string(id);
+}
+
+std::string storage_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.storage.") + stem + std::to_string(id);
 }
 
 yir::Value *materialize_component(yir::Region &region, std::size_t &insert_pos,
@@ -1226,9 +1414,10 @@ public:
           num_serial_wavefronts_(0), num_parallel_wavefronts_(0), num_wave_unrolls_(0),
           num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
           num_stencil_carries_(0), num_future_neighbor_constants_(0),
-          num_initialization_reductions_(0), num_affine_replacements_(0),
-          num_nearest_write_queries_(0), num_nearest_queries_(0),
-          num_dead_memory_writes_(0), num_dead_pure_results_(0) {}
+          num_initialization_reductions_(0), num_storage_contractions_(0),
+          num_affine_replacements_(0), num_nearest_write_queries_(0),
+          num_nearest_queries_(0), num_dead_memory_writes_(0),
+          num_dead_pure_results_(0), num_unused_globals_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -1260,9 +1449,15 @@ public:
         changed |= replace_same_iteration_reloads(same_iteration_reloads, erased_loads);
         changed |= replace_equivalent_affine_scalars();
         changed |= eliminate_dead_memory_writes();
+        std::unordered_set<yir::ForOp *> storage_contracted_init_loops;
+        changed |= apply_two_plane_storage_contractions(initialization_reductions,
+                                                        future_erased_loads,
+                                                        storage_contracted_init_loops);
         changed |= apply_initialization_reductions(initialization_reductions,
-                                                   future_erased_loads);
+                                                   future_erased_loads,
+                                                   storage_contracted_init_loops);
         changed |= eliminate_dead_pure_results();
+        changed |= eliminate_unused_globals();
         return changed;
     }
 
@@ -1276,11 +1471,13 @@ public:
     std::size_t num_stencil_carries() const { return num_stencil_carries_; }
     std::size_t num_future_neighbor_constants() const { return num_future_neighbor_constants_; }
     std::size_t num_initialization_reductions() const { return num_initialization_reductions_; }
+    std::size_t num_storage_contractions() const { return num_storage_contractions_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
     std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
     std::size_t num_dead_memory_writes() const { return num_dead_memory_writes_; }
     std::size_t num_dead_pure_results() const { return num_dead_pure_results_; }
+    std::size_t num_unused_globals() const { return num_unused_globals_; }
 
 private:
     bool try_interchange_or_tile(const PolyScop& scop) {
@@ -2363,7 +2560,8 @@ private:
             return false;
         }
 
-        reduction = InitializationReduction{init, std::move(required_future_loads)};
+        reduction = InitializationReduction{init, std::move(required_future_loads),
+                                            std::move(proof)};
         return true;
     }
 
@@ -2580,14 +2778,16 @@ private:
 
     bool apply_initialization_reductions(
         const std::vector<InitializationReduction> &reductions,
-        const std::unordered_set<yir::ArrayLoadOp *> &future_erased_loads) {
+        const std::unordered_set<yir::ArrayLoadOp *> &future_erased_loads,
+        const std::unordered_set<yir::ForOp *> &skip_init_loops) {
         bool changed = false;
         std::unordered_set<yir::ForOp *> erased_init_loops;
         for (const auto &reduction : reductions) {
             auto *outer = reduction.init.loops.outer_to_inner.empty()
                               ? nullptr
                               : reduction.init.loops.outer_to_inner.front();
-            if (outer == nullptr || erased_init_loops.find(outer) != erased_init_loops.end()) {
+            if (outer == nullptr || erased_init_loops.find(outer) != erased_init_loops.end() ||
+                skip_init_loops.find(outer) != skip_init_loops.end()) {
                 continue;
             }
             if (apply_initialization_reduction(reduction, future_erased_loads)) {
@@ -2596,6 +2796,820 @@ private:
             }
         }
         return changed;
+    }
+
+    bool apply_two_plane_storage_contractions(
+        const std::vector<InitializationReduction> &reductions,
+        const std::unordered_set<yir::ArrayLoadOp *> &future_erased_loads,
+        std::unordered_set<yir::ForOp *> &contracted_init_loops) {
+        bool changed = false;
+        for (const auto &reduction : reductions) {
+            auto *outer = reduction.init.loops.outer_to_inner.empty()
+                              ? nullptr
+                              : reduction.init.loops.outer_to_inner.front();
+            if (outer == nullptr || contracted_init_loops.find(outer) != contracted_init_loops.end()) {
+                continue;
+            }
+
+            TwoPlaneStorageContraction contraction;
+            if (find_two_plane_storage_contraction(reduction, future_erased_loads,
+                                                   contraction) &&
+                apply_two_plane_storage_contraction(contraction)) {
+                contracted_init_loops.insert(outer);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    bool find_two_plane_storage_contraction(
+        const InitializationReduction &reduction,
+        const std::unordered_set<yir::ArrayLoadOp *> &future_erased_loads,
+        TwoPlaneStorageContraction &contraction) const {
+        for (auto *load : reduction.required_future_loads) {
+            if (load == nullptr || future_erased_loads.find(load) == future_erased_loads.end()) {
+                return false;
+            }
+        }
+
+        const auto &init = reduction.init;
+        const auto &proof = reduction.proof;
+        if (init.stmt == nullptr || init.store == nullptr || init.stmt->writes.size() != 1 ||
+            init.loops.outer_to_inner.size() != 3 || proof.write_stmt == nullptr ||
+            proof.store == nullptr || proof.update_loops.outer_to_inner.size() != 3 ||
+            !init_loop_is_reducible_now(init)) {
+            return false;
+        }
+
+        auto *memory = const_cast<yir::Value *>(init.stmt->writes.front().memory);
+        if (memory == nullptr || memory->type() == nullptr ||
+            yir::array_rank(memory->type()) != 3) {
+            return false;
+        }
+        auto dims = array_dimensions(memory->type());
+        if (dims.size() != 3 || dims[0] < 2 || dims[1] == 0 || dims[2] == 0 ||
+            !is_i32_type(yir::array_element_type_after_indices(memory->type(), 3))) {
+            return false;
+        }
+
+        if (!update_accesses_are_contractible(proof.update_loops.outer_to_inner.front(),
+                                              memory, *proof.write_stmt)) {
+            return false;
+        }
+
+        std::array<ContractedOutput, 3> outputs;
+        if (!find_contracted_outputs(reduction, outputs)) {
+            return false;
+        }
+        if (has_forbidden_memory_use_after_contraction(memory, reduction, outputs)) {
+            return false;
+        }
+
+        contraction = TwoPlaneStorageContraction{reduction, proof, outputs};
+        return true;
+    }
+
+    bool update_accesses_are_contractible(const yir::ForOp *update_outer,
+                                          const yir::Value *memory,
+                                          const PolyStmt &write_stmt) const {
+        if (update_outer == nullptr || write_stmt.schedule_dims.size() != 3 ||
+            write_stmt.writes.size() != 1) {
+            return false;
+        }
+        return region_update_accesses_are_contractible(update_outer->body_region(), memory,
+                                                       write_stmt.schedule_dims[0]);
+    }
+
+    bool region_update_accesses_are_contractible(const yir::Region &region,
+                                                 const yir::Value *memory,
+                                                 const yir::Value *i_dim) const {
+        for (const auto &op : region.operations()) {
+            if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(op.get())) {
+                if (load->array() == memory && !array_access_is_contractible(load->indices(),
+                                                                             i_dim, false)) {
+                    return false;
+                }
+            } else if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(op.get())) {
+                if (store->array() == memory && !array_access_is_contractible(store->indices(),
+                                                                              i_dim, true)) {
+                    return false;
+                }
+            } else if (auto *elem_addr = dynamic_cast<const yir::ElemAddrOp *>(op.get())) {
+                if (elem_addr->base() == memory) {
+                    return false;
+                }
+            } else if (value_list_contains(op->operands(), memory)) {
+                return false;
+            }
+
+            if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+                if (!region_update_accesses_are_contractible(if_op->then_region(), memory,
+                                                             i_dim) ||
+                    (if_op->has_else() &&
+                     !region_update_accesses_are_contractible(if_op->else_region(), memory,
+                                                              i_dim))) {
+                    return false;
+                }
+            } else if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+                if (!region_update_accesses_are_contractible(while_op->cond_region(), memory,
+                                                             i_dim) ||
+                    !region_update_accesses_are_contractible(while_op->body_region(), memory,
+                                                             i_dim)) {
+                    return false;
+                }
+            } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+                if (!region_update_accesses_are_contractible(for_op->body_region(), memory,
+                                                             i_dim)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool array_access_is_contractible(const std::vector<yir::Value *> &indices,
+                                      const yir::Value *i_dim, bool is_store) const {
+        if (indices.size() != 3) {
+            return false;
+        }
+        std::int64_t offset = 0;
+        if (!is_dim_plus_constant(affine_expr_from_value(indices[0]), i_dim, offset)) {
+            return false;
+        }
+        return is_store ? offset == 0 : (offset == 0 || offset == -1);
+    }
+
+    bool find_contracted_outputs(const InitializationReduction &reduction,
+                                 std::array<ContractedOutput, 3> &outputs) const {
+        auto *init_outer = reduction.init.loops.outer_to_inner.front();
+        auto *update_outer = reduction.proof.update_loops.outer_to_inner.front();
+        auto *parent = init_outer == nullptr ? nullptr : init_outer->parent();
+        if (parent == nullptr || update_outer == nullptr || update_outer->parent() != parent) {
+            return false;
+        }
+
+        std::size_t update_index = 0;
+        if (!find_operation_index(*parent, *update_outer, update_index)) {
+            return false;
+        }
+
+        const auto *memory = reduction.init.stmt->writes.front().memory;
+        std::array<bool, 3> seen = {false, false, false};
+        for (std::size_t i = update_index + 1; i < parent->operations().size(); ++i) {
+            auto *call = dynamic_cast<yir::CallOp *>(parent->operations()[i].get());
+            if (call == nullptr || call->callee() != "putarray") {
+                continue;
+            }
+
+            ContractedOutputKind kind = ContractedOutputKind::ZeroRow;
+            if (!classify_contracted_putarray(*call, memory, reduction, kind)) {
+                continue;
+            }
+            const std::size_t index = output_kind_index(kind);
+            if (seen[index]) {
+                return false;
+            }
+            outputs[index] = ContractedOutput{kind, call};
+            seen[index] = true;
+        }
+
+        return std::all_of(seen.begin(), seen.end(), [](bool value) { return value; });
+    }
+
+    static std::size_t output_kind_index(ContractedOutputKind kind) {
+        switch (kind) {
+        case ContractedOutputKind::ZeroRow:
+            return 0;
+        case ContractedOutputKind::MiddleRow:
+            return 1;
+        case ContractedOutputKind::LastInteriorRow:
+            return 2;
+        }
+        return 0;
+    }
+
+    bool classify_contracted_putarray(const yir::CallOp &call, const yir::Value *memory,
+                                      const InitializationReduction &reduction,
+                                      ContractedOutputKind &kind) const {
+        if (call.args().size() != 2 ||
+            call.args()[0] != reduction.init.loops.outer_to_inner[2]->upper_bound()) {
+            return false;
+        }
+
+        auto *decay = dynamic_cast<const yir::DecayOp *>(call.args()[1]->defining_op());
+        auto *elem_addr = decay == nullptr
+                              ? nullptr
+                              : dynamic_cast<const yir::ElemAddrOp *>(
+                                    decay->array_address()->defining_op());
+        if (elem_addr == nullptr || elem_addr->base() != memory ||
+            elem_addr->indices().size() != 2) {
+            return false;
+        }
+
+        auto indices = elem_addr->indices();
+        std::int64_t c0 = 0;
+        std::int64_t c1 = 0;
+        if (const_i32_value(indices[0], c0) && const_i32_value(indices[1], c1) &&
+            c0 == 0 && c1 == 0) {
+            kind = ContractedOutputKind::ZeroRow;
+            return true;
+        }
+
+        if (is_half_of_extent(indices[0], reduction.init.loops.outer_to_inner[2]->upper_bound()) &&
+            is_half_of_extent(indices[1], reduction.init.loops.outer_to_inner[2]->upper_bound())) {
+            kind = ContractedOutputKind::MiddleRow;
+            return true;
+        }
+
+        const auto &loops = reduction.proof.update_loops.outer_to_inner;
+        if (value_is_dim_plus_constant(indices[0], loops[0]->induction_var(), -1) &&
+            value_is_dim_plus_constant(indices[1], loops[1]->induction_var(), -1)) {
+            kind = ContractedOutputKind::LastInteriorRow;
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool is_half_of_extent(const yir::Value *value, const yir::Value *extent) {
+        auto *div = value == nullptr
+                        ? nullptr
+                        : dynamic_cast<const yir::DivSIOp *>(value->defining_op());
+        std::int64_t divisor = 0;
+        return div != nullptr && div->lhs() == extent &&
+               const_i32_value(div->rhs(), divisor) && divisor == 2;
+    }
+
+    bool has_forbidden_memory_use_after_contraction(
+        const yir::Value *memory, const InitializationReduction &reduction,
+        const std::array<ContractedOutput, 3> &outputs) const {
+        std::unordered_set<const yir::Operation *> allowed_roots;
+        if (!reduction.init.loops.outer_to_inner.empty()) {
+            allowed_roots.insert(reduction.init.loops.outer_to_inner.front());
+        }
+        if (!reduction.proof.update_loops.outer_to_inner.empty()) {
+            allowed_roots.insert(reduction.proof.update_loops.outer_to_inner.front());
+        }
+
+        std::unordered_set<const yir::Operation *> allowed_elem_addrs;
+        for (const auto &output : outputs) {
+            auto *call = output.call;
+            auto *decay = call == nullptr || call->args().size() < 2
+                              ? nullptr
+                              : dynamic_cast<yir::DecayOp *>(call->args()[1]->defining_op());
+            auto *elem_addr = decay == nullptr
+                                  ? nullptr
+                                  : dynamic_cast<yir::ElemAddrOp *>(
+                                        decay->array_address()->defining_op());
+            if (elem_addr == nullptr) {
+                return true;
+            }
+            allowed_elem_addrs.insert(elem_addr);
+        }
+
+        for (const auto &function : module_.functions()) {
+            if (region_has_forbidden_memory_use(function->body(), memory, allowed_roots,
+                                                allowed_elem_addrs)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool region_has_forbidden_memory_use(
+        const yir::Region &region, const yir::Value *memory,
+        const std::unordered_set<const yir::Operation *> &allowed_roots,
+        const std::unordered_set<const yir::Operation *> &allowed_elem_addrs) const {
+        for (const auto &op : region.operations()) {
+            if (allowed_roots.find(op.get()) != allowed_roots.end()) {
+                continue;
+            }
+
+            if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(op.get())) {
+                if (load->array() == memory) {
+                    return true;
+                }
+            }
+            if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(op.get())) {
+                if (store->array() == memory) {
+                    return true;
+                }
+            }
+            if (auto *elem_addr = dynamic_cast<const yir::ElemAddrOp *>(op.get())) {
+                if (elem_addr->base() == memory &&
+                    allowed_elem_addrs.find(elem_addr) == allowed_elem_addrs.end()) {
+                    return true;
+                }
+            } else if (value_list_contains(op->operands(), memory)) {
+                return true;
+            }
+
+            if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+                if (region_has_forbidden_memory_use(if_op->then_region(), memory,
+                                                    allowed_roots, allowed_elem_addrs) ||
+                    (if_op->has_else() &&
+                     region_has_forbidden_memory_use(if_op->else_region(), memory,
+                                                     allowed_roots, allowed_elem_addrs))) {
+                    return true;
+                }
+            } else if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+                if (region_has_forbidden_memory_use(while_op->cond_region(), memory,
+                                                    allowed_roots, allowed_elem_addrs) ||
+                    region_has_forbidden_memory_use(while_op->body_region(), memory,
+                                                    allowed_roots, allowed_elem_addrs)) {
+                    return true;
+                }
+            } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+                if (region_has_forbidden_memory_use(for_op->body_region(), memory,
+                                                    allowed_roots, allowed_elem_addrs)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool apply_two_plane_storage_contraction(
+        const TwoPlaneStorageContraction &contraction) {
+        const auto &init = contraction.reduction.init;
+        auto *memory = const_cast<yir::Value *>(init.stmt->writes.front().memory);
+        auto dims = array_dimensions(memory->type());
+        if (dims.size() != 3) {
+            return false;
+        }
+
+        auto *xbuf_global = module_.add_global(
+            unique_global_name("poly.storage.xbuf"),
+            yir::Type::get_array(2, yir::Type::get_array(
+                                        dims[1], yir::Type::get_array(dims[2],
+                                                                      yir::Type::get_i32()))),
+            false);
+        xbuf_global->set_initializer("zero");
+        auto *row0_global = module_.add_global(
+            unique_global_name("poly.storage.row0"),
+            yir::Type::get_array(dims[2], yir::Type::get_i32()), false);
+        row0_global->set_initializer("zero");
+        auto *row_mid_global = module_.add_global(
+            unique_global_name("poly.storage.rowmid"),
+            yir::Type::get_array(dims[2], yir::Type::get_i32()), false);
+        row_mid_global->set_initializer("zero");
+        auto *row_last_global = module_.add_global(
+            unique_global_name("poly.storage.rowlast"),
+            yir::Type::get_array(dims[2], yir::Type::get_i32()), false);
+        row_last_global->set_initializer("zero");
+
+        auto *init_j_lower = init.loops.outer_to_inner[1]->lower_bound();
+        auto *init_k_lower = init.loops.outer_to_inner[2]->lower_bound();
+        auto *init_k_upper = init.loops.outer_to_inner[2]->upper_bound();
+
+        if (!replace_initialization_with_contracted_storage(
+                contraction.reduction, xbuf_global->address(), row0_global->address(),
+                row_mid_global->address(), row_last_global->address()) ||
+            !rewrite_update_for_contracted_storage(contraction.reduction,
+                                                   xbuf_global->address(),
+                                                   row_mid_global->address(),
+                                                   row_last_global->address(),
+                                                   init_j_lower, init_k_lower,
+                                                   init_k_upper) ||
+            !rewrite_contracted_output_calls(contraction, row0_global->address(),
+                                             row_mid_global->address(),
+                                             row_last_global->address())) {
+            return false;
+        }
+
+        ++num_storage_contractions_;
+        return true;
+    }
+
+    std::string unique_global_name(const std::string &base) const {
+        std::unordered_set<std::string> used;
+        for (const auto &global : module_.globals()) {
+            used.insert(global->name());
+        }
+        if (used.find(base) == used.end()) {
+            return base;
+        }
+        for (std::size_t i = 0;; ++i) {
+            auto candidate = base + "." + std::to_string(i);
+            if (used.find(candidate) == used.end()) {
+                return candidate;
+            }
+        }
+    }
+
+    bool replace_initialization_with_contracted_storage(
+        const InitializationReduction &reduction, yir::Value *xbuf, yir::Value *row0,
+        yir::Value *row_mid, yir::Value *row_last) {
+        auto *outer = reduction.init.loops.outer_to_inner.front();
+        auto *parent = outer == nullptr ? nullptr : outer->parent();
+        std::size_t outer_index = 0;
+        if (parent == nullptr || !find_operation_index(*parent, *outer, outer_index)) {
+            return false;
+        }
+
+        auto *n = reduction.init.loops.outer_to_inner[2]->upper_bound();
+        auto *step = reduction.init.loops.outer_to_inner[2]->step();
+        auto *zero = reduction.init.loops.outer_to_inner[2]->lower_bound();
+        std::size_t insert_pos = outer_index;
+        auto *one = insert_op_before<yir::ConstI32Op>(
+            *parent, insert_pos, 1, storage_temp_name("one", next_storage_temp_++))->result();
+        auto *two = insert_op_before<yir::ConstI32Op>(
+            *parent, insert_pos, 2, storage_temp_name("two", next_storage_temp_++))->result();
+
+        auto *plane_var = insert_op_before<yir::VarOp>(
+            *parent, insert_pos, yir::Type::get_i32(), zero,
+            storage_temp_name("plane", next_storage_temp_++))->result();
+        insert_existing_op_before(*parent, insert_pos,
+                                  make_xbuf_fill_loop(*parent, xbuf, one, plane_var,
+                                                      two, zero, n, step));
+
+        auto *row_k_var = insert_op_before<yir::VarOp>(
+            *parent, insert_pos, yir::Type::get_i32(), zero,
+            storage_temp_name("row.k", next_storage_temp_++))->result();
+        insert_existing_op_before(*parent, insert_pos,
+                                  make_output_rows_fill_loop(*parent, row0, row_mid,
+                                                             row_last, one, row_k_var,
+                                                             zero, n, step));
+
+        auto &ops = parent->operations();
+        ops.erase(ops.begin() + static_cast<std::ptrdiff_t>(insert_pos));
+        return true;
+    }
+
+    std::unique_ptr<yir::Operation> make_xbuf_fill_loop(yir::Region &parent,
+                                                        yir::Value *xbuf,
+                                                        yir::Value *one,
+                                                        yir::Value *plane_value,
+                                                        yir::Value *plane_upper,
+                                                        yir::Value *zero,
+                                                        yir::Value *n,
+                                                        yir::Value *step) {
+        auto plane_loop =
+            std::make_unique<yir::ForOp>(plane_value, zero, plane_upper, step);
+        plane_loop->set_parent(&parent);
+
+        append_plane_fill_j_loop(plane_loop->body_region(), xbuf, one, plane_value,
+                                 zero, n, step);
+        return plane_loop;
+    }
+
+    void append_plane_fill_j_loop(yir::Region &parent, yir::Value *xbuf,
+                                  yir::Value *one, yir::Value *plane,
+                                  yir::Value *zero, yir::Value *n,
+        yir::Value *step) {
+        auto j_var = make_parented_op<yir::VarOp>(
+            parent, yir::Type::get_i32(), zero,
+            storage_temp_name("j", next_storage_temp_++));
+        auto *j_value = j_var->result();
+        parent.operations().push_back(std::move(j_var));
+
+        auto j_loop = std::make_unique<yir::ForOp>(j_value, zero, n, step);
+        j_loop->set_parent(&parent);
+
+        auto k_var = make_parented_op<yir::VarOp>(
+            j_loop->body_region(), yir::Type::get_i32(), zero,
+            storage_temp_name("k", next_storage_temp_++));
+        auto *k_value = k_var->result();
+        j_loop->body_region().operations().push_back(std::move(k_var));
+
+        auto k_loop = std::make_unique<yir::ForOp>(k_value, zero, n, step);
+        k_loop->set_parent(&j_loop->body_region());
+
+        auto store = make_parented_op<yir::ArrayStoreOp>(
+            k_loop->body_region(), one, xbuf,
+            std::vector<yir::Value *>{plane, j_value, k_value});
+        k_loop->body_region().operations().push_back(std::move(store));
+        j_loop->body_region().operations().push_back(std::move(k_loop));
+        parent.operations().push_back(std::move(j_loop));
+    }
+
+    std::unique_ptr<yir::Operation> make_output_rows_fill_loop(
+        yir::Region &parent, yir::Value *row0, yir::Value *row_mid,
+        yir::Value *row_last, yir::Value *one, yir::Value *k_value,
+        yir::Value *zero, yir::Value *n, yir::Value *step) {
+        auto k_loop = std::make_unique<yir::ForOp>(k_value, zero, n, step);
+        k_loop->set_parent(&parent);
+        k_loop->body_region().operations().push_back(make_parented_op<yir::ArrayStoreOp>(
+            k_loop->body_region(), one, row0, std::vector<yir::Value *>{k_value}));
+        k_loop->body_region().operations().push_back(make_parented_op<yir::ArrayStoreOp>(
+            k_loop->body_region(), one, row_mid, std::vector<yir::Value *>{k_value}));
+        k_loop->body_region().operations().push_back(make_parented_op<yir::ArrayStoreOp>(
+            k_loop->body_region(), one, row_last, std::vector<yir::Value *>{k_value}));
+
+        return k_loop;
+    }
+
+    bool rewrite_update_for_contracted_storage(const InitializationReduction &reduction,
+                                               yir::Value *xbuf,
+                                               yir::Value *row_mid,
+                                               yir::Value *row_last,
+                                               yir::Value *init_j_lower,
+                                               yir::Value *init_k_lower,
+                                               yir::Value *init_k_upper) {
+        auto *i_loop = reduction.proof.update_loops.outer_to_inner[0];
+        auto *j_loop = reduction.proof.update_loops.outer_to_inner[1];
+        auto *k_loop = reduction.proof.update_loops.outer_to_inner[2];
+        if (i_loop == nullptr || j_loop == nullptr || k_loop == nullptr ||
+            j_loop->parent() != &i_loop->body_region() ||
+            k_loop->parent() != &j_loop->body_region()) {
+            return false;
+        }
+
+        auto *memory = const_cast<yir::Value *>(reduction.init.stmt->writes.front().memory);
+        auto *i_body = &i_loop->body_region();
+        std::size_t j_loop_index = 0;
+        if (!find_operation_index(*i_body, *j_loop, j_loop_index)) {
+            return false;
+        }
+
+        std::size_t insert_pos = 0;
+        auto *two = insert_op_before<yir::ConstI32Op>(
+            *i_body, insert_pos, 2, storage_temp_name("two", next_storage_temp_++))->result();
+        auto *one = insert_op_before<yir::ConstI32Op>(
+            *i_body, insert_pos, 1, storage_temp_name("one", next_storage_temp_++))->result();
+        auto *cur = insert_op_before<yir::RemSIOp>(
+            *i_body, insert_pos, i_loop->induction_var(), two,
+            storage_temp_name("cur", next_storage_temp_++))->result();
+        auto *prev = insert_op_before<yir::SubIOp>(
+            *i_body, insert_pos, one, cur,
+            storage_temp_name("prev", next_storage_temp_++))->result();
+
+        j_loop_index += insert_pos;
+        insert_current_plane_boundary_resets(*i_body, j_loop_index, xbuf, cur, one,
+                                             init_j_lower, init_k_lower,
+                                             j_loop->lower_bound(), k_loop->lower_bound(),
+                                             j_loop->upper_bound(), k_loop->upper_bound(),
+                                             j_loop->step(), k_loop->step());
+
+        if (!rewrite_region_accesses_to_xbuf(i_loop->body_region(), memory, xbuf,
+                                             i_loop->induction_var(), cur, prev)) {
+            return false;
+        }
+        if (!append_output_row_capture(reduction, xbuf, row_mid, row_last, cur,
+                                       init_k_upper)) {
+            return false;
+        }
+        return true;
+    }
+
+    void insert_current_plane_boundary_resets(yir::Region &i_body, std::size_t &insert_pos,
+                                              yir::Value *xbuf, yir::Value *cur,
+                                              yir::Value *one, yir::Value *j_boundary,
+                                              yir::Value *k_boundary, yir::Value *j_lower,
+                                              yir::Value *k_lower, yir::Value *j_upper,
+                                              yir::Value *k_upper, yir::Value *j_step,
+                                              yir::Value *k_step) {
+        auto *reset_k = insert_op_before<yir::VarOp>(
+            i_body, insert_pos, yir::Type::get_i32(), k_lower,
+            storage_temp_name("reset.k", next_storage_temp_++))->result();
+        insert_existing_op_before(i_body, insert_pos,
+                                  make_current_plane_zero_row_loop(
+                                      i_body, xbuf, cur, one, reset_k,
+                                      j_boundary, k_lower, k_upper, k_step));
+        auto *reset_j = insert_op_before<yir::VarOp>(
+            i_body, insert_pos, yir::Type::get_i32(), j_lower,
+            storage_temp_name("reset.j", next_storage_temp_++))->result();
+        insert_existing_op_before(i_body, insert_pos,
+                                  make_current_plane_k_boundary_loop(
+                                      i_body, xbuf, cur, one, reset_j, j_lower, k_boundary,
+                                      j_upper, j_step));
+    }
+
+    std::unique_ptr<yir::Operation> make_current_plane_zero_row_loop(
+        yir::Region &parent, yir::Value *xbuf, yir::Value *cur, yir::Value *one,
+        yir::Value *k_value, yir::Value *j_boundary, yir::Value *k_lower, yir::Value *k_upper,
+        yir::Value *k_step) {
+        auto k_loop = std::make_unique<yir::ForOp>(k_value, k_lower, k_upper, k_step);
+        k_loop->set_parent(&parent);
+        k_loop->body_region().operations().push_back(make_parented_op<yir::ArrayStoreOp>(
+            k_loop->body_region(), one, xbuf, std::vector<yir::Value *>{cur, j_boundary, k_value}));
+        return k_loop;
+    }
+
+    std::unique_ptr<yir::Operation> make_current_plane_k_boundary_loop(
+        yir::Region &parent, yir::Value *xbuf, yir::Value *cur, yir::Value *one,
+        yir::Value *j_value, yir::Value *j_lower, yir::Value *k_boundary,
+        yir::Value *j_upper, yir::Value *j_step) {
+        auto j_loop = std::make_unique<yir::ForOp>(j_value, j_lower, j_upper, j_step);
+        j_loop->set_parent(&parent);
+        j_loop->body_region().operations().push_back(make_parented_op<yir::ArrayStoreOp>(
+            j_loop->body_region(), one, xbuf, std::vector<yir::Value *>{cur, j_value, k_boundary}));
+        return j_loop;
+    }
+
+    bool rewrite_region_accesses_to_xbuf(yir::Region &region, yir::Value *memory,
+                                         yir::Value *xbuf, yir::Value *i_dim,
+                                         yir::Value *cur, yir::Value *prev) {
+        for (auto &op : region.operations()) {
+            if (auto *load = dynamic_cast<yir::ArrayLoadOp *>(op.get())) {
+                if (load->array() == memory &&
+                    !rewrite_load_to_xbuf(*load, xbuf, i_dim, cur, prev)) {
+                    return false;
+                }
+            } else if (auto *store = dynamic_cast<yir::ArrayStoreOp *>(op.get())) {
+                if (store->array() == memory &&
+                    !rewrite_store_to_xbuf(*store, xbuf, i_dim, cur, prev)) {
+                    return false;
+                }
+            }
+
+            if (auto *if_op = dynamic_cast<yir::IfOp *>(op.get())) {
+                if (!rewrite_region_accesses_to_xbuf(if_op->then_region(), memory, xbuf,
+                                                     i_dim, cur, prev) ||
+                    (if_op->has_else() &&
+                     !rewrite_region_accesses_to_xbuf(if_op->else_region(), memory, xbuf,
+                                                      i_dim, cur, prev))) {
+                    return false;
+                }
+            } else if (auto *while_op = dynamic_cast<yir::WhileOp *>(op.get())) {
+                if (!rewrite_region_accesses_to_xbuf(while_op->cond_region(), memory, xbuf,
+                                                     i_dim, cur, prev) ||
+                    !rewrite_region_accesses_to_xbuf(while_op->body_region(), memory, xbuf,
+                                                     i_dim, cur, prev)) {
+                    return false;
+                }
+            } else if (auto *for_op = dynamic_cast<yir::ForOp *>(op.get())) {
+                if (!rewrite_region_accesses_to_xbuf(for_op->body_region(), memory, xbuf,
+                                                     i_dim, cur, prev)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool rewrite_load_to_xbuf(yir::ArrayLoadOp &load, yir::Value *xbuf, yir::Value *i_dim,
+                              yir::Value *cur, yir::Value *prev) {
+        auto indices = load.indices();
+        yir::Value *plane = plane_for_contracted_index(indices, i_dim, cur, prev, false);
+        if (plane == nullptr) {
+            return false;
+        }
+        load.operands().clear();
+        load.operands().push_back(xbuf);
+        load.operands().push_back(plane);
+        load.operands().push_back(indices[1]);
+        load.operands().push_back(indices[2]);
+        return true;
+    }
+
+    bool rewrite_store_to_xbuf(yir::ArrayStoreOp &store, yir::Value *xbuf, yir::Value *i_dim,
+                               yir::Value *cur, yir::Value *prev) {
+        auto indices = store.indices();
+        yir::Value *plane = plane_for_contracted_index(indices, i_dim, cur, prev, true);
+        if (plane == nullptr) {
+            return false;
+        }
+        auto *value = store.value();
+        store.operands().clear();
+        store.operands().push_back(value);
+        store.operands().push_back(xbuf);
+        store.operands().push_back(plane);
+        store.operands().push_back(indices[1]);
+        store.operands().push_back(indices[2]);
+        return true;
+    }
+
+    yir::Value *plane_for_contracted_index(const std::vector<yir::Value *> &indices,
+                                           yir::Value *i_dim, yir::Value *cur,
+                                           yir::Value *prev, bool is_store) {
+        if (indices.size() != 3) {
+            return nullptr;
+        }
+        std::int64_t offset = 0;
+        if (!is_dim_plus_constant(affine_expr_from_value(indices[0]), i_dim, offset)) {
+            return nullptr;
+        }
+        if (offset == 0) {
+            return cur;
+        }
+        if (!is_store && offset == -1) {
+            return prev;
+        }
+        return nullptr;
+    }
+
+    bool append_output_row_capture(const InitializationReduction &reduction,
+                                   yir::Value *xbuf, yir::Value *row_mid,
+                                   yir::Value *row_last, yir::Value *cur,
+                                   yir::Value *output_length) {
+        auto *i_loop = reduction.proof.update_loops.outer_to_inner[0];
+        auto *j_loop = reduction.proof.update_loops.outer_to_inner[1];
+        auto *k_loop = reduction.proof.update_loops.outer_to_inner[2];
+        auto *j_body = &j_loop->body_region();
+        std::size_t k_loop_index = 0;
+        if (!find_operation_index(*j_body, *k_loop, k_loop_index)) {
+            return false;
+        }
+
+        auto *n = output_length;
+        auto *copy_upper = k_loop->upper_bound();
+        auto *step = k_loop->step();
+        auto *zero = k_loop->lower_bound();
+        std::size_t insert_pos = k_loop_index + 1;
+        auto *two = insert_op_before<yir::ConstI32Op>(
+            *j_body, insert_pos, 2, storage_temp_name("two", next_storage_temp_++))->result();
+        auto *half = insert_op_before<yir::DivSIOp>(
+            *j_body, insert_pos, n, two,
+            storage_temp_name("half", next_storage_temp_++))->result();
+        auto *last = insert_op_before<yir::SubIOp>(
+            *j_body, insert_pos, i_loop->upper_bound(), i_loop->step(),
+            storage_temp_name("last", next_storage_temp_++))->result();
+
+        if (row_mid == nullptr || row_last == nullptr) {
+            return false;
+        }
+
+        append_guarded_row_copy(*j_body, insert_pos, xbuf, row_mid, cur,
+                                i_loop->induction_var(), j_loop->induction_var(),
+                                half, half, zero, copy_upper, step);
+        append_guarded_row_copy(*j_body, insert_pos, xbuf, row_last, cur,
+                                i_loop->induction_var(), j_loop->induction_var(),
+                                last, last, zero, copy_upper, step);
+        return true;
+    }
+
+    void append_guarded_row_copy(yir::Region &parent, std::size_t &insert_pos,
+                                 yir::Value *xbuf, yir::Value *row, yir::Value *cur,
+                                 yir::Value *i_var, yir::Value *j_var,
+                                 yir::Value *target_i, yir::Value *target_j,
+                                 yir::Value *zero, yir::Value *n, yir::Value *step) {
+        auto *j_cmp = insert_op_before<yir::ICmpOp>(
+            parent, insert_pos, yir::ICmpOp::Predicate::Eq, j_var, target_j,
+            storage_temp_name("j.eq", next_storage_temp_++));
+        auto *j_if = insert_op_before<yir::IfOp>(parent, insert_pos, j_cmp->result());
+
+        auto i_cmp = make_parented_op<yir::ICmpOp>(
+            j_if->then_region(), yir::ICmpOp::Predicate::Eq, i_var, target_i,
+            storage_temp_name("i.eq", next_storage_temp_++));
+        auto *i_cmp_value = i_cmp->result();
+        j_if->then_region().operations().push_back(std::move(i_cmp));
+
+        auto i_if = make_parented_op<yir::IfOp>(j_if->then_region(), i_cmp_value);
+        append_row_copy_loop(i_if->then_region(), xbuf, row, cur, j_var, zero, n, step);
+        j_if->then_region().operations().push_back(std::move(i_if));
+    }
+
+    void append_row_copy_loop(yir::Region &parent, yir::Value *xbuf, yir::Value *row,
+                              yir::Value *cur, yir::Value *j_var,
+                              yir::Value *zero, yir::Value *n, yir::Value *step) {
+        auto k_var = make_parented_op<yir::VarOp>(
+            parent, yir::Type::get_i32(), zero,
+            storage_temp_name("copy.k", next_storage_temp_++));
+        auto *k_value = k_var->result();
+        parent.operations().push_back(std::move(k_var));
+
+        auto k_loop = std::make_unique<yir::ForOp>(k_value, zero, n, step);
+        k_loop->set_parent(&parent);
+        auto load = make_parented_op<yir::ArrayLoadOp>(
+            k_loop->body_region(), xbuf,
+            std::vector<yir::Value *>{cur, j_var, k_value}, yir::Type::get_i32(),
+            storage_temp_name("copy.load", next_storage_temp_++));
+        auto *loaded = load->result();
+        k_loop->body_region().operations().push_back(std::move(load));
+        k_loop->body_region().operations().push_back(make_parented_op<yir::ArrayStoreOp>(
+            k_loop->body_region(), loaded, row, std::vector<yir::Value *>{k_value}));
+        parent.operations().push_back(std::move(k_loop));
+    }
+
+    bool rewrite_contracted_output_calls(const TwoPlaneStorageContraction &contraction,
+                                         yir::Value *row0, yir::Value *row_mid,
+                                         yir::Value *row_last) {
+        for (const auto &output : contraction.outputs) {
+            yir::Value *row = nullptr;
+            switch (output.kind) {
+            case ContractedOutputKind::ZeroRow:
+                row = row0;
+                break;
+            case ContractedOutputKind::MiddleRow:
+                row = row_mid;
+                break;
+            case ContractedOutputKind::LastInteriorRow:
+                row = row_last;
+                break;
+            }
+            if (row == nullptr || !rewrite_putarray_to_row_buffer(output.call, row)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool rewrite_putarray_to_row_buffer(yir::CallOp *call, yir::Value *row) {
+        if (call == nullptr || call->parent() == nullptr || call->args().size() != 2) {
+            return false;
+        }
+        std::size_t call_index = 0;
+        auto *parent = call->parent();
+        if (!find_operation_index(*parent, *call, call_index)) {
+            return false;
+        }
+        std::size_t insert_pos = call_index;
+        auto *decay = insert_op_before<yir::DecayOp>(
+            *parent, insert_pos, row, yir::Type::get_ptr(yir::Type::get_i32()),
+            storage_temp_name("row.decay", next_storage_temp_++));
+        call->operands()[1] = decay->result();
+        return true;
     }
 
     bool replace_load_with_constant(yir::ArrayLoadOp &load, int value) {
@@ -2974,6 +3988,23 @@ private:
         return changed;
     }
 
+    bool eliminate_unused_globals() {
+        bool changed = false;
+        auto &globals = module_.globals();
+        for (std::size_t i = 0; i < globals.size();) {
+            auto *global = globals[i].get();
+            if (global == nullptr ||
+                count_value_uses_in_module(module_, global->address()) != 0) {
+                ++i;
+                continue;
+            }
+            globals.erase(globals.begin() + static_cast<std::ptrdiff_t>(i));
+            ++num_unused_globals_;
+            changed = true;
+        }
+        return changed;
+    }
+
     bool eliminate_dead_pure_results() {
         bool changed = false;
         bool changed_round = true;
@@ -3101,15 +4132,18 @@ private:
     std::size_t num_stencil_carries_;
     std::size_t num_future_neighbor_constants_;
     std::size_t num_initialization_reductions_;
+    std::size_t num_storage_contractions_;
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
     std::size_t num_dead_memory_writes_;
     std::size_t num_dead_pure_results_;
+    std::size_t num_unused_globals_;
     std::size_t next_stencil_temp_ = 0;
     std::size_t next_future_temp_ = 0;
     std::size_t next_init_temp_ = 0;
     std::size_t next_wave_temp_ = 0;
+    std::size_t next_storage_temp_ = 0;
 };
 
 } // namespace
@@ -3164,11 +4198,13 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", stencil_carries=" << transformer.num_stencil_carries()
         << ", future_neighbor_constants=" << transformer.num_future_neighbor_constants()
         << ", initialization_reductions=" << transformer.num_initialization_reductions()
+        << ", storage_contractions=" << transformer.num_storage_contractions()
         << ", affine_replacements=" << transformer.num_affine_replacements()
         << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
         << ", nearest_queries=" << transformer.num_nearest_queries()
         << ", dead_memory_writes=" << transformer.num_dead_memory_writes()
-        << ", dead_pure_results=" << transformer.num_dead_pure_results();
+        << ", dead_pure_results=" << transformer.num_dead_pure_results()
+        << ", unused_globals=" << transformer.num_unused_globals();
 
     return PassResult::ok(changed, oss.str());
 }
