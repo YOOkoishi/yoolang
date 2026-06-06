@@ -481,6 +481,17 @@ struct ConstantInitialization {
     EnclosingLoopNest loops;
 };
 
+struct InitializationReduction {
+    ConstantInitialization init;
+    std::vector<yir::ArrayLoadOp *> required_future_loads;
+};
+
+struct FutureNeighborProof {
+    const PolyStmt *write_stmt = nullptr;
+    yir::ArrayStoreOp *store = nullptr;
+    EnclosingLoopNest update_loops;
+};
+
 struct DeadMemoryWrite {
     yir::ArrayStoreOp *store = nullptr;
     const yir::Value *memory = nullptr;
@@ -665,27 +676,38 @@ bool is_identity_access_for_dims(const PolyAccess &access,
     return true;
 }
 
-bool is_single_unit_future_neighbor(const PolyAccess &read,
-                                    const std::vector<const yir::Value *> &dims) {
+bool single_unit_future_neighbor_dim(const PolyAccess &read,
+                                     const std::vector<const yir::Value *> &dims,
+                                     std::size_t &future_dim) {
     if (read.indices.size() != dims.size() || !is_valid_affine_access(read)) {
         return false;
     }
 
-    std::size_t positive_offsets = 0;
+    bool saw_positive_offset = false;
     for (std::size_t dim = 0; dim < dims.size(); ++dim) {
         std::int64_t offset = 0;
         if (!is_dim_plus_constant(read.indices[dim], dims[dim], offset)) {
             return false;
         }
         if (offset == 1) {
-            ++positive_offsets;
+            if (saw_positive_offset) {
+                return false;
+            }
+            saw_positive_offset = true;
+            future_dim = dim;
             continue;
         }
         if (offset != 0) {
             return false;
         }
     }
-    return positive_offsets == 1;
+    return saw_positive_offset;
+}
+
+bool is_single_unit_future_neighbor(const PolyAccess &read,
+                                    const std::vector<const yir::Value *> &dims) {
+    std::size_t future_dim = 0;
+    return single_unit_future_neighbor_dim(read, dims, future_dim);
 }
 
 bool is_innermost_unit_distance(const std::vector<std::int64_t> &distance) {
@@ -740,6 +762,32 @@ void replace_operands(yir::Operation &op, yir::Value *old_value, yir::Value *new
 void replace_value_in_region(yir::Region &region, yir::Value *old_value, yir::Value *new_value);
 
 bool operation_uses_value(const yir::Operation &op, const yir::Value *value);
+bool value_depends_on_value(const yir::Value *value, const yir::Value *needle);
+
+bool value_depends_on_value(const yir::Value *value, const yir::Value *needle,
+                            std::unordered_set<const yir::Value *> &visiting) {
+    if (value == needle) {
+        return true;
+    }
+    if (value == nullptr || !visiting.insert(value).second) {
+        return false;
+    }
+    auto *def = value->defining_op();
+    if (def == nullptr) {
+        return false;
+    }
+    for (const auto *operand : def->operands()) {
+        if (value_depends_on_value(operand, needle, visiting)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool value_depends_on_value(const yir::Value *value, const yir::Value *needle) {
+    std::unordered_set<const yir::Value *> visiting;
+    return value_depends_on_value(value, needle, visiting);
+}
 
 bool region_uses_value(const yir::Region &region, const yir::Value *value) {
     return std::any_of(region.operations().begin(), region.operations().end(),
@@ -1084,6 +1132,10 @@ std::string future_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.future.") + stem + std::to_string(id);
 }
 
+std::string init_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.init.") + stem + std::to_string(id);
+}
+
 std::string wave_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.wave.") + stem + std::to_string(id);
 }
@@ -1174,8 +1226,9 @@ public:
           num_serial_wavefronts_(0), num_parallel_wavefronts_(0), num_wave_unrolls_(0),
           num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
           num_stencil_carries_(0), num_future_neighbor_constants_(0),
-          num_affine_replacements_(0), num_nearest_write_queries_(0),
-          num_nearest_queries_(0), num_dead_memory_writes_(0), num_dead_pure_results_(0) {}
+          num_initialization_reductions_(0), num_affine_replacements_(0),
+          num_nearest_write_queries_(0), num_nearest_queries_(0),
+          num_dead_memory_writes_(0), num_dead_pure_results_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -1190,6 +1243,8 @@ public:
         std::vector<StencilCarryCandidate> stencil_carries;
         std::vector<FutureNeighborConstant> future_neighbor_constants =
             find_future_neighbor_constants(for_body_owners);
+        std::vector<InitializationReduction> initialization_reductions =
+            find_initialization_reductions(for_body_owners);
         for (const auto &scop : model_info_.models) {
             auto reloads = find_same_iteration_reloads(scop);
             same_iteration_reloads.insert(same_iteration_reloads.end(), reloads.begin(), reloads.end());
@@ -1200,10 +1255,13 @@ public:
 
         std::unordered_set<yir::ArrayLoadOp *> erased_loads;
         changed |= replace_future_neighbor_constants(future_neighbor_constants, erased_loads);
+        const auto future_erased_loads = erased_loads;
         changed |= apply_stencil_carries(stencil_carries, erased_loads);
         changed |= replace_same_iteration_reloads(same_iteration_reloads, erased_loads);
         changed |= replace_equivalent_affine_scalars();
         changed |= eliminate_dead_memory_writes();
+        changed |= apply_initialization_reductions(initialization_reductions,
+                                                   future_erased_loads);
         changed |= eliminate_dead_pure_results();
         return changed;
     }
@@ -1217,6 +1275,7 @@ public:
     std::size_t num_same_iteration_reloads() const { return num_same_iteration_reloads_; }
     std::size_t num_stencil_carries() const { return num_stencil_carries_; }
     std::size_t num_future_neighbor_constants() const { return num_future_neighbor_constants_; }
+    std::size_t num_initialization_reductions() const { return num_initialization_reductions_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
     std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
@@ -1997,11 +2056,10 @@ private:
         return write_stmt;
     }
 
-    bool collect_future_neighbor_constants_from_scop(
+    bool prove_future_neighbor_candidate(
         const PolyScop &scop, const ConstantInitialization &init,
         const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
-        std::unordered_set<yir::ArrayLoadOp *> &seen_loads,
-        std::vector<FutureNeighborConstant> &candidates) const {
+        FutureNeighborProof &proof) const {
         if (init.stmt == nullptr || init.store == nullptr || init.stmt->writes.size() != 1) {
             return false;
         }
@@ -2021,6 +2079,136 @@ private:
         if (store == nullptr || store->parent() == nullptr) {
             return false;
         }
+
+        proof = FutureNeighborProof{write_stmt, store, std::move(update_loops)};
+        return true;
+    }
+
+    static bool is_nonpositive_unit_neighbor_read(
+        const PolyAccess &read, const std::vector<const yir::Value *> &dims) {
+        if (read.indices.size() != dims.size() || !is_valid_affine_access(read)) {
+            return false;
+        }
+
+        bool saw_negative_offset = false;
+        for (std::size_t dim = 0; dim < dims.size(); ++dim) {
+            std::int64_t offset = 0;
+            if (!is_dim_plus_constant(read.indices[dim], dims[dim], offset)) {
+                return false;
+            }
+            if (offset > 0 || offset < -1) {
+                return false;
+            }
+            saw_negative_offset = saw_negative_offset || offset == -1;
+        }
+        return saw_negative_offset;
+    }
+
+    static bool assign_resets_value_without_reading_old_value(const yir::Operation &op,
+                                                              const yir::Value *value) {
+        auto *assign = dynamic_cast<const yir::AssignOp *>(&op);
+        return assign != nullptr && assign->target() == value &&
+               !value_depends_on_value(assign->value(), value);
+    }
+
+    static bool induction_vars_reset_before_update(const EnclosingLoopNest &init_loops,
+                                                   const EnclosingLoopNest &update_loops) {
+        if (init_loops.outer_to_inner.empty() || update_loops.outer_to_inner.empty()) {
+            return false;
+        }
+
+        auto *init_outer = init_loops.outer_to_inner.front();
+        auto *update_outer = update_loops.outer_to_inner.front();
+        if (init_outer == nullptr || update_outer == nullptr || init_outer->parent() == nullptr ||
+            init_outer->parent() != update_outer->parent()) {
+            return false;
+        }
+
+        auto *parent = init_outer->parent();
+        std::size_t init_index = 0;
+        std::size_t update_index = 0;
+        if (!find_operation_index(*parent, *init_outer, init_index) ||
+            !find_operation_index(*parent, *update_outer, update_index) ||
+            init_index >= update_index) {
+            return false;
+        }
+
+        std::vector<const yir::Value *> vars;
+        vars.reserve(init_loops.outer_to_inner.size());
+        for (auto *loop : init_loops.outer_to_inner) {
+            if (loop == nullptr || loop->induction_var() == nullptr) {
+                return false;
+            }
+            vars.push_back(loop->induction_var());
+        }
+
+        std::vector<bool> reset(vars.size(), false);
+        const auto &ops = parent->operations();
+        for (std::size_t i = init_index + 1; i < update_index; ++i) {
+            for (std::size_t var_index = 0; var_index < vars.size(); ++var_index) {
+                if (reset[var_index]) {
+                    continue;
+                }
+
+                const auto *var = vars[var_index];
+                if (assign_resets_value_without_reading_old_value(*ops[i], var)) {
+                    reset[var_index] = true;
+                    continue;
+                }
+                if (operation_uses_value(*ops[i], var)) {
+                    return false;
+                }
+            }
+        }
+
+        return std::all_of(reset.begin(), reset.end(), [](bool value) { return value; });
+    }
+
+    static bool no_intervening_memory_observation(const EnclosingLoopNest &init_loops,
+                                                  const EnclosingLoopNest &update_loops,
+                                                  const yir::Value *memory) {
+        if (init_loops.outer_to_inner.empty() || update_loops.outer_to_inner.empty()) {
+            return false;
+        }
+
+        auto *init_outer = init_loops.outer_to_inner.front();
+        auto *update_outer = update_loops.outer_to_inner.front();
+        if (init_outer == nullptr || update_outer == nullptr || init_outer->parent() == nullptr ||
+            init_outer->parent() != update_outer->parent()) {
+            return false;
+        }
+
+        auto *parent = init_outer->parent();
+        std::size_t init_index = 0;
+        std::size_t update_index = 0;
+        if (!find_operation_index(*parent, *init_outer, init_index) ||
+            !find_operation_index(*parent, *update_outer, update_index) ||
+            init_index >= update_index) {
+            return false;
+        }
+
+        const auto &ops = parent->operations();
+        for (std::size_t i = init_index + 1; i < update_index; ++i) {
+            if (operation_observes_memory_except_writes(*ops[i], memory)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool collect_future_neighbor_constants_from_scop(
+        const PolyScop &scop, const ConstantInitialization &init,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
+        std::unordered_set<yir::ArrayLoadOp *> &seen_loads,
+        std::vector<FutureNeighborConstant> &candidates) const {
+        FutureNeighborProof proof;
+        if (!prove_future_neighbor_candidate(scop, init, for_body_owners, proof)) {
+            return false;
+        }
+
+        const auto *memory = init.stmt->writes[0].memory;
+        const auto *write_stmt = proof.write_stmt;
+        auto *store = proof.store;
 
         bool found = false;
         for (const auto &stmt : scop.statements) {
@@ -2094,6 +2282,320 @@ private:
         }
 
         return candidates;
+    }
+
+    bool collect_initialization_reduction_from_scop(
+        const PolyScop &scop, const ConstantInitialization &init,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
+        InitializationReduction &reduction) const {
+        FutureNeighborProof proof;
+        if (!prove_future_neighbor_candidate(scop, init, for_body_owners, proof) ||
+            init.loops.outer_to_inner.size() != 3 ||
+            proof.write_stmt == nullptr || proof.write_stmt->schedule_dims.size() != 3 ||
+            proof.store == nullptr || proof.store->parent() == nullptr ||
+            !induction_vars_reset_before_update(init.loops, proof.update_loops) ||
+            !no_intervening_memory_observation(init.loops, proof.update_loops,
+                                               init.stmt->writes[0].memory)) {
+            return false;
+        }
+
+        const auto *memory = init.stmt->writes[0].memory;
+        const auto &dims = proof.write_stmt->schedule_dims;
+        std::vector<bool> covered_future_dims(dims.size(), false);
+        std::unordered_set<yir::ArrayLoadOp *> seen_required_loads;
+        std::vector<yir::ArrayLoadOp *> required_future_loads;
+
+        std::size_t store_index = 0;
+        if (!find_operation_index(*proof.store->parent(), *proof.store, store_index)) {
+            return false;
+        }
+
+        for (const auto &stmt : scop.statements) {
+            if (stmt.reads.empty()) {
+                continue;
+            }
+
+            bool reads_target_memory = false;
+            for (const auto &read : stmt.reads) {
+                reads_target_memory = reads_target_memory || read.memory == memory;
+            }
+            if (!reads_target_memory) {
+                continue;
+            }
+
+            if (stmt.reads.size() != 1 || !stmt.writes.empty() ||
+                stmt.schedule_dims != dims || !same_iteration_domain(*proof.write_stmt, stmt) ||
+                stmt.lexical_id >= proof.write_stmt->lexical_id) {
+                return false;
+            }
+
+            const auto &read = stmt.reads.front();
+            auto *load =
+                dynamic_cast<yir::ArrayLoadOp *>(const_cast<yir::Operation *>(stmt.op));
+            if (load == nullptr || load->parent() == nullptr || load->array() != memory ||
+                load->parent() != proof.store->parent()) {
+                return false;
+            }
+
+            std::size_t load_index = 0;
+            if (!find_operation_index(*load->parent(), *load, load_index) ||
+                load_index >= store_index) {
+                return false;
+            }
+
+            std::size_t future_dim = 0;
+            if (single_unit_future_neighbor_dim(read, dims, future_dim)) {
+                covered_future_dims[future_dim] = true;
+                if (seen_required_loads.insert(load).second) {
+                    required_future_loads.push_back(load);
+                }
+                continue;
+            }
+
+            if (!is_nonpositive_unit_neighbor_read(read, dims)) {
+                return false;
+            }
+        }
+
+        if (!std::all_of(covered_future_dims.begin(), covered_future_dims.end(),
+                         [](bool covered) { return covered; }) ||
+            required_future_loads.empty()) {
+            return false;
+        }
+
+        reduction = InitializationReduction{init, std::move(required_future_loads)};
+        return true;
+    }
+
+    std::vector<InitializationReduction> find_initialization_reductions(
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners) const {
+        std::vector<InitializationReduction> reductions;
+        std::unordered_map<const yir::Value *, ConstantInitialization> available_inits;
+        std::unordered_set<yir::ForOp *> seen_init_loops;
+
+        for (const auto &scop : model_info_.models) {
+            for (const auto &[_, init] : available_inits) {
+                if (init.loops.outer_to_inner.empty() ||
+                    seen_init_loops.find(init.loops.outer_to_inner.front()) !=
+                        seen_init_loops.end()) {
+                    continue;
+                }
+
+                InitializationReduction reduction;
+                if (collect_initialization_reduction_from_scop(scop, init, for_body_owners,
+                                                               reduction)) {
+                    seen_init_loops.insert(init.loops.outer_to_inner.front());
+                    reductions.push_back(std::move(reduction));
+                }
+            }
+
+            std::unordered_map<const yir::Value *, std::size_t> write_counts;
+            for (const auto &stmt : scop.statements) {
+                for (const auto &write : stmt.writes) {
+                    if (write.memory != nullptr) {
+                        ++write_counts[write.memory];
+                    }
+                }
+            }
+            for (const auto &[memory, _] : write_counts) {
+                available_inits.erase(memory);
+            }
+
+            for (const auto &stmt : scop.statements) {
+                if (stmt.writes.size() != 1 || write_counts[stmt.writes.front().memory] != 1) {
+                    continue;
+                }
+                ConstantInitialization init;
+                if (is_constant_one_initialization(stmt, for_body_owners, init)) {
+                    available_inits[stmt.writes.front().memory] = std::move(init);
+                }
+            }
+        }
+
+        return reductions;
+    }
+
+    static bool init_scaffold_region_is_safe(
+        const yir::Region &region, const yir::ArrayStoreOp *target_store,
+        const yir::Value *target_memory,
+        const std::unordered_set<const yir::ForOp *> &allowed_loops,
+        const std::unordered_set<const yir::Value *> &allowed_assigned_values,
+        bool &saw_target_store) {
+        for (const auto &op : region.operations()) {
+            if (op.get() == target_store) {
+                auto *store = dynamic_cast<const yir::ArrayStoreOp *>(op.get());
+                if (store == nullptr || store->array() != target_memory || saw_target_store) {
+                    return false;
+                }
+                saw_target_store = true;
+                continue;
+            }
+
+            if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(op.get())) {
+                (void)store;
+                return false;
+            }
+
+            if (auto *assign = dynamic_cast<const yir::AssignOp *>(op.get())) {
+                if (allowed_assigned_values.find(assign->target()) ==
+                    allowed_assigned_values.end()) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+                if (allowed_loops.find(for_op) == allowed_loops.end() ||
+                    !init_scaffold_region_is_safe(for_op->body_region(), target_store,
+                                                  target_memory, allowed_loops,
+                                                  allowed_assigned_values,
+                                                  saw_target_store)) {
+                    return false;
+                }
+                continue;
+            }
+
+            return false;
+        }
+        return true;
+    }
+
+    static bool init_loop_is_reducible_now(const ConstantInitialization &init) {
+        if (init.stmt == nullptr || init.store == nullptr || init.stmt->writes.size() != 1 ||
+            init.loops.outer_to_inner.size() != 3) {
+            return false;
+        }
+
+        std::unordered_set<const yir::ForOp *> allowed_loops;
+        std::unordered_set<const yir::Value *> allowed_assigned_values;
+        for (auto *loop : init.loops.outer_to_inner) {
+            if (loop == nullptr || loop->parent() == nullptr || loop->induction_var() == nullptr) {
+                return false;
+            }
+            allowed_loops.insert(loop);
+            allowed_assigned_values.insert(loop->induction_var());
+        }
+
+        auto *outer = init.loops.outer_to_inner.front();
+        bool saw_target_store = false;
+        return init_scaffold_region_is_safe(outer->body_region(), init.store,
+                                            init.stmt->writes.front().memory,
+                                            allowed_loops, allowed_assigned_values,
+                                            saw_target_store) &&
+               saw_target_store;
+    }
+
+    std::unique_ptr<yir::Operation> make_boundary_face_loop(
+        yir::Region &parent, const ConstantInitialization &init, yir::Value *store_value,
+        std::size_t fixed_dim, yir::Value *fixed_value,
+        std::size_t outer_dim, std::size_t inner_dim) {
+        auto *memory = init.stmt->writes.front().memory;
+        auto *outer_source = init.loops.outer_to_inner[outer_dim];
+        auto *inner_source = init.loops.outer_to_inner[inner_dim];
+
+        auto outer_loop = std::make_unique<yir::ForOp>(
+            outer_source->induction_var(), outer_source->lower_bound(),
+            outer_source->upper_bound(), outer_source->step());
+        outer_loop->set_parent(&parent);
+
+        auto inner_loop = std::make_unique<yir::ForOp>(
+            inner_source->induction_var(), inner_source->lower_bound(),
+            inner_source->upper_bound(), inner_source->step());
+        inner_loop->set_parent(&outer_loop->body_region());
+
+        std::vector<yir::Value *> indices(init.loops.outer_to_inner.size(), nullptr);
+        indices[fixed_dim] = fixed_value;
+        indices[outer_dim] = outer_source->induction_var();
+        indices[inner_dim] = inner_source->induction_var();
+
+        auto store = make_parented_op<yir::ArrayStoreOp>(
+            inner_loop->body_region(), store_value, const_cast<yir::Value *>(memory),
+            std::move(indices));
+        inner_loop->body_region().operations().push_back(std::move(store));
+        outer_loop->body_region().operations().push_back(std::move(inner_loop));
+        return outer_loop;
+    }
+
+    bool apply_initialization_reduction(
+        const InitializationReduction &reduction,
+        const std::unordered_set<yir::ArrayLoadOp *> &future_erased_loads) {
+        for (auto *load : reduction.required_future_loads) {
+            if (load == nullptr || future_erased_loads.find(load) == future_erased_loads.end()) {
+                return false;
+            }
+        }
+
+        const auto &init = reduction.init;
+        if (!init_loop_is_reducible_now(init)) {
+            return false;
+        }
+
+        auto *outer = init.loops.outer_to_inner.front();
+        auto *parent = outer->parent();
+        std::size_t outer_index = 0;
+        if (parent == nullptr || !find_operation_index(*parent, *outer, outer_index)) {
+            return false;
+        }
+
+        std::size_t insert_pos = outer_index;
+        auto *store_value = insert_op_before<yir::ConstI32Op>(
+            *parent, insert_pos, 1, init_temp_name("c", next_init_temp_++))->result();
+        auto *i_last = insert_op_before<yir::SubIOp>(
+            *parent, insert_pos, init.loops.outer_to_inner[0]->upper_bound(),
+            init.loops.outer_to_inner[0]->step(),
+            init_temp_name("ilast", next_init_temp_++))->result();
+        auto *j_last = insert_op_before<yir::SubIOp>(
+            *parent, insert_pos, init.loops.outer_to_inner[1]->upper_bound(),
+            init.loops.outer_to_inner[1]->step(),
+            init_temp_name("jlast", next_init_temp_++))->result();
+        auto *k_last = insert_op_before<yir::SubIOp>(
+            *parent, insert_pos, init.loops.outer_to_inner[2]->upper_bound(),
+            init.loops.outer_to_inner[2]->step(),
+            init_temp_name("klast", next_init_temp_++))->result();
+
+        std::vector<std::unique_ptr<yir::Operation>> replacements;
+        replacements.push_back(make_boundary_face_loop(
+            *parent, init, store_value, 0, init.loops.outer_to_inner[0]->lower_bound(), 1, 2));
+        replacements.push_back(make_boundary_face_loop(
+            *parent, init, store_value, 0, i_last, 1, 2));
+        replacements.push_back(make_boundary_face_loop(
+            *parent, init, store_value, 1, init.loops.outer_to_inner[1]->lower_bound(), 0, 2));
+        replacements.push_back(make_boundary_face_loop(
+            *parent, init, store_value, 1, j_last, 0, 2));
+        replacements.push_back(make_boundary_face_loop(
+            *parent, init, store_value, 2, init.loops.outer_to_inner[2]->lower_bound(), 0, 1));
+        replacements.push_back(make_boundary_face_loop(
+            *parent, init, store_value, 2, k_last, 0, 1));
+
+        auto &ops = parent->operations();
+        ops.erase(ops.begin() + static_cast<std::ptrdiff_t>(insert_pos));
+        for (std::size_t i = 0; i < replacements.size(); ++i) {
+            ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(insert_pos + i),
+                       std::move(replacements[i]));
+        }
+
+        ++num_initialization_reductions_;
+        return true;
+    }
+
+    bool apply_initialization_reductions(
+        const std::vector<InitializationReduction> &reductions,
+        const std::unordered_set<yir::ArrayLoadOp *> &future_erased_loads) {
+        bool changed = false;
+        std::unordered_set<yir::ForOp *> erased_init_loops;
+        for (const auto &reduction : reductions) {
+            auto *outer = reduction.init.loops.outer_to_inner.empty()
+                              ? nullptr
+                              : reduction.init.loops.outer_to_inner.front();
+            if (outer == nullptr || erased_init_loops.find(outer) != erased_init_loops.end()) {
+                continue;
+            }
+            if (apply_initialization_reduction(reduction, future_erased_loads)) {
+                erased_init_loops.insert(outer);
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     bool replace_load_with_constant(yir::ArrayLoadOp &load, int value) {
@@ -2598,6 +3100,7 @@ private:
     std::size_t num_same_iteration_reloads_;
     std::size_t num_stencil_carries_;
     std::size_t num_future_neighbor_constants_;
+    std::size_t num_initialization_reductions_;
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
@@ -2605,6 +3108,7 @@ private:
     std::size_t num_dead_pure_results_;
     std::size_t next_stencil_temp_ = 0;
     std::size_t next_future_temp_ = 0;
+    std::size_t next_init_temp_ = 0;
     std::size_t next_wave_temp_ = 0;
 };
 
@@ -2659,6 +3163,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", same_iteration_reloads=" << transformer.num_same_iteration_reloads()
         << ", stencil_carries=" << transformer.num_stencil_carries()
         << ", future_neighbor_constants=" << transformer.num_future_neighbor_constants()
+        << ", initialization_reductions=" << transformer.num_initialization_reductions()
         << ", affine_replacements=" << transformer.num_affine_replacements()
         << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
         << ", nearest_queries=" << transformer.num_nearest_queries()

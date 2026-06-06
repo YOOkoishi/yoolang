@@ -7,8 +7,10 @@ int main() {
   int j;
   int k;
   int N;
+  int s;
 
   N = getint();
+  s = 0;
 
   i = 0;
   j = 0;
@@ -27,6 +29,8 @@ int main() {
     i = i + 1;
   }
 
+  s = x[1][1][1];
+
   i = 1;
   j = 1;
   k = 1;
@@ -44,21 +48,15 @@ int main() {
     i = i + 1;
   }
 
-  return 0;
+  return s;
 }
 
-// YIR: [[INIT:%poly.init.c[0-9]+]] = yir.const.i32 1 : i32
-// YIR: [[ILAST:%poly.init.ilast[0-9]+]] = yir.subi %N,
-// YIR: [[JLAST:%poly.init.jlast[0-9]+]] = yir.subi %N,
-// YIR: [[KLAST:%poly.init.klast[0-9]+]] = yir.subi %N,
-// YIR: yir.array_store [[INIT]], @x, [%poly.c{{[0-9]+}}, %j, %k]
-// YIR: yir.array_store [[INIT]], @x, [[[ILAST]], %j, %k]
-// YIR: yir.array_store [[INIT]], @x, [%i, %poly.c{{[0-9]+}}, %k]
-// YIR: yir.array_store [[INIT]], @x, [%i, [[JLAST]], %k]
-// YIR: yir.array_store [[INIT]], @x, [%i, %j, %poly.c{{[0-9]+}}]
-// YIR: yir.array_store [[INIT]], @x, [%i, %j, [[KLAST]]]
+// YIR-NOT: poly.init
+// YIR: yir.for %i = %poly.c{{[0-9]+}} to %N step %poly.c{{[0-9]+}} {
+// YIR: yir.for %j = %poly.c{{[0-9]+}} to %N step %poly.c{{[0-9]+}} {
+// YIR: yir.for %k = %poly.c{{[0-9]+}} to %N step %poly.c{{[0-9]+}} {
+// YIR: yir.array_store {{.*}}, @x, [%i, %j, %k]
+// YIR: yir.array_load @x
 // YIR-DAG: [[F0:%poly.future.c[0-9]+]] = yir.const.i32 1 : i32
 // YIR-DAG: [[F1:%poly.future.c[0-9]+]] = yir.const.i32 1 : i32
 // YIR-DAG: [[F2:%poly.future.c[0-9]+]] = yir.const.i32 1 : i32
-// YIR-NOT: yir.array_load @x
-// YIR: yir.array_store {{.*}}, @x, [%i, %j, %k]
