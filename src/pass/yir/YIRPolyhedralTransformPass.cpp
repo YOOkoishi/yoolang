@@ -1156,7 +1156,7 @@ private:
         w_loop->body_region().operations().push_back(std::move(moved_i_loop));
         outer_ops[i_loop_index] = std::move(w_loop);
 
-        if (!rewrite_k_loop_as_wave_guard(candidate, w_var->result())) {
+        if (!rewrite_k_loop_as_bounded_wavefront(candidate, w_var->result())) {
             return false;
         }
 
@@ -1199,64 +1199,121 @@ private:
         return upper->result();
     }
 
-    bool rewrite_k_loop_as_wave_guard(const SerialWavefrontCandidate &candidate,
-                                      yir::Value *wave_iv) {
-        auto *j_body = candidate.k_loop->parent();
-        std::size_t k_loop_index = 0;
-        if (j_body == nullptr || !find_operation_index(*j_body, *candidate.k_loop, k_loop_index)) {
+    bool rewrite_k_loop_as_bounded_wavefront(const SerialWavefrontCandidate &candidate,
+                                             yir::Value *wave_iv) {
+        auto *w_body = candidate.i_loop->parent();
+        std::size_t i_loop_index = 0;
+        if (w_body == nullptr || !find_operation_index(*w_body, *candidate.i_loop,
+                                                       i_loop_index)) {
             return false;
         }
+
         auto *i_body = candidate.j_loop->parent();
         std::size_t j_loop_index = 0;
-        if (i_body == nullptr || !find_operation_index(*i_body, *candidate.j_loop, j_loop_index)) {
+        if (i_body == nullptr || i_body != &candidate.i_loop->body_region() ||
+            !find_operation_index(*i_body, *candidate.j_loop, j_loop_index)) {
+            return false;
+        }
+
+        auto *j_body = candidate.k_loop->parent();
+        std::size_t k_loop_index = 0;
+        if (j_body == nullptr || j_body != &candidate.j_loop->body_region() ||
+            !find_operation_index(*j_body, *candidate.k_loop, k_loop_index)) {
             return false;
         }
 
         auto *i_iv = candidate.i_loop->induction_var();
         auto *j_iv = candidate.j_loop->induction_var();
         auto *k_iv = candidate.k_loop->induction_var();
+        auto *i_lower = candidate.i_loop->lower_bound();
+        auto *i_upper = candidate.i_loop->upper_bound();
+        auto *j_lower = candidate.j_loop->lower_bound();
+        auto *j_upper = candidate.j_loop->upper_bound();
         auto *k_lower = candidate.k_loop->lower_bound();
         auto *k_upper = candidate.k_loop->upper_bound();
 
-        auto sub_wave_i = make_parented_op<yir::SubIOp>(
-            *i_body, wave_iv, i_iv, wave_temp_name("sub", next_wave_temp_++));
-        auto *wave_minus_i = sub_wave_i->result();
-        auto sub_wave_i_j = make_parented_op<yir::SubIOp>(
-            *j_body, wave_minus_i, j_iv, wave_temp_name("k", next_wave_temp_++));
-        auto *computed_k = sub_wave_i_j->result();
-        auto assign_k = make_parented_op<yir::AssignOp>(*j_body, k_iv, computed_k);
-        auto cmp_ge = make_parented_op<yir::ICmpOp>(
-            *j_body, yir::ICmpOp::Predicate::Ge, k_iv, k_lower,
-            wave_temp_name("ge", next_wave_temp_++));
+        std::size_t w_insert_pos = i_loop_index;
+        auto *minus_one = insert_op_before<yir::ConstI32Op>(
+            *w_body, w_insert_pos, -1, wave_temp_name("c", next_wave_temp_++));
+        auto *one = insert_op_before<yir::ConstI32Op>(
+            *w_body, w_insert_pos, 1, wave_temp_name("c", next_wave_temp_++));
+        auto *j_last = insert_op_before<yir::AddIOp>(
+            *w_body, w_insert_pos, j_upper, minus_one->result(),
+            wave_temp_name("jlast", next_wave_temp_++));
+        auto *k_last = insert_op_before<yir::AddIOp>(
+            *w_body, w_insert_pos, k_upper, minus_one->result(),
+            wave_temp_name("klast", next_wave_temp_++));
 
-        auto outer_if = make_parented_op<yir::IfOp>(*j_body, cmp_ge->result());
-        auto cmp_lt = make_parented_op<yir::ICmpOp>(
-            outer_if->then_region(), yir::ICmpOp::Predicate::Lt, k_iv, k_upper,
-            wave_temp_name("lt", next_wave_temp_++));
-        auto inner_if = make_parented_op<yir::IfOp>(outer_if->then_region(), cmp_lt->result());
+        auto *w_minus_j_last = insert_op_before<yir::SubIOp>(
+            *w_body, w_insert_pos, wave_iv, j_last->result(),
+            wave_temp_name("sub", next_wave_temp_++));
+        auto *i_lower_candidate = insert_op_before<yir::SubIOp>(
+            *w_body, w_insert_pos, w_minus_j_last->result(), k_last->result(),
+            wave_temp_name("ilb", next_wave_temp_++));
+        auto *bounded_i_lower = insert_clamped_wave_lower(
+            *w_body, w_insert_pos, i_lower_candidate->result(), i_lower, "ilb", "ilt");
 
-        auto &old_body = candidate.k_loop->body_region().operations();
-        auto &new_body = inner_if->then_region().operations();
-        for (auto &op : old_body) {
-            op->set_parent(&inner_if->then_region());
-            new_body.push_back(std::move(op));
-        }
-        old_body.clear();
+        auto *w_minus_j_lower = insert_op_before<yir::SubIOp>(
+            *w_body, w_insert_pos, wave_iv, j_lower,
+            wave_temp_name("sub", next_wave_temp_++));
+        auto *w_minus_jk_lower = insert_op_before<yir::SubIOp>(
+            *w_body, w_insert_pos, w_minus_j_lower->result(), k_lower,
+            wave_temp_name("sub", next_wave_temp_++));
+        auto *i_upper_candidate = insert_op_before<yir::AddIOp>(
+            *w_body, w_insert_pos, w_minus_jk_lower->result(), one->result(),
+            wave_temp_name("iub", next_wave_temp_++));
+        auto *bounded_i_upper = insert_clamped_wave_upper(
+            *w_body, w_insert_pos, i_upper_candidate->result(), i_upper, "iub", "igt");
 
-        outer_if->then_region().operations().push_back(std::move(cmp_lt));
-        outer_if->then_region().operations().push_back(std::move(inner_if));
-        auto finish_k = make_parented_op<yir::AssignOp>(*j_body, k_iv, k_upper);
+        candidate.i_loop->operands()[1] = bounded_i_lower;
+        candidate.i_loop->operands()[2] = bounded_i_upper;
+
+        auto &w_ops = w_body->operations();
+        w_ops.insert(w_ops.begin() + static_cast<std::ptrdiff_t>(w_insert_pos + 1),
+                     make_parented_op<yir::AssignOp>(*w_body, i_iv, i_upper));
+
+        std::size_t i_insert_pos = j_loop_index;
+        auto *wave_minus_i = insert_op_before<yir::SubIOp>(
+            *i_body, i_insert_pos, wave_iv, i_iv,
+            wave_temp_name("sub", next_wave_temp_++));
+        auto *j_lower_candidate = insert_op_before<yir::SubIOp>(
+            *i_body, i_insert_pos, wave_minus_i->result(), k_last->result(),
+            wave_temp_name("jlb", next_wave_temp_++));
+        auto *bounded_j_lower = insert_clamped_wave_lower(
+            *i_body, i_insert_pos, j_lower_candidate->result(), j_lower, "jlb", "jlt");
+
+        auto *w_i_minus_k_lower = insert_op_before<yir::SubIOp>(
+            *i_body, i_insert_pos, wave_minus_i->result(), k_lower,
+            wave_temp_name("sub", next_wave_temp_++));
+        auto *j_upper_candidate = insert_op_before<yir::AddIOp>(
+            *i_body, i_insert_pos, w_i_minus_k_lower->result(), one->result(),
+            wave_temp_name("jub", next_wave_temp_++));
+        auto *bounded_j_upper = insert_clamped_wave_upper(
+            *i_body, i_insert_pos, j_upper_candidate->result(), j_upper, "jub", "jgt");
+
+        candidate.j_loop->operands()[1] = bounded_j_lower;
+        candidate.j_loop->operands()[2] = bounded_j_upper;
 
         auto &i_ops = i_body->operations();
-        i_ops.insert(i_ops.begin() + static_cast<std::ptrdiff_t>(j_loop_index),
-                     std::move(sub_wave_i));
+        i_ops.insert(i_ops.begin() + static_cast<std::ptrdiff_t>(i_insert_pos + 1),
+                     make_parented_op<yir::AssignOp>(*i_body, k_iv, k_upper));
+        i_ops.insert(i_ops.begin() + static_cast<std::ptrdiff_t>(i_insert_pos + 2),
+                     make_parented_op<yir::AssignOp>(*i_body, j_iv, j_upper));
 
         std::vector<std::unique_ptr<yir::Operation>> replacements;
-        replacements.push_back(std::move(sub_wave_i_j));
-        replacements.push_back(std::move(assign_k));
-        replacements.push_back(std::move(cmp_ge));
-        replacements.push_back(std::move(outer_if));
-        replacements.push_back(std::move(finish_k));
+        auto compute_k = make_parented_op<yir::SubIOp>(
+            *j_body, wave_minus_i->result(), j_iv, wave_temp_name("k", next_wave_temp_++));
+        auto *computed_k = compute_k->result();
+        replacements.push_back(std::move(compute_k));
+        replacements.push_back(make_parented_op<yir::AssignOp>(*j_body, k_iv, computed_k));
+
+        auto &old_body = candidate.k_loop->body_region().operations();
+        for (auto &op : old_body) {
+            op->set_parent(j_body);
+            replacements.push_back(std::move(op));
+        }
+        old_body.clear();
+        replacements.push_back(make_parented_op<yir::AssignOp>(*j_body, k_iv, k_upper));
 
         auto &j_ops = j_body->operations();
         j_ops.erase(j_ops.begin() + static_cast<std::ptrdiff_t>(k_loop_index));
@@ -1265,6 +1322,38 @@ private:
                          std::move(replacements[i]));
         }
         return true;
+    }
+
+    yir::Value *insert_clamped_wave_lower(yir::Region &region, std::size_t &insert_pos,
+                                          yir::Value *candidate, yir::Value *lower,
+                                          const char *limit_name, const char *cmp_name) {
+        auto *limit = insert_op_before<yir::VarOp>(
+            region, insert_pos, yir::Type::get_i32(), candidate,
+            wave_temp_name(limit_name, next_wave_temp_++));
+        auto *cmp = insert_op_before<yir::ICmpOp>(
+            region, insert_pos, yir::ICmpOp::Predicate::Lt, limit->result(), lower,
+            wave_temp_name(cmp_name, next_wave_temp_++));
+        auto *clamp = insert_op_before<yir::IfOp>(region, insert_pos, cmp->result());
+        auto assign = make_parented_op<yir::AssignOp>(
+            clamp->then_region(), limit->result(), lower);
+        clamp->then_region().operations().push_back(std::move(assign));
+        return limit->result();
+    }
+
+    yir::Value *insert_clamped_wave_upper(yir::Region &region, std::size_t &insert_pos,
+                                          yir::Value *candidate, yir::Value *upper,
+                                          const char *limit_name, const char *cmp_name) {
+        auto *limit = insert_op_before<yir::VarOp>(
+            region, insert_pos, yir::Type::get_i32(), candidate,
+            wave_temp_name(limit_name, next_wave_temp_++));
+        auto *cmp = insert_op_before<yir::ICmpOp>(
+            region, insert_pos, yir::ICmpOp::Predicate::Gt, limit->result(), upper,
+            wave_temp_name(cmp_name, next_wave_temp_++));
+        auto *clamp = insert_op_before<yir::IfOp>(region, insert_pos, cmp->result());
+        auto assign = make_parented_op<yir::AssignOp>(
+            clamp->then_region(), limit->result(), upper);
+        clamp->then_region().operations().push_back(std::move(assign));
+        return limit->result();
     }
 
     bool apply_wavefront_plane_tiling(const SerialWavefrontCandidate &candidate) {
@@ -1334,10 +1423,6 @@ private:
             ++num_parallel_wave_unrolls_;
         }
 
-        auto finish_i =
-            make_parented_op<yir::AssignOp>(*w_body, candidate.i_loop->induction_var(), i_upper);
-        w_ops.insert(w_ops.begin() + static_cast<std::ptrdiff_t>(insert_pos + 1),
-                     std::move(finish_i));
         return true;
     }
 
@@ -1377,10 +1462,6 @@ private:
         j_tile_loop->body_region().operations().push_back(std::move(moved_j_loop));
         i_ops[insert_pos] = std::move(j_tile_loop);
 
-        auto finish_j =
-            make_parented_op<yir::AssignOp>(*i_body, j_loop.induction_var(), j_upper);
-        i_ops.insert(i_ops.begin() + static_cast<std::ptrdiff_t>(insert_pos + 1),
-                     std::move(finish_j));
         return true;
     }
 

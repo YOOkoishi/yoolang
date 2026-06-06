@@ -36,12 +36,22 @@ int main() {
 
 // YIR: [[WLB:%poly.wave.lb[0-9]+]] = yir.addi {{%poly.wave.lb[0-9]+}},
 // YIR: [[W:%poly.wave.w[0-9]+]] = yir.var : i32 = [[WLB]]
+// YIR: [[JLAST:%poly.wave.jlast[0-9]+]] = yir.addi
+// YIR: [[KLAST:%poly.wave.klast[0-9]+]] = yir.addi
 // YIR: [[TILE:%poly.wave.tile[0-9]+]] = yir.const.i32 8 : i32
 // YIR: [[PAR_UNROLL:%poly.wave.par.unroll.step[0-9]+]] = yir.const.i32 2 : i32
 // YIR: [[UNROLL:%poly.wave.unroll.step[0-9]+]] = yir.const.i32 2 : i32
 // YIR: yir.for [[W]] = [[WLB]] to {{%poly.wave.ub[0-9]+}} step
-// YIR: [[IT:%poly.wave.it[0-9]+]] = yir.var : i32 =
-// YIR: yir.for [[IT]] = {{.*}} step [[TILE]]
+// YIR: [[ILB:%poly.wave.ilb[0-9]+]] = yir.var : i32 =
+// YIR: [[ILT:%poly.wave.ilt[0-9]+]] = yir.icmp lt [[ILB]],
+// YIR: yir.if [[ILT]]
+// YIR: yir.assign [[ILB]],
+// YIR: [[IUB:%poly.wave.iub[0-9]+]] = yir.var : i32 =
+// YIR: [[IGT:%poly.wave.igt[0-9]+]] = yir.icmp gt [[IUB]],
+// YIR: yir.if [[IGT]]
+// YIR: yir.assign [[IUB]],
+// YIR: [[IT:%poly.wave.it[0-9]+]] = yir.var : i32 = [[ILB]]
+// YIR: yir.for [[IT]] = [[ILB]] to [[IUB]] step [[TILE]]
 // YIR: [[IEND:%poly.wave.iend[0-9]+]] = yir.addi [[IT]], [[TILE]]
 // YIR: [[ILIM:%poly.wave.ilim[0-9]+]] = yir.var : i32 = [[IEND]]
 // YIR: [[IGT:%poly.wave.igt[0-9]+]] = yir.icmp gt [[ILIM]],
@@ -49,8 +59,16 @@ int main() {
 // YIR: yir.assign [[ILIM]],
 // YIR: yir.for %i = [[IT]] to [[ILIM]] step [[PAR_UNROLL]] parallel
 // YIR: [[WSUB:%poly.wave.sub[0-9]+]] = yir.subi [[W]], %i
-// YIR: [[JT:%poly.wave.jt[0-9]+]] = yir.var : i32 =
-// YIR: yir.for [[JT]] = {{.*}} step [[TILE]]
+// YIR: [[JLB:%poly.wave.jlb[0-9]+]] = yir.var : i32 =
+// YIR: [[JLT:%poly.wave.jlt[0-9]+]] = yir.icmp lt [[JLB]],
+// YIR: yir.if [[JLT]]
+// YIR: yir.assign [[JLB]],
+// YIR: [[JUB:%poly.wave.jub[0-9]+]] = yir.var : i32 =
+// YIR: [[JGT:%poly.wave.jgt[0-9]+]] = yir.icmp gt [[JUB]],
+// YIR: yir.if [[JGT]]
+// YIR: yir.assign [[JUB]],
+// YIR: [[JT:%poly.wave.jt[0-9]+]] = yir.var : i32 = [[JLB]]
+// YIR: yir.for [[JT]] = [[JLB]] to [[JUB]] step [[TILE]]
 // YIR: [[JEND:%poly.wave.jend[0-9]+]] = yir.addi [[JT]], [[TILE]]
 // YIR: [[JLIM:%poly.wave.jlim[0-9]+]] = yir.var : i32 = [[JEND]]
 // YIR: [[JGT:%poly.wave.jgt[0-9]+]] = yir.icmp gt [[JLIM]],
@@ -60,10 +78,8 @@ int main() {
 // YIR-NOT: yir.for %k =
 // YIR: [[WK:%poly.wave.k[0-9]+]] = yir.subi [[WSUB]], %j
 // YIR: yir.assign %k, [[WK]]
-// YIR: [[GE:%poly.wave.ge[0-9]+]] = yir.icmp ge %k,
-// YIR: yir.if [[GE]]
-// YIR: [[LT:%poly.wave.lt[0-9]+]] = yir.icmp lt %k,
-// YIR: yir.if [[LT]]
+// YIR-NOT: yir.icmp ge %k,
+// YIR-NOT: yir.icmp lt %k,
 // YIR: yir.array_store {{.*}}, @x, [%i, %j, %k]
 // YIR: [[LANE_LT:%poly.wave.lane.lt[0-9]+]] = yir.icmp lt
 // YIR: yir.if [[LANE_LT]]
