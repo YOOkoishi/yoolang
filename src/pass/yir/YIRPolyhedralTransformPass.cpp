@@ -466,6 +466,21 @@ struct StencilCarryCandidate {
     yir::ForOp *loop = nullptr;
 };
 
+struct FutureNeighborConstant {
+    yir::ArrayLoadOp *load = nullptr;
+    int value = 1;
+};
+
+struct EnclosingLoopNest {
+    std::vector<yir::ForOp *> outer_to_inner;
+};
+
+struct ConstantInitialization {
+    const PolyStmt *stmt = nullptr;
+    yir::ArrayStoreOp *store = nullptr;
+    EnclosingLoopNest loops;
+};
+
 struct DeadMemoryWrite {
     yir::ArrayStoreOp *store = nullptr;
     const yir::Value *memory = nullptr;
@@ -616,6 +631,63 @@ bool is_dim_plus_constant(const PolyAffineExpr &expr, const yir::Value *dim,
     return true;
 }
 
+bool affine_terms_equal_with_constant_delta(const PolyAffineExpr &lhs,
+                                            const PolyAffineExpr &rhs,
+                                            std::int64_t lhs_minus_rhs) {
+    return lhs.valid && rhs.valid && lhs.terms == rhs.terms &&
+           lhs.constant - rhs.constant == lhs_minus_rhs;
+}
+
+bool affine_constant_value(const PolyAffineExpr &expr, std::int64_t &value) {
+    if (!expr.valid) {
+        return false;
+    }
+    for (const auto &[_, coefficient] : expr.terms) {
+        if (coefficient != 0) {
+            return false;
+        }
+    }
+    value = expr.constant;
+    return true;
+}
+
+bool is_identity_access_for_dims(const PolyAccess &access,
+                                 const std::vector<const yir::Value *> &dims) {
+    if (access.indices.size() != dims.size() || !is_valid_affine_access(access)) {
+        return false;
+    }
+    for (std::size_t dim = 0; dim < dims.size(); ++dim) {
+        std::int64_t offset = 0;
+        if (!is_dim_plus_constant(access.indices[dim], dims[dim], offset) || offset != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_single_unit_future_neighbor(const PolyAccess &read,
+                                    const std::vector<const yir::Value *> &dims) {
+    if (read.indices.size() != dims.size() || !is_valid_affine_access(read)) {
+        return false;
+    }
+
+    std::size_t positive_offsets = 0;
+    for (std::size_t dim = 0; dim < dims.size(); ++dim) {
+        std::int64_t offset = 0;
+        if (!is_dim_plus_constant(read.indices[dim], dims[dim], offset)) {
+            return false;
+        }
+        if (offset == 1) {
+            ++positive_offsets;
+            continue;
+        }
+        if (offset != 0) {
+            return false;
+        }
+    }
+    return positive_offsets == 1;
+}
+
 bool is_innermost_unit_distance(const std::vector<std::int64_t> &distance) {
     if (distance.empty() || distance.back() != 1) {
         return false;
@@ -674,6 +746,15 @@ bool region_uses_value(const yir::Region &region, const yir::Value *value) {
                        [value](const auto &op) { return operation_uses_value(*op, value); });
 }
 
+bool module_uses_value(const yir::Module &module, const yir::Value *value) {
+    for (const auto &function : module.functions()) {
+        if (region_uses_value(function->body(), value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool operation_uses_value(const yir::Operation &op, const yir::Value *value) {
     if (std::find(op.operands().begin(), op.operands().end(), value) != op.operands().end()) {
         return true;
@@ -727,6 +808,31 @@ bool operation_writes_memory(const yir::Operation &op, const yir::Value *memory)
     }
     if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
         return region_writes_memory(for_op->body_region(), memory);
+    }
+    return false;
+}
+
+bool operation_contains_call(const yir::Operation &op);
+
+bool region_contains_call(const yir::Region &region) {
+    return std::any_of(region.operations().begin(), region.operations().end(),
+                       [](const auto &op) { return operation_contains_call(*op); });
+}
+
+bool operation_contains_call(const yir::Operation &op) {
+    if (dynamic_cast<const yir::CallOp *>(&op) != nullptr) {
+        return true;
+    }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        return region_contains_call(if_op->then_region()) ||
+               (if_op->has_else() && region_contains_call(if_op->else_region()));
+    }
+    if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        return region_contains_call(while_op->cond_region()) ||
+               region_contains_call(while_op->body_region());
+    }
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        return region_contains_call(for_op->body_region());
     }
     return false;
 }
@@ -827,6 +933,34 @@ bool is_zero_value(const yir::Value *value) {
     }
     return value != nullptr &&
            dynamic_cast<const yir::ZeroOp *>(value->defining_op()) != nullptr;
+}
+
+bool is_dead_pure_result_eliminable(const yir::Operation &op) {
+    if (op.result() == nullptr) {
+        return false;
+    }
+
+    if (dynamic_cast<const yir::ConstI32Op *>(&op) != nullptr ||
+        dynamic_cast<const yir::ConstF32Op *>(&op) != nullptr ||
+        dynamic_cast<const yir::ConstBoolOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::ZeroOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::AddIOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::SubIOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::MulIOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::AddFOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::SubFOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::MulFOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::ICmpOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::FCmpOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::ZExtI1ToI32Op *>(&op) != nullptr ||
+        dynamic_cast<const yir::TruncI32ToI1Op *>(&op) != nullptr ||
+        dynamic_cast<const yir::SIToFPOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::FPToSIOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::ToBoolOp *>(&op) != nullptr ||
+        dynamic_cast<const yir::NotOp *>(&op) != nullptr) {
+        return true;
+    }
+    return false;
 }
 
 void replace_value_in_nested_regions(yir::Operation &op, yir::Value *old_value,
@@ -946,6 +1080,10 @@ std::string stencil_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.stencil.") + stem + std::to_string(id);
 }
 
+std::string future_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.future.") + stem + std::to_string(id);
+}
+
 std::string wave_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.wave.") + stem + std::to_string(id);
 }
@@ -1035,8 +1173,9 @@ public:
           canonical_info_(canonical_info), num_interchanged_(0), num_tiled_(0),
           num_serial_wavefronts_(0), num_parallel_wavefronts_(0), num_wave_unrolls_(0),
           num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
-          num_stencil_carries_(0), num_affine_replacements_(0), num_nearest_write_queries_(0),
-          num_nearest_queries_(0), num_dead_memory_writes_(0) {}
+          num_stencil_carries_(0), num_future_neighbor_constants_(0),
+          num_affine_replacements_(0), num_nearest_write_queries_(0),
+          num_nearest_queries_(0), num_dead_memory_writes_(0), num_dead_pure_results_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -1049,6 +1188,8 @@ public:
 
         std::vector<SameIterationReload> same_iteration_reloads;
         std::vector<StencilCarryCandidate> stencil_carries;
+        std::vector<FutureNeighborConstant> future_neighbor_constants =
+            find_future_neighbor_constants(for_body_owners);
         for (const auto &scop : model_info_.models) {
             auto reloads = find_same_iteration_reloads(scop);
             same_iteration_reloads.insert(same_iteration_reloads.end(), reloads.begin(), reloads.end());
@@ -1058,10 +1199,12 @@ public:
         }
 
         std::unordered_set<yir::ArrayLoadOp *> erased_loads;
+        changed |= replace_future_neighbor_constants(future_neighbor_constants, erased_loads);
         changed |= apply_stencil_carries(stencil_carries, erased_loads);
         changed |= replace_same_iteration_reloads(same_iteration_reloads, erased_loads);
         changed |= replace_equivalent_affine_scalars();
         changed |= eliminate_dead_memory_writes();
+        changed |= eliminate_dead_pure_results();
         return changed;
     }
 
@@ -1073,10 +1216,12 @@ public:
     std::size_t num_parallel_wave_unrolls() const { return num_parallel_wave_unrolls_; }
     std::size_t num_same_iteration_reloads() const { return num_same_iteration_reloads_; }
     std::size_t num_stencil_carries() const { return num_stencil_carries_; }
+    std::size_t num_future_neighbor_constants() const { return num_future_neighbor_constants_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
     std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
     std::size_t num_dead_memory_writes() const { return num_dead_memory_writes_; }
+    std::size_t num_dead_pure_results() const { return num_dead_pure_results_; }
 
 private:
     bool try_interchange_or_tile(const PolyScop& scop) {
@@ -1702,6 +1847,293 @@ private:
         return op;
     }
 
+    static EnclosingLoopNest collect_enclosing_loop_nest(
+        yir::Region *region,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners) {
+        EnclosingLoopNest nest;
+        auto *current = region;
+        while (current != nullptr) {
+            auto owner = for_body_owners.find(current);
+            if (owner == for_body_owners.end() || owner->second == nullptr) {
+                break;
+            }
+            nest.outer_to_inner.push_back(owner->second);
+            current = owner->second->parent();
+        }
+        std::reverse(nest.outer_to_inner.begin(), nest.outer_to_inner.end());
+        return nest;
+    }
+
+    static bool loop_nest_matches_stmt(const EnclosingLoopNest &nest, const PolyStmt &stmt) {
+        if (nest.outer_to_inner.size() != stmt.schedule_dims.size() ||
+            stmt.domain.size() != stmt.schedule_dims.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < stmt.schedule_dims.size(); ++i) {
+            auto *loop = nest.outer_to_inner[i];
+            if (loop == nullptr || loop->induction_var() != stmt.schedule_dims[i] ||
+                stmt.domain[i].iv != stmt.schedule_dims[i]) {
+                return false;
+            }
+            std::int64_t step = 0;
+            if (!const_i32_value(loop->step(), step) || step != 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool simple_initializer_covers_unit_interior(const PolyStmt &init_stmt,
+                                                       const PolyStmt &update_stmt) {
+        if (init_stmt.domain.size() != update_stmt.domain.size() ||
+            init_stmt.schedule_dims != update_stmt.schedule_dims) {
+            return false;
+        }
+
+        for (std::size_t dim = 0; dim < init_stmt.domain.size(); ++dim) {
+            std::int64_t init_lower = 0;
+            std::int64_t update_lower = 0;
+            if (!affine_constant_value(init_stmt.domain[dim].lower, init_lower) ||
+                !affine_constant_value(update_stmt.domain[dim].lower, update_lower) ||
+                update_lower - init_lower != 1) {
+                return false;
+            }
+
+            if (!affine_terms_equal_with_constant_delta(update_stmt.domain[dim].upper,
+                                                        init_stmt.domain[dim].upper, -1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool same_outer_parent_ordered(const EnclosingLoopNest &init_loops,
+                                          const EnclosingLoopNest &update_loops,
+                                          const yir::Value *memory) {
+        if (init_loops.outer_to_inner.empty() || update_loops.outer_to_inner.empty()) {
+            return false;
+        }
+        auto *init_outer = init_loops.outer_to_inner.front();
+        auto *update_outer = update_loops.outer_to_inner.front();
+        if (init_outer == nullptr || update_outer == nullptr || init_outer == update_outer ||
+            init_outer->parent() == nullptr || init_outer->parent() != update_outer->parent()) {
+            return false;
+        }
+
+        auto *parent = init_outer->parent();
+        std::size_t init_index = 0;
+        std::size_t update_index = 0;
+        if (!find_operation_index(*parent, *init_outer, init_index) ||
+            !find_operation_index(*parent, *update_outer, update_index) ||
+            init_index >= update_index) {
+            return false;
+        }
+
+        const auto &ops = parent->operations();
+        for (std::size_t i = init_index + 1; i < update_index; ++i) {
+            if (operation_contains_call(*ops[i]) || operation_writes_memory(*ops[i], memory)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool is_constant_one_initialization(
+        const PolyStmt &stmt,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
+        ConstantInitialization &init) const {
+        if (!stmt.reads.empty() || stmt.writes.size() != 1 ||
+            stmt.schedule_dims.empty() || stmt.domain.size() != stmt.schedule_dims.size()) {
+            return false;
+        }
+
+        auto *store =
+            dynamic_cast<yir::ArrayStoreOp *>(const_cast<yir::Operation *>(stmt.op));
+        std::int64_t value = 0;
+        if (store == nullptr || store->parent() == nullptr || store->array() != stmt.writes[0].memory ||
+            !const_i32_value(store->value(), value) || value != 1 ||
+            !is_identity_access_for_dims(stmt.writes[0], stmt.schedule_dims)) {
+            return false;
+        }
+
+        auto loops = collect_enclosing_loop_nest(store->parent(), for_body_owners);
+        if (!loop_nest_matches_stmt(loops, stmt)) {
+            return false;
+        }
+
+        init = ConstantInitialization{&stmt, store, std::move(loops)};
+        return true;
+    }
+
+    const PolyStmt *find_single_identity_update_store(
+        const PolyScop &scop, const yir::Value *memory,
+        const std::vector<const yir::Value *> &dims,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
+        EnclosingLoopNest &update_loops) const {
+        const PolyStmt *write_stmt = nullptr;
+        for (const auto &stmt : scop.statements) {
+            for (const auto &write : stmt.writes) {
+                if (write.memory != memory) {
+                    continue;
+                }
+                if (write_stmt != nullptr || stmt.writes.size() != 1 ||
+                    stmt.schedule_dims != dims || !is_identity_access_for_dims(write, dims)) {
+                    return nullptr;
+                }
+
+                auto *store =
+                    dynamic_cast<yir::ArrayStoreOp *>(const_cast<yir::Operation *>(stmt.op));
+                if (store == nullptr || store->parent() == nullptr || store->array() != memory) {
+                    return nullptr;
+                }
+                auto loops = collect_enclosing_loop_nest(store->parent(), for_body_owners);
+                if (!loop_nest_matches_stmt(loops, stmt)) {
+                    return nullptr;
+                }
+                update_loops = std::move(loops);
+                write_stmt = &stmt;
+            }
+        }
+        return write_stmt;
+    }
+
+    bool collect_future_neighbor_constants_from_scop(
+        const PolyScop &scop, const ConstantInitialization &init,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
+        std::unordered_set<yir::ArrayLoadOp *> &seen_loads,
+        std::vector<FutureNeighborConstant> &candidates) const {
+        if (init.stmt == nullptr || init.store == nullptr || init.stmt->writes.size() != 1) {
+            return false;
+        }
+
+        const auto *memory = init.stmt->writes[0].memory;
+        EnclosingLoopNest update_loops;
+        const auto *write_stmt = find_single_identity_update_store(
+            scop, memory, init.stmt->schedule_dims, for_body_owners, update_loops);
+        if (write_stmt == nullptr ||
+            !simple_initializer_covers_unit_interior(*init.stmt, *write_stmt) ||
+            !same_outer_parent_ordered(init.loops, update_loops, memory)) {
+            return false;
+        }
+
+        auto *store =
+            dynamic_cast<yir::ArrayStoreOp *>(const_cast<yir::Operation *>(write_stmt->op));
+        if (store == nullptr || store->parent() == nullptr) {
+            return false;
+        }
+
+        bool found = false;
+        for (const auto &stmt : scop.statements) {
+            if (stmt.reads.size() != 1 || !stmt.writes.empty() ||
+                stmt.schedule_dims != write_stmt->schedule_dims ||
+                !same_iteration_domain(*write_stmt, stmt) ||
+                stmt.lexical_id >= write_stmt->lexical_id) {
+                continue;
+            }
+
+            const auto &read = stmt.reads.front();
+            if (read.memory != memory ||
+                !is_single_unit_future_neighbor(read, write_stmt->schedule_dims)) {
+                continue;
+            }
+
+            auto *load =
+                dynamic_cast<yir::ArrayLoadOp *>(const_cast<yir::Operation *>(stmt.op));
+            if (load == nullptr || load->parent() == nullptr || load->array() != memory ||
+                load->parent() != store->parent() || !seen_loads.insert(load).second) {
+                continue;
+            }
+
+            std::size_t load_index = 0;
+            std::size_t store_index = 0;
+            if (!find_operation_index(*load->parent(), *load, load_index) ||
+                !find_operation_index(*store->parent(), *store, store_index) ||
+                load_index >= store_index) {
+                continue;
+            }
+
+            candidates.push_back({load, 1});
+            found = true;
+        }
+        return found;
+    }
+
+    std::vector<FutureNeighborConstant> find_future_neighbor_constants(
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners) const {
+        std::vector<FutureNeighborConstant> candidates;
+        std::unordered_map<const yir::Value *, ConstantInitialization> available_inits;
+        std::unordered_set<yir::ArrayLoadOp *> seen_loads;
+
+        for (const auto &scop : model_info_.models) {
+            for (const auto &[_, init] : available_inits) {
+                collect_future_neighbor_constants_from_scop(scop, init, for_body_owners,
+                                                            seen_loads, candidates);
+            }
+
+            std::unordered_map<const yir::Value *, std::size_t> write_counts;
+            for (const auto &stmt : scop.statements) {
+                for (const auto &write : stmt.writes) {
+                    if (write.memory != nullptr) {
+                        ++write_counts[write.memory];
+                    }
+                }
+            }
+            for (const auto &[memory, _] : write_counts) {
+                available_inits.erase(memory);
+            }
+
+            for (const auto &stmt : scop.statements) {
+                if (stmt.writes.size() != 1 || write_counts[stmt.writes.front().memory] != 1) {
+                    continue;
+                }
+                ConstantInitialization init;
+                if (is_constant_one_initialization(stmt, for_body_owners, init)) {
+                    available_inits[stmt.writes.front().memory] = std::move(init);
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    bool replace_load_with_constant(yir::ArrayLoadOp &load, int value) {
+        auto *parent = load.parent();
+        if (parent == nullptr || load.result() == nullptr) {
+            return false;
+        }
+
+        std::size_t load_index = 0;
+        if (!find_operation_index(*parent, load, load_index)) {
+            return false;
+        }
+
+        std::size_t insert_pos = load_index;
+        auto *constant = insert_op_before<yir::ConstI32Op>(
+            *parent, insert_pos, value, future_temp_name("c", next_future_temp_++));
+        auto *old_value = load.result();
+        replace_value_after(*parent, load_index + 2, old_value, constant->result());
+        parent->operations().erase(parent->operations().begin() +
+                                   static_cast<std::ptrdiff_t>(load_index + 1));
+        ++num_future_neighbor_constants_;
+        return true;
+    }
+
+    bool replace_future_neighbor_constants(
+        const std::vector<FutureNeighborConstant> &candidates,
+        std::unordered_set<yir::ArrayLoadOp *> &erased_loads) {
+        bool changed = false;
+        for (const auto &candidate : candidates) {
+            if (candidate.load == nullptr || erased_loads.find(candidate.load) != erased_loads.end()) {
+                continue;
+            }
+            if (replace_load_with_constant(*candidate.load, candidate.value)) {
+                erased_loads.insert(candidate.load);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     std::vector<StencilCarryCandidate> find_stencil_carry_candidates(
         const PolyScop &scop,
         const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners) {
@@ -2040,6 +2472,50 @@ private:
         return changed;
     }
 
+    bool eliminate_dead_pure_results() {
+        bool changed = false;
+        bool changed_round = true;
+        while (changed_round) {
+            changed_round = false;
+            for (auto &function : module_.functions()) {
+                changed_round = eliminate_dead_pure_results(function->body()) || changed_round;
+            }
+            changed = changed || changed_round;
+        }
+        return changed;
+    }
+
+    bool eliminate_dead_pure_results(yir::Region &region) {
+        bool changed = false;
+        auto &ops = region.operations();
+        for (std::size_t i = 0; i < ops.size();) {
+            auto *op = ops[i].get();
+
+            if (auto *if_op = dynamic_cast<yir::IfOp *>(op)) {
+                changed = eliminate_dead_pure_results(if_op->then_region()) || changed;
+                if (if_op->has_else()) {
+                    changed = eliminate_dead_pure_results(if_op->else_region()) || changed;
+                }
+            } else if (auto *while_op = dynamic_cast<yir::WhileOp *>(op)) {
+                changed = eliminate_dead_pure_results(while_op->cond_region()) || changed;
+                changed = eliminate_dead_pure_results(while_op->body_region()) || changed;
+            } else if (auto *for_op = dynamic_cast<yir::ForOp *>(op)) {
+                changed = eliminate_dead_pure_results(for_op->body_region()) || changed;
+            }
+
+            if (is_dead_pure_result_eliminable(*op) &&
+                !module_uses_value(module_, op->result())) {
+                ops.erase(ops.begin() + static_cast<std::ptrdiff_t>(i));
+                ++num_dead_pure_results_;
+                changed = true;
+                continue;
+            }
+
+            ++i;
+        }
+        return changed;
+    }
+
     bool replace_equivalent_affine_scalars() {
         bool changed = false;
         for (auto &function : module_.functions()) {
@@ -2121,11 +2597,14 @@ private:
     std::size_t num_parallel_wave_unrolls_;
     std::size_t num_same_iteration_reloads_;
     std::size_t num_stencil_carries_;
+    std::size_t num_future_neighbor_constants_;
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
     std::size_t num_dead_memory_writes_;
+    std::size_t num_dead_pure_results_;
     std::size_t next_stencil_temp_ = 0;
+    std::size_t next_future_temp_ = 0;
     std::size_t next_wave_temp_ = 0;
 };
 
@@ -2179,10 +2658,12 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", parallel_wave_unrolls=" << transformer.num_parallel_wave_unrolls()
         << ", same_iteration_reloads=" << transformer.num_same_iteration_reloads()
         << ", stencil_carries=" << transformer.num_stencil_carries()
+        << ", future_neighbor_constants=" << transformer.num_future_neighbor_constants()
         << ", affine_replacements=" << transformer.num_affine_replacements()
         << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
         << ", nearest_queries=" << transformer.num_nearest_queries()
-        << ", dead_memory_writes=" << transformer.num_dead_memory_writes();
+        << ", dead_memory_writes=" << transformer.num_dead_memory_writes()
+        << ", dead_pure_results=" << transformer.num_dead_pure_results();
 
     return PassResult::ok(changed, oss.str());
 }

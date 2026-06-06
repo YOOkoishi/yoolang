@@ -34,3 +34,4 @@ int main() {
 // POLY-NOT: distance=loop-carried [0, 0, 1]
 
 // YIR-NOT: poly.stencil.carry
+// YIR-NOT: poly.future
