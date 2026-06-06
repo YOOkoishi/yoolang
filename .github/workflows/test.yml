@@ -21,9 +21,11 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - name: Checkout over SSH 443
+      - name: Checkout with SSH/HTTPS fallback
+        timeout-minutes: 10
         env:
           CI_GITHUB_SSH_KEY: ${{ secrets.CI_GITHUB_SSH_KEY }}
+          CHECKOUT_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -33,19 +35,84 @@ jobs:
           printf '%s\n' "$CI_GITHUB_SSH_KEY" > ~/.ssh/ci_github_key
           chmod 600 ~/.ssh/ci_github_key
 
-          ssh-keyscan -p 443 ssh.github.com >> ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          github_known_hosts="$HOME/.ssh/github_known_hosts"
+          ssh_ready=false
+          if timeout --kill-after=5s 20s ssh-keyscan -T 15 -p 443 ssh.github.com \
+            > "$github_known_hosts"; then
+            ssh_ready=true
+          else
+            echo "SSH host-key lookup failed; checkout will start with HTTPS"
+            : > "$github_known_hosts"
+          fi
+          chmod 644 "$github_known_hosts"
 
           git init .
-          git remote remove origin 2>/dev/null || true
-          git remote add origin ssh://git@ssh.github.com:443/YOOkoishi/yoolang.git
+          git remote set-url origin ssh://git@ssh.github.com:443/YOOkoishi/yoolang.git \
+            2>/dev/null || git remote add origin ssh://git@ssh.github.com:443/YOOkoishi/yoolang.git
 
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/ci_github_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
-            git fetch --prune --no-recurse-submodules origin \
-            +refs/heads/*:refs/remotes/origin/* \
-            +refs/tags/*:refs/tags/*
+          # A cancelled self-hosted run can leave fetch locks in the persistent workspace.
+          rm -f .git/index.lock .git/shallow.lock .git/FETCH_HEAD.lock
 
-          git checkout --force "$GITHUB_SHA"
+          export GIT_SSH_COMMAND="ssh \
+            -i $HOME/.ssh/ci_github_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=$github_known_hosts \
+            -o ConnectTimeout=15 \
+            -o ConnectionAttempts=3 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3"
+          export GIT_TERMINAL_PROMPT=0
+
+          https_auth="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+
+          fetched=false
+          for attempt in 1 2 3; do
+            if [ "$ssh_ready" = true ]; then
+              echo "Fetching $GITHUB_SHA over SSH (attempt $attempt/3)"
+              if timeout --kill-after=10s 60s git -c protocol.version=2 fetch \
+                --no-tags --no-recurse-submodules --depth=1 origin "$GITHUB_SHA"; then
+                fetched=true
+                break
+              fi
+              echo "SSH fetch failed or timed out; trying HTTPS"
+            else
+              echo "Trying HTTPS fetch (attempt $attempt/3)"
+            fi
+
+            if timeout --kill-after=10s 60s git \
+              -c protocol.version=2 \
+              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $https_auth" \
+              fetch --no-tags --no-recurse-submodules --depth=1 \
+              https://github.com/YOOkoishi/yoolang.git "$GITHUB_SHA"; then
+              fetched=true
+              break
+            fi
+
+            echo "HTTPS fetch attempt $attempt failed or timed out"
+            sleep $((attempt * 10))
+          done
+
+          if [ "$fetched" != true ]; then
+            echo "Git fetch unavailable; downloading the current commit archive"
+            archive="$RUNNER_TEMP/yoolang-$GITHUB_SHA.tar.gz"
+            rm -f "$archive"
+            curl --fail --location --silent --show-error \
+              --retry 2 --retry-all-errors --retry-max-time 150 \
+              --connect-timeout 15 --max-time 120 \
+              --header "Authorization: Bearer $CHECKOUT_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --output "$archive" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA"
+            tar -tzf "$archive" >/dev/null
+
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+            tar -xzf "$archive" --strip-components=1
+            echo "Checked out $GITHUB_SHA from GitHub archive fallback"
+          else
+            git checkout --force --detach FETCH_HEAD
+          fi
 
       - name: Clean CI outputs
         run: |
