@@ -46,6 +46,7 @@ struct NormalizedAddExprHash {
 
 using AddAvailability = std::unordered_map<NormalizedAddExpr, yir::AddIOp *, NormalizedAddExprHash>;
 using ActiveInductionVars = std::vector<const yir::Value *>;
+using ValueMap = std::unordered_map<const yir::Value *, yir::Value *>;
 
 const yir::ConstI32Op *const_i32_def(const yir::Value *value) {
     if (value == nullptr || value->defining_op() == nullptr) {
@@ -111,6 +112,259 @@ bool is_active_affine_expr(const NormalizedAddExpr &expr,
     return std::all_of(expr.terms.begin(), expr.terms.end(), [&active_ivs](const auto &term) {
         return is_active_induction_var(active_ivs, term.first);
     });
+}
+
+yir::Value *map_value(yir::Value *value, const ValueMap &map) {
+    auto found = map.find(value);
+    return found == map.end() ? value : found->second;
+}
+
+std::vector<yir::Value *> map_values(const std::vector<yir::Value *> &values,
+                                     const ValueMap &map) {
+    std::vector<yir::Value *> mapped;
+    mapped.reserve(values.size());
+    for (auto *value : values) {
+        mapped.push_back(map_value(value, map));
+    }
+    return mapped;
+}
+
+std::unique_ptr<yir::Operation> clone_wave_unroll_op(const yir::Operation &op,
+                                                     const ValueMap &map);
+
+bool clone_wave_unroll_region_into(const yir::Region &source, yir::Region &dest,
+                                   ValueMap map) {
+    for (const auto &op : source.operations()) {
+        auto clone = clone_wave_unroll_op(*op, map);
+        if (clone == nullptr) {
+            return false;
+        }
+        clone->set_parent(&dest);
+        if (op->result() != nullptr && clone->result() != nullptr) {
+            map[op->result()] = clone->result();
+        }
+        dest.operations().push_back(std::move(clone));
+    }
+    return true;
+}
+
+std::unique_ptr<yir::Operation> clone_wave_unroll_op(const yir::Operation &op,
+                                                     const ValueMap &map) {
+    if (auto *constant = dynamic_cast<const yir::ConstI32Op *>(&op)) {
+        return std::make_unique<yir::ConstI32Op>(constant->value(), op.result()->name());
+    }
+    if (auto *constant = dynamic_cast<const yir::ConstF32Op *>(&op)) {
+        return std::make_unique<yir::ConstF32Op>(constant->value(), op.result()->name());
+    }
+    if (auto *constant = dynamic_cast<const yir::ConstBoolOp *>(&op)) {
+        return std::make_unique<yir::ConstBoolOp>(constant->value(), op.result()->name());
+    }
+    if (dynamic_cast<const yir::ZeroOp *>(&op) != nullptr) {
+        return std::make_unique<yir::ZeroOp>(op.result()->type(), op.result()->name());
+    }
+    if (auto *var = dynamic_cast<const yir::VarOp *>(&op)) {
+        return std::make_unique<yir::VarOp>(
+            op.result()->type(),
+            var->has_initializer() ? map_value(var->initializer(), map) : nullptr,
+            op.result()->name());
+    }
+    if (auto *assign = dynamic_cast<const yir::AssignOp *>(&op)) {
+        return std::make_unique<yir::AssignOp>(map_value(assign->target(), map),
+                                               map_value(assign->value(), map));
+    }
+    if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(&op)) {
+        return std::make_unique<yir::ArrayLoadOp>(
+            map_value(load->array(), map), map_values(load->indices(), map),
+            op.result()->type(), op.result()->name());
+    }
+    if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(&op)) {
+        return std::make_unique<yir::ArrayStoreOp>(
+            map_value(store->value(), map), map_value(store->array(), map),
+            map_values(store->indices(), map));
+    }
+    if (auto *binary = dynamic_cast<const yir::BinaryOpBase *>(&op)) {
+        auto *lhs = map_value(binary->lhs(), map);
+        auto *rhs = map_value(binary->rhs(), map);
+        if (dynamic_cast<const yir::AddIOp *>(&op) != nullptr) {
+            return std::make_unique<yir::AddIOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::SubIOp *>(&op) != nullptr) {
+            return std::make_unique<yir::SubIOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::MulIOp *>(&op) != nullptr) {
+            return std::make_unique<yir::MulIOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::DivSIOp *>(&op) != nullptr) {
+            return std::make_unique<yir::DivSIOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::RemSIOp *>(&op) != nullptr) {
+            return std::make_unique<yir::RemSIOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::AddFOp *>(&op) != nullptr) {
+            return std::make_unique<yir::AddFOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::SubFOp *>(&op) != nullptr) {
+            return std::make_unique<yir::SubFOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::MulFOp *>(&op) != nullptr) {
+            return std::make_unique<yir::MulFOp>(lhs, rhs, op.result()->name());
+        }
+        if (dynamic_cast<const yir::DivFOp *>(&op) != nullptr) {
+            return std::make_unique<yir::DivFOp>(lhs, rhs, op.result()->name());
+        }
+        if (auto *icmp = dynamic_cast<const yir::ICmpOp *>(&op)) {
+            return std::make_unique<yir::ICmpOp>(icmp->predicate(), lhs, rhs,
+                                                 op.result()->name());
+        }
+        if (auto *fcmp = dynamic_cast<const yir::FCmpOp *>(&op)) {
+            return std::make_unique<yir::FCmpOp>(fcmp->predicate(), lhs, rhs,
+                                                 op.result()->name());
+        }
+    }
+    if (dynamic_cast<const yir::ZExtI1ToI32Op *>(&op) != nullptr) {
+        return std::make_unique<yir::ZExtI1ToI32Op>(map_value(op.operands()[0], map),
+                                                    op.result()->name());
+    }
+    if (dynamic_cast<const yir::TruncI32ToI1Op *>(&op) != nullptr) {
+        return std::make_unique<yir::TruncI32ToI1Op>(map_value(op.operands()[0], map),
+                                                     op.result()->name());
+    }
+    if (dynamic_cast<const yir::SIToFPOp *>(&op) != nullptr) {
+        return std::make_unique<yir::SIToFPOp>(map_value(op.operands()[0], map),
+                                               op.result()->name());
+    }
+    if (dynamic_cast<const yir::FPToSIOp *>(&op) != nullptr) {
+        return std::make_unique<yir::FPToSIOp>(map_value(op.operands()[0], map),
+                                               op.result()->name());
+    }
+    if (dynamic_cast<const yir::ToBoolOp *>(&op) != nullptr) {
+        return std::make_unique<yir::ToBoolOp>(map_value(op.operands()[0], map),
+                                               op.result()->name());
+    }
+    if (dynamic_cast<const yir::NotOp *>(&op) != nullptr) {
+        return std::make_unique<yir::NotOp>(map_value(op.operands()[0], map),
+                                            op.result()->name());
+    }
+    if (auto *call = dynamic_cast<const yir::CallOp *>(&op)) {
+        return std::make_unique<yir::CallOp>(
+            call->callee(), map_values(call->args(), map),
+            op.result() == nullptr ? yir::Type::get_void() : op.result()->type(),
+            op.result() == nullptr ? "" : op.result()->name());
+    }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        auto clone = std::make_unique<yir::IfOp>(map_value(if_op->condition(), map));
+        if (!clone_wave_unroll_region_into(if_op->then_region(), clone->then_region(), map)) {
+            return nullptr;
+        }
+        if (if_op->has_else()) {
+            clone->set_has_else(true);
+            if (!clone_wave_unroll_region_into(if_op->else_region(), clone->else_region(),
+                                               map)) {
+                return nullptr;
+            }
+        }
+        return clone;
+    }
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        auto clone = std::make_unique<yir::ForOp>(
+            map_value(for_op->induction_var(), map), map_value(for_op->lower_bound(), map),
+            map_value(for_op->upper_bound(), map), map_value(for_op->step(), map));
+        clone->set_parallel(for_op->is_parallel());
+        if (!clone_wave_unroll_region_into(for_op->body_region(), clone->body_region(), map)) {
+            return nullptr;
+        }
+        return clone;
+    }
+    return nullptr;
+}
+
+bool is_wave_unroll_safe(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ForOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ContinueOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ReturnOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::CondOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ArrayInitOp *>(op.get()) != nullptr) {
+            return false;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (!is_wave_unroll_safe(if_op->then_region()) ||
+                (if_op->has_else() && !is_wave_unroll_safe(if_op->else_region()))) {
+                return false;
+            }
+        }
+        if (clone_wave_unroll_op(*op, {}) == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_parallel_wave_unroll_safe(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ContinueOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ReturnOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::CondOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ArrayInitOp *>(op.get()) != nullptr) {
+            return false;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (!is_parallel_wave_unroll_safe(if_op->then_region()) ||
+                (if_op->has_else() &&
+                 !is_parallel_wave_unroll_safe(if_op->else_region()))) {
+                return false;
+            }
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (!is_parallel_wave_unroll_safe(for_op->body_region())) {
+                return false;
+            }
+        }
+        if (clone_wave_unroll_op(*op, {}) == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::size_t wave_unroll_operation_count(const yir::Region &region) {
+    std::size_t count = 0;
+    for (const auto &op : region.operations()) {
+        ++count;
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            count += wave_unroll_operation_count(if_op->then_region());
+            if (if_op->has_else()) {
+                count += wave_unroll_operation_count(if_op->else_region());
+            }
+        } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            count += wave_unroll_operation_count(for_op->body_region());
+        }
+    }
+    return count;
+}
+
+bool clone_wave_unroll_prefix_into(const yir::Region &source, yir::Region &dest,
+                                   ValueMap map, std::size_t count) {
+    if (count > source.operations().size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto &op = source.operations()[i];
+        auto clone = clone_wave_unroll_op(*op, map);
+        if (clone == nullptr) {
+            return false;
+        }
+        clone->set_parent(&dest);
+        if (op->result() != nullptr && clone->result() != nullptr) {
+            map[op->result()] = clone->result();
+        }
+        dest.operations().push_back(std::move(clone));
+    }
+    return true;
 }
 
 std::size_t symbol_index(std::vector<const yir::Value *> &symbols, const yir::Value *value) {
@@ -691,9 +945,10 @@ public:
                                    const YIRPolyhedralCanonicalInfo& canonical_info)
         : module_(module), model_info_(model_info), dep_info_(dep_info),
           canonical_info_(canonical_info), num_interchanged_(0), num_tiled_(0),
-          num_serial_wavefronts_(0), num_parallel_wavefronts_(0),
-          num_same_iteration_reloads_(0), num_stencil_carries_(0), num_affine_replacements_(0),
-          num_nearest_write_queries_(0), num_nearest_queries_(0) {}
+          num_serial_wavefronts_(0), num_parallel_wavefronts_(0), num_wave_unrolls_(0),
+          num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
+          num_stencil_carries_(0), num_affine_replacements_(0), num_nearest_write_queries_(0),
+          num_nearest_queries_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -730,6 +985,8 @@ public:
     std::size_t num_tiled() const { return num_tiled_; }
     std::size_t num_serial_wavefronts() const { return num_serial_wavefronts_; }
     std::size_t num_parallel_wavefronts() const { return num_parallel_wavefronts_; }
+    std::size_t num_wave_unrolls() const { return num_wave_unrolls_; }
+    std::size_t num_parallel_wave_unrolls() const { return num_parallel_wave_unrolls_; }
     std::size_t num_same_iteration_reloads() const { return num_same_iteration_reloads_; }
     std::size_t num_stencil_carries() const { return num_stencil_carries_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
@@ -1070,6 +1327,12 @@ private:
         if (!tile_wavefront_j_loop(*candidate.j_loop, tile_step, j_lower, j_upper, j_step)) {
             return false;
         }
+        if (unroll_wavefront_point_loop(*candidate.j_loop)) {
+            ++num_wave_unrolls_;
+        }
+        if (unroll_parallel_wavefront_loop(*candidate.i_loop)) {
+            ++num_parallel_wave_unrolls_;
+        }
 
         auto finish_i =
             make_parented_op<yir::AssignOp>(*w_body, candidate.i_loop->induction_var(), i_upper);
@@ -1118,6 +1381,131 @@ private:
             make_parented_op<yir::AssignOp>(*i_body, j_loop.induction_var(), j_upper);
         i_ops.insert(i_ops.begin() + static_cast<std::ptrdiff_t>(insert_pos + 1),
                      std::move(finish_j));
+        return true;
+    }
+
+    bool unroll_wavefront_point_loop(yir::ForOp &loop) {
+        constexpr int kWaveUnrollFactor = 2;
+        constexpr std::size_t kMaxWaveUnrolledOps = 192;
+
+        auto *parent = loop.parent();
+        std::size_t loop_index = 0;
+        if (parent == nullptr || !find_operation_index(*parent, loop, loop_index)) {
+            return false;
+        }
+
+        std::int64_t step = 0;
+        if (!const_i32_value(loop.step(), step) || step != 1 ||
+            !is_wave_unroll_safe(loop.body_region())) {
+            return false;
+        }
+
+        const std::size_t original_count = loop.body_region().operations().size();
+        const std::size_t recursive_count = wave_unroll_operation_count(loop.body_region());
+        if (original_count == 0 ||
+            recursive_count * static_cast<std::size_t>(kWaveUnrollFactor) >
+                kMaxWaveUnrolledOps) {
+            return false;
+        }
+
+        std::size_t insert_pos = loop_index;
+        auto *unroll_step = insert_op_before<yir::ConstI32Op>(
+            *parent, insert_pos, kWaveUnrollFactor,
+            wave_temp_name("unroll.step", next_wave_temp_++));
+        loop.operands()[3] = unroll_step->result();
+
+        for (int lane = 1; lane < kWaveUnrollFactor; ++lane) {
+            auto lane_const = make_parented_op<yir::ConstI32Op>(
+                loop.body_region(), lane, wave_temp_name("lane", next_wave_temp_++));
+            auto *lane_const_value = lane_const->result();
+            loop.body_region().operations().push_back(std::move(lane_const));
+
+            auto lane_iv = make_parented_op<yir::AddIOp>(
+                loop.body_region(), loop.induction_var(), lane_const_value,
+                wave_temp_name("iv", next_wave_temp_++));
+            auto *lane_iv_value = lane_iv->result();
+            loop.body_region().operations().push_back(std::move(lane_iv));
+
+            auto lane_in_bounds = make_parented_op<yir::ICmpOp>(
+                loop.body_region(), yir::ICmpOp::Predicate::Lt, lane_iv_value,
+                loop.upper_bound(), wave_temp_name("lane.lt", next_wave_temp_++));
+            auto *lane_in_bounds_value = lane_in_bounds->result();
+            loop.body_region().operations().push_back(std::move(lane_in_bounds));
+
+            auto lane_if =
+                make_parented_op<yir::IfOp>(loop.body_region(), lane_in_bounds_value);
+            ValueMap map;
+            map[loop.induction_var()] = lane_iv_value;
+            if (!clone_wave_unroll_prefix_into(loop.body_region(), lane_if->then_region(),
+                                               std::move(map), original_count)) {
+                return false;
+            }
+            loop.body_region().operations().push_back(std::move(lane_if));
+        }
+
+        return true;
+    }
+
+    bool unroll_parallel_wavefront_loop(yir::ForOp &loop) {
+        constexpr int kParallelWaveUnrollFactor = 2;
+        constexpr std::size_t kMaxParallelWaveUnrolledOps = 512;
+
+        auto *parent = loop.parent();
+        std::size_t loop_index = 0;
+        if (parent == nullptr || !loop.is_parallel() ||
+            !find_operation_index(*parent, loop, loop_index)) {
+            return false;
+        }
+
+        std::int64_t step = 0;
+        if (!const_i32_value(loop.step(), step) || step != 1 ||
+            !is_parallel_wave_unroll_safe(loop.body_region())) {
+            return false;
+        }
+
+        const std::size_t original_count = loop.body_region().operations().size();
+        const std::size_t recursive_count = wave_unroll_operation_count(loop.body_region());
+        if (original_count == 0 ||
+            recursive_count * static_cast<std::size_t>(kParallelWaveUnrollFactor) >
+                kMaxParallelWaveUnrolledOps) {
+            return false;
+        }
+
+        std::size_t insert_pos = loop_index;
+        auto *unroll_step = insert_op_before<yir::ConstI32Op>(
+            *parent, insert_pos, kParallelWaveUnrollFactor,
+            wave_temp_name("par.unroll.step", next_wave_temp_++));
+        loop.operands()[3] = unroll_step->result();
+
+        for (int lane = 1; lane < kParallelWaveUnrollFactor; ++lane) {
+            auto lane_const = make_parented_op<yir::ConstI32Op>(
+                loop.body_region(), lane, wave_temp_name("par.lane", next_wave_temp_++));
+            auto *lane_const_value = lane_const->result();
+            loop.body_region().operations().push_back(std::move(lane_const));
+
+            auto lane_iv = make_parented_op<yir::AddIOp>(
+                loop.body_region(), loop.induction_var(), lane_const_value,
+                wave_temp_name("par.iv", next_wave_temp_++));
+            auto *lane_iv_value = lane_iv->result();
+            loop.body_region().operations().push_back(std::move(lane_iv));
+
+            auto lane_in_bounds = make_parented_op<yir::ICmpOp>(
+                loop.body_region(), yir::ICmpOp::Predicate::Lt, lane_iv_value,
+                loop.upper_bound(), wave_temp_name("par.lane.lt", next_wave_temp_++));
+            auto *lane_in_bounds_value = lane_in_bounds->result();
+            loop.body_region().operations().push_back(std::move(lane_in_bounds));
+
+            auto lane_if =
+                make_parented_op<yir::IfOp>(loop.body_region(), lane_in_bounds_value);
+            ValueMap map;
+            map[loop.induction_var()] = lane_iv_value;
+            if (!clone_wave_unroll_prefix_into(loop.body_region(), lane_if->then_region(),
+                                               std::move(map), original_count)) {
+                return false;
+            }
+            loop.body_region().operations().push_back(std::move(lane_if));
+        }
+
         return true;
     }
 
@@ -1475,6 +1863,8 @@ private:
     std::size_t num_tiled_;
     std::size_t num_serial_wavefronts_;
     std::size_t num_parallel_wavefronts_;
+    std::size_t num_wave_unrolls_;
+    std::size_t num_parallel_wave_unrolls_;
     std::size_t num_same_iteration_reloads_;
     std::size_t num_stencil_carries_;
     std::size_t num_affine_replacements_;
@@ -1530,6 +1920,8 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", tiling=" << transformer.num_tiled()
         << ", serial_wavefronts=" << transformer.num_serial_wavefronts()
         << ", parallel_wavefronts=" << transformer.num_parallel_wavefronts()
+        << ", wave_unrolls=" << transformer.num_wave_unrolls()
+        << ", parallel_wave_unrolls=" << transformer.num_parallel_wave_unrolls()
         << ", same_iteration_reloads=" << transformer.num_same_iteration_reloads()
         << ", stencil_carries=" << transformer.num_stencil_carries()
         << ", affine_replacements=" << transformer.num_affine_replacements()

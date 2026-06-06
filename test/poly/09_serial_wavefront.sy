@@ -37,6 +37,8 @@ int main() {
 // YIR: [[WLB:%poly.wave.lb[0-9]+]] = yir.addi {{%poly.wave.lb[0-9]+}},
 // YIR: [[W:%poly.wave.w[0-9]+]] = yir.var : i32 = [[WLB]]
 // YIR: [[TILE:%poly.wave.tile[0-9]+]] = yir.const.i32 8 : i32
+// YIR: [[PAR_UNROLL:%poly.wave.par.unroll.step[0-9]+]] = yir.const.i32 2 : i32
+// YIR: [[UNROLL:%poly.wave.unroll.step[0-9]+]] = yir.const.i32 2 : i32
 // YIR: yir.for [[W]] = [[WLB]] to {{%poly.wave.ub[0-9]+}} step
 // YIR: [[IT:%poly.wave.it[0-9]+]] = yir.var : i32 =
 // YIR: yir.for [[IT]] = {{.*}} step [[TILE]]
@@ -45,7 +47,7 @@ int main() {
 // YIR: [[IGT:%poly.wave.igt[0-9]+]] = yir.icmp gt [[ILIM]],
 // YIR: yir.if [[IGT]]
 // YIR: yir.assign [[ILIM]],
-// YIR: yir.for %i = [[IT]] to [[ILIM]] step {{.*}} parallel
+// YIR: yir.for %i = [[IT]] to [[ILIM]] step [[PAR_UNROLL]] parallel
 // YIR: [[WSUB:%poly.wave.sub[0-9]+]] = yir.subi [[W]], %i
 // YIR: [[JT:%poly.wave.jt[0-9]+]] = yir.var : i32 =
 // YIR: yir.for [[JT]] = {{.*}} step [[TILE]]
@@ -54,7 +56,7 @@ int main() {
 // YIR: [[JGT:%poly.wave.jgt[0-9]+]] = yir.icmp gt [[JLIM]],
 // YIR: yir.if [[JGT]]
 // YIR: yir.assign [[JLIM]],
-// YIR: yir.for %j = [[JT]] to [[JLIM]] step
+// YIR: yir.for %j = [[JT]] to [[JLIM]] step [[UNROLL]]
 // YIR-NOT: yir.for %k =
 // YIR: [[WK:%poly.wave.k[0-9]+]] = yir.subi [[WSUB]], %j
 // YIR: yir.assign %k, [[WK]]
@@ -63,4 +65,8 @@ int main() {
 // YIR: [[LT:%poly.wave.lt[0-9]+]] = yir.icmp lt %k,
 // YIR: yir.if [[LT]]
 // YIR: yir.array_store {{.*}}, @x, [%i, %j, %k]
+// YIR: [[LANE_LT:%poly.wave.lane.lt[0-9]+]] = yir.icmp lt
+// YIR: yir.if [[LANE_LT]]
+// YIR: [[PAR_LANE_LT:%poly.wave.par.lane.lt[0-9]+]] = yir.icmp lt
+// YIR: yir.if [[PAR_LANE_LT]]
 // YIR: yir.assign %k, {{%poly.add[0-9]+}}
