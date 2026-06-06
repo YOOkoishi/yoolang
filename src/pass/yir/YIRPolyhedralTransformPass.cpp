@@ -216,6 +216,7 @@ struct SerialWavefrontCandidate {
     yir::ForOp *i_loop = nullptr;
     yir::ForOp *j_loop = nullptr;
     yir::ForOp *k_loop = nullptr;
+    bool inner_wave_parallel = false;
 };
 
 bool is_valid_affine_access(const PolyAccess &access) {
@@ -690,8 +691,9 @@ public:
                                    const YIRPolyhedralCanonicalInfo& canonical_info)
         : module_(module), model_info_(model_info), dep_info_(dep_info),
           canonical_info_(canonical_info), num_interchanged_(0), num_tiled_(0),
-          num_serial_wavefronts_(0), num_same_iteration_reloads_(0), num_stencil_carries_(0),
-          num_affine_replacements_(0), num_nearest_write_queries_(0), num_nearest_queries_(0) {}
+          num_serial_wavefronts_(0), num_parallel_wavefronts_(0),
+          num_same_iteration_reloads_(0), num_stencil_carries_(0), num_affine_replacements_(0),
+          num_nearest_write_queries_(0), num_nearest_queries_(0) {}
 
     bool transform() {
         bool changed = false;
@@ -727,6 +729,7 @@ public:
     std::size_t num_interchanged() const { return num_interchanged_; }
     std::size_t num_tiled() const { return num_tiled_; }
     std::size_t num_serial_wavefronts() const { return num_serial_wavefronts_; }
+    std::size_t num_parallel_wavefronts() const { return num_parallel_wavefronts_; }
     std::size_t num_same_iteration_reloads() const { return num_same_iteration_reloads_; }
     std::size_t num_stencil_carries() const { return num_stencil_carries_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
@@ -836,7 +839,7 @@ private:
             }
         }
 
-        candidate = {i_loop, j_loop, k_loop};
+        candidate = {i_loop, j_loop, k_loop, true};
         return true;
     }
 
@@ -896,7 +899,15 @@ private:
         w_loop->body_region().operations().push_back(std::move(moved_i_loop));
         outer_ops[i_loop_index] = std::move(w_loop);
 
-        return rewrite_k_loop_as_wave_guard(candidate, w_var->result());
+        if (!rewrite_k_loop_as_wave_guard(candidate, w_var->result())) {
+            return false;
+        }
+
+        if (candidate.inner_wave_parallel) {
+            candidate.i_loop->set_parallel(true);
+            ++num_parallel_wavefronts_;
+        }
+        return true;
     }
 
     yir::Value *materialize_wave_lower(yir::Region &region, std::size_t &insert_pos,
@@ -1321,6 +1332,7 @@ private:
     std::size_t num_interchanged_;
     std::size_t num_tiled_;
     std::size_t num_serial_wavefronts_;
+    std::size_t num_parallel_wavefronts_;
     std::size_t num_same_iteration_reloads_;
     std::size_t num_stencil_carries_;
     std::size_t num_affine_replacements_;
@@ -1375,6 +1387,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
     oss << "interchange=" << transformer.num_interchanged()
         << ", tiling=" << transformer.num_tiled()
         << ", serial_wavefronts=" << transformer.num_serial_wavefronts()
+        << ", parallel_wavefronts=" << transformer.num_parallel_wavefronts()
         << ", same_iteration_reloads=" << transformer.num_same_iteration_reloads()
         << ", stencil_carries=" << transformer.num_stencil_carries()
         << ", affine_replacements=" << transformer.num_affine_replacements()

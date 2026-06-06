@@ -620,9 +620,16 @@ class ForOp final : public Operation {
     const Region &body_region() const {
         return body_region_;
     }
+    bool is_parallel() const {
+        return is_parallel_;
+    }
+    void set_parallel(bool is_parallel) {
+        is_parallel_ = is_parallel;
+    }
 
   private:
     Region body_region_;
+    bool is_parallel_ = false;
 };
 
 class CondOp final : public Operation {

@@ -35,4 +35,5 @@ int main() {
 }
 
 // YIR-NOT: poly.wave
+// YIR-NOT: parallel
 // YIR: yir.for %k =

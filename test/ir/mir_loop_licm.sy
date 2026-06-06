@@ -20,10 +20,10 @@ int main() {
 
 // MIR-LABEL: func @hoist_stride
 // MIR: SLLI {{.*}}, {{.*}}, 2
-// MIR: while.cond.4:
+// MIR: {{(while|for)}}.cond.{{[0-9]+}}:
 // MIR-NOT: SLLI
-// MIR: while.body.5:
+// MIR: {{(while|for)}}.body.{{[0-9]+}}:
 // MIR-NOT: SLLI
 // MIR: ADD {{.*}}
 // MIR-NOT: SLLI
-// MIR: while.end.6:
+// MIR-LABEL: func @main

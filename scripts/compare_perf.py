@@ -252,10 +252,6 @@ def _ensure_runtime_lib() -> Path:
             return runtime_lib
         raise FileNotFoundError(f"SYSY_RUNTIME_LIB was set but file does not exist: {runtime_lib}")
 
-    for runtime_lib in (DEFAULT_RUNTIME_LIB_ALT, DEFAULT_RUNTIME_LIB):
-        if runtime_lib.exists():
-            return runtime_lib
-
     if not RUNTIME_SOURCE.exists() or not RUNTIME_HEADER.exists():
         raise FileNotFoundError(
             "missing runtime/sylib.c or runtime/sylib.h, cannot build sysy runtime"

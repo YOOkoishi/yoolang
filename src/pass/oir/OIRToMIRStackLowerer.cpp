@@ -76,6 +76,12 @@ class Lowerer final {
             out.align = 8;
             return out;
         }
+        if (type->is_function()) {
+            out.value_type = mir::ValueType::Ptr;
+            out.size = 8;
+            out.align = 8;
+            return out;
+        }
         if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
             auto element = type_info(array->element_type());
             out.value_type = mir::ValueType::Aggregate;
@@ -721,6 +727,11 @@ class Lowerer final {
         if (auto *global = dynamic_cast<oir::GlobalVariable *>(value)) {
             emit(mir::Opcode::LoadGlobalAddr,
                  {mir::MachineOperand::reg(reg), mir::MachineOperand::global(global->name())});
+            return;
+        }
+        if (auto *function = dynamic_cast<oir::Function *>(value)) {
+            emit(mir::Opcode::LoadGlobalAddr,
+                 {mir::MachineOperand::reg(reg), mir::MachineOperand::global(function->name())});
             return;
         }
 

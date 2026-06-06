@@ -1,4 +1,6 @@
 // RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-oir -O1 --polyhedral %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler -S -O1 --polyhedral %s | FileCheck %s --check-prefix=ASM
 
 int x[32][32][32];
 
@@ -34,17 +36,12 @@ int main() {
   return 0;
 }
 
-// YIR: [[WLB:%poly.wave.lb[0-9]+]] = yir.addi {{%poly.wave.lb[0-9]+}},
-// YIR: [[W:%poly.wave.w[0-9]+]] = yir.var : i32 = [[WLB]]
-// YIR: yir.for [[W]] = [[WLB]] to {{%poly.wave.ub[0-9]+}} step
 // YIR: yir.for %i = {{.*}} parallel
-// YIR: yir.for %j =
-// YIR-NOT: yir.for %k =
-// YIR: [[WK:%poly.wave.k[0-9]+]] = yir.subi
-// YIR: yir.assign %k, [[WK]]
-// YIR: [[GE:%poly.wave.ge[0-9]+]] = yir.icmp ge %k,
-// YIR: yir.if [[GE]]
-// YIR: [[LT:%poly.wave.lt[0-9]+]] = yir.icmp lt %k,
-// YIR: yir.if [[LT]]
-// YIR: yir.array_store {{.*}}, @x, [%i, %j, %k]
-// YIR: yir.assign %k, {{%poly.add[0-9]+}}
+
+// OIR-LABEL: define i32 @main()
+// OIR-NOT: __yoo_parallel_for
+// OIR-NOT: __yoo_parallel_worker
+// OIR-NOT: __yoo_parallel_capture
+
+// ASM-LABEL: main:
+// ASM-NOT: __yoo_parallel

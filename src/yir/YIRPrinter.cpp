@@ -328,7 +328,11 @@ void YIRPrinter::print_operation(const Operation &op) {
         write_indent();
         out_ << "yir.for " << value_name(for_op->induction_var()) << " = "
              << value_name(for_op->lower_bound()) << " to " << value_name(for_op->upper_bound())
-             << " step " << value_name(for_op->step()) << " {\n";
+             << " step " << value_name(for_op->step());
+        if (for_op->is_parallel()) {
+            out_ << " parallel";
+        }
+        out_ << " {\n";
         with_indent(1);
         print_region(for_op->body_region());
         with_indent(-1);
