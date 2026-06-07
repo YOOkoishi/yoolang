@@ -1,18 +1,387 @@
 #include "pass/yir/YIRPolyhedralPipelinePass.h"
 
+#include "pass/ast/ASTToYIRPass.h"
 #include "pass/yir/YIRPolyhedralCanonicalizePass.h"
 #include "pass/yir/YIRPolyhedralDependenceAnalysisPass.h"
 #include "pass/yir/YIRPolyhedralModelBuildPass.h"
 #include "pass/yir/YIRPolyhedralTransformPass.h"
 #include "pass/yir/YIRSCoPDetectPass.h"
+#include "yir/YIR.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <sstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace pass {
+namespace {
+
+const yir::ConstI32Op *const_i32_def(const yir::Value *value) {
+    return value == nullptr ? nullptr : dynamic_cast<const yir::ConstI32Op *>(value->defining_op());
+}
+
+bool const_i32_value(const yir::Value *value, std::int64_t &out) {
+    auto *constant = const_i32_def(value);
+    if (constant == nullptr) {
+        return false;
+    }
+    out = constant->value();
+    return true;
+}
+
+struct AffineDimOffset {
+    const yir::Value *dim = nullptr;
+    std::int64_t offset = 0;
+};
+
+bool parse_dim_offset(const yir::Value *value, AffineDimOffset &out) {
+    std::int64_t constant = 0;
+    if (const_i32_value(value, constant)) {
+        out = {nullptr, constant};
+        return true;
+    }
+
+    if (auto *add = value == nullptr ? nullptr : dynamic_cast<const yir::AddIOp *>(value->defining_op())) {
+        std::int64_t rhs = 0;
+        if (const_i32_value(add->rhs(), rhs)) {
+            out = {add->lhs(), rhs};
+            return true;
+        }
+        std::int64_t lhs = 0;
+        if (const_i32_value(add->lhs(), lhs)) {
+            out = {add->rhs(), lhs};
+            return true;
+        }
+    }
+
+    if (auto *sub = value == nullptr ? nullptr : dynamic_cast<const yir::SubIOp *>(value->defining_op())) {
+        std::int64_t rhs = 0;
+        if (const_i32_value(sub->rhs(), rhs)) {
+            out = {sub->lhs(), -rhs};
+            return true;
+        }
+    }
+
+    out = {value, 0};
+    return value != nullptr;
+}
+
+std::size_t array_rank_of_value(const yir::Value *value) {
+    if (value == nullptr || value->type() == nullptr) {
+        return 0;
+    }
+    auto type = value->type();
+    if (type->kind() == yir::Type::Kind::Ptr) {
+        type = type->pointee();
+    }
+    return yir::array_rank(type);
+}
+
+std::uint64_t bounded_array_element_count(const yir::Value *value) {
+    if (value == nullptr || value->type() == nullptr) {
+        return 0;
+    }
+
+    auto type = value->type();
+    if (type->kind() == yir::Type::Kind::Ptr) {
+        type = type->pointee();
+    }
+
+    std::uint64_t count = 1;
+    while (type != nullptr && type->kind() == yir::Type::Kind::Array) {
+        if (type->count() != 0 &&
+            count > std::numeric_limits<std::uint64_t>::max() / type->count()) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        count *= type->count();
+        type = type->element();
+    }
+    return count;
+}
+
+bool vector_contains_value(const std::vector<const yir::Value *> &values,
+                           const yir::Value *value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+void push_unique_value(std::vector<const yir::Value *> &values, const yir::Value *value) {
+    if (value != nullptr && !vector_contains_value(values, value)) {
+        values.push_back(value);
+    }
+}
+
+bool same_offset_vector(const std::vector<std::int64_t> &lhs,
+                        const std::vector<std::int64_t> &rhs) {
+    return lhs == rhs;
+}
+
+void push_unique_offset(std::vector<std::vector<std::int64_t>> &offsets,
+                        std::vector<std::int64_t> offset) {
+    const auto found =
+        std::find_if(offsets.begin(), offsets.end(), [&](const auto &existing) {
+            return same_offset_vector(existing, offset);
+        });
+    if (found == offsets.end()) {
+        offsets.push_back(std::move(offset));
+    }
+}
+
+bool parse_access_relative_to_store(const std::vector<yir::Value *> &indices,
+                                    const std::vector<AffineDimOffset> &store_dims,
+                                    std::vector<std::int64_t> &offsets) {
+    if (indices.size() != store_dims.size()) {
+        return false;
+    }
+
+    offsets.clear();
+    offsets.reserve(indices.size());
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        AffineDimOffset access;
+        if (!parse_dim_offset(indices[i], access) || access.dim != store_dims[i].dim) {
+            return false;
+        }
+        offsets.push_back(access.offset - store_dims[i].offset);
+    }
+    return true;
+}
+
+bool all_offsets_unit_bounded(const std::vector<std::int64_t> &offsets) {
+    return std::all_of(offsets.begin(), offsets.end(), [](std::int64_t offset) {
+        return offset >= -1 && offset <= 1;
+    });
+}
+
+bool any_nonzero_offset(const std::vector<std::int64_t> &offsets) {
+    return std::any_of(offsets.begin(), offsets.end(), [](std::int64_t offset) {
+        return offset != 0;
+    });
+}
+
+bool any_positive_offset(const std::vector<std::int64_t> &offsets) {
+    return std::any_of(offsets.begin(), offsets.end(), [](std::int64_t offset) {
+        return offset > 0;
+    });
+}
+
+bool any_negative_offset(const std::vector<std::int64_t> &offsets) {
+    return std::any_of(offsets.begin(), offsets.end(), [](std::int64_t offset) {
+        return offset < 0;
+    });
+}
+
+bool is_innermost_previous_offset(const std::vector<std::int64_t> &offsets) {
+    if (offsets.empty() || offsets.back() != -1) {
+        return false;
+    }
+    for (std::size_t i = 0; i + 1 < offsets.size(); ++i) {
+        if (offsets[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct PolyhedralProfitabilityEstimate {
+    int score = 0;
+    std::size_t best_rank = 0;
+    std::size_t best_affine_loads = 0;
+    std::size_t best_unit_neighbor_loads = 0;
+    std::size_t best_distinct_offsets = 0;
+};
+
+PolyhedralProfitabilityEstimate estimate_store_profitability(
+    const yir::ArrayStoreOp &store,
+    const std::vector<const yir::Value *> &constant_initialized_arrays) {
+    PolyhedralProfitabilityEstimate estimate;
+    const auto store_indices = store.indices();
+    const auto rank = array_rank_of_value(store.array());
+    if (rank < 2 || store_indices.size() != rank || store.parent() == nullptr) {
+        return estimate;
+    }
+
+    std::vector<AffineDimOffset> store_dims;
+    store_dims.reserve(store_indices.size());
+    std::vector<const yir::Value *> unique_dims;
+    for (auto *index : store_indices) {
+        AffineDimOffset dim;
+        if (!parse_dim_offset(index, dim) || dim.dim == nullptr ||
+            vector_contains_value(unique_dims, dim.dim)) {
+            return estimate;
+        }
+        store_dims.push_back(dim);
+        unique_dims.push_back(dim.dim);
+    }
+
+    std::size_t same_memory_loads = 0;
+    std::size_t affine_loads = 0;
+    std::size_t unit_neighbor_loads = 0;
+    std::size_t positive_unit_loads = 0;
+    std::size_t negative_unit_loads = 0;
+    bool has_innermost_previous_load = false;
+    std::vector<std::vector<std::int64_t>> distinct_offsets;
+
+    for (const auto &op : store.parent()->operations()) {
+        auto *load = dynamic_cast<const yir::ArrayLoadOp *>(op.get());
+        if (load == nullptr || load->array() != store.array()) {
+            continue;
+        }
+        ++same_memory_loads;
+
+        std::vector<std::int64_t> offsets;
+        if (!parse_access_relative_to_store(load->indices(), store_dims, offsets)) {
+            continue;
+        }
+        ++affine_loads;
+        push_unique_offset(distinct_offsets, offsets);
+
+        if (!all_offsets_unit_bounded(offsets) || !any_nonzero_offset(offsets)) {
+            continue;
+        }
+        ++unit_neighbor_loads;
+        if (any_positive_offset(offsets)) {
+            ++positive_unit_loads;
+        }
+        if (any_negative_offset(offsets)) {
+            ++negative_unit_loads;
+        }
+        has_innermost_previous_load =
+            has_innermost_previous_load || is_innermost_previous_offset(offsets);
+    }
+
+    if (same_memory_loads < 2 || affine_loads < 2 || unit_neighbor_loads < 2) {
+        return estimate;
+    }
+
+    int score = 0;
+    score += static_cast<int>(std::min<std::size_t>(affine_loads, 10) * 8);
+    score += static_cast<int>(std::min<std::size_t>(unit_neighbor_loads, 10) * 10);
+    score += static_cast<int>(std::min<std::size_t>(distinct_offsets.size(), 10) * 6);
+    score += rank >= 3 ? 24 : 8;
+
+    if (positive_unit_loads != 0 && negative_unit_loads != 0) {
+        score += 36;
+    }
+    if (positive_unit_loads >= 2 && negative_unit_loads >= 2) {
+        score += 24;
+    }
+    if (has_innermost_previous_load) {
+        score += 28;
+    }
+    if (vector_contains_value(constant_initialized_arrays, store.array()) &&
+        positive_unit_loads != 0) {
+        score += 36;
+    }
+
+    const auto elements = bounded_array_element_count(store.array());
+    if (elements >= 1'000'000) {
+        score += 28;
+    } else if (elements >= 65'536) {
+        score += 12;
+    }
+
+    estimate.score = score;
+    estimate.best_rank = rank;
+    estimate.best_affine_loads = affine_loads;
+    estimate.best_unit_neighbor_loads = unit_neighbor_loads;
+    estimate.best_distinct_offsets = distinct_offsets.size();
+    return estimate;
+}
+
+void collect_constant_initialized_arrays(const yir::Region &region,
+                                         std::vector<const yir::Value *> &arrays) {
+    for (const auto &op : region.operations()) {
+        if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(op.get())) {
+            std::int64_t constant = 0;
+            if (store->indices().size() >= 2 && const_i32_value(store->value(), constant)) {
+                push_unique_value(arrays, store->array());
+            }
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            collect_constant_initialized_arrays(if_op->then_region(), arrays);
+            if (if_op->has_else()) {
+                collect_constant_initialized_arrays(if_op->else_region(), arrays);
+            }
+            continue;
+        }
+        if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            collect_constant_initialized_arrays(while_op->cond_region(), arrays);
+            collect_constant_initialized_arrays(while_op->body_region(), arrays);
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            collect_constant_initialized_arrays(for_op->body_region(), arrays);
+        }
+    }
+}
+
+void estimate_region_profitability(
+    const yir::Region &region, const std::vector<const yir::Value *> &constant_initialized_arrays,
+    PolyhedralProfitabilityEstimate &estimate) {
+    for (const auto &op : region.operations()) {
+        if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(op.get())) {
+            auto candidate = estimate_store_profitability(*store, constant_initialized_arrays);
+            if (candidate.score > estimate.score) {
+                estimate = candidate;
+            }
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            estimate_region_profitability(if_op->then_region(), constant_initialized_arrays,
+                                          estimate);
+            if (if_op->has_else()) {
+                estimate_region_profitability(if_op->else_region(), constant_initialized_arrays,
+                                              estimate);
+            }
+            continue;
+        }
+        if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            estimate_region_profitability(while_op->cond_region(), constant_initialized_arrays,
+                                          estimate);
+            estimate_region_profitability(while_op->body_region(), constant_initialized_arrays,
+                                          estimate);
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            estimate_region_profitability(for_op->body_region(), constant_initialized_arrays,
+                                          estimate);
+        }
+    }
+}
+
+PolyhedralProfitabilityEstimate estimate_module_profitability(const yir::Module &module) {
+    std::vector<const yir::Value *> constant_initialized_arrays;
+    for (const auto &function : module.functions()) {
+        if (function != nullptr) {
+            collect_constant_initialized_arrays(function->body(), constant_initialized_arrays);
+        }
+    }
+
+    PolyhedralProfitabilityEstimate estimate;
+    for (const auto &function : module.functions()) {
+        if (function != nullptr) {
+            estimate_region_profitability(function->body(), constant_initialized_arrays, estimate);
+        }
+    }
+    return estimate;
+}
+
+bool module_is_profitable_for_auto_polyhedral(const yir::Module &module,
+                                              PolyhedralProfitabilityEstimate &estimate) {
+    constexpr int kAutoProfitabilityThreshold = 150;
+    estimate = estimate_module_profitability(module);
+    return estimate.score >= kAutoProfitabilityThreshold;
+}
+
+} // namespace
 
 YIRPolyhedralPipelinePass::YIRPolyhedralPipelinePass(bool run_transform)
-    : run_transform_(run_transform) {}
+    : YIRPolyhedralPipelinePass(YIRPolyhedralPipelineMode::Force, run_transform) {}
+
+YIRPolyhedralPipelinePass::YIRPolyhedralPipelinePass(YIRPolyhedralPipelineMode mode,
+                                                     bool run_transform)
+    : mode_(mode), run_transform_(run_transform) {}
 
 std::string_view YIRPolyhedralPipelinePass::name() const {
     return "YIRPolyhedralPipelinePass";
@@ -23,6 +392,24 @@ PassKind YIRPolyhedralPipelinePass::kind() const {
 }
 
 PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
+    if (mode_ == YIRPolyhedralPipelineMode::Auto) {
+        auto *artifact =
+            context.get_artifact<std::unique_ptr<yir::Module>>(ASTToYIRPass::kArtifactKey);
+        if (artifact == nullptr || *artifact == nullptr) {
+            return PassResult::fail("YIRPolyhedralPipelinePass requires YIR module in pass context");
+        }
+        PolyhedralProfitabilityEstimate estimate;
+        if (!module_is_profitable_for_auto_polyhedral(**artifact, estimate)) {
+            std::ostringstream message;
+            message << "skipped auto polyhedral pipeline: score=" << estimate.score
+                    << ", rank=" << estimate.best_rank
+                    << ", affine_loads=" << estimate.best_affine_loads
+                    << ", unit_neighbor_loads=" << estimate.best_unit_neighbor_loads
+                    << ", distinct_offsets=" << estimate.best_distinct_offsets;
+            return PassResult::ok(false, message.str());
+        }
+    }
+
     PassManager pm;
     pm.add_pass<YIRPolyhedralCanonicalizePass>();
     pm.add_pass<YIRSCoPDetectPass>();

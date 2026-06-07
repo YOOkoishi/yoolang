@@ -51,6 +51,7 @@ struct CommandLineOptions {
     bool emit_asm = false;
     bool emit_poly = false;
     bool enable_polyhedral = true;
+    bool force_polyhedral = false;
     bool show_help = false;
 };
 
@@ -63,7 +64,7 @@ void print_help(const char *program, std::ostream &out) {
         << "  -o <file>        Write output to <file> instead of stdout\n"
         << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR "
            "optimizations\n"
-        << "  --polyhedral     Enable the YIR polyhedral pipeline under -O1\n"
+        << "  --polyhedral     Force the YIR polyhedral pipeline under -O1\n"
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
         << "  --emit-oir       Lower the parsed AST to SSA OIR, verify it, and dump it\n"
@@ -104,6 +105,7 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         }
         if (arg == "--polyhedral") {
             options.enable_polyhedral = true;
+            options.force_polyhedral = true;
             continue;
         }
         if (arg == "-o") {
@@ -138,9 +140,8 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         return false;
     }
 
-    if (!options.show_help && options.emit_poly &&
-        (!options.enable_polyhedral || options.opt_level != 1)) {
-        error = "--emit-poly requires -O1 --polyhedral";
+    if (!options.show_help && options.emit_poly && options.opt_level != 1) {
+        error = "--emit-poly requires -O1";
         return false;
     }
 
@@ -210,13 +211,16 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
         if (optimizations_enabled(options)) {
             if (polyhedral_enabled(options)) {
                 if (options.emit_poly) {
-                    pm.add_pass<pass::YIRPolyhedralPipelinePass>(false);
+                    pm.add_pass<pass::YIRPolyhedralPipelinePass>(
+                        pass::YIRPolyhedralPipelineMode::Force, false);
                     pm.add_pass<pass::YIRPolyhedralDumpPass>(out);
                     if (needs_post_poly_yir_pipeline(options)) {
                         pm.add_pass<pass::YIRPolyhedralTransformPass>();
                     }
                 } else {
-                    pm.add_pass<pass::YIRPolyhedralPipelinePass>();
+                    pm.add_pass<pass::YIRPolyhedralPipelinePass>(
+                        options.force_polyhedral ? pass::YIRPolyhedralPipelineMode::Force
+                                                 : pass::YIRPolyhedralPipelineMode::Auto);
                 }
             }
             if (needs_post_poly_yir_pipeline(options)) {
