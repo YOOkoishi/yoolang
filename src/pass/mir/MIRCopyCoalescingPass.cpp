@@ -2,8 +2,26 @@
 
 #include "pass/mir/MIRPeepholeCommon.h"
 
+#include <map>
+#include <set>
+#include <vector>
+
 namespace pass::mir_peephole {
 namespace {
+
+struct UseSite {
+    mir::MachineInstr *instr = nullptr;
+};
+
+bool has_reg_use(const mir::MachineInstr &instr, const mir::Register &reg) {
+    for (const auto &operand : instr.operands()) {
+        if (operand.is_reg() && operand.is_use() && !operand.is_implicit() &&
+            same_reg(operand.reg_value(), reg)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 unsigned replace_reg_uses(mir::MachineInstr &instr, const mir::Register &old_reg,
                           const mir::Register &new_reg) {
@@ -23,11 +41,76 @@ bool can_copy_propagate_source(const mir::Register &src) {
     return src.is_virtual() || is_zero_reg(src);
 }
 
+std::map<const mir::MachineBasicBlock *, std::size_t>
+block_indices(const mir::MachineFunction &function) {
+    std::map<const mir::MachineBasicBlock *, std::size_t> out;
+    for (std::size_t index = 0; index < function.blocks().size(); ++index) {
+        out[function.blocks()[index].get()] = index;
+    }
+    return out;
+}
+
+bool find_all_replaceable_uses(
+    mir::MachineFunction &function,
+    const std::map<const mir::MachineBasicBlock *, std::size_t> &indices,
+    std::size_t block_index, std::size_t instr_index, const mir::Register &dst,
+    const mir::Register &src, unsigned total_uses, std::vector<UseSite> &use_sites) {
+    unsigned found_uses = 0;
+    std::set<const mir::MachineBasicBlock *> visited;
+    auto *block = function.blocks()[block_index].get();
+    std::size_t scan_index = instr_index + 1;
+
+    while (block != nullptr) {
+        if (!visited.insert(block).second) {
+            return false;
+        }
+
+        auto &instrs = block->instructions();
+        for (std::size_t i = scan_index; i < instrs.size(); ++i) {
+            auto &instr = instrs[i];
+            if (instr.opcode() == mir::Opcode::Call || defines_reg(instr, src) ||
+                defines_reg(instr, dst)) {
+                return false;
+            }
+            if (has_reg_use(instr, dst)) {
+                use_sites.push_back({&instr});
+                for (const auto &operand : instr.operands()) {
+                    if (operand.is_reg() && operand.is_use() && !operand.is_implicit() &&
+                        same_reg(operand.reg_value(), dst)) {
+                        ++found_uses;
+                    }
+                }
+                if (found_uses == total_uses) {
+                    return true;
+                }
+            }
+        }
+
+        if (block->successors().size() != 1) {
+            return false;
+        }
+        auto *succ = block->successors().front();
+        if (succ == nullptr || succ->predecessors().size() != 1) {
+            return false;
+        }
+        auto found_index = indices.find(succ);
+        if (found_index == indices.end()) {
+            return false;
+        }
+        block = succ;
+        scan_index = 0;
+    }
+
+    return false;
+}
+
 bool coalesce_copies_once(mir::MachineFunction &function, Stats &stats) {
     auto counts = count_vregs(function);
+    auto indices = block_indices(function);
     bool changed = false;
 
-    for (auto &block_ptr : function.blocks()) {
+    for (std::size_t block_index = 0; block_index < function.blocks().size(); ++block_index) {
+        auto &block_ptr = function.blocks()[block_index];
         auto &instrs = block_ptr->instructions();
         for (std::size_t i = 0; i < instrs.size();) {
             auto &instr = instrs[i];
@@ -60,20 +143,12 @@ bool coalesce_copies_once(mir::MachineFunction &function, Stats &stats) {
                 continue;
             }
 
-            unsigned replaced = 0;
-            bool blocked = false;
-            for (std::size_t j = i + 1; j < instrs.size(); ++j) {
-                if (defines_reg(instrs[j], src) || defines_reg(instrs[j], dst)) {
-                    blocked = true;
-                    break;
+            std::vector<UseSite> use_sites;
+            if (find_all_replaceable_uses(function, indices, block_index, i, dst, src,
+                                          total_uses, use_sites)) {
+                for (auto site : use_sites) {
+                    replace_reg_uses(*site.instr, dst, src);
                 }
-                replaced += replace_reg_uses(instrs[j], dst, src);
-                if (replaced == total_uses) {
-                    break;
-                }
-            }
-
-            if (!blocked && replaced == total_uses) {
                 instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(i));
                 ++stats.copies;
                 changed = true;

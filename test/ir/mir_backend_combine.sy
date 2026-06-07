@@ -116,9 +116,18 @@ int main() {
 // MIR-O1: LOAD_MEM_OFF {{.*}}, 12, i32
 
 // MIR-O1-LABEL: func @phi_shuffle
-// MIR-O1: BLT
+// MIR-O1: BGE zero, {{.*}}, %edge.entry.0.to.while.end.3
+// MIR-O1-NOT: J %edge.entry.0.to.while.body.2
+// MIR-O1: edge.entry.0.to.while.body.2:
+// MIR-O1: edge.while.body.2.to.while.body.2:
+// MIR-O1-NOT: J %while.body.2
+// MIR-O1: while.body.2:
 // MIR-O1: ADDW
 // MIR-O1: ADDIW {{.*}}, -1
+// MIR-O1: BLT
+// MIR-O1: edge.while.body.2.to.while.end.3:
+// MIR-O1-NOT: J %while.end.3
+// MIR-O1: while.end.3:
 
 // ASM-LABEL: cmp_lt:
 // ASM: bge
@@ -147,3 +156,16 @@ int main() {
 // ASM-LABEL: address_offset_fold:
 // ASM: sw {{.*}}, 12(
 // ASM: lw {{.*}}, 12(
+// ASM-LABEL: phi_shuffle:
+// ASM: bge zero, {{.*}}, .Lphi_shuffle_edge.entry.0.to.while.end.3
+// ASM-NOT: j .Lphi_shuffle_edge.entry.0.to.while.body.2
+// ASM: .Lphi_shuffle_edge.entry.0.to.while.body.2:
+// ASM: .Lphi_shuffle_edge.while.body.2.to.while.body.2:
+// ASM-NOT: j .Lphi_shuffle_while.body.2
+// ASM: .Lphi_shuffle_while.body.2:
+// ASM: addw
+// ASM: addiw {{.*}}, -1
+// ASM: blt zero, {{.*}}, .Lphi_shuffle_edge.while.body.2.to.while.body.2
+// ASM: .Lphi_shuffle_edge.while.body.2.to.while.end.3:
+// ASM-NOT: j .Lphi_shuffle_while.end.3
+// ASM: .Lphi_shuffle_while.end.3:
