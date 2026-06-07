@@ -1,4 +1,7 @@
 // RUN: %compiler --emit-mir %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler --emit-mir-stage=lowered -O1 %s | FileCheck %s --check-prefix=MIR-LOWERED
+// RUN: %compiler --emit-mir-stage=post-ra -O1 %s | FileCheck %s --check-prefix=MIR-POSTRA
+// RUN: %compiler --emit-mir-metrics -O1 %s | FileCheck %s --check-prefix=MIR-METRICS
 // RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
 
 int arith(int a, int b, int c) {
@@ -82,6 +85,20 @@ int main() {
 // MIR: %v{{[0-9]+}}:fpr32 f32
 // MIR: FMUL.S %v{{[0-9]+}}:fpr32
 // MIR: FADD.S %v{{[0-9]+}}:fpr32
+
+// MIR-LOWERED-LABEL: func @arith
+// MIR-LOWERED: virtual registers:
+// MIR-LOWERED: MULW %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr
+
+// MIR-POSTRA-LABEL: func @arith
+// MIR-POSTRA: MULW {{[a-z][a-z0-9]*}}, {{[a-z][a-z0-9]*}}, {{[a-z][a-z0-9]*}}
+
+// MIR-METRICS: "mir_stage_metrics"
+// MIR-METRICS: "stage": "lowered"
+// MIR-METRICS: "stage": "final"
+// MIR-METRICS: "instructions":
+// MIR-METRICS: "moves":
+// MIR-METRICS: "spills":
 
 // ASM-LABEL: pressure:
 // ASM: lw {{.*}}, 0(sp)

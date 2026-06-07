@@ -22,7 +22,7 @@ class RunResult:
     stderr: str = ""
     exit_code: Optional[int] = None
     detail: str = ""
-    metrics: dict[str, int] | None = None
+    metrics: dict[str, object] | None = None
     exe_path: Path | None = None
     instruction_count: int | None = None
     instruction_count_status: str = "DISABLED"
@@ -455,16 +455,23 @@ def _compile_compiler(src: Path, out_dir: Path) -> tuple[Path, str]:
     return exe, "OK"
 
 
-def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, int]:
+def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, object]:
     asm_file = out_dir / f"{src.stem}.compiler.s"
-    metrics = {
+    metrics: dict[str, object] = {
         "mir_instrs": 0,
         "stack_slots": 0,
         "load_slot": 0,
         "store_slot": 0,
         "move": 0,
         "fmove": 0,
+        "jumps": 0,
+        "branches": 0,
+        "loads": 0,
+        "stores": 0,
+        "spills": 0,
         "asm_lines": 0,
+        "mir_stage_metrics_status": "NOT_RUN",
+        "mir_stages": {},
     }
 
     if asm_file.exists():
@@ -476,29 +483,49 @@ def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, int]:
 
     try:
         proc = subprocess.run(
-            [str(COMPILER_BIN), str(src), "--emit-mir", "-O1"],
+            [str(COMPILER_BIN), str(src), "--emit-mir-metrics", "-O1"],
             check=True,
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SEC,
         )
-    except Exception:
+        payload = json.loads(proc.stdout)
+    except Exception as exc:
+        metrics["mir_stage_metrics_status"] = f"FAILED: {exc}"
         return metrics
 
-    for line in proc.stdout.splitlines():
-        stripped = line.strip()
-        if re.match(r"^(LI|FLI\.S|LA|FI_ADDR|LOAD_SLOT|STORE_SLOT|LOAD_MEM|STORE_MEM|MEMZERO|MV|FMV\.S|ADD|ADDW|SUBW|MUL|MULW|DIVW|REMW|AND|SLLI|SRLIW|XOR|XORI|SLT|SEQZ|SNEZ|FADD\.S|FSUB\.S|FMUL\.S|FDIV\.S|FEQ\.S|FLT\.S|FLE\.S|FCVT\.S\.W|FCVT\.W\.S|FMV\.W\.X|STORE_OUT_ARG|LOAD_IN_ARG|BNEZ|J|CALL)\b", stripped):
-            metrics["mir_instrs"] += 1
-        if " fi#" in line or stripped.startswith("fi#"):
-            metrics["stack_slots"] += 1
-        if stripped.startswith("LOAD_SLOT"):
-            metrics["load_slot"] += 1
-        elif stripped.startswith("STORE_SLOT"):
-            metrics["store_slot"] += 1
-        elif stripped.startswith("MV"):
-            metrics["move"] += 1
-        elif stripped.startswith("FMV.S"):
-            metrics["fmove"] += 1
+    stages: dict[str, dict[str, int]] = {}
+    for raw_stage in payload.get("mir_stage_metrics", []):
+        if not isinstance(raw_stage, dict):
+            continue
+        name = raw_stage.get("stage")
+        if not isinstance(name, str) or not name:
+            continue
+        stage_metrics: dict[str, int] = {}
+        for key, value in raw_stage.items():
+            if key == "stage":
+                continue
+            if isinstance(value, int):
+                stage_metrics[key] = value
+        stages[name] = stage_metrics
+
+    metrics["mir_stages"] = stages
+    metrics["mir_stage_metrics_status"] = "OK" if stages else "EMPTY"
+
+    final_metrics = stages.get("final")
+    if final_metrics is None and stages:
+        final_metrics = next(reversed(stages.values()))
+    if final_metrics is not None:
+        metrics["mir_instrs"] = final_metrics.get("instructions", 0)
+        metrics["stack_slots"] = final_metrics.get("stack_slots", 0)
+        metrics["load_slot"] = final_metrics.get("load_slots", 0)
+        metrics["store_slot"] = final_metrics.get("store_slots", 0)
+        metrics["move"] = final_metrics.get("moves", 0)
+        metrics["jumps"] = final_metrics.get("jumps", 0)
+        metrics["branches"] = final_metrics.get("branches", 0)
+        metrics["loads"] = final_metrics.get("loads", 0)
+        metrics["stores"] = final_metrics.get("stores", 0)
+        metrics["spills"] = final_metrics.get("spills", 0)
     return metrics
 
 
@@ -757,6 +784,78 @@ def _instruction_count_summary(rows: list[dict]) -> dict[str, object]:
     }
 
 
+MIR_STAGE_ORDER = ["lowered", "post-combine", "pre-ra", "post-ra", "final"]
+MIR_STAGE_METRIC_KEYS = [
+    "instructions",
+    "moves",
+    "branches",
+    "jumps",
+    "loads",
+    "stores",
+    "spills",
+    "stack_slots",
+]
+
+
+def _mir_stage_metric_summary(rows: list[dict]) -> dict[str, object]:
+    totals: dict[str, dict[str, int]] = {}
+    counted_cases = 0
+    failed_cases = 0
+
+    for row in rows:
+        codegen_metrics = row.get("codegen_metrics")
+        if not isinstance(codegen_metrics, dict):
+            continue
+        status = str(codegen_metrics.get("mir_stage_metrics_status", "NOT_RUN"))
+        stages = codegen_metrics.get("mir_stages")
+        if not isinstance(stages, dict) or not stages:
+            if status.startswith("FAILED"):
+                failed_cases += 1
+            continue
+        counted_cases += 1
+        for stage_name, raw_metrics in stages.items():
+            if not isinstance(stage_name, str) or not isinstance(raw_metrics, dict):
+                continue
+            stage_totals = totals.setdefault(stage_name, {key: 0 for key in MIR_STAGE_METRIC_KEYS})
+            for key in MIR_STAGE_METRIC_KEYS:
+                value = raw_metrics.get(key)
+                if isinstance(value, int):
+                    stage_totals[key] += value
+
+    if counted_cases:
+        status = "OK" if failed_cases == 0 else "PARTIAL"
+    elif failed_cases:
+        status = "FAILED"
+    else:
+        status = "EMPTY"
+
+    ordered_totals = {
+        stage: totals[stage]
+        for stage in MIR_STAGE_ORDER
+        if stage in totals
+    }
+    for stage in sorted(totals):
+        if stage not in ordered_totals:
+            ordered_totals[stage] = totals[stage]
+
+    return {
+        "status": status,
+        "counted_cases": counted_cases,
+        "failed_cases": failed_cases,
+        "stages": ordered_totals,
+    }
+
+
+def _slow_compiler_rows(rows: list[dict], limit: int = 10) -> list[dict]:
+    timed_rows = [
+        (compiler_time, row)
+        for row in rows
+        if (compiler_time := _parse_time_cell(row.get("compiler"))) is not None
+    ]
+    timed_rows.sort(key=lambda item: item[0], reverse=True)
+    return [row for _, row in timed_rows[:limit]]
+
+
 def _write_reports(rows: list[dict], failures: int, total_runtime: float, compiler_total_runtime: float) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -764,6 +863,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
     generated = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     o3_stats = _compiler_vs_o3_stats(rows)
     insn_summary = _instruction_count_summary(rows)
+    mir_stage_summary = _mir_stage_metric_summary(rows)
 
     md_lines = [
         "# 📊 RISC-V QEMU Perf Report",
@@ -777,12 +877,78 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         f"- 🧮 Geomean speedup: GCC {_format_ratio(o3_stats['gcc_o3_geomean'])} / Clang++ {_format_ratio(o3_stats['clang_o3_geomean'])}",
         f"- 🏁 Faster cases: GCC {o3_stats['gcc_o3_faster_cases']} / Clang++ {o3_stats['clang_o3_faster_cases']}",
         f"- QEMU dynamic instruction count: {insn_summary['status']}",
+        f"- MIR stage metrics: {mir_stage_summary['status']} ({mir_stage_summary['counted_cases']} cases)",
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
-        "",
-        "| Case | GCC | Clang++ | Compiler | Status |",
-        "| --- | --- | --- | --- | --- |",
     ]
+
+    stage_totals = mir_stage_summary.get("stages")
+    if isinstance(stage_totals, dict) and stage_totals:
+        md_lines.extend(
+            [
+                "",
+                "## MIR Stage Metrics",
+                "",
+                "| Stage | Instrs | Moves | Branches | Jumps | Loads | Stores | Spills | Stack slots |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for stage_name, totals in stage_totals.items():
+            if not isinstance(totals, dict):
+                continue
+            md_lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _md_escape(str(stage_name)),
+                        str(totals.get("instructions", 0)),
+                        str(totals.get("moves", 0)),
+                        str(totals.get("branches", 0)),
+                        str(totals.get("jumps", 0)),
+                        str(totals.get("loads", 0)),
+                        str(totals.get("stores", 0)),
+                        str(totals.get("spills", 0)),
+                        str(totals.get("stack_slots", 0)),
+                    ]
+                )
+                + " |"
+            )
+
+    slow_rows = _slow_compiler_rows(rows)
+    if slow_rows:
+        md_lines.extend(
+            [
+                "",
+                "## Slow Compiler Cases",
+                "",
+                "| Case | Compiler | GCC | Clang++ | Status |",
+                "| --- | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for row in slow_rows:
+            md_lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _md_escape(str(row["case"])),
+                        _md_escape(str(row["compiler"])),
+                        _md_escape(str(row["gcc"])),
+                        _md_escape(str(row["clang"])),
+                        _md_escape(str(row["status"])),
+                    ]
+                )
+                + " |"
+            )
+
+    md_lines.extend(
+        [
+            "",
+            "## Case Results",
+            "",
+            "| Case | GCC | Clang++ | Compiler | Status |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
 
     display_rows = sorted(rows, key=lambda row: str(row.get("status", "")) == "OK")
     for row in display_rows:
@@ -825,6 +991,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         "gcc_o3_faster_cases": o3_stats["gcc_o3_faster_cases"],
         "clang_o3_faster_cases": o3_stats["clang_o3_faster_cases"],
         "instruction_count_summary": insn_summary,
+        "mir_stage_metric_summary": mir_stage_summary,
         "rows": rows,
     }
     REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
