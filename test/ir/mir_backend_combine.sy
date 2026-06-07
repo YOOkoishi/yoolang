@@ -15,6 +15,27 @@ int cmp_eq(int a, int b) {
   return 22;
 }
 
+int cmp_ge_const(int a) {
+  if (a >= 1234) {
+    return a + 3;
+  }
+  return a - 4;
+}
+
+int cmp_ne_zero(int a) {
+  if (a != 0) {
+    return 31;
+  }
+  return 41;
+}
+
+int float_ne_branch(float a, float b) {
+  if (a != b) {
+    return 51;
+  }
+  return 61;
+}
+
 int nonnegative_divrem(int x) {
   if (x >= 0) {
     return x / 8 + x % 16;
@@ -51,6 +72,7 @@ int phi_shuffle(int n) {
 
 int main() {
   return cmp_lt(1, 2) + cmp_eq(3, 3) + nonnegative_divrem(32) +
+         cmp_ge_const(1235) + cmp_ne_zero(9) +
          parity_branch(9) + address_offset_fold(7) + phi_shuffle(4);
 }
 
@@ -61,6 +83,21 @@ int main() {
 // MIR-O1-LABEL: func @cmp_eq
 // MIR-O1: BNE
 // MIR-O1-NOT: SEQZ
+
+// MIR-O1-LABEL: func @cmp_ge_const
+// MIR-O1: LI {{.*}}, 1234
+// MIR-O1: BLT
+// MIR-O1-NOT: XORI
+// MIR-O1-NOT: SLT
+
+// MIR-O1-LABEL: func @cmp_ne_zero
+// MIR-O1: BEQ
+// MIR-O1-NOT: SNEZ
+
+// MIR-O1-LABEL: func @float_ne_branch
+// MIR-O1: FEQ.S
+// MIR-O1: BNEZ
+// MIR-O1-NOT: XORI
 
 // MIR-O1-LABEL: func @nonnegative_divrem
 // MIR-O1: SRLIW {{.*}}, 3
@@ -87,6 +124,17 @@ int main() {
 // ASM: bge
 // ASM-LABEL: cmp_eq:
 // ASM: bne
+// ASM-LABEL: cmp_ge_const:
+// ASM: li {{.*}}, 1234
+// ASM: blt
+// ASM-NOT: xori
+// ASM-LABEL: cmp_ne_zero:
+// ASM: beq
+// ASM-NOT: snez
+// ASM-LABEL: float_ne_branch:
+// ASM: feq.s
+// ASM: bnez
+// ASM-NOT: xori
 // ASM-LABEL: nonnegative_divrem:
 // ASM: srliw {{.*}}, 3
 // ASM: andi {{.*}}, 15

@@ -1,12 +1,12 @@
 # Task: MIR Branch Combine
 
-Status: proposed
+Status: ready_for_review
 Created: 2026-06-07
 Last update: 2026-06-07
 Owner: Codex
-Branch: task/mir-branch-combine
-Worktree: ../yoolang-mir-branch-combine
-Base commit: d206fd7
+Branch: tasksys
+Worktree: .
+Base commit: 047a018
 
 ## Goal
 
@@ -56,16 +56,18 @@ Do not read unless explicitly needed:
 | `src/pass/mir/MIRBitIdiomCombinePass.cpp` | full | boolean/bit simplification interactions | yes | primary anchor |
 | `include/pass/mir/MIRCombineCommon.h` | full | shared helpers and stats | yes | pair with cpp if needed |
 | `src/mir/AsmPrinter.cpp` | branch emission ranges | ensure direct branch output | yes | read branch cases only |
+| `src/pass/oir/OIRToMIRVRegLowerer.cpp` | compare/branch/value_reg ranges | confirm constant materialization and boolean lowering shapes | no | constants lower through `LI`; zero constants use `zero` |
+| `scripts/run_tests.py` | discovery/stage ranges | explain focused stage filter behavior | no | `stage` suite excludes `test/ir`, which is FileCheck-only |
 
 ## Worktree
 
-Decision: used
+Decision: current checkout used
 
 Reason:
 
 ```text
-This task changes MIR branch semantics and dead producer removal. Use an isolated worktree before code edits.
-The worktree is planned here but not created by this task-record split.
+The current checkout was clean and already on the task-system branch where the user asked to
+complete the task. No separate worktree was created.
 ```
 
 Commands:
@@ -73,7 +75,8 @@ Commands:
 ```bash
 git status --short
 git rev-parse --short HEAD
-git worktree add ../yoolang-mir-branch-combine -b task/mir-branch-combine
+git branch --show-current
+git worktree list
 ```
 
 ## Invariants And Risks
@@ -96,21 +99,21 @@ Risk areas:
 
 | Patch | Intent | Files | Verifier/Test | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| P1 | Support direct branches against small constants by materializing reusable constants | `MIRCompareBranchCombinePass.cpp`, `MIRCombineCommon.*` | focused FileCheck | pending | Keep materialization outside hot repeated path when possible |
-| P2 | Match `XorI 1`, `SeqZ`, `Snez`, and their branch-zero/nonzero uses | `MIRCompareBranchCombinePass.cpp` | MIR stage focused tests | pending | Remove dead boolean temps |
-| P3 | Add branch inversion cleanup after combine | `MIRCompareBranchCombinePass.cpp`, `MIRBitIdiomCombinePass.cpp` | ASM/e2e focused tests | pending | Coordinate with block simplify |
+| P1 | Support direct branches against small constants by reusing materialized constant regs | `MIRCompareBranchCombinePass.cpp`, `test/ir/mir_backend_combine.sy` | focused FileCheck | done | `cmp_ge_const` keeps `LI 1234` and branches directly, with no `SLT/XORI` |
+| P2 | Match `XorI 1`, `SeqZ`, `Snez`, and their branch-zero/nonzero uses | `MIRCompareBranchCombinePass.cpp`, `test/ir/mir_backend_combine.sy` | focused FileCheck, full tests | done | Matcher now returns dead producer indices; boolean temps are erased in the combine |
+| P3 | Add branch inversion cleanup after combine | `MIRCompareBranchCombinePass.cpp`, `test/ir/mir_backend_combine.sy` | ASM/e2e focused tests | done | Existing block simplify performs final fallthrough inversion; no `MIRBitIdiomCombinePass` change was needed |
 
 ## Verification Matrix
 
 | Gate | Command | Required? | Result | Notes |
 | --- | --- | --- | --- | --- |
-| Build | `xmake` | yes | NOT_RUN | |
-| Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter mir_backend_combine --jobs 1` | yes | NOT_RUN | add compare branch patterns |
-| MIR stage | `python3 scripts/run_tests.py --suite stage --stage mir --filter mir_backend_combine --jobs 1 --o1` | yes | NOT_RUN | |
-| ASM stage | `python3 scripts/run_tests.py --suite stage --stage asm --filter mir_backend_combine --jobs 1 --o1` | yes | NOT_RUN | |
-| E2E | `python3 scripts/run_tests.py --suite e2e --filter 01_mm --jobs 1 --o1` | yes | NOT_RUN | |
-| Full optimized | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | before broad finalization | NOT_RUN | |
-| Performance | `PERF_TEST_DIRS=test/performance PERF_MAX_CASES=6 python3 scripts/compare_perf.py` | yes | NOT_RUN | |
+| Build | `xmake` | yes | PASS | debug build passed before switching release; release build also passed after `xmake f -m release` |
+| Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter mir_backend_combine --jobs 1` | yes | PASS | covers MIR and ASM RUN lines |
+| MIR stage | `python3 scripts/run_tests.py --suite stage --stage mir --filter mir_backend_combine --jobs 1 --o1` | yes | SKIP | command ran but matched 0 tests because `stage` excludes `test/ir` FileCheck cases |
+| ASM stage | `python3 scripts/run_tests.py --suite stage --stage asm --filter mir_backend_combine --jobs 1 --o1` | yes | SKIP | command ran but matched 0 tests for the same reason |
+| E2E | `python3 scripts/run_tests.py --suite e2e --filter 01_mm --jobs 1 --o1` | yes | PASS | 3 passed, 0 failed |
+| Full optimized | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | before broad finalization | PASS | 1410 passed, 0 failed, 1 skipped |
+| Performance | `PERF_TEST_DIRS=test/performance PERF_MAX_CASES=6 python3 scripts/compare_perf.py` | yes | PASS | 6 cases OK; geomean speedup GCC 0.66x / Clang++ 0.72x in `build/perf-ci/perf-report.md` |
 
 ## Alternatives
 
@@ -122,6 +125,7 @@ Risk areas:
 ## Change Log
 
 - 2026-06-07: created task file.
+- 2026-06-07: implemented MIR compare-branch combine extensions, added FileCheck coverage, and completed verification gates.
 
 ## Open Questions
 
@@ -131,19 +135,21 @@ Risk areas:
 
 Current state:
 
-- Task record created from the MIR optimization split; no code edits made.
+- Implementation is ready for review.
+- `MIRCompareBranchCombinePass` now rewrites `SLT`, `XOR+SEQZ/SNEZ`,
+  generic `SEQZ/SNEZ`, safe boolean `XORI 1`, and `SLT+XORI 1` branch users
+  to direct MIR branches.
+- Matched dead boolean producers are erased explicitly; constant `LI` producers
+  used by the replacement branch are preserved.
+- Focused FileCheck, focused e2e, full optimized tests, and sampled perf compare passed.
 
 Next action:
 
-- Create the recorded worktree, read keep=yes anchors, then implement P1.
+- Review the uncommitted diff and merge when accepted.
 
 Read next:
 
 - `docs/task-system.md`
 - `docs/tasks/2026-06-07-mir-branch-combine.md`
-- `docs/mir-design.md`
 - `src/pass/mir/MIRCompareBranchCombinePass.cpp`
-- `src/pass/mir/MIRRemZeroBranchCombinePass.cpp`
-- `src/pass/mir/MIRBitIdiomCombinePass.cpp`
-- `include/pass/mir/MIRCombineCommon.h`
-- `src/mir/AsmPrinter.cpp`
+- `test/ir/mir_backend_combine.sy`
