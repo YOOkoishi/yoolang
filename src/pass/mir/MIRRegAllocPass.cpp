@@ -108,6 +108,24 @@ std::vector<mir::Register> caller_saved(mir::RegisterClass reg_class) {
     return out;
 }
 
+std::vector<mir::Register> callee_saved(mir::RegisterClass reg_class) {
+    std::vector<mir::Register> out;
+    if (reg_class == mir::RegisterClass::GPR) {
+        for (const std::string &name :
+             {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
+              "s11"}) {
+            out.push_back(mir::Register::physical(name, reg_class));
+        }
+    } else {
+        for (const std::string &name :
+             {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
+              "fs10", "fs11"}) {
+            out.push_back(mir::Register::physical(name, reg_class));
+        }
+    }
+    return out;
+}
+
 std::set<std::string> reserved_scratch_names(mir::RegisterClass reg_class) {
     if (reg_class == mir::RegisterClass::GPR) {
         return {"t4", "t5"};
@@ -133,19 +151,8 @@ std::vector<mir::Register> allocatable(mir::RegisterClass reg_class) {
                   return reserved.find(reg.name) != reserved.end();
               }),
               out.end());
-    if (reg_class == mir::RegisterClass::GPR) {
-        for (const std::string &name :
-             {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
-              "s11"}) {
-            out.push_back(mir::Register::physical(name, reg_class));
-        }
-    } else {
-        for (const std::string &name :
-             {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
-              "fs10", "fs11"}) {
-            out.push_back(mir::Register::physical(name, reg_class));
-        }
-    }
+    auto saved = callee_saved(reg_class);
+    out.insert(out.end(), saved.begin(), saved.end());
     return out;
 }
 
@@ -178,6 +185,17 @@ bool is_move_opcode_for_class(mir::Opcode opcode, mir::RegisterClass reg_class) 
            (opcode == mir::Opcode::FMove && reg_class == mir::RegisterClass::FPR32);
 }
 
+VRegSet live_across_call(const mir::MachineInstr &instr, const VRegSet &live_after,
+                         mir::RegisterClass reg_class) {
+    VRegSet out = live_after;
+    for (const auto &def : instr.defs()) {
+        if (is_virtual_of_class(def, reg_class)) {
+            out.erase(def.id);
+        }
+    }
+    return out;
+}
+
 class RegAllocator {
   public:
     void run(mir::MachineFunction &function) {
@@ -191,7 +209,7 @@ class RegAllocator {
 
             for (auto reg_class : {mir::RegisterClass::GPR, mir::RegisterClass::FPR32}) {
                 auto remat = collect_rematerializable_defs(function);
-                auto spill_costs = compute_spill_costs(function, reg_class, remat);
+                auto spill_costs = compute_spill_costs(function, live, reg_class, remat);
                 auto attempt = allocate_class(function, live, reg_class, spill_costs);
                 colors.insert(attempt.colors.begin(), attempt.colors.end());
                 spills.insert(attempt.spills.begin(), attempt.spills.end());
@@ -322,10 +340,20 @@ class RegAllocator {
         return depth;
     }
 
-    std::map<VRegId, double> compute_spill_costs(const mir::MachineFunction &function,
-                                                 mir::RegisterClass reg_class,
-                                                 const RematMap &remat) const {
+    std::map<VRegId, double>
+    compute_spill_costs(const mir::MachineFunction &function,
+                        const std::map<mir::MachineBasicBlock *, BlockLiveInfo> &live_info,
+                        mir::RegisterClass reg_class, const RematMap &remat) const {
         auto loop_depths = estimate_loop_depths(function);
+        auto block_weight = [&](mir::MachineBasicBlock *block) {
+            double weight = 1.0;
+            auto found_depth = loop_depths.find(block);
+            unsigned depth = found_depth == loop_depths.end() ? 0 : found_depth->second;
+            for (unsigned i = 0; i < depth; ++i) {
+                weight *= 10.0;
+            }
+            return weight;
+        };
         std::map<VRegId, double> costs;
 
         for (const auto &reg : function.regs().virtual_registers()) {
@@ -335,12 +363,7 @@ class RegAllocator {
         }
 
         for (const auto &block_ptr : function.blocks()) {
-            double weight = 1.0;
-            auto found_depth = loop_depths.find(block_ptr.get());
-            unsigned depth = found_depth == loop_depths.end() ? 0 : found_depth->second;
-            for (unsigned i = 0; i < depth; ++i) {
-                weight *= 10.0;
-            }
+            const double weight = block_weight(block_ptr.get());
 
             for (const auto &instr : block_ptr->instructions()) {
                 for (const auto &operand : instr.operands()) {
@@ -353,6 +376,41 @@ class RegAllocator {
                     }
                     if (operand.is_def()) {
                         costs[operand.reg_value().id] += weight * 0.5;
+                    }
+                }
+            }
+        }
+
+        constexpr double kCallCrossingSpillCost = 8.0;
+        for (const auto &block_ptr : function.blocks()) {
+            auto *block = block_ptr.get();
+            auto found_live = live_info.find(block);
+            if (found_live == live_info.end()) {
+                continue;
+            }
+
+            VRegSet live = found_live->second.out;
+            const double weight = block_weight(block);
+            for (auto instr_it = block->instructions().rbegin();
+                 instr_it != block->instructions().rend(); ++instr_it) {
+                const auto &instr = *instr_it;
+                if (instr.opcode() == mir::Opcode::Call) {
+                    for (auto id : live_across_call(instr, live, reg_class)) {
+                        const auto *reg = function.regs().virtual_register(id);
+                        if (reg != nullptr && reg->reg_class == reg_class) {
+                            costs[id] += weight * kCallCrossingSpillCost;
+                        }
+                    }
+                }
+
+                for (const auto &def : instr.defs()) {
+                    if (def.is_virtual()) {
+                        live.erase(def.id);
+                    }
+                }
+                for (const auto &use : instr.uses()) {
+                    if (use.is_virtual()) {
+                        live.insert(use.id);
                     }
                 }
             }
@@ -473,8 +531,18 @@ class RegAllocator {
                 }
 
                 if (instr.opcode() == mir::Opcode::Call) {
+                    const auto crossing = live_across_call(instr, live, reg_class);
                     for (const auto &phys : caller_saved(reg_class)) {
-                        forbid_live(live, phys);
+                        forbid_live(crossing, phys);
+                    }
+                    for (auto id : crossing) {
+                        const auto *reg = function.regs().virtual_register(id);
+                        if (reg == nullptr || reg->reg_class != reg_class) {
+                            continue;
+                        }
+                        for (const auto &phys : callee_saved(reg_class)) {
+                            note_physical_preference(id, phys);
+                        }
                     }
                 }
                 for (const auto &phys : physical_defs_for_special_instr(instr, reg_class)) {

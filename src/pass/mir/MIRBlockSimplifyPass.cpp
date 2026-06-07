@@ -77,6 +77,15 @@ bool simplify_block(mir::MachineBasicBlock &block, const mir::MachineBasicBlock 
             auto &next = instrs[i + 1];
             const auto &next_ops = next.operands();
 
+            if (post_ra && is_move(instr.opcode()) && instr.opcode() == next.opcode() &&
+                ops.size() == 2 && next_ops.size() == 2 && same_reg(ops[0], next_ops[1]) &&
+                same_reg(ops[1], next_ops[0])) {
+                instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(i + 1));
+                ++stats.copies;
+                changed = true;
+                continue;
+            }
+
             if (instr.opcode() == mir::Opcode::StoreSlot &&
                 next.opcode() == mir::Opcode::LoadSlot && ops.size() >= 3 &&
                 next_ops.size() >= 3 && same_slot(ops[0], next_ops[1]) &&
@@ -147,7 +156,6 @@ bool simplify_block(mir::MachineBasicBlock &block, const mir::MachineBasicBlock 
         }
     }
 
-    (void)post_ra;
     return changed;
 }
 

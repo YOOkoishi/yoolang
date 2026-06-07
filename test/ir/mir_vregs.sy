@@ -38,6 +38,12 @@ float float_arith(float x, float y) {
   return x * y + x;
 }
 
+int call_live(int x, int y) {
+  int keep = x + y;
+  int z = getint();
+  return keep + z;
+}
+
 int pressure(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7,
              int a8, int a9, int a10, int a11, int a12, int a13, int a14, int a15,
              int a16, int a17, int a18, int a19, int a20, int a21, int a22, int a23,
@@ -92,6 +98,13 @@ int main() {
 
 // MIR-POSTRA-LABEL: func @arith
 // MIR-POSTRA: MULW {{[a-z][a-z0-9]*}}, {{[a-z][a-z0-9]*}}, {{[a-z][a-z0-9]*}}
+
+// MIR-POSTRA-LABEL: func @call_live
+// MIR-POSTRA: saved registers:
+// MIR-POSTRA: s0 offset=sp+0
+// MIR-POSTRA: ADDW s0, a0, a1
+// MIR-POSTRA: CALL getint
+// MIR-POSTRA: ADDW a0, s0, a0
 
 // MIR-METRICS: "mir_stage_metrics"
 // MIR-METRICS: "stage": "lowered"
