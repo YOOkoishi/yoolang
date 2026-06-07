@@ -4,6 +4,7 @@
 #include "pass/ast/ASTSemanticAnalysisPass.h"
 #include "pass/ast/ASTToYIRPass.h"
 #include "pass/mir/MIRCombinePipelinePass.h"
+#include "pass/mir/MIRListSchedulerPass.h"
 #include "pass/mir/MIRPeepholePipelinePass.h"
 #include "pass/mir/MIRRegAllocPass.h"
 #include "pass/mir/MIRToAsmPass.h"
@@ -254,8 +255,10 @@ void add_mir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
     if (optimizations_enabled(options)) {
         pm.add_pass<pass::MIRCombinePipelinePass>();
         pm.add_pass<pass::MIRPeepholePipelinePass>(false);
+        pm.add_pass<pass::MIRListSchedulerPass>(false);
         pm.add_pass<pass::MIRRegAllocPass>();
         pm.add_pass<pass::MIRPeepholePipelinePass>(true);
+        pm.add_pass<pass::MIRListSchedulerPass>(true);
     }
 }
 

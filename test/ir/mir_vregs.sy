@@ -84,5 +84,8 @@ int main() {
 // MIR: FADD.S %v{{[0-9]+}}:fpr32
 
 // ASM-LABEL: pressure:
-// ASM: sw
-// ASM: lw
+// ASM: lw {{.*}}, 0(sp)
+// ASM: lw {{.*}}, 184(sp)
+// ASM-LABEL: main:
+// ASM: sd {{.*}}, 184(sp)
+// ASM: call pressure
