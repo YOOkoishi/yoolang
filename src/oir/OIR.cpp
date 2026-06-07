@@ -1855,6 +1855,7 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 case Instruction::OpID::Add:
                 case Instruction::OpID::Sub:
                 case Instruction::OpID::Mul:
+                case Instruction::OpID::And:
                 case Instruction::OpID::SDiv:
                 case Instruction::OpID::SRem:
                 case Instruction::OpID::FAdd:
@@ -1869,6 +1870,10 @@ VerifyResult Verifier::verify_module(const Module &module) {
                         bin->lhs()->type() != bin->type()) {
                         return fail("binary instruction " + inst_ref(bin) +
                                     " type mismatch between operands and result");
+                    }
+                    if (inst->op() == Instruction::OpID::And && !bin->type()->is_integer()) {
+                        return fail("and instruction " + inst_ref(bin) +
+                                    " operands must be integer");
                     }
                     break;
                 }

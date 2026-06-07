@@ -33,6 +33,20 @@ int global_const(int x) {
   return x / C + x % C;
 }
 
+int range_gated_rem(int x) {
+  if (x >= 0) {
+    return x % 16;
+  }
+  return x % 16;
+}
+
+int range_gated_negative_divisor_rem(int x) {
+  if (x >= 0) {
+    return x % -8;
+  }
+  return x % -8;
+}
+
 int tail_sum(int n, int acc) {
   if (n == 0) {
     return acc;
@@ -41,7 +55,8 @@ int tail_sum(int n, int acc) {
 }
 
 int main() {
-  return algebra(42) + folded_branch() + zext_cmp(3) + global_const(99) + tail_sum(4, 0);
+  return algebra(42) + folded_branch() + zext_cmp(3) + global_const(99) +
+         range_gated_rem(23) + range_gated_negative_divisor_rem(23) + tail_sum(4, 0);
 }
 
 // OIR-LABEL: define i32 @algebra
@@ -66,6 +81,14 @@ int main() {
 // OIR: sdiv i32 %x.arg, 16
 // OIR: srem i32 %x.arg, 16
 // OIR-NOT: load i32, i32* @C
+
+// OIR-LABEL: define i32 @range_gated_rem
+// OIR: and i32 %x.arg, 15
+// OIR: srem i32 %x.arg, 16
+
+// OIR-LABEL: define i32 @range_gated_negative_divisor_rem
+// OIR: and i32 %x.arg, 7
+// OIR: srem i32 %x.arg, -8
 
 // OIR-LABEL: define i32 @tail_sum
 // OIR: %n.arg.tail = phi

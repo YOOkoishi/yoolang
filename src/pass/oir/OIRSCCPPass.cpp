@@ -248,6 +248,18 @@ class SCCPSolver final {
                 return rhs;
             }
             break;
+        case oir::Instruction::OpID::And:
+            if ((rhs.kind == LatticeKind::Constant && is_int_value(rhs.constant, 0)) ||
+                (lhs.kind == LatticeKind::Constant && is_int_value(lhs.constant, 0))) {
+                return LatticeValue::constant_value(make_zero_constant(module_, inst.type()));
+            }
+            if (rhs.kind == LatticeKind::Constant && is_int_value(rhs.constant, -1)) {
+                return lhs;
+            }
+            if (lhs.kind == LatticeKind::Constant && is_int_value(lhs.constant, -1)) {
+                return rhs;
+            }
+            break;
         case oir::Instruction::OpID::SDiv:
             if (rhs.kind == LatticeKind::Constant && is_int_value(rhs.constant, 1)) {
                 return lhs;

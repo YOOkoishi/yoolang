@@ -1,12 +1,12 @@
 # Task: Range Gated Arith Idioms
 
-Status: proposed
+Status: ready_for_review
 Created: 2026-06-07
-Last update: 2026-06-07
+Last update: 2026-06-08
 Owner: Codex
 Branch: task/range-gated-arith-idioms
-Worktree: ../yoolang-range-gated-arith-idioms
-Base commit: d206fd7
+Worktree: current workspace
+Base commit: 5801a2a
 
 ## Goal
 
@@ -60,13 +60,15 @@ Do not read unless explicitly needed:
 
 ## Worktree
 
-Decision: used
+Decision: not used
 
 Reason:
 
 ```text
-This task changes arithmetic semantics across OIR and MIR. Use an isolated worktree before code edits.
-The worktree is planned here but not created by this task-record split.
+This task changes arithmetic semantics across OIR and MIR, so an isolated worktree was preferred.
+The worktree creation required writing Git metadata outside the sandbox and was rejected.
+The user explicitly requested creating a branch and doing the implementation there, so the current
+workspace is on branch task/range-gated-arith-idioms.
 ```
 
 Commands:
@@ -74,7 +76,8 @@ Commands:
 ```bash
 git status --short
 git rev-parse --short HEAD
-git worktree add ../yoolang-range-gated-arith-idioms -b task/range-gated-arith-idioms
+git worktree add /tmp/yoolang-range-gated-arith-idioms -b task/range-gated-arith-idioms # rejected
+git switch -c task/range-gated-arith-idioms
 ```
 
 ## Invariants And Risks
@@ -97,22 +100,24 @@ Risk areas:
 
 | Patch | Intent | Files | Verifier/Test | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| P1 | Expose or reuse OIR range proof for non-negative and bounded values | `OIRValueRange.cpp`, OIR simplify helpers | OIR stage focused tests | pending | No transform without proof |
-| P2 | Add OIR/MIR power-of-two div/rem idioms with signed safeguards | `OIRAlgebraicSimplifyPass.cpp`, `MIRImmediateCombinePass.cpp`, `MIRRemZeroBranchCombinePass.cpp` | FileCheck and e2e tests | pending | Cover negative values |
-| P3 | Add rotate-like arithmetic transforms only where semantics are proven | OIR/MIR arithmetic passes | focused perf and correctness tests | pending | Keep broad patterns, no name matching |
+| P1 | Expose or reuse OIR range proof for non-negative and bounded values | `OIRValueRange.cpp`, OIR simplify helpers | OIR stage focused tests | done | Added path-sensitive branch-constraint overlay without copying whole-function range maps. |
+| P2 | Add OIR/MIR power-of-two div/rem idioms with signed safeguards | `OIRValueRange.cpp`, OIR/MIR lowering helpers | FileCheck and e2e tests | done | OIR rewrites non-negative `% +/-2^k` to `and mask`; existing MIR non-negative `/ 2^k` lowering remains guarded by range proof. |
+| P3 | Add rotate-like arithmetic transforms only where semantics are proven | OIR/MIR arithmetic passes | focused perf and correctness tests | done | No rotate-like transform added: current OIR lacks a proven general rotate expression shape and no safe range proof was available. |
 
 ## Verification Matrix
 
 | Gate | Command | Required? | Result | Notes |
 | --- | --- | --- | --- | --- |
-| Build | `xmake` | yes | NOT_RUN | |
-| Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_o3 --jobs 1` | yes | NOT_RUN | add signed edge cases |
-| OIR stage | `python3 scripts/run_tests.py --suite stage --stage oir --filter oir_o3 --jobs 1 --o1` | yes | NOT_RUN | |
-| MIR stage | `python3 scripts/run_tests.py --suite stage --stage mir --filter mir_backend_combine --jobs 1 --o1` | yes | NOT_RUN | |
-| ASM stage | `python3 scripts/run_tests.py --suite stage --stage asm --filter mir_backend_combine --jobs 1 --o1` | yes | NOT_RUN | |
-| E2E | `python3 scripts/run_tests.py --suite e2e --filter crypto --jobs 1 --o1` | yes | NOT_RUN | |
-| Full optimized | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | before broad finalization | NOT_RUN | |
-| Performance | `PERF_TEST_DIRS=test/performance PERF_MAX_CASES=9 python3 scripts/compare_perf.py` | yes | NOT_RUN | include crypto/huffman/sort |
+| Build | `xmake` | yes | PASS | |
+| Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_opt --jobs 1` | yes | PASS | Added signed guarded `% 16` and `% -8` checks. |
+| Full FileCheck | `python3 scripts/run_tests.py --suite filecheck --jobs 1` | yes | PASS | 17 passed. |
+| OIR stage | `python3 scripts/run_tests.py --suite stage --stage oir --filter 20_rem --jobs 1 --o1` | yes | PASS | Signed remainder verifier smoke. |
+| MIR stage | `python3 scripts/run_tests.py --suite stage --stage mir --filter 20_rem --jobs 1 --o1` | yes | PASS | Signed remainder verifier smoke. |
+| ASM stage | `python3 scripts/run_tests.py --suite stage --stage asm --filter 20_rem --jobs 1 --o1` | yes | PASS | Signed remainder verifier smoke. |
+| E2E | `python3 scripts/run_tests.py --suite e2e --filter crypto --jobs 1 --o1` | yes | PASS | 3 passed. |
+| Compile-time regression check | `python3 scripts/run_tests.py --suite stage --suite e2e --filter 29_long_line --jobs 1 --o1` | yes | PASS | 5 passed after range overlay fix. |
+| Full optimized stage/e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --jobs 1 --o1` | before broad finalization | PASS | 1388 passed, 0 failed, 1 skipped; log at `/tmp/yoolang-stage-e2e-range-gated.log`. |
+| Performance | `PERF_TEST_DIRS=test/performance PERF_MAX_CASES=9 python3 scripts/compare_perf.py` | yes | PASS | 9 cases, GCC geomean 0.775x, Clang++ geomean 0.751x, MIR stage metrics OK, QEMU instruction count disabled. |
 
 ## Alternatives
 
@@ -124,6 +129,8 @@ Risk areas:
 ## Change Log
 
 - 2026-06-07: created task file.
+- 2026-06-08: switched current workspace to `task/range-gated-arith-idioms` after worktree creation was rejected.
+- 2026-06-08: implemented range-gated non-negative `% +/-2^k -> and mask`, completed OIR `And` lowering/support, fixed range propagation compile-time regression, and verified.
 
 ## Open Questions
 
@@ -133,20 +140,21 @@ Risk areas:
 
 Current state:
 
-- Task record created from the MIR optimization split; no code edits made.
+- Implementation is ready for review on branch `task/range-gated-arith-idioms`.
+- OIR `And` is now a verified integer binary instruction, participates in constant/SCCP/local simplification, GVN/LICM/loop cloning, and lowers through both VReg and stack lowering.
+- `OIRValueRange` now carries path-sensitive branch constraints with a lightweight overlay and rewrites `srem` by positive or negative powers of two to `and mask` only when the left-hand range is proven non-negative.
+- No rotate-like transform was added because no general, proven rotate expression exists in the current OIR surface.
 
 Next action:
 
-- Create the recorded worktree, read keep=yes anchors, then implement P1.
+- Review the diff. Full stage/e2e and focused performance smoke are passing.
 
 Read next:
 
 - `docs/task-system.md`
 - `docs/tasks/2026-06-07-range-gated-arith-idioms.md`
-- `docs/mir-design.md`
 - `src/pass/oir/OIRValueRange.cpp`
-- `src/pass/oir/OIRAlgebraicSimplifyPass.cpp`
 - `src/pass/oir/OIRLocalSimplify.cpp`
-- `src/pass/mir/MIRImmediateCombinePass.cpp`
-- `src/pass/mir/MIRBitIdiomCombinePass.cpp`
-- `src/pass/mir/MIRRemZeroBranchCombinePass.cpp`
+- `src/pass/oir/OIRToMIRVRegLowerer.cpp`
+- `src/pass/oir/OIRToMIRStackLowerer.cpp`
+- `test/ir/oir_opt.sy`

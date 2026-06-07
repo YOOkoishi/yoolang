@@ -279,6 +279,16 @@ class VRegLowerer final {
             auto [min_it, max_it] = std::minmax_element(products, products + 4);
             return make_range_for_type(inst.type(), *min_it, *max_it);
         }
+        case oir::Instruction::OpID::And: {
+            std::int64_t mask = 0;
+            if (exact_constant_range(rhs, &mask) && mask >= 0) {
+                return make_range_for_type(inst.type(), 0, mask);
+            }
+            if (exact_constant_range(lhs, &mask) && mask >= 0) {
+                return make_range_for_type(inst.type(), 0, mask);
+            }
+            return full_range_for_type(inst.type());
+        }
         case oir::Instruction::OpID::SDiv: {
             std::int64_t divisor = 0;
             if (!exact_constant_range(rhs, &divisor) || divisor == 0) {
@@ -334,6 +344,7 @@ class VRegLowerer final {
         case oir::Instruction::OpID::Add:
         case oir::Instruction::OpID::Sub:
         case oir::Instruction::OpID::Mul:
+        case oir::Instruction::OpID::And:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
             return eval_binary_range(static_cast<const oir::BinaryInst &>(inst), local,
@@ -804,6 +815,7 @@ class VRegLowerer final {
         case oir::Instruction::OpID::Add:
         case oir::Instruction::OpID::Sub:
         case oir::Instruction::OpID::Mul:
+        case oir::Instruction::OpID::And:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
             lower_int_binary(static_cast<const oir::BinaryInst &>(inst));
@@ -1327,6 +1339,21 @@ class VRegLowerer final {
                                                             lhs_const->value())) {
                 return;
             }
+        } else if (inst.op() == oir::Instruction::OpID::And) {
+            if (rhs_const != nullptr && fits_simm12(rhs_const->value())) {
+                emit(mir::Opcode::AndI,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.lhs())),
+                      mir::MachineOperand::imm(rhs_const->value())});
+                return;
+            }
+            if (lhs_const != nullptr && fits_simm12(lhs_const->value())) {
+                emit(mir::Opcode::AndI,
+                     {mir::MachineOperand::reg_def(dst),
+                      mir::MachineOperand::reg_use(value_reg(inst.rhs())),
+                      mir::MachineOperand::imm(lhs_const->value())});
+                return;
+            }
         } else if (inst.op() == oir::Instruction::OpID::SDiv) {
             if (rhs_const != nullptr) {
                 auto lhs = value_reg(inst.lhs());
@@ -1363,6 +1390,9 @@ class VRegLowerer final {
             break;
         case oir::Instruction::OpID::Mul:
             opcode = mir::Opcode::MulW;
+            break;
+        case oir::Instruction::OpID::And:
+            opcode = mir::Opcode::And;
             break;
         case oir::Instruction::OpID::SDiv:
             opcode = mir::Opcode::DivW;

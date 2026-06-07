@@ -51,6 +51,7 @@ bool is_scev_speculatable(const Instruction &inst) {
     case Instruction::OpID::Add:
     case Instruction::OpID::Sub:
     case Instruction::OpID::Mul:
+    case Instruction::OpID::And:
     case Instruction::OpID::SDiv:
     case Instruction::OpID::SRem:
     case Instruction::OpID::FAdd:

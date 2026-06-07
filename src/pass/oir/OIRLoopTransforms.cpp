@@ -64,6 +64,7 @@ bool is_cloneable_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Add:
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
+    case oir::Instruction::OpID::And:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
     case oir::Instruction::OpID::FAdd:
@@ -1096,6 +1097,7 @@ bool is_allowed_zero_loop_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Add:
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
+    case oir::Instruction::OpID::And:
     case oir::Instruction::OpID::ICmp:
     case oir::Instruction::OpID::GetElementPtr:
     case oir::Instruction::OpID::ZExt:

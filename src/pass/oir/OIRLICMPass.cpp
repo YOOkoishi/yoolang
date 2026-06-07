@@ -153,6 +153,7 @@ bool is_licm_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Add:
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
+    case oir::Instruction::OpID::And:
     case oir::Instruction::OpID::FAdd:
     case oir::Instruction::OpID::FSub:
     case oir::Instruction::OpID::FMul:
