@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = ROOT / "build/linux/x86_64/release/compiler"
 DEFAULT_WORK_DIR = ROOT / "tmp/test-run"
 DEFAULT_RUNTIME = ROOT / "runtime/libsysy_riscv.a"
+RISCV_CODE_MODEL_FLAGS = ["-mcmodel=medany"]
 STAGE_FLAGS = {
     "yir": "--emit-yir",
     "oir": "--emit-oir",
@@ -416,7 +417,7 @@ def run_e2e(
 
     try:
         link_proc = run_process(
-            [gcc, "-static", str(asm_path), str(runtime), "-o", str(exe_path)],
+            [gcc, "-static", *RISCV_CODE_MODEL_FLAGS, str(asm_path), str(runtime), "-o", str(exe_path)],
             timeout=link_timeout,
         )
     except subprocess.TimeoutExpired:

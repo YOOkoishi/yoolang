@@ -224,6 +224,10 @@ MIR 允许少量 pseudo，直到合适阶段展开：
   arg area，可不生成。
 - `MachinePHI`：OIR phi 进入 MIR 后的短暂形式，必须在寄存器分配前消除。
 
+默认目标代码模型是静态 RV64 medany non-PIC。ASM printer 输出 `.option nopic`，
+并保留 `la` 给 GNU as 展开成 PC-relative 重定位序列，从而避免普通全局地址物化使用
+GOT/PIC load。未来如果需要 PIC 或其他 code model，应先增加显式目标选项再改变默认行为。
+
 原则：final MIR 里的真实 opcode 必须满足 RISC-V 立即数和操作数约束；汇编器广泛
 支持的 `li/la/call/j/ret/mv` 可以在 asm printer 层作为文本伪指令输出。
 

@@ -1,0 +1,23 @@
+// RUN: %compiler -S %s -o %t.s
+// RUN: FileCheck %s --check-prefix=ASM < %t.s
+// RUN: riscv64-linux-gnu-gcc -mcmodel=medany -c %t.s -o %t.o
+// RUN: riscv64-linux-gnu-readelf -Wr %t.o | FileCheck %s --check-prefix=RELOC
+
+int medany_global[4] = {1, 2, 3, 4};
+
+int read_medany_global(int i) {
+  return medany_global[i];
+}
+
+int main() {
+  return read_medany_global(2);
+}
+
+// ASM-NOT: .option pic
+// ASM: .option nopic
+// ASM-NOT: .option pic
+// ASM: la {{[a-z0-9]+}}, medany_global
+
+// RELOC-NOT: R_RISCV_GOT_HI20
+// RELOC: R_RISCV_PCREL_HI20 {{.*}}medany_global
+// RELOC-NOT: R_RISCV_GOT_HI20

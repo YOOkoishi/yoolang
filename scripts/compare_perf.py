@@ -44,6 +44,7 @@ TIMEOUT_SEC = int(os.environ.get("PERF_TIMEOUT_SEC", "20"))
 QEMU_INSN_TIMEOUT = int(os.environ.get("QEMU_INSN_TIMEOUT", "30"))
 ENABLE_QEMU_INSN_COUNT = os.environ.get("ENABLE_QEMU_INSN_COUNT", "0").strip().lower() in {"1", "true", "yes", "on"}
 QEMU_INSN_STRICT = os.environ.get("QEMU_INSN_STRICT", "0").strip().lower() in {"1", "true", "yes", "on"}
+RISCV_CODE_MODEL_FLAGS = ["-mcmodel=medany"]
 REPORT_DIR = WORKSPACE / "build" / "perf-ci"
 REPORT_MD = REPORT_DIR / "perf-report.md"
 REPORT_JSON = REPORT_DIR / "perf-report.json"
@@ -274,6 +275,7 @@ def _ensure_runtime_lib() -> Path:
                 str(cmake_build_dir),
                 "-DCMAKE_BUILD_TYPE=Release",
                 "-DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc",
+                f"-DCMAKE_C_FLAGS={' '.join(RISCV_CODE_MODEL_FLAGS)}",
                 f"-DCMAKE_AR={AR_BIN}",
                 f"-DCMAKE_RANLIB={RANLIB_BIN}",
             ],
@@ -301,6 +303,7 @@ def _ensure_runtime_lib() -> Path:
         [
             "riscv64-linux-gnu-gcc",
             "-O2",
+            *RISCV_CODE_MODEL_FLAGS,
             "-I",
             str(RUNTIME_HEADER.parent),
             "-c",
@@ -399,6 +402,7 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
     compile_cmd = [
         GCC_BIN,
         "-O3",
+        *RISCV_CODE_MODEL_FLAGS,
         "-std=gnu++17",
         "-include",
         str(RUNTIME_WRAPPER),
@@ -408,7 +412,7 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
     ]
     subprocess.run([*compile_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
     subprocess.run([*compile_cmd, "-c", "-o", str(obj)], check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -420,6 +424,7 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
     compile_cmd = [
         CLANG_BIN,
         "-O3",
+        *RISCV_CODE_MODEL_FLAGS,
         "-std=gnu++17",
         "--target=riscv64-linux-gnu",
         "--sysroot=/usr/riscv64-linux-gnu",
@@ -431,7 +436,7 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
     ]
     subprocess.run([*compile_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
     subprocess.run([*compile_cmd, "-c", "-o", str(obj)], check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -450,8 +455,8 @@ def _compile_compiler(src: Path, out_dir: Path) -> tuple[Path, str]:
     asm_file, _ = _emit_compiler_asm(src, out_dir)
     obj = out_dir / f"{src.stem}.compiler.o"
     exe = out_dir / f"{src.stem}.compiler.riscv"
-    subprocess.run([GCC_BIN, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, *RISCV_CODE_MODEL_FLAGS, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 

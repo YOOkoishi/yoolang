@@ -18,6 +18,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Worktree | Last update |
 | --- | --- | --- | --- |
+| [RISC-V Medany Code Model](2026-06-08-riscv-medany-code-model.md) | ready_for_review | `.` | 2026-06-08 |
 | [MIR Perf Diagnostics](2026-06-07-mir-perf-diagnostics.md) | ready_for_review | `.` | 2026-06-07 |
 | [MIR CFG Copy Cleanup](2026-06-07-mir-cfg-copy-cleanup.md) | proposed | `../yoolang-mir-cfg-copy-cleanup` | 2026-06-07 |
 | [MIR Branch Combine](2026-06-07-mir-branch-combine.md) | proposed | `../yoolang-mir-branch-combine` | 2026-06-07 |

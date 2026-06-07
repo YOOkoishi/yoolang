@@ -32,7 +32,7 @@ AsmPrinter::AsmPrinter(std::ostream &out) : out_(out) {
 
 void AsmPrinter::print(const Module &module) {
     out_ << "\t.attribute stack_align, 16\n";
-    out_ << "\t.option pic\n";
+    out_ << "\t.option nopic\n";
     print_global_sections(module);
     out_ << "\t.text\n";
     for (const auto &function : module.functions()) {
