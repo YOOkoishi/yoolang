@@ -273,6 +273,12 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
             module.types().void_ty(), map_value(store.value(), values, blocks),
             map_value(store.ptr(), values, blocks), parent);
     }
+    case oir::Instruction::OpID::MemZero: {
+        auto &memzero = static_cast<oir::MemZeroInst &>(inst);
+        return std::make_unique<oir::MemZeroInst>(
+            module.types().void_ty(), map_value(memzero.ptr(), values, blocks),
+            map_value(memzero.byte_count(), values, blocks), parent);
+    }
     case oir::Instruction::OpID::GetElementPtr: {
         auto &gep = static_cast<oir::GetElementPtrInst &>(inst);
         return std::make_unique<oir::GetElementPtrInst>(

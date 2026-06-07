@@ -1,0 +1,48 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-mir-stage=lowered -O1 %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+
+int static_clear() {
+  int buf[1000];
+  int i = 0;
+  while (i < 1000) {
+    buf[i] = 0;
+    i = i + 1;
+  }
+  return buf[999];
+}
+
+int dynamic_clear(int n) {
+  int buf[128];
+  buf[0] = 3;
+  int i = 0;
+  while (i < n) {
+    buf[i] = 0;
+    i = i + 1;
+  }
+  return buf[0];
+}
+
+int main() {
+  return static_clear() + dynamic_clear(3);
+}
+
+// OIR-LABEL: define i32 @static_clear
+// OIR: memzero i32* {{.*}}, i32 4000
+
+// OIR-LABEL: define i32 @dynamic_clear
+// OIR: memzero.bytes = mul i32 %n.arg, 4
+// OIR: memzero i32* {{.*}}, i32 %memzero.bytes
+
+// MIR-LABEL: func @static_clear
+// MIR: MEMZERO %v{{[0-9]+}}:gpr, 4000
+
+// MIR-LABEL: func @dynamic_clear
+// MIR: MEMZERO %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr
+
+// ASM-LABEL: static_clear:
+// ASM: call memset
+
+// ASM-LABEL: dynamic_clear:
+// ASM: .Lmemzero_
+// ASM: bge zero,

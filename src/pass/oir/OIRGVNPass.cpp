@@ -83,6 +83,7 @@ bool is_gvn_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Load:
     case oir::Instruction::OpID::Store:
     case oir::Instruction::OpID::Call:
+    case oir::Instruction::OpID::MemZero:
     case oir::Instruction::OpID::Phi:
         return false;
     }

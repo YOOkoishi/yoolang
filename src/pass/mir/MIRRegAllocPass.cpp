@@ -169,8 +169,20 @@ std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineIns
                                                            mir::RegisterClass reg_class) {
     std::vector<mir::Register> out;
     if (instr.opcode() == mir::Opcode::MemZero && reg_class == mir::RegisterClass::GPR) {
+        const auto &ops = instr.operands();
+        if (ops.size() >= 2 && ops[1].kind() == mir::OperandKind::Imm &&
+            ops[1].int_value() >= mir::kMemZeroMemsetThresholdBytes) {
+            return caller_saved(reg_class);
+        }
         out.push_back(mir::Register::physical("t4", reg_class));
         out.push_back(mir::Register::physical("t5", reg_class));
+    }
+    if (instr.opcode() == mir::Opcode::MemZero && reg_class == mir::RegisterClass::FPR32) {
+        const auto &ops = instr.operands();
+        if (ops.size() >= 2 && ops[1].kind() == mir::OperandKind::Imm &&
+            ops[1].int_value() >= mir::kMemZeroMemsetThresholdBytes) {
+            return caller_saved(reg_class);
+        }
     }
     return out;
 }
@@ -183,6 +195,16 @@ bool is_rematerializable_opcode(mir::Opcode opcode) {
 bool is_move_opcode_for_class(mir::Opcode opcode, mir::RegisterClass reg_class) {
     return (opcode == mir::Opcode::Move && reg_class == mir::RegisterClass::GPR) ||
            (opcode == mir::Opcode::FMove && reg_class == mir::RegisterClass::FPR32);
+}
+
+bool is_call_like_instr(const mir::MachineInstr &instr) {
+    if (instr.opcode() == mir::Opcode::Call) {
+        return true;
+    }
+    const auto &ops = instr.operands();
+    return instr.opcode() == mir::Opcode::MemZero && ops.size() >= 2 &&
+           ops[1].kind() == mir::OperandKind::Imm &&
+           ops[1].int_value() >= mir::kMemZeroMemsetThresholdBytes;
 }
 
 VRegSet live_across_call(const mir::MachineInstr &instr, const VRegSet &live_after,
@@ -394,7 +416,7 @@ class RegAllocator {
             for (auto instr_it = block->instructions().rbegin();
                  instr_it != block->instructions().rend(); ++instr_it) {
                 const auto &instr = *instr_it;
-                if (instr.opcode() == mir::Opcode::Call) {
+                if (is_call_like_instr(instr)) {
                     for (auto id : live_across_call(instr, live, reg_class)) {
                         const auto *reg = function.regs().virtual_register(id);
                         if (reg != nullptr && reg->reg_class == reg_class) {
@@ -530,7 +552,7 @@ class RegAllocator {
                     }
                 }
 
-                if (instr.opcode() == mir::Opcode::Call) {
+                if (is_call_like_instr(instr)) {
                     const auto crossing = live_across_call(instr, live, reg_class);
                     for (const auto &phys : caller_saved(reg_class)) {
                         forbid_live(crossing, phys);

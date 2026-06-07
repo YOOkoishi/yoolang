@@ -20,6 +20,7 @@ bool is_live_root(const oir::Instruction &inst, const oir::FunctionModRefAnalysi
     case oir::Instruction::OpID::Ret:
     case oir::Instruction::OpID::Br:
     case oir::Instruction::OpID::Store:
+    case oir::Instruction::OpID::MemZero:
         return true;
     default:
         return false;

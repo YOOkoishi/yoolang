@@ -70,6 +70,7 @@ bool is_scev_speculatable(const Instruction &inst) {
     case Instruction::OpID::Load:
     case Instruction::OpID::Store:
     case Instruction::OpID::Call:
+    case Instruction::OpID::MemZero:
     case Instruction::OpID::Phi:
         return false;
     }
@@ -1068,6 +1069,7 @@ bool OIRAliasAnalysis::may_read_memory(const Instruction &inst) const {
 bool OIRAliasAnalysis::may_write_memory(const Instruction &inst) const {
     switch (inst.op()) {
     case Instruction::OpID::Store:
+    case Instruction::OpID::MemZero:
     case Instruction::OpID::Call:
         return true;
     default:
@@ -1078,6 +1080,7 @@ bool OIRAliasAnalysis::may_write_memory(const Instruction &inst) const {
 bool OIRAliasAnalysis::has_side_effect(const Instruction &inst) const {
     switch (inst.op()) {
     case Instruction::OpID::Store:
+    case Instruction::OpID::MemZero:
     case Instruction::OpID::Call:
         return true;
     case Instruction::OpID::Ret:
@@ -1325,6 +1328,11 @@ FunctionMemorySummary FunctionModRefAnalysis::scan_function(const Function &func
 
             if (auto *store = dynamic_cast<const StoreInst *>(inst.get())) {
                 add_pointer_effect(out, store->ptr(), alias_analysis, true);
+                continue;
+            }
+
+            if (auto *memzero = dynamic_cast<const MemZeroInst *>(inst.get())) {
+                add_pointer_effect(out, memzero->ptr(), alias_analysis, true);
                 continue;
             }
 
@@ -1655,6 +1663,14 @@ void MemorySSA::scan_block(BasicBlock *block, MemoryAccess *start_access) {
             continue;
         }
 
+        if (auto *memzero = dynamic_cast<MemZeroInst *>(inst)) {
+            auto *access = create_access(MemoryAccessKind::Def, block, memzero);
+            access->set_defining_access(current);
+            access_for_inst_[memzero] = access;
+            current = access;
+            continue;
+        }
+
         if (auto *call = dynamic_cast<CallInst *>(inst)) {
             if (modref_->call_may_write_memory(*call)) {
                 auto *access = create_access(MemoryAccessKind::Def, block, call);
@@ -1841,6 +1857,9 @@ bool MemorySSA::access_clobbers_pointer(const MemoryAccess &access, const Value 
     if (auto *store = dynamic_cast<StoreInst *>(inst)) {
         return alias_analysis_->alias(store->ptr(), ptr) != AliasResult::NoAlias;
     }
+    if (auto *memzero = dynamic_cast<MemZeroInst *>(inst)) {
+        return alias_analysis_->alias(memzero->ptr(), ptr) != AliasResult::NoAlias;
+    }
     if (auto *call = dynamic_cast<CallInst *>(inst)) {
         return modref_->call_may_clobber(*call, ptr, *alias_analysis_);
     }
@@ -1856,6 +1875,9 @@ bool MemorySSA::access_clobbers_call_read(const MemoryAccess &access,
 
     if (auto *store = dynamic_cast<StoreInst *>(inst)) {
         return modref_->call_may_read(call, store->ptr(), *alias_analysis_);
+    }
+    if (auto *memzero = dynamic_cast<MemZeroInst *>(inst)) {
+        return modref_->call_may_read(call, memzero->ptr(), *alias_analysis_);
     }
     if (auto *writer = dynamic_cast<CallInst *>(inst)) {
         return modref_->call_may_write_memory(*writer);

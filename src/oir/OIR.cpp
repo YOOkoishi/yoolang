@@ -55,6 +55,8 @@ std::string op_to_string(Instruction::OpID op) {
         return "gep";
     case Instruction::OpID::Call:
         return "call";
+    case Instruction::OpID::MemZero:
+        return "memzero";
     case Instruction::OpID::ZExt:
         return "zext";
     case Instruction::OpID::SIToFP:
@@ -744,6 +746,24 @@ std::string StoreInst::print() const {
     return "store " + typed_value_ref(value()) + ", " + typed_value_ref(ptr());
 }
 
+MemZeroInst::MemZeroInst(Type *void_type, Value *ptr, Value *byte_count, BasicBlock *parent)
+    : Instruction(void_type, OpID::MemZero, parent, "") {
+    add_operand(ptr);
+    add_operand(byte_count);
+}
+
+Value *MemZeroInst::ptr() const {
+    return operand(0);
+}
+
+Value *MemZeroInst::byte_count() const {
+    return operand(1);
+}
+
+std::string MemZeroInst::print() const {
+    return "memzero " + typed_value_ref(ptr()) + ", " + typed_value_ref(byte_count());
+}
+
 CallInst::CallInst(Type *return_type, Value *callee, const std::vector<Value *> &args,
                    BasicBlock *parent, const std::string &name)
     : Instruction(return_type, OpID::Call, parent, name) {
@@ -1412,6 +1432,11 @@ StoreInst *IRBuilder::create_store(Value *value, Value *ptr) {
         std::make_unique<StoreInst>(module_->types().void_ty(), value, ptr, insert_block_));
 }
 
+MemZeroInst *IRBuilder::create_memzero(Value *ptr, Value *byte_count) {
+    return append(
+        std::make_unique<MemZeroInst>(module_->types().void_ty(), ptr, byte_count, insert_block_));
+}
+
 GetElementPtrInst *IRBuilder::create_gep(Value *base_ptr, Type *result_ptr_type,
                                          const std::vector<Value *> &indices,
                                          const std::string &name) {
@@ -1809,6 +1834,21 @@ VerifyResult Verifier::verify_module(const Module &module) {
                     }
                     if (ptr_ty->element_type() != store->value()->type()) {
                         return fail("store in " + block_ref(block) + " value type mismatch");
+                    }
+                    break;
+                }
+                case Instruction::OpID::MemZero: {
+                    const auto *memzero = dynamic_cast<const MemZeroInst *>(inst);
+                    if (memzero == nullptr) {
+                        return fail("memzero instruction type mismatch in " + block_ref(block));
+                    }
+                    if (!memzero->ptr()->type()->is_pointer()) {
+                        return fail("memzero in " + block_ref(block) + " expects pointer operand");
+                    }
+                    auto *count_ty = dynamic_cast<IntegerType *>(memzero->byte_count()->type());
+                    if (count_ty == nullptr || count_ty->bit_width() != 32) {
+                        return fail("memzero in " + block_ref(block) +
+                                    " expects i32 byte count");
                     }
                     break;
                 }

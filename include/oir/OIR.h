@@ -251,6 +251,7 @@ class Instruction : public User {
         Store,
         GetElementPtr,
         Call,
+        MemZero,
         ZExt,
         SIToFP,
         FPToSI,
@@ -341,6 +342,15 @@ class StoreInst final : public Instruction {
 
     Value *value() const;
     Value *ptr() const;
+    std::string print() const override;
+};
+
+class MemZeroInst final : public Instruction {
+  public:
+    MemZeroInst(Type *void_type, Value *ptr, Value *byte_count, BasicBlock *parent);
+
+    Value *ptr() const;
+    Value *byte_count() const;
     std::string print() const override;
 };
 
@@ -554,6 +564,7 @@ class IRBuilder final {
     AllocaInst *create_alloca(Type *allocated_type, const std::string &name = "");
     LoadInst *create_load(Value *ptr, Type *loaded_type, const std::string &name = "");
     StoreInst *create_store(Value *value, Value *ptr);
+    MemZeroInst *create_memzero(Value *ptr, Value *byte_count);
     GetElementPtrInst *create_gep(Value *base_ptr, Type *result_ptr_type,
                                   const std::vector<Value *> &indices,
                                   const std::string &name = "");

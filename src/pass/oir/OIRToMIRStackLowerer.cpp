@@ -236,6 +236,9 @@ class Lowerer final {
         case oir::Instruction::OpID::Store:
             lower_store(static_cast<const oir::StoreInst &>(inst));
             break;
+        case oir::Instruction::OpID::MemZero:
+            lower_memzero(static_cast<const oir::MemZeroInst &>(inst));
+            break;
         case oir::Instruction::OpID::GetElementPtr:
             lower_gep(static_cast<const oir::GetElementPtrInst &>(inst));
             break;
@@ -322,6 +325,9 @@ class Lowerer final {
             emit(mir::Opcode::MemZero,
                  {mir::MachineOperand::reg("t0"),
                   mir::MachineOperand::imm(static_cast<std::int64_t>(stored.size))});
+            if (static_cast<std::int64_t>(stored.size) >= mir::kMemZeroMemsetThresholdBytes) {
+                current_function_->note_call();
+            }
             return;
         }
 
@@ -336,6 +342,25 @@ class Lowerer final {
                  {mir::MachineOperand::reg("t0"), mir::MachineOperand::reg("t1"),
                   mir::MachineOperand::type(stored.value_type)});
         }
+    }
+
+    void lower_memzero(const oir::MemZeroInst &inst) {
+        load_int_value(inst.ptr(), "t0");
+        if (auto *constant = dynamic_cast<const oir::ConstantInt *>(inst.byte_count())) {
+            if (constant->value() < 0) {
+                throw std::runtime_error("memzero byte count must be non-negative");
+            }
+            emit(mir::Opcode::MemZero,
+                 {mir::MachineOperand::reg("t0"), mir::MachineOperand::imm(constant->value())});
+            if (constant->value() >= mir::kMemZeroMemsetThresholdBytes) {
+                current_function_->note_call();
+            }
+            return;
+        }
+
+        load_int_value(inst.byte_count(), "t1");
+        emit(mir::Opcode::MemZero,
+             {mir::MachineOperand::reg("t0"), mir::MachineOperand::reg("t1")});
     }
 
     void lower_gep(const oir::GetElementPtrInst &inst) {

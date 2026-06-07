@@ -115,6 +115,8 @@ struct TargetInfo {
     unsigned stack_align = 16;
 };
 
+inline constexpr std::int64_t kMemZeroMemsetThresholdBytes = 256;
+
 struct TypeInfo {
     ValueType value_type = ValueType::Void;
     std::string ir;

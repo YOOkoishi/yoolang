@@ -174,6 +174,7 @@ bool is_licm_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Alloca:
     case oir::Instruction::OpID::Store:
     case oir::Instruction::OpID::Call:
+    case oir::Instruction::OpID::MemZero:
     case oir::Instruction::OpID::Phi:
         return false;
     case oir::Instruction::OpID::Load:

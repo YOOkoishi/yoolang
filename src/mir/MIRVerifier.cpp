@@ -87,6 +87,19 @@ class Verifier {
             require(ops[3].kind() == OperandKind::Type, function, block, instr,
                     "offset memory instruction missing type operand");
             break;
+        case Opcode::MemZero:
+            require(ops.size() >= 2 && ops[0].is_reg(), function, block, instr,
+                    "malformed MEMZERO");
+            require(ops[1].kind() == OperandKind::Imm || ops[1].is_reg(), function, block, instr,
+                    "MEMZERO byte count must be immediate or register");
+            if (ops[1].kind() == OperandKind::Imm) {
+                require(ops[1].int_value() >= 0, function, block, instr,
+                        "MEMZERO byte count must be non-negative");
+            } else {
+                require(ops[1].reg_value().reg_class == RegisterClass::GPR, function, block, instr,
+                        "MEMZERO byte count register must be a GPR");
+            }
+            break;
         case Opcode::BranchNonZero:
             require(ops.size() >= 2 && ops[0].is_reg() && ops[1].kind() == OperandKind::Block,
                     function, block, instr, "malformed BNEZ");

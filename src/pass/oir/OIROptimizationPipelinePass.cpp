@@ -32,6 +32,7 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::rotate_loops(module, stats);
     changed |= oir_opt::eliminate_overwritten_countdown_loops(module, stats);
     changed |= oir_opt::reduce_gep_strength(module, stats);
+    changed |= oir_opt::lower_counted_zero_store_loops_to_memzero(module, stats);
     changed |= oir_opt::global_value_numbering(module, stats);
     changed |= oir_opt::eliminate_dead_loads(module, stats);
     changed |= oir_opt::eliminate_dead_stores(module, stats);
@@ -91,6 +92,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= reduce_gep_strength(module, stats);
     changed |= value_range_propagation(module, stats);
     changed |= eliminate_overwritten_countdown_loops(module, stats);
+    changed |= lower_counted_zero_store_loops_to_memzero(module, stats);
     changed |= propagate_global_constants(module, stats);
     changed |= promote_global_loads(module, stats);
     changed |= scalar_replacement_of_aggregates(module, stats);

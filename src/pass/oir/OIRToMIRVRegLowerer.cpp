@@ -351,6 +351,7 @@ class VRegLowerer final {
         }
         case oir::Instruction::OpID::Load:
         case oir::Instruction::OpID::Call:
+        case oir::Instruction::OpID::MemZero:
         case oir::Instruction::OpID::FPToSI:
             return full_range_for_type(inst.type());
         default:
@@ -794,6 +795,9 @@ class VRegLowerer final {
         case oir::Instruction::OpID::Store:
             lower_store(static_cast<const oir::StoreInst &>(inst));
             break;
+        case oir::Instruction::OpID::MemZero:
+            lower_memzero(static_cast<const oir::MemZeroInst &>(inst));
+            break;
         case oir::Instruction::OpID::GetElementPtr:
             lower_gep(static_cast<const oir::GetElementPtrInst &>(inst));
             break;
@@ -865,6 +869,9 @@ class VRegLowerer final {
             emit(mir::Opcode::MemZero,
                  {mir::MachineOperand::reg_use(addr),
                   mir::MachineOperand::imm(static_cast<std::int64_t>(stored.size))});
+            if (static_cast<std::int64_t>(stored.size) >= mir::kMemZeroMemsetThresholdBytes) {
+                current_function_->note_call();
+            }
             return;
         }
 
@@ -872,6 +879,25 @@ class VRegLowerer final {
         emit(mir::Opcode::StoreMem,
              {mir::MachineOperand::reg_use(addr), mir::MachineOperand::reg_use(value),
               mir::MachineOperand::type(stored.value_type)});
+    }
+
+    void lower_memzero(const oir::MemZeroInst &inst) {
+        auto addr = value_reg(inst.ptr());
+        if (auto *constant = constant_int(inst.byte_count())) {
+            if (constant->value() < 0) {
+                throw std::runtime_error("memzero byte count must be non-negative");
+            }
+            emit(mir::Opcode::MemZero,
+                 {mir::MachineOperand::reg_use(addr), mir::MachineOperand::imm(constant->value())});
+            if (constant->value() >= mir::kMemZeroMemsetThresholdBytes) {
+                current_function_->note_call();
+            }
+            return;
+        }
+
+        auto byte_count = value_reg(inst.byte_count());
+        emit(mir::Opcode::MemZero,
+             {mir::MachineOperand::reg_use(addr), mir::MachineOperand::reg_use(byte_count)});
     }
 
     void lower_gep(const oir::GetElementPtrInst &inst) {

@@ -4,9 +4,12 @@
 #include "oir/OIRCFGUtils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <iterator>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,6 +83,7 @@ bool is_cloneable_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Load:
     case oir::Instruction::OpID::Store:
     case oir::Instruction::OpID::Call:
+    case oir::Instruction::OpID::MemZero:
     case oir::Instruction::OpID::Phi:
         return false;
     }
@@ -127,6 +131,11 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
     if (auto *store = dynamic_cast<const oir::StoreInst *>(&inst)) {
         return std::make_unique<oir::StoreInst>(store->type(), map_value(store->value(), map),
                                                 map_value(store->ptr(), map), parent);
+    }
+    if (auto *memzero = dynamic_cast<const oir::MemZeroInst *>(&inst)) {
+        return std::make_unique<oir::MemZeroInst>(
+            memzero->type(), map_value(memzero->ptr(), map),
+            map_value(memzero->byte_count(), map), parent);
     }
     if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
         return std::make_unique<oir::CallInst>(call->type(), map_value(call->callee(), map),
@@ -999,6 +1008,444 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
     return true;
 }
 
+struct NormalizedCmp {
+    oir::CmpPred pred = oir::CmpPred::EQ;
+    oir::Value *lhs = nullptr;
+    oir::Value *rhs = nullptr;
+};
+
+struct ZeroStoreLoopMatch {
+    oir::BasicBlock *header = nullptr;
+    oir::BasicBlock *preheader = nullptr;
+    oir::BasicBlock *exit = nullptr;
+    oir::Value *start_ptr = nullptr;
+    oir::Value *bound = nullptr;
+    std::int64_t start = 0;
+    oir::CmpPred pred = oir::CmpPred::LT;
+    std::uint64_t element_size = 0;
+};
+
+oir::CmpPred negate_predicate(oir::CmpPred pred) {
+    switch (pred) {
+    case oir::CmpPred::EQ:
+        return oir::CmpPred::NE;
+    case oir::CmpPred::NE:
+        return oir::CmpPred::EQ;
+    case oir::CmpPred::LT:
+        return oir::CmpPred::GE;
+    case oir::CmpPred::LE:
+        return oir::CmpPred::GT;
+    case oir::CmpPred::GT:
+        return oir::CmpPred::LE;
+    case oir::CmpPred::GE:
+        return oir::CmpPred::LT;
+    }
+    return pred;
+}
+
+oir::CmpPred swap_predicate_operands(oir::CmpPred pred) {
+    switch (pred) {
+    case oir::CmpPred::LT:
+        return oir::CmpPred::GT;
+    case oir::CmpPred::LE:
+        return oir::CmpPred::GE;
+    case oir::CmpPred::GT:
+        return oir::CmpPred::LT;
+    case oir::CmpPred::GE:
+        return oir::CmpPred::LE;
+    case oir::CmpPred::EQ:
+    case oir::CmpPred::NE:
+        return pred;
+    }
+    return pred;
+}
+
+std::uint64_t oir_type_size(oir::Type *type) {
+    if (type == nullptr || type->is_void() || type->is_label() || type->is_function()) {
+        return 0;
+    }
+    if (auto *integer = dynamic_cast<oir::IntegerType *>(type)) {
+        return (integer->bit_width() + 7) / 8;
+    }
+    if (type->is_float()) {
+        return 4;
+    }
+    if (type->is_pointer()) {
+        return 8;
+    }
+    if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
+        return oir_type_size(array->element_type()) * array->element_count();
+    }
+    return 0;
+}
+
+bool is_zero_store_value(oir::Value *value) {
+    auto int_zero = int_constant(value);
+    if (int_zero.has_value()) {
+        return *int_zero == 0;
+    }
+    auto float_zero = float_constant(value);
+    if (float_zero.has_value()) {
+        return *float_zero == 0.0F;
+    }
+    return dynamic_cast<oir::ConstantZero *>(value) != nullptr;
+}
+
+bool is_allowed_zero_loop_instruction(const oir::Instruction &inst) {
+    switch (inst.op()) {
+    case oir::Instruction::OpID::Add:
+    case oir::Instruction::OpID::Sub:
+    case oir::Instruction::OpID::Mul:
+    case oir::Instruction::OpID::ICmp:
+    case oir::Instruction::OpID::GetElementPtr:
+    case oir::Instruction::OpID::ZExt:
+        return true;
+    default:
+        return false;
+    }
+}
+
+oir::Value *incoming_value_from(const oir::PhiInst &phi, const oir::BasicBlock *pred) {
+    for (const auto &incoming : phi.incoming()) {
+        if (incoming.second == pred) {
+            return incoming.first;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<oir::BasicBlock *> outside_predecessors(const oir::Loop &loop) {
+    std::vector<oir::BasicBlock *> out;
+    for (auto *pred : loop.header->predecessors()) {
+        if (!contains_block(loop, pred)) {
+            out.push_back(pred);
+        }
+    }
+    return out;
+}
+
+bool loop_defs_have_no_external_uses(const oir::Loop &loop) {
+    for (auto *const_block : loop.blocks) {
+        for (const auto &inst : const_block->instructions()) {
+            for (const auto &use : inst->uses()) {
+                auto *user_inst = dynamic_cast<oir::Instruction *>(use.user);
+                if (user_inst != nullptr && !contains_block(loop, user_inst->parent())) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+oir::StoreInst *single_zero_store(const oir::BasicBlock &block, std::uint64_t &element_size) {
+    oir::StoreInst *store = nullptr;
+    for (const auto &inst : block.instructions()) {
+        if (dynamic_cast<const oir::PhiInst *>(inst.get()) != nullptr || inst->is_terminator()) {
+            continue;
+        }
+        if (auto *candidate = dynamic_cast<oir::StoreInst *>(inst.get())) {
+            if (store != nullptr || !is_zero_store_value(candidate->value())) {
+                return nullptr;
+            }
+            element_size = oir_type_size(candidate->value()->type());
+            if (element_size != 4) {
+                return nullptr;
+            }
+            store = candidate;
+            continue;
+        }
+        if (!is_allowed_zero_loop_instruction(*inst)) {
+            return nullptr;
+        }
+    }
+    return store;
+}
+
+bool match_unit_gep_from_phi(oir::Value *value, oir::PhiInst *phi) {
+    auto *gep = dynamic_cast<oir::GetElementPtrInst *>(value);
+    if (gep == nullptr || gep->base_ptr() != phi) {
+        return false;
+    }
+    auto indices = gep->indices();
+    return indices.size() == 1 && is_int_value(indices.front(), 1);
+}
+
+oir::BinaryInst *match_increment_by_one(oir::Value *value, oir::PhiInst *phi) {
+    auto *binary = dynamic_cast<oir::BinaryInst *>(value);
+    if (binary == nullptr || binary->op() != oir::Instruction::OpID::Add) {
+        return nullptr;
+    }
+    if ((binary->lhs() == phi && is_int_value(binary->rhs(), 1)) ||
+        (binary->rhs() == phi && is_int_value(binary->lhs(), 1))) {
+        return binary;
+    }
+    return nullptr;
+}
+
+std::optional<NormalizedCmp> normalized_continue_cmp(const oir::BranchInst &branch,
+                                                     bool continues_on_true) {
+    auto *cmp = dynamic_cast<oir::CmpInst *>(branch.cond());
+    if (cmp == nullptr || cmp->op() != oir::Instruction::OpID::ICmp) {
+        return std::nullopt;
+    }
+    NormalizedCmp out;
+    out.pred = continues_on_true ? cmp->pred() : negate_predicate(cmp->pred());
+    out.lhs = cmp->lhs();
+    out.rhs = cmp->rhs();
+    return out;
+}
+
+bool match_continue_bound(const NormalizedCmp &cmp, oir::Value *next, oir::Value *&bound,
+                          oir::CmpPred &pred) {
+    if (cmp.lhs == next) {
+        pred = cmp.pred;
+        bound = cmp.rhs;
+    } else if (cmp.rhs == next) {
+        pred = swap_predicate_operands(cmp.pred);
+        bound = cmp.lhs;
+    } else {
+        return false;
+    }
+    return pred == oir::CmpPred::LT || pred == oir::CmpPred::LE;
+}
+
+bool match_induction(const oir::Loop &loop, oir::BasicBlock *preheader,
+                     const NormalizedCmp &continue_cmp, ZeroStoreLoopMatch &match) {
+    for (auto &inst : mutable_block(loop.header)->instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        auto *start_value = incoming_value_from(*phi, preheader);
+        auto *next_value = incoming_value_from(*phi, mutable_block(loop.header));
+        auto start = int_constant(start_value);
+        if (start_value == nullptr || next_value == nullptr || !start.has_value()) {
+            continue;
+        }
+        auto *next = match_increment_by_one(next_value, phi);
+        if (next == nullptr) {
+            continue;
+        }
+
+        oir::Value *bound = nullptr;
+        oir::CmpPred pred = oir::CmpPred::LT;
+        if (!match_continue_bound(continue_cmp, next, bound, pred) ||
+            value_defined_in_loop(bound, loop)) {
+            continue;
+        }
+
+        match.start = *start;
+        match.bound = bound;
+        match.pred = pred;
+        return true;
+    }
+    return false;
+}
+
+bool match_pointer_progression(const oir::Loop &loop, oir::BasicBlock *preheader,
+                               oir::StoreInst &store, ZeroStoreLoopMatch &match) {
+    auto *ptr_phi = dynamic_cast<oir::PhiInst *>(store.ptr());
+    if (ptr_phi == nullptr || ptr_phi->parent() != loop.header) {
+        return false;
+    }
+    auto *start_ptr = incoming_value_from(*ptr_phi, preheader);
+    auto *next_ptr = incoming_value_from(*ptr_phi, mutable_block(loop.header));
+    if (start_ptr == nullptr || next_ptr == nullptr || value_defined_in_loop(start_ptr, loop) ||
+        !match_unit_gep_from_phi(next_ptr, ptr_phi)) {
+        return false;
+    }
+    match.start_ptr = start_ptr;
+    return true;
+}
+
+std::optional<std::int64_t> constant_iteration_count(const ZeroStoreLoopMatch &match) {
+    auto bound = int_constant(match.bound);
+    if (!bound.has_value()) {
+        return std::nullopt;
+    }
+    std::int64_t count = *bound - match.start;
+    if (match.pred == oir::CmpPred::LE) {
+        ++count;
+    }
+    return count;
+}
+
+bool is_int_constant_value(oir::Value *value, std::int64_t expected) {
+    auto constant = int_constant(value);
+    return constant.has_value() && *constant == expected;
+}
+
+bool match_entry_guard_bound(const NormalizedCmp &cmp, const ZeroStoreLoopMatch &match) {
+    oir::CmpPred pred = cmp.pred;
+    if (is_int_constant_value(cmp.lhs, match.start) && cmp.rhs == match.bound) {
+        return pred == match.pred;
+    }
+    if (cmp.lhs == match.bound && is_int_constant_value(cmp.rhs, match.start)) {
+        pred = swap_predicate_operands(pred);
+        return pred == match.pred;
+    }
+    return false;
+}
+
+bool dynamic_count_has_entry_guard(const ZeroStoreLoopMatch &match) {
+    auto *branch = dynamic_cast<oir::BranchInst *>(match.preheader->terminator());
+    if (branch == nullptr || !branch->is_conditional()) {
+        return false;
+    }
+    if (branch->true_bb() != match.header && branch->false_bb() != match.header) {
+        return false;
+    }
+    auto guard = normalized_continue_cmp(*branch, branch->true_bb() == match.header);
+    return guard.has_value() && match_entry_guard_bound(*guard, match);
+}
+
+oir::Value *materialize_byte_count(oir::Module &module, oir::BasicBlock *block,
+                                   const ZeroStoreLoopMatch &match) {
+    if (auto count = constant_iteration_count(match)) {
+        if (*count <= 0) {
+            return nullptr;
+        }
+        const auto bytes = *count * static_cast<std::int64_t>(match.element_size);
+        if (bytes < 0 || bytes > std::numeric_limits<std::int32_t>::max()) {
+            return nullptr;
+        }
+        return module.create_i32(bytes);
+    }
+
+    if (!dynamic_count_has_entry_guard(match)) {
+        return nullptr;
+    }
+
+    oir::IRBuilder builder(&module);
+    builder.set_insert_point(block);
+    oir::Value *count = match.bound;
+    if (match.start != 0) {
+        count = builder.create_binary(oir::Instruction::OpID::Sub, count,
+                                      module.create_i32(match.start), "memzero.count");
+    }
+    if (match.pred == oir::CmpPred::LE) {
+        count = builder.create_binary(oir::Instruction::OpID::Add, count, module.create_i32(1),
+                                      "memzero.count");
+    }
+    if (match.element_size != 1) {
+        count = builder.create_binary(oir::Instruction::OpID::Mul, count,
+                                      module.create_i32(static_cast<std::int64_t>(match.element_size)),
+                                      "memzero.bytes");
+    }
+    return count;
+}
+
+std::optional<ZeroStoreLoopMatch> match_zero_store_loop(const oir::Loop &loop) {
+    if (loop.blocks.size() != 1 || loop.header == nullptr || !loop_defs_have_no_external_uses(loop)) {
+        return std::nullopt;
+    }
+
+    auto *header = mutable_block(loop.header);
+    auto *branch = dynamic_cast<oir::BranchInst *>(header->terminator());
+    if (branch == nullptr || !branch->is_conditional()) {
+        return std::nullopt;
+    }
+
+    const bool true_continues = branch->true_bb() == header;
+    const bool false_continues = branch->false_bb() == header;
+    if (true_continues == false_continues) {
+        return std::nullopt;
+    }
+    auto *exit = true_continues ? branch->false_bb() : branch->true_bb();
+    if (exit == nullptr || contains_block(loop, exit)) {
+        return std::nullopt;
+    }
+
+    auto outside = outside_predecessors(loop);
+    if (outside.size() != 1) {
+        return std::nullopt;
+    }
+    auto *preheader = outside.front();
+
+    std::uint64_t element_size = 0;
+    auto *store = single_zero_store(*header, element_size);
+    if (store == nullptr) {
+        return std::nullopt;
+    }
+
+    auto continue_cmp = normalized_continue_cmp(*branch, true_continues);
+    if (!continue_cmp.has_value()) {
+        return std::nullopt;
+    }
+
+    ZeroStoreLoopMatch match;
+    match.header = header;
+    match.preheader = preheader;
+    match.exit = exit;
+    match.element_size = element_size;
+    if (!match_induction(loop, preheader, *continue_cmp, match) ||
+        !match_pointer_progression(loop, preheader, *store, match)) {
+        return std::nullopt;
+    }
+    return match;
+}
+
+bool rewrite_zero_store_loop(oir::Function &function, const ZeroStoreLoopMatch &match,
+                             Stats &stats) {
+    auto *memzero_block = function.create_block("memzero");
+    auto *byte_count = materialize_byte_count(*function.parent(), memzero_block, match);
+    if (byte_count == nullptr) {
+        function.erase_block(memzero_block);
+        return false;
+    }
+
+    oir::IRBuilder builder(function.parent());
+    builder.set_insert_point(memzero_block);
+    builder.create_memzero(match.start_ptr, byte_count);
+    builder.create_br(match.exit);
+
+    if (!oir::cfg::replace_successor(match.preheader, match.header, memzero_block)) {
+        oir::cfg::remove_edge_no_phi_update(memzero_block, match.exit);
+        function.erase_block(memzero_block);
+        return false;
+    }
+
+    oir::cfg::replace_phi_incoming_block(match.exit, match.header, memzero_block);
+    oir::cfg::remove_edge_no_phi_update(match.header, match.header);
+    oir::cfg::remove_edge_no_phi_update(match.header, match.exit);
+    function.erase_block(match.header);
+
+    ++stats.memzero;
+    ++stats.cfg;
+    return true;
+}
+
+bool lower_zero_store_loops_in_function(oir::Function &function, Stats &stats) {
+    bool changed = false;
+    constexpr unsigned kMaxMemZeroLoopsPerFunction = 64;
+    for (unsigned iteration = 0; iteration < kMaxMemZeroLoopsPerFunction; ++iteration) {
+        oir::DominatorTree dom_tree(function);
+        oir::LoopInfo loop_info(function, dom_tree);
+        auto loops = loop_info.loops();
+        std::sort(loops.begin(), loops.end(), [](const oir::Loop &lhs, const oir::Loop &rhs) {
+            return lhs.blocks.size() < rhs.blocks.size();
+        });
+
+        bool rewritten = false;
+        for (const auto &loop : loops) {
+            auto match = match_zero_store_loop(loop);
+            if (!match.has_value()) {
+                continue;
+            }
+            if (rewrite_zero_store_loop(function, *match, stats)) {
+                changed = true;
+                rewritten = true;
+                break;
+            }
+        }
+        if (!rewritten) {
+            break;
+        }
+    }
+    return changed;
+}
+
 bool rotate_loops_in_function(oir::Function &function, Stats &stats) {
     bool changed = false;
     constexpr unsigned kMaxRotationsPerFunction = 32;
@@ -1076,6 +1523,17 @@ bool unswitch_loops(oir::Module &module, Stats &stats) {
             continue;
         }
         changed |= unswitch_loops_in_function(*function, stats);
+    }
+    return changed;
+}
+
+bool lower_counted_zero_store_loops_to_memzero(oir::Module &module, Stats &stats) {
+    bool changed = false;
+    for (auto &function : module.functions()) {
+        if (function->is_external() || function->entry_block() == nullptr) {
+            continue;
+        }
+        changed |= lower_zero_store_loops_in_function(*function, stats);
     }
     return changed;
 }
