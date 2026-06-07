@@ -60,4 +60,9 @@ $RECYCLE.BIN/
 
 tmp/*
 
+# docs related
+docs/TODOs.md
+docs/polyhedral_transform_todo.md
+docs/sl3-optimization.md
+
 
