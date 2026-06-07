@@ -14,6 +14,7 @@ using BlockSet = std::set<Block *>;
 
 constexpr std::size_t kMaxLICMBlocks = 512;
 constexpr std::size_t kMaxLICMInstructions = 12000;
+constexpr std::size_t kMaxExtendedLICMLoopBlocks = 8;
 
 struct Loop {
     Block *header = nullptr;
@@ -196,6 +197,10 @@ bool is_terminator(mir::Opcode opcode) {
     return opcode == mir::Opcode::Jump || is_conditional_branch(opcode);
 }
 
+bool legacy_licm_candidate(mir::Opcode opcode) {
+    return opcode == mir::Opcode::SllI || opcode == mir::Opcode::SllIW;
+}
+
 std::vector<mir::MachineInstr>::iterator insertion_point(Block *block) {
     auto &instrs = block->instructions();
     auto it = instrs.end();
@@ -211,12 +216,44 @@ std::vector<mir::MachineInstr>::iterator insertion_point(Block *block) {
 
 bool is_licm_candidate(mir::Opcode opcode) {
     switch (opcode) {
+    case mir::Opcode::LoadImm:
+    case mir::Opcode::LoadFloatImm:
+    case mir::Opcode::LoadGlobalAddr:
+    case mir::Opcode::LoadStackAddr:
+    case mir::Opcode::Add:
+    case mir::Opcode::AddW:
+    case mir::Opcode::AddI:
+    case mir::Opcode::AddIW:
+    case mir::Opcode::SubW:
+    case mir::Opcode::Mul:
+    case mir::Opcode::MulW:
+    case mir::Opcode::And:
+    case mir::Opcode::AndI:
     case mir::Opcode::SllI:
     case mir::Opcode::SllIW:
+    case mir::Opcode::SraI:
+    case mir::Opcode::SraIW:
+    case mir::Opcode::SrliW:
+    case mir::Opcode::Xor:
+    case mir::Opcode::XorI:
+    case mir::Opcode::Slt:
+    case mir::Opcode::SeqZ:
+    case mir::Opcode::Snez:
         return true;
     default:
         return false;
     }
+}
+
+bool loop_contains_call(const Loop &loop) {
+    for (auto *block : loop.blocks) {
+        for (const auto &instr : block->instructions()) {
+            if (instr.opcode() == mir::Opcode::Call) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 DefUseInfo collect_def_use_info(mir::MachineFunction &function) {
@@ -282,8 +319,11 @@ bool operand_available_in_preheader(const DefUseInfo &info,
 }
 
 bool can_hoist(const DefUseInfo &info, const std::map<Block *, BlockSet> &dom, const Loop &loop,
-               Block *preheader, const mir::MachineInstr &instr) {
+               Block *preheader, bool extended_allowed, const mir::MachineInstr &instr) {
     if (!is_licm_candidate(instr.opcode())) {
+        return false;
+    }
+    if (!extended_allowed && !legacy_licm_candidate(instr.opcode())) {
         return false;
     }
     for (const auto &operand : instr.operands()) {
@@ -320,6 +360,8 @@ bool hoist_from_loop(mir::MachineFunction &function, const Loop &loop,
     }
 
     auto info = collect_def_use_info(function);
+    const bool has_call = loop_contains_call(loop);
+    const bool extended_allowed = !has_call && loop.blocks.size() <= kMaxExtendedLICMLoopBlocks;
     std::vector<MoveLoc> to_move;
     for (auto &block_ptr : function.blocks()) {
         auto *block = block_ptr.get();
@@ -328,7 +370,7 @@ bool hoist_from_loop(mir::MachineFunction &function, const Loop &loop,
         }
         auto &instrs = block->instructions();
         for (std::size_t index = 0; index < instrs.size(); ++index) {
-            if (can_hoist(info, dom, loop, preheader, instrs[index])) {
+            if (can_hoist(info, dom, loop, preheader, extended_allowed, instrs[index])) {
                 to_move.push_back({block, index});
             }
         }

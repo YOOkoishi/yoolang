@@ -21,7 +21,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 | [MIR Perf Diagnostics](2026-06-07-mir-perf-diagnostics.md) | proposed | `../yoolang-mir-perf-diagnostics` | 2026-06-07 |
 | [MIR CFG Copy Cleanup](2026-06-07-mir-cfg-copy-cleanup.md) | proposed | `../yoolang-mir-cfg-copy-cleanup` | 2026-06-07 |
 | [MIR Branch Combine](2026-06-07-mir-branch-combine.md) | proposed | `../yoolang-mir-branch-combine` | 2026-06-07 |
-| [MIR Global CSE LICM](2026-06-07-mir-global-cse-licm.md) | proposed | `../yoolang-mir-global-cse-licm` | 2026-06-07 |
+| [MIR Global CSE LICM](2026-06-07-mir-global-cse-licm.md) | ready_for_review | `.` | 2026-06-07 |
 | [OIR Memzero MIR Lowering](2026-06-07-oir-memzero-mir-lowering.md) | proposed | `../yoolang-oir-memzero-mir-lowering` | 2026-06-07 |
 | [MIR RA PostRA Cleanup](2026-06-07-mir-ra-postra-cleanup.md) | proposed | `../yoolang-mir-ra-postra-cleanup` | 2026-06-07 |
 | [MIR List Scheduler](2026-06-07-mir-list-scheduler.md) | proposed | `../yoolang-mir-list-scheduler` | 2026-06-07 |
