@@ -1,5 +1,7 @@
 // RUN: %compiler --emit-mir -O1 %s | FileCheck %s --check-prefix=MIR
 
+int G[4];
+
 int hoist_stride(int rows, int cols, int a[]) {
   int i = 0;
   int sum = 0;
@@ -9,6 +11,34 @@ int hoist_stride(int rows, int cols, int a[]) {
       sum = sum + a[j * rows + i];
       j = j + 1;
     }
+    i = i + 1;
+  }
+  return sum;
+}
+
+int global_cse_const(int n, int x) {
+  int base = x + 70000;
+  if (n > 0) {
+    return base + 70000;
+  }
+  return base;
+}
+
+int hoist_large_const(int n) {
+  int i = 0;
+  int sum = 0;
+  while (i < n) {
+    sum = sum + 70000;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int hoist_global_addr(int n) {
+  int i = 0;
+  int sum = 0;
+  while (i < n) {
+    sum = sum + G[i];
     i = i + 1;
   }
   return sum;
@@ -26,4 +56,23 @@ int main() {
 // MIR-NOT: SLLI
 // MIR: ADD {{.*}}
 // MIR-NOT: SLLI
-// MIR-LABEL: func @main
+// MIR: while.end.6:
+
+// MIR-LABEL: func @global_cse_const
+// MIR: LI {{.*}}, 70000
+// MIR-NOT: LI {{.*}}, 70000
+// MIR-LABEL: func @hoist_large_const
+// MIR: LI {{.*}}, 70000
+// MIR: while.body
+// MIR-NOT: LI {{.*}}, 70000
+// MIR: ADDW
+// MIR-NOT: LI {{.*}}, 70000
+// MIR: while.end
+
+// MIR-LABEL: func @hoist_global_addr
+// MIR: LA {{.*}}, @G
+// MIR: while.body
+// MIR-NOT: LA {{.*}}, @G
+// MIR: LOAD_MEM
+// MIR-NOT: LA {{.*}}, @G
+// MIR: while.end

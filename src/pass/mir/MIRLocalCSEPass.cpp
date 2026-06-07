@@ -3,11 +3,23 @@
 #include "pass/mir/MIRPeepholeCommon.h"
 
 #include <algorithm>
+#include <functional>
+#include <iterator>
+#include <set>
 #include <sstream>
 #include <vector>
 
 namespace pass::mir_peephole {
 namespace {
+
+using Block = mir::MachineBasicBlock;
+using BlockSet = std::set<Block *>;
+using AvailableMap = std::map<std::string, mir::Register>;
+
+enum class CSEScope {
+    Local,
+    Global,
+};
 
 std::string reg_key(const mir::Register &reg) {
     if (reg.is_virtual()) {
@@ -16,11 +28,19 @@ std::string reg_key(const mir::Register &reg) {
     return "p" + reg.name;
 }
 
-bool stable_operand_for_cse(const mir::MachineOperand &operand) {
+bool stable_operand_for_cse(const mir::MachineOperand &operand,
+                            const std::map<VRegId, RegCounts> *counts) {
     if (!operand.is_reg()) {
         return true;
     }
-    return operand.reg_value().is_virtual() || is_zero_reg(operand.reg_value());
+    const auto &reg = operand.reg_value();
+    if (is_zero_reg(reg)) {
+        return true;
+    }
+    if (!reg.is_virtual()) {
+        return false;
+    }
+    return counts == nullptr || def_count(*counts, reg) == 1;
 }
 
 std::string operand_key(const mir::MachineOperand &operand) {
@@ -48,6 +68,47 @@ std::string operand_key(const mir::MachineOperand &operand) {
     return "";
 }
 
+bool global_cse_opcode(mir::Opcode opcode) {
+    switch (opcode) {
+    case mir::Opcode::LoadImm:
+    case mir::Opcode::LoadFloatImm:
+    case mir::Opcode::LoadGlobalAddr:
+    case mir::Opcode::LoadStackAddr:
+    case mir::Opcode::Add:
+    case mir::Opcode::AddW:
+    case mir::Opcode::AddI:
+    case mir::Opcode::AddIW:
+    case mir::Opcode::SubW:
+    case mir::Opcode::Mul:
+    case mir::Opcode::MulW:
+    case mir::Opcode::And:
+    case mir::Opcode::AndI:
+    case mir::Opcode::SllI:
+    case mir::Opcode::SllIW:
+    case mir::Opcode::SraI:
+    case mir::Opcode::SraIW:
+    case mir::Opcode::SrliW:
+    case mir::Opcode::Xor:
+    case mir::Opcode::XorI:
+    case mir::Opcode::Slt:
+    case mir::Opcode::SeqZ:
+    case mir::Opcode::Snez:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool cse_opcode(mir::Opcode opcode, CSEScope scope) {
+    if (is_move(opcode)) {
+        return false;
+    }
+    if (scope == CSEScope::Global) {
+        return global_cse_opcode(opcode);
+    }
+    return is_pure_def(opcode);
+}
+
 bool commutative_opcode(mir::Opcode opcode) {
     switch (opcode) {
     case mir::Opcode::Add:
@@ -62,19 +123,24 @@ bool commutative_opcode(mir::Opcode opcode) {
     }
 }
 
-std::optional<std::string> cse_key(const mir::MachineInstr &instr) {
-    if (!is_pure_def(instr.opcode()) || is_move(instr.opcode())) {
+std::optional<std::string> cse_key(const mir::MachineInstr &instr,
+                                   const std::map<VRegId, RegCounts> *counts,
+                                   CSEScope scope) {
+    if (!cse_opcode(instr.opcode(), scope)) {
         return std::nullopt;
     }
     const auto defs = instr.defs();
     if (defs.size() != 1 || !defs[0].is_virtual()) {
         return std::nullopt;
     }
+    if (counts != nullptr && def_count(*counts, defs[0]) != 1) {
+        return std::nullopt;
+    }
 
     std::vector<std::string> pieces;
     const auto &ops = instr.operands();
     for (std::size_t i = 1; i < ops.size(); ++i) {
-        if (!stable_operand_for_cse(ops[i])) {
+        if (ops[i].is_implicit() || !stable_operand_for_cse(ops[i], counts)) {
             return std::nullopt;
         }
         pieces.push_back(operand_key(ops[i]));
@@ -85,28 +151,148 @@ std::optional<std::string> cse_key(const mir::MachineInstr &instr) {
 
     std::ostringstream oss;
     oss << static_cast<int>(instr.opcode());
+    oss << "|" << static_cast<int>(defs[0].reg_class);
+    oss << "|" << static_cast<int>(defs[0].value_type);
     for (const auto &piece : pieces) {
         oss << "|" << piece;
     }
     return oss.str();
 }
 
-} // namespace
+bool memory_or_call_barrier(mir::Opcode opcode) {
+    return opcode == mir::Opcode::Call || opcode == mir::Opcode::StoreMem ||
+           opcode == mir::Opcode::StoreMemOffset || opcode == mir::Opcode::StoreSlot ||
+           opcode == mir::Opcode::MemZero;
+}
 
-bool local_cse(mir::MachineFunction &function, bool post_ra, Stats &stats) {
-    (void)post_ra;
+BlockSet all_blocks(mir::MachineFunction &function) {
+    BlockSet out;
+    for (auto &block : function.blocks()) {
+        out.insert(block.get());
+    }
+    return out;
+}
 
+bool contains(const BlockSet &blocks, Block *block) {
+    return blocks.find(block) != blocks.end();
+}
+
+BlockSet intersect_sets(const BlockSet &lhs, const BlockSet &rhs) {
+    BlockSet out;
+    std::set_intersection(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
+                          std::inserter(out, out.begin()));
+    return out;
+}
+
+std::map<Block *, BlockSet> compute_dominators(mir::MachineFunction &function) {
+    std::map<Block *, BlockSet> dom;
+    if (function.blocks().empty()) {
+        return dom;
+    }
+
+    auto universe = all_blocks(function);
+    auto *entry = function.blocks().front().get();
+    for (auto &block : function.blocks()) {
+        dom[block.get()] = block.get() == entry ? BlockSet{entry} : universe;
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto &block_ptr : function.blocks()) {
+            auto *block = block_ptr.get();
+            if (block == entry) {
+                continue;
+            }
+
+            BlockSet next = universe;
+            if (block->predecessors().empty()) {
+                next.clear();
+            } else {
+                bool first = true;
+                for (auto *pred : block->predecessors()) {
+                    if (first) {
+                        next = dom[pred];
+                        first = false;
+                    } else {
+                        next = intersect_sets(next, dom[pred]);
+                    }
+                }
+            }
+            next.insert(block);
+            if (next != dom[block]) {
+                dom[block] = std::move(next);
+                changed = true;
+            }
+        }
+    }
+
+    return dom;
+}
+
+bool dominates(const std::map<Block *, BlockSet> &dom, Block *dominator, Block *block) {
+    auto found = dom.find(block);
+    return found != dom.end() && contains(found->second, dominator);
+}
+
+std::map<Block *, Block *> compute_idoms(mir::MachineFunction &function,
+                                         const std::map<Block *, BlockSet> &dom) {
+    std::map<Block *, Block *> idom;
+    if (function.blocks().empty()) {
+        return idom;
+    }
+
+    auto *entry = function.blocks().front().get();
+    for (auto &block_ptr : function.blocks()) {
+        auto *block = block_ptr.get();
+        if (block == entry) {
+            continue;
+        }
+        auto found_dom = dom.find(block);
+        if (found_dom == dom.end()) {
+            continue;
+        }
+
+        Block *best = nullptr;
+        for (auto *candidate : found_dom->second) {
+            if (candidate == block) {
+                continue;
+            }
+
+            bool closest = true;
+            for (auto *other : found_dom->second) {
+                if (other == block || other == candidate) {
+                    continue;
+                }
+                if (!dominates(dom, other, candidate)) {
+                    closest = false;
+                    break;
+                }
+            }
+            if (closest) {
+                best = candidate;
+                break;
+            }
+        }
+
+        if (best != nullptr) {
+            idom[block] = best;
+        }
+    }
+
+    return idom;
+}
+
+bool local_cse_blocks(mir::MachineFunction &function, Stats &stats) {
     bool changed = false;
     for (auto &block_ptr : function.blocks()) {
-        std::map<std::string, mir::Register> available;
+        AvailableMap available;
         for (auto &instr : block_ptr->instructions()) {
-            if (instr.opcode() == mir::Opcode::Call || instr.opcode() == mir::Opcode::StoreMem ||
-                instr.opcode() == mir::Opcode::StoreMemOffset ||
-                instr.opcode() == mir::Opcode::StoreSlot || instr.opcode() == mir::Opcode::MemZero) {
+            if (memory_or_call_barrier(instr.opcode())) {
                 available.clear();
             }
 
-            auto key = cse_key(instr);
+            auto key = cse_key(instr, nullptr, CSEScope::Local);
             const auto defs = instr.defs();
             if (key && defs.size() == 1) {
                 auto found = available.find(*key);
@@ -127,6 +313,83 @@ bool local_cse(mir::MachineFunction &function, bool post_ra, Stats &stats) {
             }
         }
     }
+    return changed;
+}
+
+bool function_contains_call(const mir::MachineFunction &function) {
+    for (const auto &block_ptr : function.blocks()) {
+        for (const auto &instr : block_ptr->instructions()) {
+            if (instr.opcode() == mir::Opcode::Call) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool global_cse_dominator_tree(mir::MachineFunction &function, Stats &stats) {
+    if (function.blocks().empty() || function_contains_call(function)) {
+        return false;
+    }
+
+    const auto counts = count_vregs(function);
+    const auto dom = compute_dominators(function);
+    const auto idom = compute_idoms(function, dom);
+
+    std::map<Block *, std::vector<Block *>> children;
+    for (auto &block_ptr : function.blocks()) {
+        children[block_ptr.get()];
+    }
+    for (const auto &[block, parent] : idom) {
+        children[parent].push_back(block);
+    }
+
+    bool changed = false;
+    std::set<Block *> visited;
+    std::function<void(Block *, AvailableMap)> visit = [&](Block *block, AvailableMap available) {
+        if (block == nullptr || !visited.insert(block).second) {
+            return;
+        }
+
+        for (auto &instr : block->instructions()) {
+            auto key = cse_key(instr, &counts, CSEScope::Global);
+            const auto defs = instr.defs();
+            if (!key || defs.size() != 1) {
+                continue;
+            }
+
+            auto found = available.find(*key);
+            if (found != available.end() && found->second != defs[0]) {
+                instr = make_move_like(defs[0], found->second);
+                ++stats.cse;
+                changed = true;
+                continue;
+            }
+            available[*key] = defs[0];
+        }
+
+        for (auto *child : children[block]) {
+            visit(child, available);
+        }
+    };
+
+    visit(function.blocks().front().get(), {});
+    for (auto &block_ptr : function.blocks()) {
+        if (!contains(visited, block_ptr.get())) {
+            visit(block_ptr.get(), {});
+        }
+    }
+    return changed;
+}
+
+} // namespace
+
+bool local_cse(mir::MachineFunction &function, bool post_ra, Stats &stats) {
+    (void)post_ra;
+
+    bool changed = false;
+    changed |= local_cse_blocks(function, stats);
+    changed |= global_cse_dominator_tree(function, stats);
     return changed;
 }
 
