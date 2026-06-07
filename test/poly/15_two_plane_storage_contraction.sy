@@ -60,6 +60,13 @@ int main() {
 // YIR: yir.global @poly.storage.rowmid : array<16 x i32> = zero
 // YIR: yir.global @poly.storage.rowlast : array<16 x i32> = zero
 // YIR-NOT: yir.global @x
+// YIR: [[BJ:%poly.storage.bj[0-9]+]] = yir.const.i32 16 : i32
+// YIR: [[BK:%poly.storage.bk[0-9]+]] = yir.const.i32 64 : i32
+// YIR: [[JT:%poly.storage.jt[0-9]+]] = yir.var : i32 =
+// YIR: yir.for [[JT]] =
+// YIR: [[KT:%poly.storage.kt[0-9]+]] = yir.var : i32 =
+// YIR: yir.for [[KT]] =
+// YIR: yir.for %k = [[KT]]
 // YIR: yir.array_load @poly.storage.xbuf
 // YIR: yir.array_store {{.*}}, @poly.storage.xbuf
 // YIR: yir.call @putarray(%N, %poly.storage.row.decay

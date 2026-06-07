@@ -523,6 +523,11 @@ struct TwoPlaneStorageContraction {
     std::array<ContractedOutput, 3> outputs;
 };
 
+struct ContractedSpatialBlock {
+    yir::ForOp *j_loop = nullptr;
+    yir::ForOp *k_loop = nullptr;
+};
+
 bool is_valid_affine_access(const PolyAccess &access) {
     return access.memory != nullptr && std::all_of(access.indices.begin(), access.indices.end(),
                                                    [](const PolyAffineExpr &expr) {
@@ -1415,7 +1420,7 @@ public:
           num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
           num_stencil_carries_(0), num_future_neighbor_constants_(0),
           num_initialization_reductions_(0), num_storage_contractions_(0),
-          num_affine_replacements_(0), num_nearest_write_queries_(0),
+          num_spatial_blocks_(0), num_affine_replacements_(0), num_nearest_write_queries_(0),
           num_nearest_queries_(0), num_dead_memory_writes_(0),
           num_dead_pure_results_(0), num_unused_globals_(0) {}
 
@@ -1472,6 +1477,7 @@ public:
     std::size_t num_future_neighbor_constants() const { return num_future_neighbor_constants_; }
     std::size_t num_initialization_reductions() const { return num_initialization_reductions_; }
     std::size_t num_storage_contractions() const { return num_storage_contractions_; }
+    std::size_t num_spatial_blocks() const { return num_spatial_blocks_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
     std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
@@ -3215,13 +3221,20 @@ private:
             *parent, insert_pos, 1, storage_temp_name("one", next_storage_temp_++))->result();
         auto *two = insert_op_before<yir::ConstI32Op>(
             *parent, insert_pos, 2, storage_temp_name("two", next_storage_temp_++))->result();
+        std::int64_t init_i_lower = 0;
+        auto *plane_upper =
+            const_i32_value(reduction.init.loops.outer_to_inner[0]->lower_bound(),
+                            init_i_lower) &&
+                    init_i_lower == 0
+                ? one
+                : two;
 
         auto *plane_var = insert_op_before<yir::VarOp>(
             *parent, insert_pos, yir::Type::get_i32(), zero,
             storage_temp_name("plane", next_storage_temp_++))->result();
         insert_existing_op_before(*parent, insert_pos,
                                   make_xbuf_fill_loop(*parent, xbuf, one, plane_var,
-                                                      two, zero, n, step));
+                                                      plane_upper, zero, n, step));
 
         auto *row_k_var = insert_op_before<yir::VarOp>(
             *parent, insert_pos, yir::Type::get_i32(), zero,
@@ -3349,7 +3362,140 @@ private:
                                        init_k_upper)) {
             return false;
         }
+        apply_contracted_spatial_blocking(ContractedSpatialBlock{j_loop, k_loop});
         return true;
+    }
+
+    bool apply_contracted_spatial_blocking(const ContractedSpatialBlock &block) {
+        constexpr int kJBlockSize = 16;
+        constexpr int kKBlockSize = 64;
+
+        auto *j_loop = block.j_loop;
+        auto *k_loop = block.k_loop;
+        if (j_loop == nullptr || k_loop == nullptr ||
+            j_loop->parent() == nullptr || k_loop->parent() == nullptr ||
+            k_loop->parent() != &j_loop->body_region() ||
+            !loop_has_unit_step(*j_loop) || !loop_has_unit_step(*k_loop)) {
+            return false;
+        }
+
+        auto *i_body = j_loop->parent();
+        std::size_t j_loop_index = 0;
+        if (!find_operation_index(*i_body, *j_loop, j_loop_index)) {
+            return false;
+        }
+
+        auto *j_lower = j_loop->lower_bound();
+        auto *j_upper = j_loop->upper_bound();
+        auto *j_step = j_loop->step();
+        auto *k_lower = k_loop->lower_bound();
+        auto *k_upper = k_loop->upper_bound();
+        auto *k_step = k_loop->step();
+        std::size_t ignored_k_loop_index = 0;
+        if (!find_operation_index(*k_loop->parent(), *k_loop, ignored_k_loop_index)) {
+            return false;
+        }
+
+        std::size_t j_insert_pos = j_loop_index;
+        auto *j_tile_step_op = insert_op_before<yir::ConstI32Op>(
+            *i_body, j_insert_pos, kJBlockSize,
+            storage_temp_name("bj", next_storage_temp_++));
+        auto *j_tile_var_op = insert_op_before<yir::VarOp>(
+            *i_body, j_insert_pos, yir::Type::get_i32(), j_lower,
+            storage_temp_name("jt", next_storage_temp_++));
+
+        auto j_tile_loop = std::make_unique<yir::ForOp>(
+            j_tile_var_op->result(), j_lower, j_upper, j_tile_step_op->result());
+        j_tile_loop->set_parent(i_body);
+        auto *j_tile_limit = append_clamped_storage_tile_upper(
+            j_tile_loop->body_region(), j_tile_var_op->result(),
+            j_tile_step_op->result(), j_upper, "jend", "jlim", "jgt");
+
+        j_loop->operands()[1] = j_tile_var_op->result();
+        j_loop->operands()[2] = j_tile_limit;
+        j_loop->operands()[3] = j_step;
+
+        auto &i_ops = i_body->operations();
+        auto moved_j_loop = std::move(i_ops[j_insert_pos]);
+        moved_j_loop->set_parent(&j_tile_loop->body_region());
+        j_tile_loop->body_region().operations().push_back(std::move(moved_j_loop));
+        i_ops[j_insert_pos] = std::move(j_tile_loop);
+
+        if (!tile_contracted_k_loop(*k_loop, k_lower, k_upper, k_step, kKBlockSize)) {
+            return false;
+        }
+
+        ++num_spatial_blocks_;
+        ++num_tiled_;
+        return true;
+    }
+
+    bool tile_contracted_k_loop(yir::ForOp &k_loop, yir::Value *k_lower,
+                                yir::Value *k_upper, yir::Value *k_step,
+                                int block_size) {
+        auto *j_body = k_loop.parent();
+        std::size_t k_loop_index = 0;
+        if (j_body == nullptr || !find_operation_index(*j_body, k_loop, k_loop_index)) {
+            return false;
+        }
+
+        std::size_t k_insert_pos = k_loop_index;
+        auto *k_tile_step_op = insert_op_before<yir::ConstI32Op>(
+            *j_body, k_insert_pos, block_size,
+            storage_temp_name("bk", next_storage_temp_++));
+        auto *k_tile_var_op = insert_op_before<yir::VarOp>(
+            *j_body, k_insert_pos, yir::Type::get_i32(), k_lower,
+            storage_temp_name("kt", next_storage_temp_++));
+
+        auto k_tile_loop = std::make_unique<yir::ForOp>(
+            k_tile_var_op->result(), k_lower, k_upper, k_tile_step_op->result());
+        k_tile_loop->set_parent(j_body);
+        auto *k_tile_limit = append_clamped_storage_tile_upper(
+            k_tile_loop->body_region(), k_tile_var_op->result(),
+            k_tile_step_op->result(), k_upper, "kend", "klim", "kgt");
+
+        k_loop.operands()[1] = k_tile_var_op->result();
+        k_loop.operands()[2] = k_tile_limit;
+        k_loop.operands()[3] = k_step;
+
+        auto &j_ops = j_body->operations();
+        auto moved_k_loop = std::move(j_ops[k_insert_pos]);
+        moved_k_loop->set_parent(&k_tile_loop->body_region());
+        k_tile_loop->body_region().operations().push_back(std::move(moved_k_loop));
+        j_ops[k_insert_pos] = std::move(k_tile_loop);
+        return true;
+    }
+
+    yir::Value *append_clamped_storage_tile_upper(yir::Region &region,
+                                                  yir::Value *tile_start,
+                                                  yir::Value *tile_step,
+                                                  yir::Value *upper,
+                                                  const char *end_name,
+                                                  const char *limit_name,
+                                                  const char *cmp_name) {
+        auto tile_end = make_parented_op<yir::AddIOp>(
+            region, tile_start, tile_step,
+            storage_temp_name(end_name, next_storage_temp_++));
+        auto *tile_end_value = tile_end->result();
+        region.operations().push_back(std::move(tile_end));
+
+        auto limit = make_parented_op<yir::VarOp>(
+            region, yir::Type::get_i32(), tile_end_value,
+            storage_temp_name(limit_name, next_storage_temp_++));
+        auto *limit_value = limit->result();
+        region.operations().push_back(std::move(limit));
+
+        auto cmp = make_parented_op<yir::ICmpOp>(
+            region, yir::ICmpOp::Predicate::Gt, limit_value, upper,
+            storage_temp_name(cmp_name, next_storage_temp_++));
+        auto *cmp_value = cmp->result();
+        region.operations().push_back(std::move(cmp));
+
+        auto clamp = make_parented_op<yir::IfOp>(region, cmp_value);
+        clamp->then_region().operations().push_back(
+            make_parented_op<yir::AssignOp>(clamp->then_region(), limit_value, upper));
+        region.operations().push_back(std::move(clamp));
+        return limit_value;
     }
 
     void insert_current_plane_boundary_resets(yir::Region &i_body, std::size_t &insert_pos,
@@ -3496,58 +3642,59 @@ private:
         auto *i_loop = reduction.proof.update_loops.outer_to_inner[0];
         auto *j_loop = reduction.proof.update_loops.outer_to_inner[1];
         auto *k_loop = reduction.proof.update_loops.outer_to_inner[2];
-        auto *j_body = &j_loop->body_region();
-        std::size_t k_loop_index = 0;
-        if (!find_operation_index(*j_body, *k_loop, k_loop_index)) {
+        if (i_loop == nullptr || j_loop == nullptr || k_loop == nullptr ||
+            i_loop->parent() == nullptr || j_loop->parent() == nullptr ||
+            row_mid == nullptr || row_last == nullptr) {
             return false;
         }
 
+        auto *i_parent = i_loop->parent();
+        std::size_t i_loop_index = 0;
+        if (!find_operation_index(*i_parent, *i_loop, i_loop_index)) {
+            return false;
+        }
+
+        std::size_t preheader_insert_pos = i_loop_index;
         auto *n = output_length;
-        auto *copy_upper = k_loop->upper_bound();
-        auto *step = k_loop->step();
-        auto *zero = k_loop->lower_bound();
-        std::size_t insert_pos = k_loop_index + 1;
         auto *two = insert_op_before<yir::ConstI32Op>(
-            *j_body, insert_pos, 2, storage_temp_name("two", next_storage_temp_++))->result();
+            *i_parent, preheader_insert_pos, 2,
+            storage_temp_name("two", next_storage_temp_++))->result();
         auto *half = insert_op_before<yir::DivSIOp>(
-            *j_body, insert_pos, n, two,
+            *i_parent, preheader_insert_pos, n, two,
             storage_temp_name("half", next_storage_temp_++))->result();
         auto *last = insert_op_before<yir::SubIOp>(
-            *j_body, insert_pos, i_loop->upper_bound(), i_loop->step(),
+            *i_parent, preheader_insert_pos, i_loop->upper_bound(), i_loop->step(),
             storage_temp_name("last", next_storage_temp_++))->result();
 
-        if (row_mid == nullptr || row_last == nullptr) {
+        auto *i_body = &i_loop->body_region();
+        std::size_t j_loop_index = 0;
+        if (!find_operation_index(*i_body, *j_loop, j_loop_index)) {
             return false;
         }
 
-        append_guarded_row_copy(*j_body, insert_pos, xbuf, row_mid, cur,
-                                i_loop->induction_var(), j_loop->induction_var(),
-                                half, half, zero, copy_upper, step);
-        append_guarded_row_copy(*j_body, insert_pos, xbuf, row_last, cur,
-                                i_loop->induction_var(), j_loop->induction_var(),
-                                last, last, zero, copy_upper, step);
+        auto *copy_upper = k_loop->upper_bound();
+        auto *step = k_loop->step();
+        auto *copy_lower = k_loop->lower_bound();
+        std::size_t insert_pos = j_loop_index + 1;
+        append_guarded_i_row_copy(*i_body, insert_pos, xbuf, row_mid, cur,
+                                  i_loop->induction_var(), half, half,
+                                  copy_lower, copy_upper, step);
+        append_guarded_i_row_copy(*i_body, insert_pos, xbuf, row_last, cur,
+                                  i_loop->induction_var(), last, last,
+                                  copy_lower, copy_upper, step);
         return true;
     }
 
-    void append_guarded_row_copy(yir::Region &parent, std::size_t &insert_pos,
-                                 yir::Value *xbuf, yir::Value *row, yir::Value *cur,
-                                 yir::Value *i_var, yir::Value *j_var,
-                                 yir::Value *target_i, yir::Value *target_j,
-                                 yir::Value *zero, yir::Value *n, yir::Value *step) {
-        auto *j_cmp = insert_op_before<yir::ICmpOp>(
-            parent, insert_pos, yir::ICmpOp::Predicate::Eq, j_var, target_j,
-            storage_temp_name("j.eq", next_storage_temp_++));
-        auto *j_if = insert_op_before<yir::IfOp>(parent, insert_pos, j_cmp->result());
-
-        auto i_cmp = make_parented_op<yir::ICmpOp>(
-            j_if->then_region(), yir::ICmpOp::Predicate::Eq, i_var, target_i,
+    void append_guarded_i_row_copy(yir::Region &parent, std::size_t &insert_pos,
+                                   yir::Value *xbuf, yir::Value *row, yir::Value *cur,
+                                   yir::Value *i_var, yir::Value *target_i,
+                                   yir::Value *target_j, yir::Value *zero,
+                                   yir::Value *n, yir::Value *step) {
+        auto *i_cmp = insert_op_before<yir::ICmpOp>(
+            parent, insert_pos, yir::ICmpOp::Predicate::Eq, i_var, target_i,
             storage_temp_name("i.eq", next_storage_temp_++));
-        auto *i_cmp_value = i_cmp->result();
-        j_if->then_region().operations().push_back(std::move(i_cmp));
-
-        auto i_if = make_parented_op<yir::IfOp>(j_if->then_region(), i_cmp_value);
-        append_row_copy_loop(i_if->then_region(), xbuf, row, cur, j_var, zero, n, step);
-        j_if->then_region().operations().push_back(std::move(i_if));
+        auto *i_if = insert_op_before<yir::IfOp>(parent, insert_pos, i_cmp->result());
+        append_row_copy_loop(i_if->then_region(), xbuf, row, cur, target_j, zero, n, step);
     }
 
     void append_row_copy_loop(yir::Region &parent, yir::Value *xbuf, yir::Value *row,
@@ -4133,6 +4280,7 @@ private:
     std::size_t num_future_neighbor_constants_;
     std::size_t num_initialization_reductions_;
     std::size_t num_storage_contractions_;
+    std::size_t num_spatial_blocks_;
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
@@ -4199,6 +4347,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", future_neighbor_constants=" << transformer.num_future_neighbor_constants()
         << ", initialization_reductions=" << transformer.num_initialization_reductions()
         << ", storage_contractions=" << transformer.num_storage_contractions()
+        << ", spatial_blocks=" << transformer.num_spatial_blocks()
         << ", affine_replacements=" << transformer.num_affine_replacements()
         << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
         << ", nearest_queries=" << transformer.num_nearest_queries()
