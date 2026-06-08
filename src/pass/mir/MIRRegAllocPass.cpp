@@ -165,22 +165,35 @@ bool phys_in_set(const std::set<std::string> &set, const mir::Register &reg) {
     return reg.is_physical() && set.find(reg.name) != set.end();
 }
 
+const mir::MachineOperand *memzero_byte_count_operand(const mir::MachineInstr &instr) {
+    if (instr.opcode() != mir::Opcode::MemZero) {
+        return nullptr;
+    }
+    const auto &ops = instr.operands();
+    return ops.size() >= 3 ? &ops[2] : nullptr;
+}
+
 std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineInstr &instr,
                                                            mir::RegisterClass reg_class) {
     std::vector<mir::Register> out;
     if (instr.opcode() == mir::Opcode::MemZero && reg_class == mir::RegisterClass::GPR) {
+        const auto *byte_count = memzero_byte_count_operand(instr);
+        if (byte_count != nullptr && byte_count->kind() == mir::OperandKind::Imm &&
+            byte_count->int_value() >= mir::kMemZeroMemsetThresholdBytes) {
+            return caller_saved(reg_class);
+        }
         const auto &ops = instr.operands();
         if (ops.size() >= 2 && ops[1].kind() == mir::OperandKind::Imm &&
-            ops[1].int_value() >= mir::kMemZeroMemsetThresholdBytes) {
-            return caller_saved(reg_class);
+            ops[1].int_value() != 0) {
+            out.push_back(mir::Register::physical("t3", reg_class));
         }
         out.push_back(mir::Register::physical("t4", reg_class));
         out.push_back(mir::Register::physical("t5", reg_class));
     }
     if (instr.opcode() == mir::Opcode::MemZero && reg_class == mir::RegisterClass::FPR32) {
-        const auto &ops = instr.operands();
-        if (ops.size() >= 2 && ops[1].kind() == mir::OperandKind::Imm &&
-            ops[1].int_value() >= mir::kMemZeroMemsetThresholdBytes) {
+        const auto *byte_count = memzero_byte_count_operand(instr);
+        if (byte_count != nullptr && byte_count->kind() == mir::OperandKind::Imm &&
+            byte_count->int_value() >= mir::kMemZeroMemsetThresholdBytes) {
             return caller_saved(reg_class);
         }
     }
@@ -201,10 +214,9 @@ bool is_call_like_instr(const mir::MachineInstr &instr) {
     if (instr.opcode() == mir::Opcode::Call) {
         return true;
     }
-    const auto &ops = instr.operands();
-    return instr.opcode() == mir::Opcode::MemZero && ops.size() >= 2 &&
-           ops[1].kind() == mir::OperandKind::Imm &&
-           ops[1].int_value() >= mir::kMemZeroMemsetThresholdBytes;
+    const auto *byte_count = memzero_byte_count_operand(instr);
+    return byte_count != nullptr && byte_count->kind() == mir::OperandKind::Imm &&
+           byte_count->int_value() >= mir::kMemZeroMemsetThresholdBytes;
 }
 
 VRegSet live_across_call(const mir::MachineInstr &instr, const VRegSet &live_after,

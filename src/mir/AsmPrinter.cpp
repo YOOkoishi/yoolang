@@ -25,6 +25,12 @@ std::uint32_t float_bits(float value) {
     return bits;
 }
 
+std::int64_t repeated_byte_word(std::int64_t byte_value) {
+    auto byte = static_cast<std::uint32_t>(byte_value) & 0xffU;
+    std::uint32_t word = byte | (byte << 8U) | (byte << 16U) | (byte << 24U);
+    return static_cast<std::int32_t>(word);
+}
+
 } // namespace
 
 AsmPrinter::AsmPrinter(std::ostream &out) : out_(out) {
@@ -153,7 +159,7 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
                        ops[3].type_value());
         break;
     case Opcode::MemZero:
-        emit_memzero(ops[0], ops[1]);
+        emit_memzero(ops[0], ops[1], ops[2]);
         break;
     case Opcode::Move:
         out_ << "\tmv " << ops[0].string_value() << ", " << ops[1].string_value() << "\n";
@@ -431,30 +437,33 @@ void AsmPrinter::emit_adjust_sp(std::int64_t amount) {
     out_ << "\tadd sp, sp, t6\n";
 }
 
-void AsmPrinter::emit_memzero(const MachineOperand &addr, const MachineOperand &byte_count) {
+void AsmPrinter::emit_memzero(const MachineOperand &addr, const MachineOperand &byte_value,
+                              const MachineOperand &byte_count) {
     if (byte_count.kind() == OperandKind::Imm) {
         auto size = static_cast<std::uint64_t>(byte_count.int_value());
         if (size == 0) {
             return;
         }
         if (byte_count.int_value() >= kMemZeroMemsetThresholdBytes) {
-            emit_memset_call(addr.string_value(), size);
+            emit_memset_call(addr.string_value(), byte_value, size);
             return;
         }
     }
-    emit_memzero_loop(addr.string_value(), byte_count);
+    emit_memzero_loop(addr.string_value(), byte_value, byte_count);
 }
 
-void AsmPrinter::emit_memset_call(const std::string &addr_reg, std::uint64_t size) {
+void AsmPrinter::emit_memset_call(const std::string &addr_reg, const MachineOperand &byte_value,
+                                  std::uint64_t size) {
     if (addr_reg != "a0") {
         out_ << "\tmv a0, " << addr_reg << "\n";
     }
-    out_ << "\tli a1, 0\n";
+    out_ << "\tli a1, " << byte_value.int_value() << "\n";
     out_ << "\tli a2, " << size << "\n";
     out_ << "\tcall memset\n";
 }
 
 void AsmPrinter::emit_memzero_loop(const std::string &addr_reg,
+                                   const MachineOperand &byte_value,
                                    const MachineOperand &byte_count) {
     if (byte_count.kind() == OperandKind::Imm && byte_count.int_value() == 0) {
         return;
@@ -469,9 +478,13 @@ void AsmPrinter::emit_memzero_loop(const std::string &addr_reg,
     } else {
         out_ << "\tmv " << counter << ", " << byte_count.string_value() << "\n";
     }
+    const bool stores_zero = byte_value.kind() == OperandKind::Imm && byte_value.int_value() == 0;
+    if (!stores_zero) {
+        out_ << "\tli t3, " << repeated_byte_word(byte_value.int_value()) << "\n";
+    }
     out_ << loop << ":\n";
     out_ << "\tbge zero, " << counter << ", " << done << "\n";
-    out_ << "\tsw zero, 0(" << cursor << ")\n";
+    out_ << "\tsw " << (stores_zero ? "zero" : "t3") << ", 0(" << cursor << ")\n";
     out_ << "\taddi " << cursor << ", " << cursor << ", 4\n";
     out_ << "\taddi " << counter << ", " << counter << ", -4\n";
     out_ << "\tj " << loop << "\n";
