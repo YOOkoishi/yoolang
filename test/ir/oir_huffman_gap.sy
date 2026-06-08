@@ -1,0 +1,76 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int signed_odd_eq(int x) {
+  if (x % 2 == 1) {
+    return 1;
+  }
+  return 0;
+}
+
+int signed_odd_ne(int x) {
+  if (x % -2 != 1) {
+    return 1;
+  }
+  return 0;
+}
+
+int constprop_many_returns(int x, int n) {
+  if (n == 0) return x + 1;
+  if (n == 1) return x + 2;
+  if (n == 2) return x + 3;
+  if (n == 3) return x + 4;
+  if (n == 4) return x + 5;
+  if (n == 5) return x + 6;
+  return x;
+}
+
+int constprop_call(int x) {
+  return constprop_many_returns(x, 5);
+}
+
+int conditional_add(int x, int y, int c) {
+  if (c != 0) {
+    x = x + y;
+  }
+  return x;
+}
+
+int short_and_add(int a, int b, int x, int y) {
+  if (a == 1 && b == 1) {
+    x = x + y;
+  }
+  return x;
+}
+
+int main() {
+  return signed_odd_eq(3) + signed_odd_ne(-3) + constprop_call(9) +
+         conditional_add(1, 2, 3) + short_and_add(1, 1, 4, 5);
+}
+
+// OIR-LABEL: define i32 @signed_odd_eq
+// OIR-NOT: srem i32
+// OIR: and i32 %x.arg, -2147483647
+// OIR: icmp eq i32
+
+// OIR-LABEL: define i32 @signed_odd_ne
+// OIR-NOT: srem i32
+// OIR: and i32 %x.arg, -2147483647
+// OIR: icmp ne i32
+
+// OIR-LABEL: define i32 @constprop_call
+// OIR-NOT: call i32 @constprop_many_returns
+// OIR: add i32 %x.arg, 6
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @conditional_add
+// OIR-NOT: br i1
+// OIR: zext i1
+// OIR: sub i32 0
+// OIR: and i32 %y.arg
+// OIR: add i32 %x.arg
+
+// OIR-LABEL: define i32 @short_and_add
+// OIR-NOT: br i1
+// OIR: and i1
+// OIR: zext i1
+// OIR: add i32 %x.arg

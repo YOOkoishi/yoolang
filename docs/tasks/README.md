@@ -18,6 +18,8 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [Huffman Follow-up Performance Regression Fix](2026-06-09-huffman-followup-regression-fix.md) | ready_for_review | `task/huffman-perf-gap` | 2026-06-09 |
+| [Huffman Performance Gap Plan](2026-06-09-huffman-perf-gap.md) | ready_for_review | `task/huffman-perf-gap` | 2026-06-09 |
 | [Pointer Loop Exit Regression Fix](2026-06-08-pointer-loop-exit-regression.md) | ready_for_review | `task/pointer-loop-exit-regression` | 2026-06-08 |
 | [Many Mat Cal Loop Fixes](2026-06-08-many-mat-cal-loop-fixes.md) | ready_for_review | `task/many-mat-cal-loop-fixes` | 2026-06-08 |
 | [Many Mat Cal Performance Gap Attribution](2026-06-08-many-mat-cal-perf-gap.md) | ready_for_review | `master` | 2026-06-08 |
