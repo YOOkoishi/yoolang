@@ -23,8 +23,40 @@ int dynamic_clear(int n) {
   return buf[0];
 }
 
+int static_fill_minus_one() {
+  int buf[1000];
+  int i = 0;
+  while (i < 1000) {
+    buf[i] = -1;
+    i = i + 1;
+  }
+  return buf[999];
+}
+
+int dynamic_fill_minus_one(int n) {
+  int buf[128];
+  buf[0] = 3;
+  int i = 0;
+  while (i < n) {
+    buf[i] = -1;
+    i = i + 1;
+  }
+  return buf[0];
+}
+
+int static_fill_nonbyte() {
+  int buf[16];
+  int i = 0;
+  while (i < 16) {
+    buf[i] = 258;
+    i = i + 1;
+  }
+  return buf[15];
+}
+
 int main() {
-  return static_clear() + dynamic_clear(3);
+  return static_clear() + dynamic_clear(3) + static_fill_minus_one() +
+         dynamic_fill_minus_one(3) + static_fill_nonbyte();
 }
 
 // OIR-LABEL: define i32 @static_clear
@@ -34,11 +66,30 @@ int main() {
 // OIR: memzero.bytes = mul i32 %n.arg, 4
 // OIR: memzero i32* {{.*}}, i32 %memzero.bytes
 
+// OIR-LABEL: define i32 @static_fill_minus_one
+// OIR: memset i32* {{.*}}, i32 255, i32 4000
+
+// OIR-LABEL: define i32 @dynamic_fill_minus_one
+// OIR: memzero.bytes = mul i32 %n.arg, 4
+// OIR: memset i32* {{.*}}, i32 255, i32 %memzero.bytes
+
+// OIR-LABEL: define i32 @static_fill_nonbyte
+// OIR-NOT: memset
+// OIR-NOT: memzero
+
+// OIR-LABEL: define i32 @main
+
 // MIR-LABEL: func @static_clear
-// MIR: MEMZERO %v{{[0-9]+}}:gpr, 4000
+// MIR: MEMZERO %v{{[0-9]+}}:gpr, 0, 4000
 
 // MIR-LABEL: func @dynamic_clear
-// MIR: MEMZERO %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr
+// MIR: MEMZERO %v{{[0-9]+}}:gpr, 0, %v{{[0-9]+}}:gpr
+
+// MIR-LABEL: func @static_fill_minus_one
+// MIR: MEMZERO %v{{[0-9]+}}:gpr, 255, 4000
+
+// MIR-LABEL: func @dynamic_fill_minus_one
+// MIR: MEMZERO %v{{[0-9]+}}:gpr, 255, %v{{[0-9]+}}:gpr
 
 // ASM-LABEL: static_clear:
 // ASM: call memset
@@ -46,3 +97,11 @@ int main() {
 // ASM-LABEL: dynamic_clear:
 // ASM: .Lmemzero_
 // ASM: bge zero,
+
+// ASM-LABEL: static_fill_minus_one:
+// ASM: li a1, 255
+// ASM: call memset
+
+// ASM-LABEL: dynamic_fill_minus_one:
+// ASM: li t3, -1
+// ASM: .Lmemzero_

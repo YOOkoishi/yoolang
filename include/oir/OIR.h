@@ -347,9 +347,11 @@ class StoreInst final : public Instruction {
 
 class MemZeroInst final : public Instruction {
   public:
-    MemZeroInst(Type *void_type, Value *ptr, Value *byte_count, BasicBlock *parent);
+    MemZeroInst(Type *void_type, Value *ptr, Value *byte_value, Value *byte_count,
+                BasicBlock *parent);
 
     Value *ptr() const;
+    Value *byte_value() const;
     Value *byte_count() const;
     std::string print() const override;
 };
@@ -565,6 +567,7 @@ class IRBuilder final {
     LoadInst *create_load(Value *ptr, Type *loaded_type, const std::string &name = "");
     StoreInst *create_store(Value *value, Value *ptr);
     MemZeroInst *create_memzero(Value *ptr, Value *byte_count);
+    MemZeroInst *create_memset(Value *ptr, Value *byte_value, Value *byte_count);
     GetElementPtrInst *create_gep(Value *base_ptr, Type *result_ptr_type,
                                   const std::vector<Value *> &indices,
                                   const std::string &name = "");

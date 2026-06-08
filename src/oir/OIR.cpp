@@ -746,9 +746,11 @@ std::string StoreInst::print() const {
     return "store " + typed_value_ref(value()) + ", " + typed_value_ref(ptr());
 }
 
-MemZeroInst::MemZeroInst(Type *void_type, Value *ptr, Value *byte_count, BasicBlock *parent)
+MemZeroInst::MemZeroInst(Type *void_type, Value *ptr, Value *byte_value, Value *byte_count,
+                         BasicBlock *parent)
     : Instruction(void_type, OpID::MemZero, parent, "") {
     add_operand(ptr);
+    add_operand(byte_value);
     add_operand(byte_count);
 }
 
@@ -756,12 +758,22 @@ Value *MemZeroInst::ptr() const {
     return operand(0);
 }
 
-Value *MemZeroInst::byte_count() const {
+Value *MemZeroInst::byte_value() const {
     return operand(1);
 }
 
+Value *MemZeroInst::byte_count() const {
+    return operand(2);
+}
+
 std::string MemZeroInst::print() const {
-    return "memzero " + typed_value_ref(ptr()) + ", " + typed_value_ref(byte_count());
+    if (auto *byte = dynamic_cast<ConstantInt *>(byte_value())) {
+        if (byte->value() == 0) {
+            return "memzero " + typed_value_ref(ptr()) + ", " + typed_value_ref(byte_count());
+        }
+    }
+    return "memset " + typed_value_ref(ptr()) + ", " + typed_value_ref(byte_value()) + ", " +
+           typed_value_ref(byte_count());
 }
 
 CallInst::CallInst(Type *return_type, Value *callee, const std::vector<Value *> &args,
@@ -1433,8 +1445,13 @@ StoreInst *IRBuilder::create_store(Value *value, Value *ptr) {
 }
 
 MemZeroInst *IRBuilder::create_memzero(Value *ptr, Value *byte_count) {
+    return create_memset(ptr, module_->create_i32(0), byte_count);
+}
+
+MemZeroInst *IRBuilder::create_memset(Value *ptr, Value *byte_value, Value *byte_count) {
     return append(
-        std::make_unique<MemZeroInst>(module_->types().void_ty(), ptr, byte_count, insert_block_));
+        std::make_unique<MemZeroInst>(module_->types().void_ty(), ptr, byte_value, byte_count,
+                                      insert_block_));
 }
 
 GetElementPtrInst *IRBuilder::create_gep(Value *base_ptr, Type *result_ptr_type,
@@ -1844,6 +1861,17 @@ VerifyResult Verifier::verify_module(const Module &module) {
                     }
                     if (!memzero->ptr()->type()->is_pointer()) {
                         return fail("memzero in " + block_ref(block) + " expects pointer operand");
+                    }
+                    auto *value_ty = dynamic_cast<IntegerType *>(memzero->byte_value()->type());
+                    if (value_ty == nullptr || value_ty->bit_width() != 32) {
+                        return fail("memzero in " + block_ref(block) +
+                                    " expects i32 byte value");
+                    }
+                    auto *byte_value = dynamic_cast<ConstantInt *>(memzero->byte_value());
+                    if (byte_value == nullptr || byte_value->value() < 0 ||
+                        byte_value->value() > 255) {
+                        return fail("memzero in " + block_ref(block) +
+                                    " expects constant byte value in [0, 255]");
                     }
                     auto *count_ty = dynamic_cast<IntegerType *>(memzero->byte_count()->type());
                     if (count_ty == nullptr || count_ty->bit_width() != 32) {

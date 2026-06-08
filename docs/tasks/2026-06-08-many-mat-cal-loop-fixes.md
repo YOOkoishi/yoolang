@@ -1,11 +1,11 @@
 # Task: Many Mat Cal Loop Fixes
 
-Status: scoped
+Status: ready_for_review
 Created: 2026-06-08
 Last update: 2026-06-08
 Owner: Codex
 Branch: task/many-mat-cal-loop-fixes
-Base commit: 85165fb
+Base commit: f199536
 
 ## Goal
 
@@ -91,9 +91,12 @@ Do not read unless explicitly needed:
 | `include/oir/OIR.h` | `MemZeroInst`, builder APIs | IR representation for generalized memset | yes | likely needs `MemSetInst` or generalized memory set API |
 | `src/oir/OIR.cpp` | verifier/printer/IRBuilder | OIR legality and pointer compare restriction | yes | `icmp` operands must be integer |
 | `src/pass/oir/OIRToMIRVRegLowerer.cpp` | `lower_memzero` | optimized lowering path for memory set operation | yes | update if adding generic memset |
+| `src/pass/oir/OIRToMIRStackLowerer.cpp` | `lower_memzero` | non-vreg lowering path for memory set operation | yes | mirrored vreg lowering operand order |
 | `src/mir/AsmPrinter.cpp` | `emit_memzero`, `emit_memset_call` | final assembly lowering | yes | currently hardcodes memset value `0` |
+| `src/pass/mir/MIRPointerLoopExitPass.cpp` | full | MIR PreRA redundant-IV pointer-exit cleanup | yes | new narrow matcher; rejects bounds defined in loop blocks |
+| `src/pass/mir/MIRPeepholePipelinePass.cpp` | pass order | schedule pointer-exit cleanup after jump cleanup | yes | PreRA only |
 | `test/ir/oir_memzero_loop.sy` | full | existing memzero FileCheck pattern | yes | extend or add sibling test for `-1`/repeated-byte memset |
-| `test/ir/oir_lsr_dynamic.sy` | full | existing LSR FileCheck pattern | yes | add sibling test for redundant IV compare cleanup |
+| `test/ir/mir_pointer_loop_exit.sy` | full | focused FileCheck for redundant IV compare cleanup | yes | checks pointer `BNE` and no loop `BLT` |
 
 ## Branch
 
@@ -145,28 +148,29 @@ Risk areas:
 
 | Patch | Intent | Files | Verifier/Test | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| P0 | Reproduce baseline on the implementation branch | `build/perf-ci/perf-report.md`, stage dumps | `xmake`; focused `compare_perf.py`; direct `--emit-oir`/`--emit-mir-stage=final` for `many_mat_cal-1` | pending | Copy current timing and hot loop shape into this task before editing code. |
-| P1 | Add or extend tests for repeated-byte store-loop lowering | `test/ir/oir_memzero_loop.sy` or new `test/ir/oir_memset_loop.sy` | FileCheck OIR/MIR/ASM | pending | Cover `0` remains valid and `-1` lowers to memset byte `255`; include a non-repeated value that must stay scalar if feasible. |
-| P2 | Introduce a generic memory set representation/lowering | `include/oir/OIR.h`, `src/oir/OIR.cpp`, OIR clone/analysis helpers, OIR-to-MIR lowering, MIR/ASM lowering | OIR verifier, MIR stage, ASM FileCheck | pending | Prefer `MemSetInst(ptr, byte_value, byte_count)` or equivalent; preserve existing `MemZeroInst` behavior or migrate it cleanly. |
-| P3 | Generalize counted store-loop matcher from zero-only to repeated-byte constants | `src/pass/oir/OIRLoopTransforms.cpp`, possibly `include/oir/OIRScalarOpt.h` stats text | FileCheck from P1; focused e2e | pending | Reuse current loop-shape checks and byte-count materialization; do not lower arbitrary constants. |
-| P4 | Add focused redundant-IV loop-exit cleanup test | new `test/ir/oir_lsr_pointer_exit.sy` or MIR-stage test | FileCheck MIR/ASM | pending | Test should check no extra integer IV bump/compare remains in a pointer-walk loop; avoid naming `many_mat_cal`. |
-| P5 | Implement redundant counted-IV compare cleanup | prefer MIR PreRA pass/helper, or explicitly extend OIR pointer compare support first | MIR verifier, ASM stage, focused e2e | pending | If choosing OIR pointer `icmp`, update verifier/lowering/tests in this patch before enabling the transform. |
-| P6 | Focused performance verification and regression check | reports under `build/perf-ci` | focused `many_mat_cal`; `PERF_MAX_CASES=3`; then full `test/performance` if focused improves | pending | Inspect MIR metrics and hot assembly; compare against baseline numbers from P0. |
+| P0 | Reproduce baseline on the implementation branch | `build/perf-ci/perf-report.md`, stage dumps | `xmake`; focused `compare_perf.py`; direct emits for `many_mat_cal-1` | done | Baseline focused report: GCC geomean `0.93x`, Clang++ `0.81x`; `many_mat_cal-1/2/3` compiler times `0.1709/0.1831/0.1546s`; final metrics total `696` instrs, `15` stores, `0` spills. |
+| P1 | Add or extend tests for repeated-byte store-loop lowering | `test/ir/oir_memzero_loop.sy` | FileCheck OIR/MIR/ASM | done | Covers zero memzero, `-1` as byte `255`, dynamic byte count, and non-repeated `258` staying scalar. |
+| P2 | Introduce a generic memory set representation/lowering | `include/oir/OIR.h`, `src/oir/OIR.cpp`, OIR clone/inline helpers, OIR-to-MIR lowering, MIR verifier/ASM/RA | OIR verifier, MIR stage, ASM FileCheck | done | Generalized existing `MemZeroInst` to carry constant byte value; printer keeps `memzero` for byte `0` and prints `memset` for non-zero. MIR `MEMZERO` operands are `addr, byte_value, byte_count`. |
+| P3 | Generalize counted store-loop matcher from zero-only to repeated-byte constants | `src/pass/oir/OIRLoopTransforms.cpp` | FileCheck from P1; full e2e | done | Only repeated-byte i32 constants or zero float/aggregate are lowered; arbitrary constants are rejected. |
+| P4 | Add focused redundant-IV loop-exit cleanup test | `test/ir/mir_pointer_loop_exit.sy` | FileCheck MIR/ASM | done | Checks a generic two-load pointer-walk loop branches with pointer `BNE` instead of counted `BLT`. |
+| P5 | Implement redundant counted-IV compare cleanup | `src/pass/mir/MIRPointerLoopExitPass.cpp`, `src/pass/mir/MIRPeepholePipelinePass.cpp` | MIR verifier, ASM stage, focused/full e2e | done | Implemented in MIR PreRA. Matcher requires zero-start unit IV, single-use IV step, pointer progression by power-of-two stride, at least two memory accesses, and loop-invariant branch bound. It computes end pointer from `max(bound, 1)` to preserve do-while semantics. |
+| P6 | Focused performance verification and regression check | reports under `build/perf-ci` | focused `many_mat_cal`; `PERF_MAX_CASES=3`; full `test/performance`; full optimized tests | done | Focused many_mat final: GCC geomean `1.07x`, Clang++ `0.92x`; full `test/performance` 60/60 PASS, GCC `0.90x`, Clang++ `0.98x`; full `--suite all --o1` 1423 PASS, 1 SKIP. |
 
 ## Verification Matrix
 
 | Gate | Command | Required? | Result | Notes |
 | --- | --- | --- | --- | --- |
-| Build | `xmake` | yes | NOT_RUN | Run before and after implementation. |
-| FileCheck memory set | `python3 scripts/run_tests.py --suite filecheck --filter oir_memset --jobs 1` | yes | NOT_RUN | Adjust filter to actual test filename. |
-| FileCheck LSR/loop exit | `python3 scripts/run_tests.py --suite filecheck --filter lsr --jobs 1` | yes | NOT_RUN | Must include the new redundant-IV cleanup test. |
-| OIR stage focused | `python3 scripts/run_tests.py --suite stage --stage oir --filter test/ir --jobs 1 --o1` | yes | NOT_RUN | Verifies OIR printer/verifier after IR changes. |
-| MIR/ASM stage focused | `python3 scripts/run_tests.py --suite stage --stage mir --stage asm --filter test/ir --jobs 1 --o1` | yes | NOT_RUN | Required for memory set lowering and branch cleanup. |
-| Focused e2e | `python3 scripts/run_tests.py --suite e2e --filter many_mat_cal --jobs 1 --o1` | if supported by filter | NOT_RUN | If run_tests does not include perf cases as e2e, use compare_perf instead. |
-| Focused performance | `PERF_TEST_DIRS=test/performance/many_mat_cal-1.sy,test/performance/many_mat_cal-2.sy,test/performance/many_mat_cal-3.sy python3 scripts/compare_perf.py` | yes | NOT_RUN | Primary performance gate for this task. |
-| Perf smoke | `PERF_TEST_DIRS=test/performance PERF_MAX_CASES=3 python3 scripts/compare_perf.py` | yes | NOT_RUN | Smoke only, not final performance proof. |
-| Full performance | `PERF_TEST_DIRS=test/performance python3 scripts/compare_perf.py` | yes | NOT_RUN | Required before ready_for_review if focused improves. |
-| Full optimized tests | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | yes | NOT_RUN | Required because this task changes shared IR/backend behavior. |
+| Build | `xmake` | yes | PASS | Final build ok. |
+| FileCheck memory set | `python3 scripts/run_tests.py --suite filecheck --filter oir_memzero_loop --jobs 1` | yes | PASS | Covers OIR `memzero`/`memset`, MIR byte operand, ASM `memset` call and inline non-zero fill loop. |
+| FileCheck LSR/loop exit | `python3 scripts/run_tests.py --suite filecheck --filter lsr --jobs 1`; `python3 scripts/run_tests.py --suite filecheck --filter mir_pointer_loop_exit --jobs 1` | yes | PASS | Existing LSR test passed; new MIR pointer-exit test passed. |
+| OIR/MIR/ASM direct focused emits | direct `--emit-oir`, `--emit-mir-stage=pre-ra`, and `-S` for focused tests | yes | PASS | `run_tests.py` stage discovery deliberately skips `/test/ir/`; direct compiler emits succeeded for the FileCheck tests. |
+| Full FileCheck | `python3 scripts/run_tests.py --suite filecheck --jobs 1` | yes | PASS | 19 passed. |
+| Full stage+e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --jobs 1 --o1` | yes | PASS | 1388 passed, 0 failed, 1 skipped. Initial crypto-related failures exposed a bound-dominance bug in the MIR matcher; fixed by rejecting bounds defined in header/backedge and reran PASS. |
+| Focused e2e | `python3 scripts/run_tests.py --suite e2e --filter many_mat_cal --jobs 1 --o1` | if supported by filter | PASS | Covered by full stage+e2e and focused performance; many_mat e2e rows passed in full run. |
+| Focused performance | `PERF_TEST_DIRS=test/performance/many_mat_cal-1.sy,test/performance/many_mat_cal-2.sy,test/performance/many_mat_cal-3.sy python3 scripts/compare_perf.py` | yes | PASS | Final focused report generated `2026-06-08 13:58:42 UTC`: GCC geomean `1.07x`, Clang++ `0.92x`; compiler times `0.1428/0.1453/0.1450s`. |
+| Perf smoke | `PERF_TEST_DIRS=test/performance PERF_MAX_CASES=3 python3 scripts/compare_perf.py` | yes | PASS | 3/3 PASS; smoke only. |
+| Full performance | `PERF_TEST_DIRS=test/performance python3 scripts/compare_perf.py` | yes | PASS | 60/60 PASS; report generated `2026-06-08 14:03:41 UTC`; geomean speedup GCC `0.90x`, Clang++ `0.98x`; QEMU instruction count disabled. |
+| Full optimized tests | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | yes | PASS | 1423 passed, 0 failed, 1 skipped. |
 
 ## Expected Evidence
 
@@ -192,32 +196,38 @@ Before claiming success, record:
 ## Change Log
 
 - 2026-06-08: created scoped follow-up task from `many_mat_cal` performance attribution, with primary redundant-IV cleanup and secondary repeated-byte memset lowering.
+- 2026-06-08: implemented repeated-byte counted-store lowering through generalized memzero byte values, added MIR PreRA pointer-loop exit cleanup, fixed a crypto e2e miscompile by requiring loop-invariant branch bounds, completed correctness and performance gates, and marked ready for review.
 
 ## Open Questions
 
-- Should redundant-IV cleanup live in MIR PreRA, or is it worth extending OIR with legal pointer comparisons?
-- Should generic memory set be represented as a new `MemSetInst`, or should `MemZeroInst` be generalized?
-- What is the minimum profitability guard for pointer-end compare cleanup so loops with small trip counts or costly dynamic end materialization do not regress?
+- Resolved: redundant-IV cleanup lives in MIR PreRA; OIR pointer comparisons were not introduced.
+- Resolved: generic memory set is represented by generalized `MemZeroInst` with constant byte value. Zero still prints as `memzero`; non-zero prints as `memset`.
+- Resolved for this patch: pointer-exit cleanup is gated to loops with at least two memory accesses, zero-start unit IV, single-use removable IV, power-of-two pointer stride, and branch bounds not defined in the header/backedge. End pointer uses `max(bound, 1)` to preserve do-while semantics.
 
 ## Handoff Note
 
 Current state:
 
-- No repair code has been written for this task.
-- The task is scoped and ready to start on a task branch.
-- The current repo has documentation changes from the attribution task; do not revert them.
+- Implementation complete on `task/many-mat-cal-loop-fixes`; ready for review.
+- Repeated-byte store loops lower to byte-valued `MEMZERO`/`memset` when the stored i32 pattern repeats in all bytes.
+- Hot `many_mat_cal` matrix multiply loop now uses pointer-end `bne` and no longer carries the redundant integer IV in the steady-state body.
+- Full optimized correctness passed: `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` -> 1423 passed, 1 skipped.
+- Full `test/performance` compare passed: 60 cases, GCC geomean `0.90x`, Clang++ `0.98x`; focused many_mat improved to GCC `1.07x`, Clang++ `0.92x`.
 
 Next action:
 
-- Create the planned branch with `git checkout -b task/many-mat-cal-loop-fixes`, run P0 baseline commands, then start with the repeated-byte memory set path or the MIR PreRA redundant-IV cleanup path.
+- Review the implementation diff, especially `src/pass/mir/MIRPointerLoopExitPass.cpp` safety predicates and the generalized `MemZeroInst` operand contract.
 
 Read next:
 
 - `docs/task-system.md`
 - `docs/tasks/2026-06-08-many-mat-cal-loop-fixes.md`
-- `docs/tasks/2026-06-08-many-mat-cal-perf-gap.md`
-- `src/pass/oir/OIRLoopTransforms.cpp`
 - `include/oir/OIR.h`
 - `src/oir/OIR.cpp`
+- `src/pass/oir/OIRLoopTransforms.cpp`
 - `src/pass/oir/OIRToMIRVRegLowerer.cpp`
+- `src/pass/oir/OIRToMIRStackLowerer.cpp`
 - `src/mir/AsmPrinter.cpp`
+- `src/pass/mir/MIRPointerLoopExitPass.cpp`
+- `test/ir/oir_memzero_loop.sy`
+- `test/ir/mir_pointer_loop_exit.sy`
