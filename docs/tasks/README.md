@@ -16,19 +16,21 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 ## Active Tasks
 
-| Task | Status | Worktree | Last update |
+| Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
-| [RISC-V Medany Code Model](2026-06-08-riscv-medany-code-model.md) | ready_for_review | `.` | 2026-06-08 |
-| [MIR Perf Diagnostics](2026-06-07-mir-perf-diagnostics.md) | ready_for_review | `.` | 2026-06-07 |
-| [MIR CFG Copy Cleanup](2026-06-07-mir-cfg-copy-cleanup.md) | proposed | `../yoolang-mir-cfg-copy-cleanup` | 2026-06-07 |
-| [MIR Branch Combine](2026-06-07-mir-branch-combine.md) | proposed | `../yoolang-mir-branch-combine` | 2026-06-07 |
-| [MIR Global CSE LICM](2026-06-07-mir-global-cse-licm.md) | ready_for_review | `.` | 2026-06-07 |
-| [OIR Memzero MIR Lowering](2026-06-07-oir-memzero-mir-lowering.md) | proposed | `../yoolang-oir-memzero-mir-lowering` | 2026-06-07 |
-| [MIR RA PostRA Cleanup](2026-06-07-mir-ra-postra-cleanup.md) | proposed | `../yoolang-mir-ra-postra-cleanup` | 2026-06-07 |
-| [MIR List Scheduler](2026-06-07-mir-list-scheduler.md) | proposed | `../yoolang-mir-list-scheduler` | 2026-06-07 |
-| [MIR Small If Conversion](2026-06-07-mir-small-if-conversion.md) | proposed | `../yoolang-mir-small-if-conversion` | 2026-06-07 |
-| [Range Gated Arith Idioms](2026-06-07-range-gated-arith-idioms.md) | proposed | `../yoolang-range-gated-arith-idioms` | 2026-06-07 |
-| [MIR Perf Integration](2026-06-07-mir-perf-integration.md) | ready_for_review | `.` | 2026-06-07 |
+| [Many Mat Cal Loop Fixes](2026-06-08-many-mat-cal-loop-fixes.md) | scoped | `task/many-mat-cal-loop-fixes` | 2026-06-08 |
+| [Many Mat Cal Performance Gap Attribution](2026-06-08-many-mat-cal-perf-gap.md) | ready_for_review | `master` | 2026-06-08 |
+| [RISC-V Medany Code Model](2026-06-08-riscv-medany-code-model.md) | ready_for_review | `master` | 2026-06-08 |
+| [MIR Perf Diagnostics](2026-06-07-mir-perf-diagnostics.md) | ready_for_review | `mir++` | 2026-06-07 |
+| [MIR CFG Copy Cleanup](2026-06-07-mir-cfg-copy-cleanup.md) | proposed | `task/mir-cfg-copy-cleanup` | 2026-06-07 |
+| [MIR Branch Combine](2026-06-07-mir-branch-combine.md) | proposed | `tasksys` | 2026-06-07 |
+| [MIR Global CSE LICM](2026-06-07-mir-global-cse-licm.md) | ready_for_review | `tasksys` | 2026-06-07 |
+| [OIR Memzero MIR Lowering](2026-06-07-oir-memzero-mir-lowering.md) | proposed | `mir++` | 2026-06-07 |
+| [MIR RA PostRA Cleanup](2026-06-07-mir-ra-postra-cleanup.md) | proposed | `task/mir-ra-postra-cleanup` | 2026-06-07 |
+| [MIR List Scheduler](2026-06-07-mir-list-scheduler.md) | proposed | `mir++` | 2026-06-07 |
+| [MIR Small If Conversion](2026-06-07-mir-small-if-conversion.md) | proposed | `task/mir-small-if-conversion` | 2026-06-07 |
+| [Range Gated Arith Idioms](2026-06-07-range-gated-arith-idioms.md) | proposed | `task/range-gated-arith-idioms` | 2026-06-07 |
+| [MIR Perf Integration](2026-06-07-mir-perf-integration.md) | ready_for_review | `mir++` | 2026-06-07 |
 
 ## Shared MIR Perf Gates
 

@@ -5,7 +5,6 @@ Created: YYYY-MM-DD
 Last update: YYYY-MM-DD
 Owner: <name-or-agent>
 Branch: <branch-or-not-used>
-Worktree: <path-or-not-used>
 Base commit: <short-sha>
 
 ## Goal
@@ -48,14 +47,14 @@ Do not read unless explicitly needed:
 | --- | --- | --- | --- | --- |
 | `docs/task-system.md` | full | task protocol | yes | required |
 
-## Worktree
+## Branch
 
 Decision: <used / not used>
 
 Reason:
 
 ```text
-<why this task needs or does not need a worktree>
+<why this task needs or does not need a new branch>
 ```
 
 Commands:
@@ -63,7 +62,7 @@ Commands:
 ```bash
 git status --short
 git rev-parse --short HEAD
-git worktree add ../yoolang-<slug> -b task/<slug>
+git checkout -b task/<slug>
 ```
 
 ## Invariants And Risks

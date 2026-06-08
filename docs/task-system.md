@@ -60,8 +60,8 @@ docs/
 3. 用 `rg` 建立候选文件集。
    搜索只用于定位锚点，不用于无限扩张上下文。每次搜索后，把保留的锚点写到 `Context Ledger`，把丢弃原因写到备注。
 
-4. 选择 worktree 策略。
-   侵入式任务或需要并行尝试时，使用 Git worktree；文档或极小修复可以留在当前工作区。无论哪种，都要记录 base commit、branch、worktree path 和 `git status --short`。
+4. 选择分支策略。
+   侵入式任务或需要多轮实现时，在当前仓库用 `git checkout -b task/<slug>` 新建任务分支；文档或极小修复可以留在当前分支。无论哪种，都要记录 base commit、branch 和 `git status --short`。
 
 5. 写 patch 计划。
    每个 patch 只解决一个行为点。先写 `Patch Queue`，再编辑文件。
@@ -102,11 +102,11 @@ docs/
   -> verifier/test 脚本
 ```
 
-## Git worktree 规则
+## Git 分支规则
 
-worktree 用来隔离多轮实验，避免上下文中断时污染主工作区。
+任务分支用来隔离多轮实验，避免上下文中断时把不相关修改混在同一条开发线上。
 
-创建前：
+创建或选择分支前：
 
 ```bash
 git status --short
@@ -116,23 +116,22 @@ git rev-parse --short HEAD
 常规创建：
 
 ```bash
-git worktree add ../yoolang-<slug> -b task/<slug>
+git checkout -b task/<slug>
 ```
 
 使用已有分支：
 
 ```bash
-git worktree add ../yoolang-<slug> task/<slug>
+git checkout task/<slug>
 ```
 
 规则：
 
-- worktree 路径不要放在仓库内部。
-- 每个任务文件只记录一个主 worktree；实验性分支写在 `Alternatives`。
-- 不在没有记录的 worktree 中修改代码。
-- 合并或丢弃 worktree 前，任务文件必须记录最终 branch、commit 或 diff 状态。
+- 每个任务文件只记录一个主分支；实验性分支写在 `Alternatives`。
+- 不在没有记录的任务分支中修改代码。
+- 合并、放弃或切换任务分支前，任务文件必须记录最终 branch、commit 或 diff 状态。
 
-文档-only 或单文件小修可以不创建 worktree，但要在 `Worktree` 节写明 `not used` 和原因。
+文档-only 或单文件小修可以不创建新分支，但要在 `Branch` 节写明 `not used` 或 `current branch` 和原因。
 
 ## 小 patch 规则
 
