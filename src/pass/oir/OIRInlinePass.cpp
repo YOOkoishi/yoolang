@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <list>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -23,6 +24,13 @@ constexpr unsigned kMaxCalleeBlocks = 12;
 constexpr unsigned kMaxCalleeCost = 45;
 constexpr unsigned kMaxCalleeReturns = 4;
 constexpr unsigned kMaxCalleeParams = 16;
+constexpr unsigned kMaxSpecializedInlineBlocks = 96;
+constexpr unsigned kMaxSpecializedInlineCost = 260;
+constexpr unsigned kMaxSpecializedInlineReturns = 8;
+constexpr unsigned kMaxSpecializationCalleeBlocks = 64;
+constexpr unsigned kMaxSpecializationCalleeCost = 180;
+constexpr unsigned kMaxSpecializedFunctions = 48;
+constexpr unsigned kMaxSpecializedCallSites = 128;
 constexpr unsigned kMaxRecursiveInlineDepth = 5;
 constexpr unsigned kMaxRecursiveCalleeBlocks = 16;
 constexpr unsigned kMaxRecursiveCalleeCost = 90;
@@ -40,6 +48,8 @@ struct CalleeInfo {
 struct InlineContext {
     std::unordered_map<oir::Function *, std::unique_ptr<oir::Function>> recursive_templates;
 };
+
+bool is_constprop_specialization(const oir::Function &function);
 
 std::string inline_name(const oir::Function &callee, const oir::Value &value,
                         unsigned inline_index) {
@@ -79,6 +89,62 @@ bool contains_call_to(const oir::Function &function, const oir::Function &target
         }
     }
     return false;
+}
+
+std::vector<oir::Function *> direct_callees(const oir::Function &function) {
+    std::vector<oir::Function *> out;
+    for (const auto &block : function.blocks()) {
+        for (const auto &inst : block->instructions()) {
+            auto *call = dynamic_cast<const oir::CallInst *>(inst.get());
+            if (call == nullptr) {
+                continue;
+            }
+            auto *callee = dynamic_cast<oir::Function *>(call->callee());
+            if (callee != nullptr && !callee->is_external()) {
+                out.push_back(callee);
+            }
+        }
+    }
+    return out;
+}
+
+bool reaches_function(const oir::Function &function, const oir::Function &target,
+                      std::unordered_set<const oir::Function *> &seen) {
+    if (!seen.insert(&function).second) {
+        return false;
+    }
+    for (auto *callee : direct_callees(function)) {
+        if (callee == &target || reaches_function(*callee, target, seen)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_recursive_in_call_graph(const oir::Function &function) {
+    std::unordered_set<const oir::Function *> seen;
+    return reaches_function(function, function, seen);
+}
+
+bool reaches_recursive_function(const oir::Function &function,
+                                std::unordered_set<const oir::Function *> &seen) {
+    if (!seen.insert(&function).second) {
+        return false;
+    }
+    for (auto *callee : direct_callees(function)) {
+        if (is_recursive_in_call_graph(*callee) || reaches_recursive_function(*callee, seen)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_recursive_call_graph_dependency(const oir::Function &function) {
+    if (is_recursive_in_call_graph(function)) {
+        return true;
+    }
+    std::unordered_set<const oir::Function *> seen;
+    return reaches_recursive_function(function, seen);
 }
 
 std::string recursive_inline_marker(const oir::Function &function) {
@@ -172,6 +238,11 @@ bool is_eligible_non_recursive_call(const oir::Function &caller, const oir::Call
     }
 
     auto info = inspect_callee(*callee);
+    if (is_constprop_specialization(*callee)) {
+        return info.blocks <= kMaxSpecializedInlineBlocks &&
+               info.cost <= kMaxSpecializedInlineCost && info.returns != 0 &&
+               info.returns <= kMaxSpecializedInlineReturns;
+    }
     return info.blocks <= kMaxCalleeBlocks && info.cost <= kMaxCalleeCost && info.returns != 0 &&
            info.returns <= kMaxCalleeReturns;
 }
@@ -391,6 +462,216 @@ std::unique_ptr<oir::Function> clone_function_template(oir::Function &source) {
     return out;
 }
 
+bool is_constprop_specialization(const oir::Function &function) {
+    return function.name().rfind("__yo_constprop.", 0) == 0;
+}
+
+bool is_specializable_constant(oir::Value *value) {
+    return int_constant(value).has_value() || float_constant(value).has_value();
+}
+
+std::string constant_key(oir::Value *value) {
+    if (auto constant = int_constant(value)) {
+        return "i" + std::to_string(*constant);
+    }
+    if (auto constant = float_constant(value)) {
+        std::ostringstream oss;
+        oss << "f" << *constant;
+        return oss.str();
+    }
+    return "*";
+}
+
+std::string specialization_key(const oir::Function &callee, const oir::CallInst &call) {
+    std::ostringstream oss;
+    oss << static_cast<const void *>(&callee);
+    auto args = call.args();
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        oss << ";";
+        if (is_specializable_constant(args[i])) {
+            oss << i << "=" << constant_key(args[i]);
+        } else {
+            oss << i << "=*";
+        }
+    }
+    return oss.str();
+}
+
+std::string next_specialization_name(oir::Module &module, const oir::Function &callee,
+                                     unsigned &next_id) {
+    while (true) {
+        std::string name = "__yo_constprop." + callee.name() + "." + std::to_string(next_id++);
+        if (module.get_function(name) == nullptr) {
+            return name;
+        }
+    }
+}
+
+bool has_constant_argument(const oir::CallInst &call) {
+    for (auto *arg : call.args()) {
+        if (is_specializable_constant(arg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool specialized_constant_argument_feeds_phi(const oir::CallInst &call,
+                                             const oir::Function &callee) {
+    auto args = call.args();
+    if (args.size() != callee.args().size()) {
+        return true;
+    }
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (!is_specializable_constant(args[i])) {
+            continue;
+        }
+        for (auto *user : callee.args()[i]->users()) {
+            if (dynamic_cast<oir::PhiInst *>(user) != nullptr) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool is_eligible_for_constant_specialization(const oir::Function &caller, const oir::CallInst &call,
+                                             oir::Function *callee) {
+    if (callee == nullptr || callee == &caller || callee->is_external() ||
+        callee->entry_block() == nullptr || callee->name() == "main" ||
+        is_constprop_specialization(*callee) ||
+        !has_compatible_call_shape(call, *callee) || !has_constant_argument(call) ||
+        specialized_constant_argument_feeds_phi(call, *callee) ||
+        has_recursive_call_graph_dependency(*callee)) {
+        return false;
+    }
+
+    auto info = inspect_callee(*callee);
+    return info.blocks <= kMaxSpecializationCalleeBlocks &&
+           info.cost <= kMaxSpecializationCalleeCost && info.returns != 0;
+}
+
+oir::Function *clone_constant_specialization(oir::Module &module, oir::Function &callee,
+                                             const oir::CallInst &call, unsigned &next_id) {
+    auto args = call.args();
+    std::vector<oir::Type *> param_types;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (!is_specializable_constant(args[i])) {
+            param_types.push_back(callee.args()[i]->type());
+        }
+    }
+
+    auto *clone = module.create_function(next_specialization_name(module, callee, next_id),
+                                         module.types().func_ty(callee.return_type(), param_types),
+                                         false);
+
+    ValueMap values;
+    BlockMap blocks;
+    std::size_t next_arg = 0;
+    for (std::size_t i = 0; i < callee.args().size(); ++i) {
+        if (is_specializable_constant(args[i])) {
+            values[callee.args()[i].get()] = args[i];
+            continue;
+        }
+        auto *arg = clone->args()[next_arg++].get();
+        if (!callee.args()[i]->name().empty()) {
+            arg->set_name(callee.args()[i]->name());
+        }
+        values[callee.args()[i].get()] = arg;
+    }
+
+    for (const auto &block : callee.blocks()) {
+        blocks[block.get()] = clone->create_block("constprop." + block->name());
+    }
+
+    for (const auto &block : callee.blocks()) {
+        auto *out_block = blocks.at(block.get());
+        for (const auto &inst : block->instructions()) {
+            auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+            if (phi == nullptr) {
+                break;
+            }
+            auto out_phi =
+                std::make_unique<oir::PhiInst>(phi->type(), out_block, phi->name());
+            values[phi] = out_phi.get();
+            out_block->append_instruction(std::move(out_phi));
+        }
+    }
+
+    for (const auto &block : callee.blocks()) {
+        auto *out_block = blocks.at(block.get());
+        for (const auto &inst_ptr : block->instructions()) {
+            auto *inst = inst_ptr.get();
+            if (inst->op() == oir::Instruction::OpID::Phi) {
+                continue;
+            }
+            if (auto *ret = dynamic_cast<oir::ReturnInst *>(inst)) {
+                out_block->append_instruction(std::make_unique<oir::ReturnInst>(
+                    module.types().void_ty(),
+                    ret->has_value() ? map_value(ret->value(), values, blocks) : nullptr,
+                    out_block));
+                continue;
+            }
+            if (auto *br = dynamic_cast<oir::BranchInst *>(inst)) {
+                if (br->is_conditional()) {
+                    auto *true_bb = static_cast<oir::BasicBlock *>(
+                        map_value(br->true_bb(), values, blocks));
+                    auto *false_bb = static_cast<oir::BasicBlock *>(
+                        map_value(br->false_bb(), values, blocks));
+                    out_block->append_instruction(std::make_unique<oir::BranchInst>(
+                        module.types().void_ty(), map_value(br->cond(), values, blocks), true_bb,
+                        false_bb, out_block));
+                    out_block->add_successor(true_bb);
+                    out_block->add_successor(false_bb);
+                    true_bb->add_predecessor(out_block);
+                    false_bb->add_predecessor(out_block);
+                } else {
+                    auto *target = static_cast<oir::BasicBlock *>(
+                        map_value(br->target_bb(), values, blocks));
+                    out_block->append_instruction(std::make_unique<oir::BranchInst>(
+                        module.types().void_ty(), target, out_block));
+                    out_block->add_successor(target);
+                    target->add_predecessor(out_block);
+                }
+                continue;
+            }
+
+            auto cloned =
+                clone_non_phi_instruction(module, callee, *inst, out_block, values, blocks, 0);
+            values[inst] = cloned.get();
+            out_block->append_instruction(std::move(cloned));
+        }
+    }
+
+    for (const auto &block : callee.blocks()) {
+        auto *out_block = blocks.at(block.get());
+        auto out_it = out_block->instructions().begin();
+        for (const auto &inst : block->instructions()) {
+            auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+            if (phi == nullptr) {
+                break;
+            }
+            auto *out_phi = static_cast<oir::PhiInst *>(out_it->get());
+            for (const auto &[value, from] : phi->incoming()) {
+                out_phi->add_incoming(map_value(value, values, blocks), blocks.at(from));
+            }
+            ++out_it;
+        }
+    }
+
+    return clone;
+}
+
+void retarget_call_to_specialization(oir::CallInst &call, oir::Function &clone) {
+    auto args = call.args();
+    call.set_operand(0, &clone);
+    for (std::size_t i = args.size(); i > 0; --i) {
+        if (is_specializable_constant(args[i - 1])) {
+            call.remove_arg(i - 1);
+        }
+    }
+}
+
 oir::Function &recursive_template_for(InlineContext &context, oir::Function &function) {
     auto found = context.recursive_templates.find(&function);
     if (found != context.recursive_templates.end()) {
@@ -584,6 +865,76 @@ bool inline_one_call(oir::Module &module, InlineContext &context, oir::Function 
 }
 
 } // namespace
+
+bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
+    struct Site {
+        oir::Function *caller = nullptr;
+        oir::Function *callee = nullptr;
+        oir::CallInst *call = nullptr;
+        std::string key;
+    };
+
+    std::vector<Site> sites;
+    for (auto &function : module.functions()) {
+        if (function->is_external()) {
+            continue;
+        }
+        for (auto &block : function->blocks()) {
+            for (auto &inst : block->instructions()) {
+                auto *call = dynamic_cast<oir::CallInst *>(inst.get());
+                if (call == nullptr) {
+                    continue;
+                }
+                auto *callee = dynamic_cast<oir::Function *>(call->callee());
+                if (!is_eligible_for_constant_specialization(*function, *call, callee)) {
+                    continue;
+                }
+                sites.push_back({function.get(), callee, call, specialization_key(*callee, *call)});
+                if (sites.size() >= kMaxSpecializedCallSites) {
+                    break;
+                }
+            }
+            if (sites.size() >= kMaxSpecializedCallSites) {
+                break;
+            }
+        }
+        if (sites.size() >= kMaxSpecializedCallSites) {
+            break;
+        }
+    }
+
+    if (sites.empty()) {
+        return false;
+    }
+
+    bool changed = false;
+    unsigned next_id = 0;
+    std::unordered_map<std::string, oir::Function *> clones;
+    for (auto &site : sites) {
+        if (site.call == nullptr || site.callee == nullptr ||
+            dynamic_cast<oir::Function *>(site.call->callee()) != site.callee) {
+            continue;
+        }
+
+        auto found = clones.find(site.key);
+        oir::Function *clone = nullptr;
+        if (found != clones.end()) {
+            clone = found->second;
+        } else {
+            if (clones.size() >= kMaxSpecializedFunctions) {
+                break;
+            }
+            clone = clone_constant_specialization(module, *site.callee, *site.call, next_id);
+            clones.emplace(site.key, clone);
+        }
+        retarget_call_to_specialization(*site.call, *clone);
+        ++stats.specialized;
+        changed = true;
+        (void)site.caller;
+    }
+
+    return changed;
+}
 
 bool inline_functions(oir::Module &module, Stats &stats) {
     bool changed = false;
