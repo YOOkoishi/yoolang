@@ -20,6 +20,9 @@ bool optimize_function(mir::MachineFunction &function, bool post_ra,
             iteration_changed |= mir_peephole::hoist_loop_invariants(function, post_ra, stats);
         }
         iteration_changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
+        if (!post_ra) {
+            iteration_changed |= mir_peephole::optimize_pointer_loop_exits(function, post_ra, stats);
+        }
         iteration_changed |= mir_peephole::remove_dead_defs(function, post_ra, stats);
         if (!iteration_changed) {
             break;
@@ -30,6 +33,10 @@ bool optimize_function(mir::MachineFunction &function, bool post_ra,
     changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
     changed |= mir_peephole::simplify_blocks(function, post_ra, stats);
     changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
+    if (!post_ra) {
+        changed |= mir_peephole::optimize_pointer_loop_exits(function, post_ra, stats);
+        changed |= mir_peephole::cleanup_jumps(function, post_ra, stats);
+    }
     changed |= mir_peephole::remove_dead_defs(function, post_ra, stats);
     return changed;
 }

@@ -1,0 +1,28 @@
+// RUN: %compiler --emit-mir-stage=pre-ra -O1 %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+
+int pointer_exit_dot(int n, int a[], int b[]) {
+  int acc = 0;
+  int k = 0;
+  while (k < n) {
+    acc = acc + a[k] * b[k];
+    k = k + 1;
+  }
+  return acc;
+}
+
+int main() {
+  int a[8];
+  int b[8];
+  a[0] = 1;
+  b[0] = 2;
+  return pointer_exit_dot(1, a, b);
+}
+
+// MIR-LABEL: func @pointer_exit_dot
+// MIR: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}pointer_exit_dot
+// MIR-NOT: BLT %v{{[0-9]+}}:gpr, %n.arg:gpr, %edge.{{.*}}pointer_exit_dot
+
+// ASM-LABEL: pointer_exit_dot:
+// ASM: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lpointer_exit_dot_edge
+// ASM-NOT: blt

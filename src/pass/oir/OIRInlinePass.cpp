@@ -277,6 +277,7 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
         auto &memzero = static_cast<oir::MemZeroInst &>(inst);
         return std::make_unique<oir::MemZeroInst>(
             module.types().void_ty(), map_value(memzero.ptr(), values, blocks),
+            map_value(memzero.byte_value(), values, blocks),
             map_value(memzero.byte_count(), values, blocks), parent);
     }
     case oir::Instruction::OpID::GetElementPtr: {

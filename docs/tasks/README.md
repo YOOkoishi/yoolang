@@ -18,7 +18,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
-| [Many Mat Cal Loop Fixes](2026-06-08-many-mat-cal-loop-fixes.md) | scoped | `task/many-mat-cal-loop-fixes` | 2026-06-08 |
+| [Many Mat Cal Loop Fixes](2026-06-08-many-mat-cal-loop-fixes.md) | ready_for_review | `task/many-mat-cal-loop-fixes` | 2026-06-08 |
 | [Many Mat Cal Performance Gap Attribution](2026-06-08-many-mat-cal-perf-gap.md) | ready_for_review | `master` | 2026-06-08 |
 | [RISC-V Medany Code Model](2026-06-08-riscv-medany-code-model.md) | ready_for_review | `master` | 2026-06-08 |
 | [MIR Perf Diagnostics](2026-06-07-mir-perf-diagnostics.md) | ready_for_review | `mir++` | 2026-06-07 |

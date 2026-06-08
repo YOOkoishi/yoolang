@@ -63,6 +63,7 @@ bool fuse_compare_branches(mir::MachineFunction &function, bool post_ra, Stats &
 bool local_cse(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool hoist_loop_invariants(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool fold_address_offsets(mir::MachineFunction &function, bool post_ra, Stats &stats);
+bool optimize_pointer_loop_exits(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool cleanup_jumps(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool remove_dead_defs(mir::MachineFunction &function, bool post_ra, Stats &stats);
 bool simplify_blocks(mir::MachineFunction &function, bool post_ra, Stats &stats);

@@ -880,6 +880,7 @@ class VRegLowerer final {
             }
             emit(mir::Opcode::MemZero,
                  {mir::MachineOperand::reg_use(addr),
+                  mir::MachineOperand::imm(0),
                   mir::MachineOperand::imm(static_cast<std::int64_t>(stored.size))});
             if (static_cast<std::int64_t>(stored.size) >= mir::kMemZeroMemsetThresholdBytes) {
                 current_function_->note_call();
@@ -895,12 +896,17 @@ class VRegLowerer final {
 
     void lower_memzero(const oir::MemZeroInst &inst) {
         auto addr = value_reg(inst.ptr());
+        auto *byte_value = constant_int(inst.byte_value());
+        if (byte_value == nullptr || byte_value->value() < 0 || byte_value->value() > 255) {
+            throw std::runtime_error("memzero byte value must be a constant in [0, 255]");
+        }
         if (auto *constant = constant_int(inst.byte_count())) {
             if (constant->value() < 0) {
                 throw std::runtime_error("memzero byte count must be non-negative");
             }
             emit(mir::Opcode::MemZero,
-                 {mir::MachineOperand::reg_use(addr), mir::MachineOperand::imm(constant->value())});
+                 {mir::MachineOperand::reg_use(addr), mir::MachineOperand::imm(byte_value->value()),
+                  mir::MachineOperand::imm(constant->value())});
             if (constant->value() >= mir::kMemZeroMemsetThresholdBytes) {
                 current_function_->note_call();
             }
@@ -909,7 +915,8 @@ class VRegLowerer final {
 
         auto byte_count = value_reg(inst.byte_count());
         emit(mir::Opcode::MemZero,
-             {mir::MachineOperand::reg_use(addr), mir::MachineOperand::reg_use(byte_count)});
+             {mir::MachineOperand::reg_use(addr), mir::MachineOperand::imm(byte_value->value()),
+              mir::MachineOperand::reg_use(byte_count)});
     }
 
     void lower_gep(const oir::GetElementPtrInst &inst) {

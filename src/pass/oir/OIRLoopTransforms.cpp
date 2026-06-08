@@ -136,6 +136,7 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
     if (auto *memzero = dynamic_cast<const oir::MemZeroInst *>(&inst)) {
         return std::make_unique<oir::MemZeroInst>(
             memzero->type(), map_value(memzero->ptr(), map),
+            map_value(memzero->byte_value(), map),
             map_value(memzero->byte_count(), map), parent);
     }
     if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
@@ -1022,6 +1023,7 @@ struct ZeroStoreLoopMatch {
     oir::Value *start_ptr = nullptr;
     oir::Value *bound = nullptr;
     std::int64_t start = 0;
+    std::uint8_t byte_value = 0;
     oir::CmpPred pred = oir::CmpPred::LT;
     std::uint64_t element_size = 0;
 };
@@ -1080,16 +1082,32 @@ std::uint64_t oir_type_size(oir::Type *type) {
     return 0;
 }
 
-bool is_zero_store_value(oir::Value *value) {
+std::optional<std::uint8_t> repeated_byte_store_value(oir::Value *value) {
     auto int_zero = int_constant(value);
     if (int_zero.has_value()) {
-        return *int_zero == 0;
+        auto *integer = dynamic_cast<oir::IntegerType *>(value->type());
+        if (integer == nullptr || integer->bit_width() != 32) {
+            return std::nullopt;
+        }
+        const auto word = static_cast<std::uint32_t>(*int_zero);
+        const auto byte = static_cast<std::uint8_t>(word & 0xffU);
+        const auto repeated = static_cast<std::uint32_t>(byte) |
+                              (static_cast<std::uint32_t>(byte) << 8U) |
+                              (static_cast<std::uint32_t>(byte) << 16U) |
+                              (static_cast<std::uint32_t>(byte) << 24U);
+        if (word == repeated) {
+            return byte;
+        }
+        return std::nullopt;
     }
     auto float_zero = float_constant(value);
     if (float_zero.has_value()) {
-        return *float_zero == 0.0F;
+        return *float_zero == 0.0F ? std::optional<std::uint8_t>(0) : std::nullopt;
     }
-    return dynamic_cast<oir::ConstantZero *>(value) != nullptr;
+    if (dynamic_cast<oir::ConstantZero *>(value) != nullptr) {
+        return 0;
+    }
+    return std::nullopt;
 }
 
 bool is_allowed_zero_loop_instruction(const oir::Instruction &inst) {
@@ -1140,20 +1158,24 @@ bool loop_defs_have_no_external_uses(const oir::Loop &loop) {
     return true;
 }
 
-oir::StoreInst *single_zero_store(const oir::BasicBlock &block, std::uint64_t &element_size) {
+oir::StoreInst *single_byte_pattern_store(const oir::BasicBlock &block,
+                                          std::uint64_t &element_size,
+                                          std::uint8_t &byte_value) {
     oir::StoreInst *store = nullptr;
     for (const auto &inst : block.instructions()) {
         if (dynamic_cast<const oir::PhiInst *>(inst.get()) != nullptr || inst->is_terminator()) {
             continue;
         }
         if (auto *candidate = dynamic_cast<oir::StoreInst *>(inst.get())) {
-            if (store != nullptr || !is_zero_store_value(candidate->value())) {
+            auto pattern = repeated_byte_store_value(candidate->value());
+            if (store != nullptr || !pattern.has_value()) {
                 return nullptr;
             }
             element_size = oir_type_size(candidate->value()->type());
             if (element_size != 4) {
                 return nullptr;
             }
+            byte_value = *pattern;
             store = candidate;
             continue;
         }
@@ -1366,7 +1388,8 @@ std::optional<ZeroStoreLoopMatch> match_zero_store_loop(const oir::Loop &loop) {
     auto *preheader = outside.front();
 
     std::uint64_t element_size = 0;
-    auto *store = single_zero_store(*header, element_size);
+    std::uint8_t byte_value = 0;
+    auto *store = single_byte_pattern_store(*header, element_size, byte_value);
     if (store == nullptr) {
         return std::nullopt;
     }
@@ -1381,6 +1404,7 @@ std::optional<ZeroStoreLoopMatch> match_zero_store_loop(const oir::Loop &loop) {
     match.preheader = preheader;
     match.exit = exit;
     match.element_size = element_size;
+    match.byte_value = byte_value;
     if (!match_induction(loop, preheader, *continue_cmp, match) ||
         !match_pointer_progression(loop, preheader, *store, match)) {
         return std::nullopt;
@@ -1399,7 +1423,13 @@ bool rewrite_zero_store_loop(oir::Function &function, const ZeroStoreLoopMatch &
 
     oir::IRBuilder builder(function.parent());
     builder.set_insert_point(memzero_block);
-    builder.create_memzero(match.start_ptr, byte_count);
+    if (match.byte_value == 0) {
+        builder.create_memzero(match.start_ptr, byte_count);
+    } else {
+        builder.create_memset(match.start_ptr,
+                              function.parent()->create_i32(static_cast<std::int64_t>(match.byte_value)),
+                              byte_count);
+    }
     builder.create_br(match.exit);
 
     if (!oir::cfg::replace_successor(match.preheader, match.header, memzero_block)) {
