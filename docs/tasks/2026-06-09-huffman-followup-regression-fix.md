@@ -1,6 +1,6 @@
 # Task: Huffman Follow-up Performance Regression Fix
 
-Status: in_progress
+Status: ready_for_review
 Created: 2026-06-09
 Last update: 2026-06-09
 Owner: Codex
@@ -101,31 +101,55 @@ a valid baseline-regression check across machines or runs. The correct gate is a
 same-environment comparison against the pre-huffman baseline report or a local
 pre-huffman worktree.
 
-Local reproduction after rebuilding the release compiler did not reproduce the
-user-reported absolute slowdown numbers, but that does not prove the baseline
-regression is fixed. Continue from the same-machine baseline comparison below.
+The invalid conclusion was: "no source change after rebuild is enough." The
+same-machine baseline comparison below proved that the current huffman patch did
+increase code size for the crypto-like regression group, even when wall-clock
+noise hid the full CI slowdown locally.
 
-Focused regression command after rebuild:
+## Final Evidence
+
+Baseline worktree:
+
+```text
+/tmp/yoolang-baseline-d3f5016 at d3f5016
+```
+
+Focused regression command, run once in the baseline worktree and once in this
+worktree after the guard:
 
 ```bash
 PERF_TEST_DIRS=test/performance/crypto-1.sy,test/performance/crypto-2.sy,test/performance/crypto-3.sy,test/bsb-final/2025-PDZ-59.sy,test/bsb-final/2025-N3A-33.sy,test/bsb-final/2025-EQV-46.sy,test/bsb-final/2025-FPU-45.sy,test/bsb-final/2025-CXI-10.sy,test/bsb-final/2025-MB8-51.sy,test/bsb-final/2025-FH0-62.sy python3 scripts/compare_perf.py
 ```
 
-Focused regression result: all 10 cases passed; every compiler time is faster
-than the user-provided pre-huffman-patch baseline.
+Before the guard, the crypto-like group had final MIR growth from `700` to
+`1233` instructions, branches `28` to `60`, jumps `57` to `117`, loads `23` to
+`52`, stores `51` to `97`, spills `3` to `11`, and asm lines `966` to `1646`.
+The OIR showed `__yo_constprop.pseudo_md5.*` cloning and inlining as the cause.
 
-| Case | Compiler after rebuild | User-provided baseline | Result |
-| --- | ---: | ---: | --- |
-| `test/performance/crypto-1.sy` | `0.1000s` | `0.1265s` | recovered |
-| `test/performance/crypto-2.sy` | `0.0792s` | `0.0946s` | recovered |
-| `test/performance/crypto-3.sy` | `0.0496s` | `0.0632s` | recovered |
-| `test/bsb-final/2025-PDZ-59.sy` | `0.0973s` | `0.1251s` | recovered |
-| `test/bsb-final/2025-N3A-33.sy` | `0.0784s` | `0.0943s` | recovered |
-| `test/bsb-final/2025-EQV-46.sy` | `0.0474s` | `0.0625s` | recovered |
-| `test/bsb-final/2025-FPU-45.sy` | `0.1367s` | `0.2553s` | recovered |
-| `test/bsb-final/2025-CXI-10.sy` | `0.0174s` | `0.0159s` | within `0.01s` absolute threshold |
-| `test/bsb-final/2025-MB8-51.sy` | `0.0154s` | `0.0163s` | recovered |
-| `test/bsb-final/2025-FH0-62.sy` | `0.1272s` | `0.1763s` | recovered |
+The fix adds a general profitability guard: callees above the normal inline
+threshold are not constant-specialized when specialization would leave live
+pointer arguments in the clone. This blocks large mutable-memory callees such as
+`pseudo_md5(input*, len, output*)` without disabling scalar helpers such as
+`read_bits(int)`, `rotlN(int, int)`, or the focused FileCheck constprop case.
+
+Focused regression result after the guard:
+
+| Case | Baseline compiler | Fixed compiler | Delta | Result |
+| --- | ---: | ---: | ---: | --- |
+| `test/performance/crypto-1.sy` | `0.1155s` | `0.1022s` | `-11.5%` | recovered |
+| `test/performance/crypto-2.sy` | `0.0797s` | `0.0762s` | `-4.4%` | recovered |
+| `test/performance/crypto-3.sy` | `0.0514s` | `0.0491s` | `-4.5%` | recovered |
+| `test/bsb-final/2025-PDZ-59.sy` | `0.0984s` | `0.1026s` | `+4.3%` | within threshold |
+| `test/bsb-final/2025-N3A-33.sy` | `0.0745s` | `0.0786s` | `+5.5%` | `+0.0041s`, within abs threshold |
+| `test/bsb-final/2025-EQV-46.sy` | `0.0474s` | `0.0489s` | `+3.2%` | within threshold |
+| `test/bsb-final/2025-FPU-45.sy` | `0.1359s` | `0.1392s` | `+2.4%` | within threshold |
+| `test/bsb-final/2025-CXI-10.sy` | `0.0139s` | `0.0143s` | `+2.9%` | `+0.0004s`, within abs threshold |
+| `test/bsb-final/2025-MB8-51.sy` | `0.0130s` | `0.0152s` | `+16.9%` | `+0.0022s`, within abs threshold |
+| `test/bsb-final/2025-FH0-62.sy` | `0.1258s` | `0.1188s` | `-5.6%` | recovered |
+
+The crypto-like group final MIR metrics returned to the baseline shape:
+`700` instructions, `28` branches, `57` jumps, `23` loads, `51` stores,
+`3` spills, and `966` asm lines.
 
 Focused huffman preservation command:
 
@@ -134,13 +158,13 @@ PERF_TEST_DIRS=test/performance/huffman-01.sy,test/performance/huffman-02.sy,tes
 ```
 
 Focused huffman preservation result: all 6 cases passed; total runtime
-`1.3728s`; geomean speedup stayed near GCC parity at GCC `0.99x` and Clang++
-`0.66x`, so it did not fall back toward the original GCC `0.77x` / Clang++
+`1.3451s`; geomean speedup stayed near GCC parity at GCC `1.04x` and Clang++
+`0.70x`, so it did not fall back toward the original GCC `0.77x` / Clang++
 `0.54x` baseline.
 
 Full performance result from `build/perf-ci/perf-report.md`: PASS, 119 cases,
-0 failed, total runtime `65.8020s`, geomean speedup GCC `0.92x` / Clang++
-`0.99x`; QEMU dynamic instruction counting was DISABLED by default and MIR
+0 failed, total runtime `65.7780s`, geomean speedup GCC `0.91x` / Clang++
+`1.00x`; QEMU dynamic instruction counting was DISABLED by default and MIR
 stage metrics were OK for 119 cases.
 
 ## Branch
@@ -188,10 +212,10 @@ Risk areas:
 
 | Patch | Intent | Files | Verifier/Test | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| P0 | Reproduce and record focused regression metrics, including MIR stage deltas and specialization counts if available | reports only | focused regression `compare_perf.py` | done | Rebuilt release compiler first; 10-case focused regression set passed and satisfied the user baseline thresholds. |
-| P1 | Attribute regression to one huffman-patch component by controlled local toggles or minimal temporary guards | `OIRInlinePass.cpp`, `OIRLocalSimplify.cpp`, `OIROptimizationPipelinePass.cpp` | focused regression perf plus huffman preservation perf | not needed | No regression remained after rebuild/current HEAD verification, so no temporary component toggles were kept or needed. |
-| P2 | If specialization is responsible, add a general profitability guard for clone fanout/code growth/hot loop cost | `OIRInlinePass.cpp`, pipeline if needed | focused regression + `oir_huffman_gap` FileCheck | not needed | Existing current-branch specialization guards met the focused regression thresholds. |
-| P3 | If if-conversion is responsible, narrow the pattern with a general cost model or loop-sensitive guard | `OIRLocalSimplify.cpp`, pipeline if needed | focused regression + huffman preservation perf | not needed | Existing current-branch if-conversion guards preserved huffman speedup without reproducing listed regressions. |
+| P0 | Reproduce and record same-machine baseline/current metrics | reports only | focused regression `compare_perf.py` in `/tmp/yoolang-baseline-d3f5016` and current worktree | done | Baseline used commit `d3f5016`; current huffman patch showed crypto-like MIR growth `700 -> 1233` before the guard. |
+| P1 | Attribute regression to one huffman-patch component | `OIRInlinePass.cpp`, OIR dumps | focused metrics plus OIR inspection | done | Attributed to constant-argument specialization cloning/inlining large mutable-memory `pseudo_md5` callees. |
+| P2 | Add a general profitability guard for large specializations with live pointer args | `src/pass/oir/OIRInlinePass.cpp` | focused regression + `oir_huffman_gap` FileCheck | done | Blocks large pointer-carrying clones while preserving scalar helper specialization. |
+| P3 | Verify huffman preservation after the guard | reports only | focused huffman perf | done | 6-case huffman perf stayed at GCC `1.04x` / Clang++ `0.70x`. |
 | P4 | Re-run full correctness and full performance gates | reports only | full optimized tests and full perf | done | Full optimized correctness and full performance gates passed. |
 
 ## Verification Matrix
@@ -201,10 +225,11 @@ Risk areas:
 | Build | `xmake` | yes | PASS | Rebuilt/relinked release compiler. |
 | Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_huffman_gap --jobs 1` | yes if OIR guards change | PASS | 1 passed, 0 failed. |
 | Focused regression stage/e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --filter crypto --jobs 1 --o1` plus targeted bsb filters as needed | yes after implementation | PASS | Covered by full optimized `--suite all --jobs 1 --o1`, including listed crypto and bsb cases. |
-| Focused regression perf | `PERF_TEST_DIRS=test/performance/crypto-1.sy,test/performance/crypto-2.sy,test/performance/crypto-3.sy,test/bsb-final/2025-PDZ-59.sy,test/bsb-final/2025-N3A-33.sy,test/bsb-final/2025-EQV-46.sy,test/bsb-final/2025-FPU-45.sy,test/bsb-final/2025-CXI-10.sy,test/bsb-final/2025-MB8-51.sy,test/bsb-final/2025-FH0-62.sy python3 scripts/compare_perf.py` | yes | PASS | 10 cases, 0 failed; all listed cases satisfied the user baseline threshold after rebuild. |
-| Huffman preservation perf | `PERF_TEST_DIRS=test/performance/huffman-01.sy,test/performance/huffman-02.sy,test/performance/huffman-03.sy,test/bsb-final/2025-236-50.sy,test/bsb-final/2025-UNA-47.sy,test/bsb-final/2025-ZUM-7.sy python3 scripts/compare_perf.py` | yes | PASS | 6 cases, 0 failed; total runtime `1.3728s`; geomean GCC `0.99x`, Clang++ `0.66x`. |
+| Baseline focused regression perf | same focused regression command in `/tmp/yoolang-baseline-d3f5016` | yes | PASS | 10 cases, 0 failed; used as same-machine baseline for deltas. |
+| Fixed focused regression perf | `PERF_TEST_DIRS=test/performance/crypto-1.sy,test/performance/crypto-2.sy,test/performance/crypto-3.sy,test/bsb-final/2025-PDZ-59.sy,test/bsb-final/2025-N3A-33.sy,test/bsb-final/2025-EQV-46.sy,test/bsb-final/2025-FPU-45.sy,test/bsb-final/2025-CXI-10.sy,test/bsb-final/2025-MB8-51.sy,test/bsb-final/2025-FH0-62.sy python3 scripts/compare_perf.py` | yes | PASS | 10 cases, 0 failed; all listed cases satisfy `<=5%` or `<=0.01s` absolute threshold. |
+| Huffman preservation perf | `PERF_TEST_DIRS=test/performance/huffman-01.sy,test/performance/huffman-02.sy,test/performance/huffman-03.sy,test/bsb-final/2025-236-50.sy,test/bsb-final/2025-UNA-47.sy,test/bsb-final/2025-ZUM-7.sy python3 scripts/compare_perf.py` | yes | PASS | 6 cases, 0 failed; total runtime `1.3451s`; geomean GCC `1.04x`, Clang++ `0.70x`. |
 | Full optimized | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | before finalization | PASS | `1424 passed, 0 failed, 1 skipped, 0 xfailed, 0 xpassed`; skipped case was `test/performance/shuffle1.sy` in e2e. |
-| Full performance | `PERF_TEST_DIRS=test/performance,test/bsb-final python3 scripts/compare_perf.py` | before finalization | PASS | 119 cases, 0 failed, total runtime `65.8020s`; geomean GCC `0.92x`, Clang++ `0.99x`; MIR metrics OK, QEMU instruction count DISABLED by default. |
+| Full performance | `PERF_TEST_DIRS=test/performance,test/bsb-final python3 scripts/compare_perf.py` | before finalization | PASS | 119 cases, 0 failed, total runtime `65.7780s`; geomean GCC `0.91x`, Clang++ `1.00x`; MIR metrics OK, QEMU instruction count DISABLED by default. |
 
 ## Alternatives
 
@@ -213,30 +238,34 @@ Risk areas:
 | Revert all huffman optimizations | Fastest way to recover regressions | rejected as first step; loses confirmed huffman speedup and hides attribution |
 | Disable constant specialization for crypto-like files | Would recover listed cases if specialization is the cause | forbidden; testcase/file/family special-casing |
 | Add a global compile flag to turn off huffman patch | Useful for attribution | allowed only as a temporary local experiment; do not keep in final patch |
-| Lower specialization caps generally | Plausible if code growth is root cause | pending; must measure huffman preservation |
-| Narrow if-conversion in loops | Plausible if dependency-chain growth is root cause | pending; must measure huffman preservation |
-| No source change after rebuild | Current branch may already satisfy thresholds if the first report used a stale or different build | chosen; release rebuild plus focused/full perf satisfied all task gates |
+| Lower specialization caps generally | Plausible if code growth is root cause | rejected; would also risk huffman scalar helper specialization |
+| Narrow if-conversion in loops | Plausible if dependency-chain growth is root cause | not needed; metrics and OIR attribute the large regression to specialization |
+| No source change after rebuild | Current branch may already satisfy thresholds if the first report used a stale or different build | rejected; same-machine baseline showed real MIR code growth before the guard |
+| Guard large specializations that retain pointer args | Blocks mutable-memory clone bloat without filename/function matching | chosen |
 
 ## Change Log
 
 - 2026-06-09: created scoped regression-fix task from user-provided slowdown list after the huffman optimization patch.
 - 2026-06-09: rebuilt release compiler, verified the focused regression set no longer reproduces the reported slowdown, confirmed huffman preservation, completed full optimized and full performance gates, and moved task to `ready_for_review`.
+- 2026-06-09: superseded the no-source-change conclusion with same-machine baseline comparison, added the live-pointer specialization guard, verified focused regression recovery, huffman preservation, full optimized correctness, and full performance.
 
 ## Open Questions
 
-- None for this follow-up. The current rebuilt branch satisfies the recorded regression thresholds without an additional compiler source patch.
+- None for this follow-up.
 
 ## Handoff Note
 
 Current state:
 
-- Task is back in progress on `task/huffman-perf-gap`.
-- The earlier no-source-change conclusion was invalid because it did not compare current and baseline on the same environment.
-- Next work must use a local `d3f5016` pre-huffman baseline worktree or the CI baseline JSON, then fix the listed regressions with a general optimization heuristic.
+- Task is ready for review on `task/huffman-perf-gap`.
+- Final source change is limited to `src/pass/oir/OIRInlinePass.cpp`.
+- The regression source was constant-argument specialization of large callees that still carry pointer arguments after specialization.
+- The fix is a general profitability guard, not a testcase/file/function-name special case.
+- Full optimized correctness and full performance passed.
 
 Next action:
 
-- Create a `/tmp` baseline worktree at `d3f5016`, run the 10-case focused perf there, then compare current `bd7661f` against that same-machine baseline before editing source.
+- Review the guard and merge if acceptable.
 
 Read next:
 
@@ -244,8 +273,4 @@ Read next:
 - `docs/tasks/2026-06-09-huffman-followup-regression-fix.md`
 - `docs/tasks/2026-06-09-huffman-perf-gap.md`
 - `src/pass/oir/OIRInlinePass.cpp`
-- `src/pass/oir/OIROptimizationPipelinePass.cpp`
-- `src/pass/oir/OIRLocalSimplify.cpp`
-- `include/oir/OIRScalarOpt.h`
-- `src/pass/oir/OIRScalarOptUtils.cpp`
 - `test/ir/oir_huffman_gap.sy`
