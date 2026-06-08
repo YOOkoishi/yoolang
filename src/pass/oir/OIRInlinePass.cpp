@@ -516,6 +516,23 @@ bool has_constant_argument(const oir::CallInst &call) {
     return false;
 }
 
+bool has_live_pointer_argument_after_specialization(const oir::CallInst &call,
+                                                    const oir::Function &callee) {
+    auto args = call.args();
+    if (args.size() != callee.args().size()) {
+        return true;
+    }
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (is_specializable_constant(args[i])) {
+            continue;
+        }
+        if (callee.args()[i]->type()->is_pointer()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool specialized_constant_argument_feeds_phi(const oir::CallInst &call,
                                              const oir::Function &callee) {
     auto args = call.args();
@@ -547,6 +564,10 @@ bool is_eligible_for_constant_specialization(const oir::Function &caller, const 
     }
 
     auto info = inspect_callee(*callee);
+    if ((info.blocks > kMaxCalleeBlocks || info.cost > kMaxCalleeCost) &&
+        has_live_pointer_argument_after_specialization(call, *callee)) {
+        return false;
+    }
     return info.blocks <= kMaxSpecializationCalleeBlocks &&
            info.cost <= kMaxSpecializationCalleeCost && info.returns != 0;
 }
