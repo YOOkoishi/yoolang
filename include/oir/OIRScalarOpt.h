@@ -34,6 +34,7 @@ struct Stats {
     unsigned jump_threading = 0;
     unsigned dae = 0;
     unsigned memzero = 0;
+    unsigned specialized = 0;
 
     bool changed() const;
     std::string message() const;
@@ -65,6 +66,7 @@ bool local_simplify(oir::Module &module, Stats &stats, SimplifyMode mode);
 bool value_range_propagation(oir::Module &module, Stats &stats);
 bool lower_dense_return_chains(oir::Module &module, Stats &stats);
 bool simplify_branches(oir::Module &module, Stats &stats);
+bool if_convert_conditional_adds(oir::Module &module, Stats &stats);
 bool run_sccp(oir::Module &module, Stats &stats);
 bool eliminate_dead_code(oir::Module &module, Stats &stats);
 bool cleanup_cfg(oir::Module &module, Stats &stats);
@@ -82,6 +84,7 @@ bool global_value_numbering(oir::Module &module, Stats &stats);
 bool aggressive_dead_code_elimination(oir::Module &module, Stats &stats);
 bool jump_threading(oir::Module &module, Stats &stats);
 bool inline_functions(oir::Module &module, Stats &stats);
+bool specialize_constant_argument_calls(oir::Module &module, Stats &stats);
 bool eliminate_dead_arguments(oir::Module &module, Stats &stats);
 bool propagate_global_constants(oir::Module &module, Stats &stats);
 bool promote_global_loads(oir::Module &module, Stats &stats);
