@@ -9,6 +9,7 @@ import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from posixpath import relpath as posix_relpath
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--commit-sha", default="")
     parser.add_argument("--commit-title", default="")
     parser.add_argument("--actor", default="")
+    parser.add_argument("--report-index-url", default="")
     return parser.parse_args()
 
 
@@ -127,6 +129,7 @@ def build_payload(perf: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
             "compiler": as_int(raw_counts.get("compiler", row.get("instruction_count"))),
             "gcc": as_int(raw_counts.get("gcc")),
             "clang": as_int(raw_counts.get("clang")),
+            "hy": as_int(raw_counts.get("hy")),
         }
         status, reason = status_for(row, counts)
         yoolang_vs_gcc = speedup(counts["gcc"], counts["compiler"])
@@ -141,6 +144,7 @@ def build_payload(perf: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
                 "yoolang_vs_clang_speedup": yoolang_vs_clang,
                 "status": status,
                 "reason": reason,
+                "hy_instructions": counts.get("hy"),
             }
         )
 
@@ -248,11 +252,24 @@ def build_payload(perf: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
             "instruction_more": top_more,
         },
         "rows": rows,
+        "report_index_url": "",
     }
 
 
 def html_escape_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=True, indent=2).replace("</", "<\\/")
+
+
+def default_report_index_url(out_html: Path, pages_base_url: str = "") -> str:
+    if pages_base_url:
+        return f"{pages_base_url.rstrip('/')}/report-index.json"
+    parts = out_html.parent.parts
+    if "public" not in parts:
+        return "../report-index.json"
+    public_index = parts.index("public")
+    html_dir = "/".join(parts[public_index + 1 :])
+    rel = posix_relpath("report-index.json", html_dir or ".")
+    return rel if rel.startswith(".") else f"./{rel}"
 
 
 def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = "") -> None:
@@ -374,13 +391,32 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       padding: 6px 10px;
       background: #f8fafc;
     }}
+    .baseline-toolbar {{
+      display: grid;
+      grid-template-columns: minmax(260px, 520px) minmax(220px, 1fr);
+      gap: 12px;
+      margin-bottom: 12px;
+      align-items: center;
+    }}
     .toolbar {{
       display: grid;
       grid-template-columns: minmax(240px, 1fr) minmax(240px, 360px);
       gap: 12px;
       margin-bottom: 12px;
     }}
-    input, select {{
+    .selection-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 12px;
+    }}
+    .selection-count {{
+      color: var(--muted);
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }}
+    input, select, button {{
       width: 100%;
       min-height: 40px;
       border: 1px solid var(--line);
@@ -390,7 +426,25 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       color: var(--text);
       font: inherit;
     }}
-    input:focus, select:focus {{
+    button {{
+      width: auto;
+      min-width: 78px;
+      cursor: pointer;
+      background: #f8fafc;
+      color: var(--accent);
+      font-weight: 600;
+    }}
+    button:hover {{ background: var(--accent-soft); }}
+    input[type="checkbox"] {{
+      width: 16px;
+      min-height: 16px;
+      height: 16px;
+      margin: 0;
+      padding: 0;
+      vertical-align: middle;
+      accent-color: var(--accent);
+    }}
+    input:focus, select:focus, button:focus {{
       border-color: var(--accent);
       box-shadow: 0 0 0 3px var(--accent-soft);
       outline: none;
@@ -401,7 +455,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       border: 1px solid var(--line);
       border-radius: 8px;
     }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 1080px; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 1130px; }}
     th, td {{
       padding: 10px 12px;
       border-bottom: 1px solid var(--line);
@@ -418,10 +472,16 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       white-space: nowrap;
     }}
     th.active {{ color: var(--accent); }}
+    th.select-col {{
+      width: 44px;
+      cursor: default;
+      text-align: center;
+    }}
     th .sort {{ color: var(--muted); margin-left: 4px; }}
     tr:hover td {{ background: #fafcff; }}
     td.num {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
     td.case {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    td.select-col {{ text-align: center; }}
     td.better {{ background: var(--good-soft); color: var(--good); font-weight: 600; }}
     td.worse {{ background: var(--bad-soft); color: var(--bad); font-weight: 600; }}
     td.tie {{ background: var(--warn-soft); }}
@@ -431,7 +491,9 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
     .empty {{ padding: 24px; color: var(--muted); }}
     @media (max-width: 760px) {{
       header, main {{ padding-left: 16px; padding-right: 16px; }}
-      .toolbar {{ grid-template-columns: 1fr; }}
+      .toolbar, .baseline-toolbar {{ grid-template-columns: 1fr; }}
+      .selection-toolbar {{ align-items: stretch; }}
+      .selection-count {{ width: 100%; }}
     }}
   </style>
 </head>
@@ -458,6 +520,12 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       <div class="section-grid" id="top-lists"></div>
     </section>
     <section class="section" id="failures"></section>
+    <section class="baseline-toolbar">
+      <select id="baseline-select" aria-label="选择 baseline">
+        <option value="embedded">当前 CI baseline（无）</option>
+      </select>
+      <div class="muted" id="baseline-load-status">正在读取可选对比报告...</div>
+    </section>
     <section class="toolbar">
       <input id="search" type="search" placeholder="搜索 case 名">
       <select id="filter">
@@ -468,19 +536,31 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         <option value="lose-any">只看 yoolang 输给 GCC 或 Clang++</option>
         <option value="lose-gcc">只看 yoolang 输给 GCC</option>
         <option value="lose-clang">只看 yoolang 输给 Clang++</option>
+        <option value="improvement">只看相对 baseline 指令数减少</option>
+        <option value="regression">只看相对 baseline 指令数增加</option>
         <option value="failed">只看失败或缺失数据</option>
       </select>
+    </section>
+    <section class="selection-toolbar">
+      <span class="selection-count" id="selection-count"></span>
+      <button id="select-all" type="button">全选</button>
+      <button id="select-none" type="button">清空</button>
+      <button id="select-preliminary" type="button">初赛测例</button>
+      <button id="invert-visible" type="button">反选当前筛选结果</button>
     </section>
     <section class="table-wrap">
       <table>
         <thead>
           <tr>
+            <th class="select-col"><input id="select-visible" type="checkbox" aria-label="选择当前筛选结果"></th>
             <th data-key="case">Case <span class="sort"></span></th>
             <th data-key="yoolang_instructions">Yoolang 指令数 <span class="sort"></span></th>
             <th data-key="gcc_instructions">GCC 指令数 <span class="sort"></span></th>
             <th data-key="clang_instructions">Clang++ 指令数 <span class="sort"></span></th>
             <th data-key="yoolang_vs_gcc_speedup">Yoolang vs GCC <span class="sort"></span></th>
             <th data-key="yoolang_vs_clang_speedup">Yoolang vs Clang++ <span class="sort"></span></th>
+            <th data-key="baseline_insn">Baseline 指令数 <span class="sort"></span></th>
+            <th data-key="delta_pct">相对 baseline <span class="sort"></span></th>
             <th data-key="status">状态 <span class="sort"></span></th>
             <th data-key="reason">失败原因 <span class="sort"></span></th>
           </tr>
@@ -493,12 +573,22 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
   <script id="report-data" type="application/json">{data}</script>
   <script>
     const report = JSON.parse(document.getElementById('report-data').textContent);
+    const sourceRows = Array.isArray(report.rows) ? report.rows : [];
+    let allRows = sourceRows.map((row) => ({{...row}}));
+    const selectedCases = new Set(allRows.map((row) => String(row.case || '')));
+    let reportIndex = [];
+    let activeBaseline = {{
+      kind: 'embedded',
+      label: '当前 CI baseline（无）',
+      rowsByCase: null,
+    }};
     let sortKey = 'case';
     let sortDir = 1;
 
+    const isNumber = (value) => Number.isFinite(value);
     const fmtInt = (value) => Number.isInteger(value) ? value.toLocaleString() : 'N/A';
-    const fmtSpeedup = (value) => Number.isFinite(value) ? `${{value.toFixed(2)}}x` : 'N/A';
-    const fmtPct = (value) => Number.isFinite(value) ? `${{value > 0 ? '+' : ''}}${{value.toFixed(2)}}%` : 'N/A';
+    const fmtSpeedup = (value) => isNumber(value) ? `${{value.toFixed(2)}}x` : 'N/A';
+    const fmtPct = (value) => isNumber(value) ? `${{value > 0 ? '+' : ''}}${{value.toFixed(2)}}%` : 'N/A';
     const winsGcc = (row) => Number.isInteger(row.yoolang_instructions) && Number.isInteger(row.gcc_instructions) && row.yoolang_instructions < row.gcc_instructions;
     const winsClang = (row) => Number.isInteger(row.yoolang_instructions) && Number.isInteger(row.clang_instructions) && row.yoolang_instructions < row.clang_instructions;
     const losesGcc = (row) => Number.isInteger(row.yoolang_instructions) && Number.isInteger(row.gcc_instructions) && row.yoolang_instructions > row.gcc_instructions;
@@ -510,8 +600,272 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       return 'tie';
     }};
 
+    function speedup(reference, current) {{
+      return Number.isInteger(reference) && Number.isInteger(current) && current > 0 ? reference / current : null;
+    }}
+
+    function geometricMean(values) {{
+      const positives = values.filter((value) => isNumber(value) && value > 0);
+      if (!positives.length) return null;
+      return Math.exp(positives.reduce((sum, value) => sum + Math.log(value), 0) / positives.length);
+    }}
+
+    function baselineLabel(entry) {{
+      if (!entry || entry.kind === 'embedded') return '当前 CI baseline（无）';
+      const name = entry.name || entry.kind || 'report';
+      const branch = entry.branch ? `/${{entry.branch}}` : '';
+      const sha = entry.commit_sha ? String(entry.commit_sha).slice(0, 12) : 'unknown';
+      const title = entry.commit_title ? ` ${{entry.commit_title}}` : '';
+      return `${{name}}${{branch}} @ ${{sha}}${{title}}`;
+    }}
+
+    function baselineInsnFromRow(baselineRow) {{
+      if (!baselineRow) return null;
+      if (activeBaseline.kind === 'external') {{
+        if (Number.isInteger(baselineRow.hy_instructions)) return baselineRow.hy_instructions;
+        const ic = baselineRow.instruction_counts;
+        if (ic && Number.isInteger(ic.hy)) return ic.hy;
+        return null;
+      }}
+      return Number.isInteger(baselineRow.yoolang_instructions) ? baselineRow.yoolang_instructions : null;
+    }}
+
+    function hyFailedInsn(row) {{
+      if (!row) return false;
+      const hy = row.hy_instructions ?? row.instruction_counts?.hy ?? row.hy;
+      if (hy === null || hy === undefined) return false;
+      if (Number.isInteger(hy)) return false;
+      const s = String(hy).trim();
+      return s && s !== 'MISSING';
+    }}
+
+    function rebuildRowsForBaseline() {{
+      allRows = sourceRows.map((row) => {{
+        const next = {{...row}};
+        if (!activeBaseline.rowsByCase) {{
+          next.baseline_insn = null;
+          next.delta_pct = null;
+          next.baseline_speedup = null;
+          next.baseline_status = 'MISSING';
+          return next;
+        }}
+        const baselineRow = activeBaseline.rowsByCase[String(row.case || '')];
+        const baselineInsn = baselineRow ? baselineInsnFromRow(baselineRow) : null;
+        const baselineRowStatus = baselineRow ? String(baselineRow.status || '') : 'MISSING';
+        const baselineHyFailed = activeBaseline.kind === 'external' && hyFailedInsn(baselineRow);
+        const baselineFailed = baselineRow && baselineRowStatus !== 'OK' && baselineRowStatus !== 'MISSING';
+        const baselineFailedFinal = baselineFailed || baselineHyFailed;
+        next.baseline_insn = baselineFailedFinal ? null : baselineInsn;
+        next.baseline_speedup = baselineFailedFinal ? null : speedup(baselineInsn, row.yoolang_instructions);
+        if (baselineHyFailed) {{
+          const hyRaw = baselineRow.hy_instructions ?? baselineRow.instruction_counts?.hy ?? baselineRow.hy ?? 'CFAIL';
+          next.baseline_status = String(hyRaw).trim();
+        }} else if (baselineFailed) {{
+          next.baseline_status = 'ERROR';
+        }} else {{
+          next.baseline_status = baselineRowStatus;
+        }}
+        next.delta_pct = Number.isInteger(baselineInsn) && baselineInsn > 0 && Number.isInteger(row.yoolang_instructions)
+          ? ((baselineInsn - row.yoolang_instructions) / baselineInsn) * 100
+          : null;
+        return next;
+      }});
+      for (const key of Array.from(selectedCases)) {{
+        if (!allRows.some((row) => String(row.case || '') === key)) selectedCases.delete(key);
+      }}
+    }}
+
+    async function loadReportJson(url) {{
+      const response = await fetch(url, {{cache: 'no-store'}});
+      if (!response.ok) throw new Error(`${{response.status}} ${{response.statusText}}`);
+      return response.json();
+    }}
+
+    function rowsByCaseFromPayload(payload) {{
+      const out = {{}};
+      const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+      rows.forEach((row) => {{
+        if (!row || typeof row.case !== 'string') return;
+        const normalized = {{...row}};
+        // Normalize perf-report.json format: extract instruction_counts.* -> *_instructions
+        if (row.instruction_counts) {{
+          const ic = row.instruction_counts;
+          if (!Number.isInteger(normalized.yoolang_instructions) && Number.isInteger(ic.compiler)) normalized.yoolang_instructions = ic.compiler;
+          if (!Number.isInteger(normalized.gcc_instructions) && Number.isInteger(ic.gcc)) normalized.gcc_instructions = ic.gcc;
+          if (!Number.isInteger(normalized.clang_instructions) && Number.isInteger(ic.clang)) normalized.clang_instructions = ic.clang;
+          if (!Number.isInteger(normalized.hy_instructions) && Number.isInteger(ic.hy)) normalized.hy_instructions = ic.hy;
+        }}
+        out[row.case] = normalized;
+      }});
+      return out;
+    }}
+
+    async function selectBaseline(value) {{
+      const status = document.getElementById('baseline-load-status');
+      if (value === 'embedded') {{
+        activeBaseline = {{
+          kind: 'embedded',
+          label: '当前 CI baseline（无）',
+          rowsByCase: null,
+        }};
+        rebuildRowsForBaseline();
+        status.textContent = '使用当前内嵌数据（无 baseline 对比）。';
+        rerenderSelection();
+        return;
+      }}
+      const entry = reportIndex.find((item) => item.id === value);
+      if (!entry) return;
+      try {{
+        status.textContent = `正在加载 ${{baselineLabel(entry)}}...`;
+        const payload = await loadReportJson(entry.perf_report_url);
+        activeBaseline = {{...entry, label: baselineLabel(entry), rowsByCase: rowsByCaseFromPayload(payload)}};
+        rebuildRowsForBaseline();
+        status.textContent = `baseline: ${{baselineLabel(entry)}}`;
+        rerenderSelection();
+      }} catch (error) {{
+        status.textContent = `baseline 加载失败: ${{error.message || error}}`;
+      }}
+    }}
+
+    async function loadReportIndex() {{
+      const status = document.getElementById('baseline-load-status');
+      const select = document.getElementById('baseline-select');
+      const indexUrl = report.report_index_url || '../report-index.json';
+      try {{
+        const payload = await loadReportJson(indexUrl);
+        const indexBaseUrl = new URL(indexUrl, window.location.href);
+        const rawEntries = Array.isArray(payload?.reports) ? payload.reports : [];
+        reportIndex = rawEntries
+          .filter((entry) => entry && entry.perf_report_url)
+          .map((entry, index) => ({{
+            ...entry,
+            id: String(entry.id || `${{entry.kind || 'report'}}-${{entry.name || ''}}-${{entry.commit_sha || index}}`),
+            perf_report_url: new URL(entry.perf_report_url, indexBaseUrl).href,
+          }}));
+        const yoolangEntries = reportIndex.filter((e) => e.kind === 'yoolang');
+        const externalEntries = reportIndex.filter((e) => e.kind !== 'yoolang');
+        if (yoolangEntries.length) {{
+          const optgroup = document.createElement('optgroup');
+          optgroup.label = 'yoolang 历史';
+          yoolangEntries.forEach((entry) => {{
+            const option = document.createElement('option');
+            option.value = entry.id;
+            option.textContent = baselineLabel(entry);
+            optgroup.appendChild(option);
+          }});
+          select.appendChild(optgroup);
+        }}
+        if (externalEntries.length) {{
+          const optgroup = document.createElement('optgroup');
+          optgroup.label = '外部编译器';
+          externalEntries.forEach((entry) => {{
+            const option = document.createElement('option');
+            option.value = entry.id;
+            option.textContent = baselineLabel(entry);
+            optgroup.appendChild(option);
+          }});
+          select.appendChild(optgroup);
+        }}
+        status.textContent = reportIndex.length
+          ? `已加载 ${{reportIndex.length}} 个可选 baseline。`
+          : '没有额外可选 baseline。';
+      }} catch (error) {{
+        status.textContent = '未找到 report-index.json，仅使用当前 CI baseline。';
+      }}
+    }}
+
+    function sumCounts(rows, key) {{
+      const values = rows.map((row) => row[key]).filter(Number.isInteger);
+      return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+    }}
+
+    function failureKey(row) {{
+      const reason = String(row.reason || row.status || 'unknown').trim() || 'unknown';
+      return reason.split('\\n')[0].slice(0, 120);
+    }}
+
+    function selectedRows() {{
+      return allRows.filter((row) => selectedCases.has(String(row.case || '')));
+    }}
+
+    function isPreliminaryCase(row) {{
+      return String(row.case || '').startsWith('test/performance/');
+    }}
+
+    function selectedReport() {{
+      const rows = selectedRows();
+      const counted = rows.filter((row) => Number.isInteger(row.yoolang_instructions));
+      const failed = rows.filter((row) => row.status !== 'OK');
+      const totalYoolang = sumCounts(rows, 'yoolang_instructions');
+      const totalGcc = sumCounts(rows, 'gcc_instructions');
+      const totalClang = sumCounts(rows, 'clang_instructions');
+
+      const comparisons = [];
+      rows.forEach((row) => {{
+        const current = row.yoolang_instructions;
+        if (!Number.isInteger(current)) return;
+        [
+          ['GCC', 'gcc_instructions', 'yoolang_vs_gcc_speedup'],
+          ['Clang++', 'clang_instructions', 'yoolang_vs_clang_speedup'],
+        ].forEach(([target, referenceKey, speedupKey]) => {{
+          const reference = row[referenceKey];
+          const ratio = row[speedupKey];
+          if (!Number.isInteger(reference) || !isNumber(ratio)) return;
+          comparisons.push({{
+            case: row.case,
+            target,
+            yoolang_instructions: current,
+            reference_instructions: reference,
+            speedup: ratio,
+            delta_pct: reference > 0 ? ((current - reference) / reference) * 100 : null,
+          }});
+        }});
+      }});
+
+      const failureCounts = new Map();
+      failed.forEach((row) => {{
+        const key = failureKey(row);
+        failureCounts.set(key, (failureCounts.get(key) || 0) + 1);
+      }});
+
+      const baselineRows = rows.filter((row) => Number.isInteger(row.baseline_insn));
+      const baselineCurrentTotalInsn = sumCounts(baselineRows, 'yoolang_instructions');
+      const baselineTotalInsn = sumCounts(baselineRows, 'baseline_insn');
+      const baselineTotalSpeedup = speedup(baselineTotalInsn, baselineCurrentTotalInsn);
+      const baselineGeomeanSpeedup = geometricMean(baselineRows.map((row) => row.baseline_speedup).filter(isNumber));
+
+      return {{
+        summary: {{
+          cases: rows.length,
+          counted_yoolang_cases: counted.length,
+          failed_cases: failed.length,
+          yoolang_wins_gcc: rows.filter(winsGcc).length,
+          yoolang_wins_clang: rows.filter(winsClang).length,
+          yoolang_loses_gcc: rows.filter(losesGcc).length,
+          yoolang_loses_clang: rows.filter(losesClang).length,
+          total_yoolang_instructions: totalYoolang,
+          total_gcc_instructions: totalGcc,
+          total_clang_instructions: totalClang,
+          total_yoolang_vs_gcc_speedup: speedup(totalGcc, totalYoolang),
+          total_yoolang_vs_clang_speedup: speedup(totalClang, totalYoolang),
+          geomean_yoolang_vs_gcc_speedup: geometricMean(rows.map((row) => row.yoolang_vs_gcc_speedup)),
+          geomean_yoolang_vs_clang_speedup: geometricMean(rows.map((row) => row.yoolang_vs_clang_speedup)),
+          baseline_current_total_insn: baselineCurrentTotalInsn,
+          baseline_total_insn: baselineTotalInsn,
+          baseline_total_speedup: baselineTotalSpeedup,
+          baseline_geomean_speedup: baselineGeomeanSpeedup,
+        }},
+        top: {{
+          instruction_less: comparisons.filter((item) => item.speedup > 1).sort((a, b) => b.speedup - a.speedup).slice(0, 10),
+          instruction_more: comparisons.filter((item) => item.speedup < 1).sort((a, b) => a.speedup - b.speedup).slice(0, 10),
+        }},
+        failureReasons: Array.from(failureCounts, ([reason, count]) => ({{reason, count}})).sort((a, b) => b.count - a.count),
+      }};
+    }}
+
     function renderStats() {{
-      const stats = report.summary || {{}};
+      const selected = selectedReport();
+      const stats = selected.summary;
       const status = report.status || 'UNKNOWN';
       const meta = report.meta || {{}};
       const shortSha = meta.commit_sha ? String(meta.commit_sha).slice(0, 12) : 'unknown';
@@ -519,6 +873,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       document.getElementById('meta').textContent = `生成时间: ${{report.generated_china || 'unknown'}} | 源数据时间: ${{report.source_generated_china || 'unknown'}} | branch: ${{meta.branch || 'unknown'}} | commit: ${{shortSha}}${{commitTitle}} | 提交人: ${{meta.actor || 'unknown'}}`;
       document.getElementById('status-line').innerHTML = [
         `<span class="pill ${{status === 'OK' ? 'ok' : 'fail'}}">状态: ${{escapeHtml(status)}}</span>`,
+        `<span class="pill">统计范围: 已选 case</span>`,
         `<span class="pill">点击表头排序</span>`,
         `<span class="pill">绿色表示 yoolang 指令数更少</span>`,
         `<span class="pill">红色表示 yoolang 指令数更多</span>`,
@@ -532,20 +887,23 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         ['yoolang 输给 Clang++', stats.yoolang_loses_clang],
         ['失败 / 缺失', stats.failed_cases],
       ].map(([label, value]) => `<div class="stat"><span>${{label}}</span><strong>${{fmtInt(value)}}</strong></div>`).join('');
+      const totalsTitle = selectedCases.size === allRows.length
+        ? '整体指标'
+        : `已选 case 指标（${{selectedCases.size}} / ${{allRows.length}}）`;
       document.getElementById('totals').innerHTML = `
-        <h2>整体指标</h2>
+        <h2>${{totalsTitle}}</h2>
         <div class="section-grid">
           <div class="metric"><strong>总指令数</strong><div class="muted">Yoolang ${{fmtInt(stats.total_yoolang_instructions)}} / GCC ${{fmtInt(stats.total_gcc_instructions)}} / Clang++ ${{fmtInt(stats.total_clang_instructions)}}</div></div>
           <div class="metric"><strong>总指令数加速比</strong><div class="muted">vs GCC ${{fmtSpeedup(stats.total_yoolang_vs_gcc_speedup)}} / vs Clang++ ${{fmtSpeedup(stats.total_yoolang_vs_clang_speedup)}}</div></div>
           <div class="metric"><strong>几何平均指令数加速比</strong><div class="muted">vs GCC ${{fmtSpeedup(stats.geomean_yoolang_vs_gcc_speedup)}} / vs Clang++ ${{fmtSpeedup(stats.geomean_yoolang_vs_clang_speedup)}}</div></div>
+          <div class="metric"><strong>相对 baseline</strong><div class="muted">当前 ${{fmtInt(stats.baseline_current_total_insn)}} / baseline ${{fmtInt(stats.baseline_total_insn)}} / 总加速比 ${{fmtSpeedup(stats.baseline_total_speedup)}} / 几何平均 ${{fmtSpeedup(stats.baseline_geomean_speedup)}}</div></div>
         </div>
       `;
-      renderTopLists();
-      renderFailures();
+      renderTopLists(selected.top);
+      renderFailures(selected.failureReasons);
     }}
 
-    function renderTopLists() {{
-      const top = report.top || {{}};
+    function renderTopLists(top) {{
       const item = (row) => `${{escapeHtml(row.case || '')}} <span class="muted">vs ${{escapeHtml(row.target || '')}}: ${{fmtSpeedup(row.speedup)}} (${{fmtPct(row.delta_pct)}})</span>`;
       document.getElementById('top-lists').innerHTML = [
         renderList('指令数更少 Top 10', top.instruction_less || [], item),
@@ -553,8 +911,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       ].join('');
     }}
 
-    function renderFailures() {{
-      const reasons = report.failure_reasons || [];
+    function renderFailures(reasons) {{
       document.getElementById('failures').innerHTML = `
         <h2>失败原因聚合</h2>
         ${{renderList('', reasons, (item) => `${{escapeHtml(item.reason)}} <span class="muted">${{fmtInt(item.count)}} case</span>`)}}
@@ -570,7 +927,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
     function filteredRows() {{
       const query = document.getElementById('search').value.trim().toLowerCase();
       const filter = document.getElementById('filter').value;
-      return (report.rows || []).filter((row) => {{
+      return allRows.filter((row) => {{
         if (query && !String(row.case || '').toLowerCase().includes(query)) return false;
         if (filter === 'win-gcc' && !winsGcc(row)) return false;
         if (filter === 'win-clang' && !winsClang(row)) return false;
@@ -579,6 +936,8 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         if (filter === 'lose-clang' && !losesClang(row)) return false;
         if (filter === 'lose-any' && !losesGcc(row) && !losesClang(row)) return false;
         if (filter === 'failed' && row.status === 'OK') return false;
+        if (filter === 'improvement' && !(isNumber(row.delta_pct) && row.delta_pct > 0)) return false;
+        if (filter === 'regression' && !(isNumber(row.delta_pct) && row.delta_pct < 0)) return false;
         return true;
       }}).sort(compareRows);
     }}
@@ -596,18 +955,45 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       return String(av || '').localeCompare(String(bv || '')) * sortDir;
     }}
 
+    function updateSelectionState(rows) {{
+      document.getElementById('selection-count').textContent = `已选 ${{selectedCases.size}} / 总 ${{allRows.length}}`;
+      const selectVisible = document.getElementById('select-visible');
+      const visibleSelected = rows.filter((row) => selectedCases.has(String(row.case || ''))).length;
+      selectVisible.disabled = rows.length === 0;
+      selectVisible.checked = rows.length > 0 && visibleSelected === rows.length;
+      selectVisible.indeterminate = visibleSelected > 0 && visibleSelected < rows.length;
+    }}
+
+    function rerenderSelection() {{
+      renderStats();
+      renderRows();
+    }}
+
+    function setSelected(rows, checked) {{
+      rows.forEach((row) => {{
+        const key = String(row.case || '');
+        if (checked) selectedCases.add(key);
+        else selectedCases.delete(key);
+      }});
+      rerenderSelection();
+    }}
+
     function renderRows() {{
       const rows = filteredRows();
       document.getElementById('empty').hidden = rows.length !== 0;
       updateSortIndicators();
+      updateSelectionState(rows);
       document.getElementById('rows').innerHTML = rows.map((row) => `
         <tr>
+          <td class="select-col"><input class="case-select" type="checkbox" data-case="${{escapeHtml(row.case || '')}}" aria-label="选择 ${{escapeHtml(row.case || '')}}" ${{selectedCases.has(String(row.case || '')) ? 'checked' : ''}}></td>
           <td class="case">${{escapeHtml(row.case || '')}}</td>
           <td class="num">${{fmtInt(row.yoolang_instructions)}}</td>
           <td class="num ${{compareCountClass(row.yoolang_instructions, row.gcc_instructions)}}">${{fmtInt(row.gcc_instructions)}}</td>
           <td class="num ${{compareCountClass(row.yoolang_instructions, row.clang_instructions)}}">${{fmtInt(row.clang_instructions)}}</td>
           <td class="num ${{compareCountClass(row.yoolang_instructions, row.gcc_instructions)}}">${{fmtSpeedup(row.yoolang_vs_gcc_speedup)}}</td>
           <td class="num ${{compareCountClass(row.yoolang_instructions, row.clang_instructions)}}">${{fmtSpeedup(row.yoolang_vs_clang_speedup)}}</td>
+          <td class="num">${{row.baseline_insn != null ? fmtInt(row.baseline_insn) : (row.baseline_status !== 'OK' && row.baseline_status !== 'MISSING' ? row.baseline_status : 'N/A')}}</td>
+          <td class="num ${{isNumber(row.delta_pct) ? (row.delta_pct > 0 ? 'better' : (row.delta_pct < 0 ? 'worse' : 'tie')) : ''}}">${{fmtPct(row.delta_pct)}}</td>
           <td class="${{row.status === 'OK' ? 'ok' : 'fail'}}">${{escapeHtml(row.status || '')}}</td>
           <td class="reason">${{escapeHtml(row.reason || '')}}</td>
         </tr>
@@ -645,8 +1031,39 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
     }});
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('filter').addEventListener('change', renderRows);
+    document.getElementById('baseline-select').addEventListener('change', (event) => {{
+      selectBaseline(event.target.value);
+    }});
+    document.getElementById('select-all').addEventListener('click', () => setSelected(allRows, true));
+    document.getElementById('select-none').addEventListener('click', () => setSelected(allRows, false));
+    document.getElementById('select-preliminary').addEventListener('click', () => {{
+      selectedCases.clear();
+      allRows.filter(isPreliminaryCase).forEach((row) => selectedCases.add(String(row.case || '')));
+      rerenderSelection();
+    }});
+    document.getElementById('invert-visible').addEventListener('click', () => {{
+      filteredRows().forEach((row) => {{
+        const key = String(row.case || '');
+        if (selectedCases.has(key)) selectedCases.delete(key);
+        else selectedCases.add(key);
+      }});
+      rerenderSelection();
+    }});
+    document.getElementById('select-visible').addEventListener('change', (event) => {{
+      setSelected(filteredRows(), event.target.checked);
+    }});
+    document.getElementById('rows').addEventListener('change', (event) => {{
+      const target = event.target;
+      if (!target.classList || !target.classList.contains('case-select')) return;
+      const key = String(target.dataset.case || '');
+      if (target.checked) selectedCases.add(key);
+      else selectedCases.delete(key);
+      rerenderSelection();
+    }});
+    rebuildRowsForBaseline();
     renderStats();
     renderRows();
+    loadReportIndex();
   </script>
 </body>
 </html>
@@ -665,7 +1082,9 @@ def main() -> int:
             "instruction_count_summary": {"status": "FAILED"},
             "rows": [],
         }
+    report_index_url = args.report_index_url or default_report_index_url(args.out_html, args.pages_base_url)
     payload = build_payload(perf, report_meta(args))
+    payload["report_index_url"] = report_index_url
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     json_text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
     args.out_json.write_text(json_text)

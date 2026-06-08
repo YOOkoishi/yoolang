@@ -70,6 +70,17 @@ def load_history(path: Path) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
+def load_report_index(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(errors="replace"))
+    except Exception:
+        return []
+    rows = payload.get("reports") if isinstance(payload, dict) else payload
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
 def read_perf_summary(perf_path: Path | None) -> tuple[float | None, int | None]:
     if perf_path is None or not perf_path.exists():
         return None, None
@@ -124,6 +135,52 @@ def report_links(row: dict[str, Any], scope: str) -> tuple[str, str]:
         perf_url = f"./branches/{safe}/perf-report/runs/{run_id}/"
         insn_url = f"./branches/{safe}/instruction-report/runs/{run_id}/"
     return perf_url, insn_url
+
+
+def perf_report_json_url(row: dict[str, Any], scope: str) -> str:
+    perf_url, _ = report_links(row, scope)
+    return f"{perf_url.rstrip('/')}/perf-report.json"
+
+
+def report_index_entry(row: dict[str, Any], scope: str) -> dict[str, Any]:
+    commit_sha = str(row.get("commit_sha", ""))
+    run_id = str(row.get("run_id", ""))
+    branch = str(row.get("branch", ""))
+    return {
+        "id": f"yoolang-{commit_sha[:12] or run_id}",
+        "kind": "yoolang",
+        "name": "yoolang",
+        "branch": branch,
+        "commit_sha": commit_sha,
+        "commit_title": row.get("commit_title", ""),
+        "actor": row.get("actor", ""),
+        "generated_china": row.get("generated_china", ""),
+        "run_id": run_id,
+        "run_url": row.get("run_url", ""),
+        "perf_report_url": perf_report_json_url(row, scope),
+    }
+
+
+def write_report_index(public_dir: Path, runs: list[dict[str, Any]], scope: str = "root") -> None:
+    path = public_dir / "report-index.json"
+    existing = load_report_index(path)
+    external = [
+        row
+        for row in existing
+        if isinstance(row.get("kind"), str) and row.get("kind") != "yoolang"
+    ]
+    new_entries = [report_index_entry(row, scope) for row in runs if row.get("run_id") or row.get("commit_sha")]
+    seen: set[str] = set()
+    yoolang_entries: list[dict[str, Any]] = []
+    for row in new_entries:
+        key = str(row.get("id") or row.get("perf_report_url") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        yoolang_entries.append(row)
+    yoolang_entries = yoolang_entries[:10]
+    merged: list[dict[str, Any]] = [*external, *yoolang_entries]
+    path.write_text(json.dumps({"reports": merged}, ensure_ascii=True, indent=2) + "\n")
 
 
 def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str = "root", pages_base_url: str = "") -> str:
@@ -303,10 +360,19 @@ def main() -> int:
         "failure_count": failure_count,
         "is_main_branch": is_main,
     }
+    if args.perf_report and args.perf_report.exists():
+        if is_main:
+            target_report = public_dir / "perf-report" / "runs" / run_id / "perf-report.json"
+        else:
+            target_report = public_dir / "branches" / safe_branch_name(branch) / "perf-report" / "runs" / run_id / "perf-report.json"
+        if not target_report.exists():
+            target_report.parent.mkdir(parents=True, exist_ok=True)
+            target_report.write_bytes(args.perf_report.read_bytes())
     runs = [row for row in runs if str(row.get("run_id", "")) != run_id]
     runs.insert(0, current)
     runs = runs[:MAX_HISTORY]
     history_path.write_text(json.dumps({"runs": runs}, ensure_ascii=True, indent=2) + "\n")
+    write_report_index(public_dir, runs, "root")
     write_history_pages(public_dir, runs, args.pages_base_url)
     return 0
 

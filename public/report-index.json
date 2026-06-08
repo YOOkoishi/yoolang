@@ -1,0 +1,15 @@
+{
+  "reports": [
+    {
+      "id": "external-hy-fcc36336197a",
+      "kind": "external",
+      "name": "hy",
+      "branch": "main",
+      "commit_sha": "fcc36336197ae450ffe923a1b289a8385501edee",
+      "commit_title": "Binary search buggy passes",
+      "source_url": "https://gitlab.eduxiji.net/educg-group-36290-2935672/T202500000205464-2455.git",
+      "generated_china": "2026-06-09 21:52:38 CST",
+      "perf_report_url": "./external/hy/fcc36336197a/perf-report.json"
+    }
+  ]
+}

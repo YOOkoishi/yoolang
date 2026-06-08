@@ -197,6 +197,17 @@ def _resolve_compiler_binary() -> Path:
     return sorted(candidates)[0]
 
 
+def _resolve_optional_binary(env_name: str) -> Path | None:
+    env_bin = os.environ.get(env_name, "").strip()
+    if not env_bin:
+        return None
+    candidate = Path(env_bin)
+    resolved = candidate if candidate.is_absolute() else (WORKSPACE / candidate)
+    if not resolved.exists():
+        raise FileNotFoundError(f"{env_name} was set but file does not exist: {resolved}")
+    return resolved
+
+
 def _normalize_text(text: str) -> str:
     return text.replace("\r\n", "\n").strip()
 
@@ -387,6 +398,7 @@ def _prepare_baseline_source(src: Path, out_dir: Path) -> Path:
 
 try:
     COMPILER_BIN = _resolve_compiler_binary()
+    HY_COMPILER_BIN = _resolve_optional_binary("HY_COMPILER_BIN")
     RUNTIME_LIB = _ensure_runtime_lib()
     RUNTIME_WRAPPER = _ensure_runtime_wrapper()
 except Exception as exc:
@@ -455,6 +467,23 @@ def _compile_compiler(src: Path, out_dir: Path) -> tuple[Path, str]:
     asm_file, _ = _emit_compiler_asm(src, out_dir)
     obj = out_dir / f"{src.stem}.compiler.o"
     exe = out_dir / f"{src.stem}.compiler.riscv"
+    subprocess.run([GCC_BIN, *RISCV_CODE_MODEL_FLAGS, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    return exe, "OK"
+
+
+def _compile_hy(src: Path, out_dir: Path) -> tuple[Path, str]:
+    if HY_COMPILER_BIN is None:
+        raise RuntimeError("HY_COMPILER_BIN is not configured")
+    asm_file = out_dir / f"{src.stem}.hy.s"
+    obj = out_dir / f"{src.stem}.hy.o"
+    exe = out_dir / f"{src.stem}.hy.riscv"
+    subprocess.run(
+        [str(HY_COMPILER_BIN), str(src), "-O1", "-o", str(asm_file)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     subprocess.run([GCC_BIN, *RISCV_CODE_MODEL_FLAGS, "-c", str(asm_file), "-o", str(obj)], check=True, capture_output=True, text=True)
     subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
@@ -609,7 +638,7 @@ def _format_detail(label: str, result: RunResult) -> str:
     return "\n\n".join(parts)
 
 
-def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, str]:
+def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, RunResult | None, bool, str]:
     input_file = _expected_input(src)
     expected = _expected_output(src)
     case_dir = _case_work_dir(src)
@@ -621,6 +650,8 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
         ("clang++", _compile_clang),
         ("compiler", _compile_compiler),
     )
+    if HY_COMPILER_BIN is not None:
+        compiler_specs = (*compiler_specs, ("hy", _compile_hy))
 
     for name, compile_func in compiler_specs:
         start = time.perf_counter()
@@ -654,13 +685,16 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
     gcc = results["gcc"]
     clang = results["clang++"]
     compiler = results["compiler"]
+    hy = results.get("hy")
 
     if not gcc.compile_ok or not gcc.run_ok:
-        return gcc, clang, compiler, False, f"gcc {gcc.detail}"
+        return gcc, clang, compiler, hy, False, f"gcc {gcc.detail}"
     if not clang.compile_ok or not clang.run_ok:
-        return gcc, clang, compiler, False, f"clang++ {clang.detail}"
+        return gcc, clang, compiler, hy, False, f"clang++ {clang.detail}"
     if not compiler.compile_ok or not compiler.run_ok:
-        return gcc, clang, compiler, False, f"compiler {compiler.detail}"
+        return gcc, clang, compiler, hy, False, f"compiler {compiler.detail}"
+    if hy is not None and (not hy.compile_ok or not hy.run_ok):
+        return gcc, clang, compiler, hy, True, "OK"
 
     clang_stdout = _normalize_text(clang.stdout)
     compiler_stdout = _normalize_text(compiler.stdout)
@@ -672,26 +706,40 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, bool, 
                 gcc,
                 clang,
                 compiler,
+                hy,
                 False,
                 f"compiler output mismatch vs expected .out for {src.name}",
             )
-        return gcc, clang, compiler, True, "OK"
+        if hy is not None and (_normalize_text(hy.stdout) != _normalize_text(expected_stdout) or hy.exit_code != expected_exit):
+            return (
+                gcc,
+                clang,
+                compiler,
+                hy,
+                True,
+                "OK",
+            )
+        return gcc, clang, compiler, hy, True, "OK"
 
     baseline_stdout = _normalize_text(gcc.stdout)
     baseline_exit = gcc.exit_code
 
     if clang_stdout != baseline_stdout or clang.exit_code != baseline_exit:
-        return gcc, clang, compiler, False, f"clang++ output mismatch vs gcc for {src.name}"
+        return gcc, clang, compiler, hy, False, f"clang++ output mismatch vs gcc for {src.name}"
     if compiler_stdout != baseline_stdout or compiler.exit_code != baseline_exit:
-        return gcc, clang, compiler, False, f"compiler output mismatch vs gcc for {src.name}"
+        return gcc, clang, compiler, hy, False, f"compiler output mismatch vs gcc for {src.name}"
+    if hy is not None and (_normalize_text(hy.stdout) != baseline_stdout or hy.exit_code != baseline_exit):
+        return gcc, clang, compiler, hy, True, "OK"
 
-    return gcc, clang, compiler, True, "OK"
+    return gcc, clang, compiler, hy, True, "OK"
 
 
 def _print_header() -> None:
     print("=== RISC-V/QEMU perf compare ===")
     print(f"Workspace: {WORKSPACE}")
     print(f"Compiler binary: {COMPILER_BIN}")
+    if HY_COMPILER_BIN is not None:
+        print(f"HY compiler binary: {HY_COMPILER_BIN}")
     print(f"Runtime lib: {RUNTIME_LIB}")
     print(f"Runtime wrapper: {RUNTIME_WRAPPER}")
     print(f"Test dirs: {', '.join(str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS)}")
@@ -752,6 +800,25 @@ def _compiler_vs_o3_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
         "clang_o3_geomean": _geomean(clang_ratios),
         "gcc_o3_faster_cases": gcc_faster_cases,
         "clang_o3_faster_cases": clang_faster_cases,
+    }
+
+
+def _hy_vs_compiler_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
+    ratios: list[float] = []
+    hy_faster_cases = 0
+
+    for row in rows:
+        hy = _parse_time_cell(row.get("hy"))
+        compiler = _parse_time_cell(row.get("compiler"))
+        if hy is None or compiler is None or hy <= 0.0:
+            continue
+        ratios.append(compiler / hy)
+        if hy < compiler:
+            hy_faster_cases += 1
+
+    return {
+        "hy_vs_compiler_geomean": _geomean(ratios),
+        "hy_faster_cases": hy_faster_cases,
     }
 
 
@@ -867,6 +934,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
     status = "PASS" if failures == 0 else "FAIL"
     generated = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     o3_stats = _compiler_vs_o3_stats(rows)
+    hy_stats = _hy_vs_compiler_stats(rows) if HY_COMPILER_BIN is not None else None
     insn_summary = _instruction_count_summary(rows)
     mir_stage_summary = _mir_stage_metric_summary(rows)
 
@@ -886,6 +954,14 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
     ]
+    if HY_COMPILER_BIN is not None:
+        md_lines.extend(
+            [
+                f"- HY compiler binary: {HY_COMPILER_BIN}",
+                f"- HY vs yoolang geomean speedup: {_format_ratio(hy_stats['hy_vs_compiler_geomean'] if hy_stats else None)}",
+                f"- HY faster than yoolang cases: {hy_stats['hy_faster_cases'] if hy_stats else 0}",
+            ]
+        )
 
     stage_totals = mir_stage_summary.get("stages")
     if isinstance(stage_totals, dict) and stage_totals:
@@ -926,8 +1002,8 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                 "",
                 "## Slow Compiler Cases",
                 "",
-                "| Case | Compiler | GCC | Clang++ | Status |",
-                "| --- | ---: | ---: | ---: | --- |",
+                "| Case | Compiler | GCC | Clang++ | HY | Status |",
+                "| --- | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         for row in slow_rows:
@@ -939,6 +1015,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                         _md_escape(str(row["compiler"])),
                         _md_escape(str(row["gcc"])),
                         _md_escape(str(row["clang"])),
+                        _md_escape(str(row.get("hy", "N/A"))),
                         _md_escape(str(row["status"])),
                     ]
                 )
@@ -950,8 +1027,8 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
             "",
             "## Case Results",
             "",
-            "| Case | GCC | Clang++ | Compiler | Status |",
-            "| --- | --- | --- | --- | --- |",
+            "| Case | GCC | Clang++ | Compiler | HY | Status |",
+            "| --- | --- | --- | --- | --- | --- |",
         ]
     )
 
@@ -970,6 +1047,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                     _md_escape(str(row["gcc"])),
                     _md_escape(str(row["clang"])),
                     _md_escape(str(row["compiler"])),
+                    _md_escape(str(row.get("hy", "N/A"))),
                     _md_escape(status_cell),
                 ]
             )
@@ -984,6 +1062,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         "generated_utc": generated,
         "workspace": str(WORKSPACE),
         "compiler_binary": str(COMPILER_BIN),
+        "hy_compiler_binary": str(HY_COMPILER_BIN) if HY_COMPILER_BIN is not None else "",
         "compiler_opt": "-O1",
         "runtime_lib": str(RUNTIME_LIB),
         "test_dirs": [str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS],
@@ -995,12 +1074,15 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         "clang_o3_geomean": o3_stats["clang_o3_geomean"],
         "gcc_o3_faster_cases": o3_stats["gcc_o3_faster_cases"],
         "clang_o3_faster_cases": o3_stats["clang_o3_faster_cases"],
+        "hy_vs_compiler_geomean": hy_stats["hy_vs_compiler_geomean"] if hy_stats else None,
+        "hy_faster_cases": hy_stats["hy_faster_cases"] if hy_stats else 0,
         "instruction_count_summary": insn_summary,
         "mir_stage_metric_summary": mir_stage_summary,
         "rows": rows,
     }
     REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
-    print(f"{'Case':<42} | {'GCC':<12} | {'Clang++':<12} | {'Compiler':<12} | Status")
+    hy_header = " | HY          " if HY_COMPILER_BIN is not None else ""
+    print(f"{'Case':<42} | {'GCC':<12} | {'Clang++':<12} | {'Compiler':<12}{hy_header} | Status")
     print("-" * 140)
 
 
@@ -1031,8 +1113,10 @@ def main() -> int:
     report_rows: list[dict] = []
 
     for case in CASES:
-        gcc, clang, compiler, ok, detail = _compile_and_run(case)
+        gcc, clang, compiler, hy, ok, detail = _compile_and_run(case)
         total_runtime += gcc.elapsed_sec + clang.elapsed_sec + compiler.elapsed_sec
+        if hy is not None:
+            total_runtime += hy.elapsed_sec
         compiler_total_runtime += compiler.elapsed_sec
         rel = str(case.relative_to(WORKSPACE))
         error_detail = ""
@@ -1043,54 +1127,67 @@ def main() -> int:
                     _format_detail("gcc", gcc),
                     _format_detail("clang++", clang),
                     _format_detail("compiler", compiler),
+                    _format_detail("hy", hy) if hy is not None else "",
                 )
                 if item
             )
+        hy_cell = f" | {_format_cell(hy):<12}" if hy is not None else ""
         print(
-            f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(compiler):<12} | {STATUS_EMOJI.get(detail, 'ℹ️')} {detail}"
+            f"{rel:<42} | {_format_cell(gcc):<12} | {_format_cell(clang):<12} | {_format_cell(compiler):<12}{hy_cell} | {STATUS_EMOJI.get(detail, 'ℹ️')} {detail}"
         )
-        report_rows.append(
-            {
-                "case": rel,
-                "gcc": _format_cell(gcc),
-                "clang": _format_cell(clang),
-                "compiler": _format_cell(compiler),
-                "status": detail,
-                "detail": error_detail,
-                "codegen_metrics": compiler.metrics or {},
-                "instruction_count": compiler.instruction_count,
-                "instruction_count_status": compiler.instruction_count_status,
-                "instruction_count_detail": compiler.instruction_count_detail,
-                "instruction_counts": {
-                    "gcc": gcc.instruction_count,
-                    "clang": clang.instruction_count,
-                    "compiler": compiler.instruction_count,
-                },
-                "instruction_count_statuses": {
-                    "gcc": gcc.instruction_count_status,
-                    "clang": clang.instruction_count_status,
-                    "compiler": compiler.instruction_count_status,
-                },
-                "instruction_count_details": {
-                    "gcc": gcc.instruction_count_detail,
-                    "clang": clang.instruction_count_detail,
-                    "compiler": compiler.instruction_count_detail,
-                },
-            }
-        )
+        instruction_counts = {
+            "gcc": gcc.instruction_count,
+            "clang": clang.instruction_count,
+            "compiler": compiler.instruction_count,
+        }
+        instruction_count_statuses = {
+            "gcc": gcc.instruction_count_status,
+            "clang": clang.instruction_count_status,
+            "compiler": compiler.instruction_count_status,
+        }
+        instruction_count_details = {
+            "gcc": gcc.instruction_count_detail,
+            "clang": clang.instruction_count_detail,
+            "compiler": compiler.instruction_count_detail,
+        }
+        if hy is not None:
+            instruction_counts["hy"] = hy.instruction_count
+            instruction_count_statuses["hy"] = hy.instruction_count_status
+            instruction_count_details["hy"] = hy.instruction_count_detail
+        row = {
+            "case": rel,
+            "gcc": _format_cell(gcc),
+            "clang": _format_cell(clang),
+            "compiler": _format_cell(compiler),
+            "status": detail,
+            "detail": error_detail,
+            "codegen_metrics": compiler.metrics or {},
+            "instruction_count": compiler.instruction_count,
+            "instruction_count_status": compiler.instruction_count_status,
+            "instruction_count_detail": compiler.instruction_count_detail,
+            "instruction_counts": instruction_counts,
+            "instruction_count_statuses": instruction_count_statuses,
+            "instruction_count_details": instruction_count_details,
+        }
+        if hy is not None:
+            row["hy"] = _format_cell(hy)
+        report_rows.append(row)
         if not ok:
             failures += 1
             print(f"❌ [FAIL] {rel}: {detail}")
             if error_detail:
                 print(error_detail)
+        strict_statuses = {
+            gcc.instruction_count_status,
+            clang.instruction_count_status,
+            compiler.instruction_count_status,
+        }
+        if hy is not None:
+            strict_statuses.add(hy.instruction_count_status)
         if (
             QEMU_INSN_STRICT
             and "FAILED"
-            in {
-                gcc.instruction_count_status,
-                clang.instruction_count_status,
-                compiler.instruction_count_status,
-            }
+            in strict_statuses
         ):
             failures += 1
             print(f"❌ [FAIL] {rel}: qemu instruction count failed")

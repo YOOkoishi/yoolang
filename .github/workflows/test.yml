@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 60
     concurrency:
       group: ci-${{ github.ref }}
-      cancel-in-progress: true
+      cancel-in-progress: false
 
     steps:
       - name: Checkout with SSH/HTTPS fallback
@@ -316,9 +316,14 @@ jobs:
           # Merge remote history to reduce staleness across runners
           if [ "$is_main" != "true" ] && [ -n "${PAGES_BASE_URL:-}" ]; then
             curl -sSf "${PAGES_BASE_URL}/report-history.json" -o /tmp/remote-history.json 2>/dev/null || true
+            curl -sSf "${PAGES_BASE_URL}/report-index.json" -o /tmp/remote-report-index.json 2>/dev/null || true
             if [ -f /tmp/remote-history.json ]; then
-              python3 scripts/merge_report_history.py public /tmp/remote-history.json || true
-              rm -f /tmp/remote-history.json
+              if [ -f /tmp/remote-report-index.json ]; then
+                python3 scripts/merge_report_history.py public /tmp/remote-history.json /tmp/remote-report-index.json || true
+              else
+                python3 scripts/merge_report_history.py public /tmp/remote-history.json || true
+              fi
+              rm -f /tmp/remote-history.json /tmp/remote-report-index.json
             fi
           fi
 
@@ -358,6 +363,7 @@ jobs:
           cp ci-result/instruction_count_compare.json "$insn_runs/$run_id/instruction_count_compare.json"
           cp "$perf_html" "$perf_runs/$run_id/index.html"
           cp ci-result/perf_compare.json "$perf_runs/$run_id/perf_compare.json"
+          cp build/perf-ci/perf-report.json "$perf_runs/$run_id/perf-report.json"
 
           python3 scripts/update_report_history.py \
             --public-dir public \
