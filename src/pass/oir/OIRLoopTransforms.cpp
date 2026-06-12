@@ -49,8 +49,7 @@ oir::Value *map_value(oir::Value *value, const ValueMap &map) {
     return found == map.end() ? value : found->second;
 }
 
-std::vector<oir::Value *> map_values(const std::vector<oir::Value *> &values,
-                                     const ValueMap &map) {
+std::vector<oir::Value *> map_values(const std::vector<oir::Value *> &values, const ValueMap &map) {
     std::vector<oir::Value *> out;
     out.reserve(values.size());
     for (auto *value : values) {
@@ -96,20 +95,17 @@ std::string suffixed_name(const oir::Value &value, const char *suffix) {
 }
 
 std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst,
-                                                    const ValueMap &map,
-                                                    oir::BasicBlock *parent,
+                                                    const ValueMap &map, oir::BasicBlock *parent,
                                                     const char *suffix) {
     if (auto *binary = dynamic_cast<const oir::BinaryInst *>(&inst)) {
-        return std::make_unique<oir::BinaryInst>(binary->type(), binary->op(),
-                                                 map_value(binary->lhs(), map),
-                                                 map_value(binary->rhs(), map), parent,
-                                                 suffixed_name(inst, suffix));
+        return std::make_unique<oir::BinaryInst>(
+            binary->type(), binary->op(), map_value(binary->lhs(), map),
+            map_value(binary->rhs(), map), parent, suffixed_name(inst, suffix));
     }
     if (auto *cmp = dynamic_cast<const oir::CmpInst *>(&inst)) {
-        return std::make_unique<oir::CmpInst>(cmp->type(), cmp->op(), cmp->pred(),
-                                              map_value(cmp->lhs(), map),
-                                              map_value(cmp->rhs(), map), parent,
-                                              suffixed_name(inst, suffix));
+        return std::make_unique<oir::CmpInst>(
+            cmp->type(), cmp->op(), cmp->pred(), map_value(cmp->lhs(), map),
+            map_value(cmp->rhs(), map), parent, suffixed_name(inst, suffix));
     }
     if (auto *cast = dynamic_cast<const oir::CastInst *>(&inst)) {
         return std::make_unique<oir::CastInst>(cast->type(), cast->op(),
@@ -134,10 +130,9 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
                                                 map_value(store->ptr(), map), parent);
     }
     if (auto *memzero = dynamic_cast<const oir::MemZeroInst *>(&inst)) {
-        return std::make_unique<oir::MemZeroInst>(
-            memzero->type(), map_value(memzero->ptr(), map),
-            map_value(memzero->byte_value(), map),
-            map_value(memzero->byte_count(), map), parent);
+        return std::make_unique<oir::MemZeroInst>(memzero->type(), map_value(memzero->ptr(), map),
+                                                  map_value(memzero->byte_value(), map),
+                                                  map_value(memzero->byte_count(), map), parent);
     }
     if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
         return std::make_unique<oir::CallInst>(call->type(), map_value(call->callee(), map),
@@ -145,11 +140,8 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
                                                suffixed_name(inst, suffix));
     }
     if (auto *ret = dynamic_cast<const oir::ReturnInst *>(&inst)) {
-        return std::make_unique<oir::ReturnInst>(ret->type(),
-                                                 ret->has_value()
-                                                     ? map_value(ret->value(), map)
-                                                     : nullptr,
-                                                 parent);
+        return std::make_unique<oir::ReturnInst>(
+            ret->type(), ret->has_value() ? map_value(ret->value(), map) : nullptr, parent);
     }
     if (auto *branch = dynamic_cast<const oir::BranchInst *>(&inst)) {
         if (branch->is_conditional()) {
@@ -163,8 +155,8 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
             parent);
     }
     if (auto *phi = dynamic_cast<const oir::PhiInst *>(&inst)) {
-        auto clone = std::make_unique<oir::PhiInst>(phi->type(), parent,
-                                                    suffixed_name(inst, suffix));
+        auto clone =
+            std::make_unique<oir::PhiInst>(phi->type(), parent, suffixed_name(inst, suffix));
         for (const auto &incoming : phi->incoming()) {
             clone->add_incoming(map_value(incoming.first, map),
                                 static_cast<oir::BasicBlock *>(map_value(incoming.second, map)));
@@ -242,7 +234,8 @@ bool non_phi_header_values_used_outside_header(const oir::Function &function,
             }
             for (auto *operand : inst->operands()) {
                 auto *operand_inst = dynamic_cast<const oir::Instruction *>(operand);
-                if (operand_inst != nullptr && header_defs.find(operand_inst) != header_defs.end()) {
+                if (operand_inst != nullptr &&
+                    header_defs.find(operand_inst) != header_defs.end()) {
                     return true;
                 }
             }
@@ -317,7 +310,8 @@ bool header_condition_uses_addrec(const oir::Loop &loop, const oir::BranchInst &
     return lhs.kind() == oir::SCEVKind::AddRec || rhs.kind() == oir::SCEVKind::AddRec;
 }
 
-bool loop_has_non_condition_side_exit(const oir::Loop &loop, const oir::BasicBlock *condition_exit) {
+bool loop_has_non_condition_side_exit(const oir::Loop &loop,
+                                      const oir::BasicBlock *condition_exit) {
     for (auto *block : loop.blocks) {
         for (auto *succ : block->successors()) {
             if (contains_block(loop, succ) || succ == condition_exit) {
@@ -403,10 +397,10 @@ void move_header_phis_to_body(oir::BasicBlock *header, oir::BasicBlock *body) {
     }
 }
 
-void split_exit_phi_incoming(oir::BasicBlock *exit, oir::BasicBlock *old_header,
-                             oir::BasicBlock *preheader, oir::BasicBlock *latch,
-                             const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming>
-                                 &header_phi_values) {
+void split_exit_phi_incoming(
+    oir::BasicBlock *exit, oir::BasicBlock *old_header, oir::BasicBlock *preheader,
+    oir::BasicBlock *latch,
+    const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &header_phi_values) {
     for (auto &inst : exit->instructions()) {
         auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
         if (phi == nullptr) {
@@ -576,8 +570,7 @@ bool rotate_loop(oir::Function &function, const oir::Loop &loop, const oir::Scal
         block_starts_with_phi(*body) ||
         non_phi_header_values_used_outside_header(function, *header) ||
         header_phi_used_by_external_phi(function, loop, *header) ||
-        header_condition_has_div_or_rem(*header) ||
-        loop_has_non_condition_side_exit(loop, exit)) {
+        header_condition_has_div_or_rem(*header) || loop_has_non_condition_side_exit(loop, exit)) {
         return false;
     }
 
@@ -807,8 +800,7 @@ oir::BranchInst *find_unswitch_branch(const oir::Loop &loop, const oir::ScalarEv
         if (branch == nullptr || !branch->is_conditional()) {
             continue;
         }
-        if (!contains_block(loop, branch->true_bb()) ||
-            !contains_block(loop, branch->false_bb())) {
+        if (!contains_block(loop, branch->true_bb()) || !contains_block(loop, branch->false_bb())) {
             continue;
         }
         if (scev.is_loop_invariant(branch->cond(), loop)) {
@@ -887,8 +879,7 @@ void build_cloned_cfg_and_exit_phis(const oir::Loop &loop,
         auto *clone = block_map.at(orig);
         for (auto *succ : orig->successors()) {
             auto block_found = block_map.find(succ);
-            auto *clone_succ =
-                block_found == block_map.end() ? succ : block_found->second;
+            auto *clone_succ = block_found == block_map.end() ? succ : block_found->second;
             oir::cfg::add_edge(clone, clone_succ);
 
             if (block_found != block_map.end()) {
@@ -955,8 +946,8 @@ void force_branch_direction(oir::BranchInst &branch, bool take_true) {
     replace_terminator_with_br(block, taken);
 }
 
-bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
-                   const oir::ScalarEvolution &scev, Stats &stats) {
+bool unswitch_loop(oir::Function &function, const oir::Loop &loop, const oir::ScalarEvolution &scev,
+                   Stats &stats) {
     auto *preheader = find_preheader(loop);
     if (preheader == nullptr || !preheader->has_terminator()) {
         return false;
@@ -1008,6 +999,377 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
     ++stats.loop_unswitch;
     ++stats.cfg;
     return true;
+}
+
+struct SmallConstantUnrollMatch {
+    oir::BasicBlock *preheader = nullptr;
+    oir::BasicBlock *header = nullptr;
+    oir::BasicBlock *latch = nullptr;
+    oir::BasicBlock *body_entry = nullptr;
+    oir::BasicBlock *exit = nullptr;
+    std::int64_t trip_count = 0;
+    std::vector<oir::BasicBlock *> blocks;
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> header_phi_values;
+};
+
+struct IterationClone {
+    BlockMap blocks;
+    ValueMap values;
+    oir::BasicBlock *header = nullptr;
+    oir::BasicBlock *latch = nullptr;
+    std::vector<oir::BasicBlock *> ordered_blocks;
+};
+
+bool is_header_phi_value(const oir::Value *value, const oir::BasicBlock *header) {
+    auto *phi = dynamic_cast<const oir::PhiInst *>(value);
+    return phi != nullptr && phi->parent() == header;
+}
+
+bool phi_has_incoming(const oir::PhiInst &phi, const oir::Value *value,
+                      const oir::BasicBlock *pred) {
+    for (const auto &incoming : phi.incoming()) {
+        if (incoming.first == value && incoming.second == pred) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool loop_external_uses_are_repairable(const oir::Loop &loop, oir::BasicBlock *exit) {
+    auto *header = mutable_block(loop.header);
+    for (auto *const_block : loop.blocks) {
+        for (const auto &inst : const_block->instructions()) {
+            const bool header_phi = is_header_phi_value(inst.get(), header);
+            for (const auto &use : inst->uses()) {
+                auto *user_inst = dynamic_cast<oir::Instruction *>(use.user);
+                if (user_inst == nullptr || contains_block(loop, user_inst->parent())) {
+                    continue;
+                }
+                if (!header_phi) {
+                    return false;
+                }
+
+                if (user_inst->parent() == exit) {
+                    auto *phi = dynamic_cast<oir::PhiInst *>(user_inst);
+                    if (phi == nullptr || phi_has_incoming(*phi, inst.get(), header)) {
+                        continue;
+                    }
+                    return false;
+                }
+
+                auto *phi = dynamic_cast<oir::PhiInst *>(user_inst);
+                if (phi != nullptr && phi_has_incoming(*phi, inst.get(), exit)) {
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool loop_has_only_header_exit(const oir::Loop &loop, oir::BasicBlock *header,
+                               oir::BasicBlock *exit) {
+    for (auto *const_block : loop.blocks) {
+        auto *block = mutable_block(const_block);
+        for (auto *succ : block->successors()) {
+            if (contains_block(loop, succ)) {
+                continue;
+            }
+            if (block == header && succ == exit) {
+                continue;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+oir::BasicBlock *unique_outside_predecessor(const oir::Loop &loop) {
+    oir::BasicBlock *preheader = nullptr;
+    for (auto *pred : loop.header->predecessors()) {
+        if (contains_block(loop, pred)) {
+            continue;
+        }
+        if (preheader != nullptr) {
+            return nullptr;
+        }
+        preheader = pred;
+    }
+    return preheader;
+}
+
+std::optional<SmallConstantUnrollMatch>
+match_small_constant_unroll_loop(oir::Function &function, const oir::Loop &loop,
+                                 const std::vector<oir::Loop> &loops,
+                                 const oir::ScalarEvolution &scev) {
+    if (loop.header == nullptr || contains_nested_loop_header(loop, loops)) {
+        return std::nullopt;
+    }
+
+    auto *header = mutable_block(loop.header);
+    auto *preheader = unique_outside_predecessor(loop);
+    auto *latch = single_latch(loop);
+    if (preheader == nullptr || latch == nullptr || header_condition_has_div_or_rem(*header)) {
+        return std::nullopt;
+    }
+
+    auto *preheader_branch = dynamic_cast<oir::BranchInst *>(preheader->terminator());
+    auto *latch_branch = dynamic_cast<oir::BranchInst *>(latch->terminator());
+    auto *header_branch = dynamic_cast<oir::BranchInst *>(header->terminator());
+    if (preheader_branch == nullptr ||
+        (!preheader_branch->is_conditional() && preheader_branch->target_bb() != header) ||
+        (preheader_branch->is_conditional() && preheader_branch->true_bb() != header &&
+         preheader_branch->false_bb() != header) ||
+        latch_branch == nullptr || latch_branch->is_conditional() ||
+        latch_branch->target_bb() != header || header_branch == nullptr ||
+        !header_branch->is_conditional()) {
+        return std::nullopt;
+    }
+
+    const bool true_in_loop = contains_block(loop, header_branch->true_bb());
+    const bool false_in_loop = contains_block(loop, header_branch->false_bb());
+    if (true_in_loop == false_in_loop) {
+        return std::nullopt;
+    }
+    auto *body_entry = true_in_loop ? header_branch->true_bb() : header_branch->false_bb();
+    auto *exit = true_in_loop ? header_branch->false_bb() : header_branch->true_bb();
+    if (body_entry == nullptr || exit == nullptr || body_entry == header ||
+        contains_block(loop, exit) || !loop_has_only_header_exit(loop, header, exit)) {
+        return std::nullopt;
+    }
+
+    auto trip_count = scev.constant_trip_count(loop);
+    constexpr std::int64_t kMaxTripCount = 5;
+    if (!trip_count.has_value() || *trip_count <= 1 || *trip_count > kMaxTripCount) {
+        return std::nullopt;
+    }
+
+    auto blocks = function_ordered_loop_blocks(function, loop);
+    constexpr std::size_t kMaxLoopBlocks = 12;
+    constexpr std::size_t kMaxUnrolledInstructions = 220;
+    const auto instruction_count = loop_instruction_count(blocks);
+    if (blocks.empty() || blocks.size() > kMaxLoopBlocks ||
+        instruction_count * static_cast<std::size_t>(*trip_count) > kMaxUnrolledInstructions) {
+        return std::nullopt;
+    }
+
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> header_phi_values;
+    if (!collect_header_phi_incoming(*header, preheader, latch, header_phi_values) ||
+        !loop_external_uses_are_repairable(loop, exit)) {
+        return std::nullopt;
+    }
+
+    SmallConstantUnrollMatch match;
+    match.preheader = preheader;
+    match.header = header;
+    match.latch = latch;
+    match.body_entry = body_entry;
+    match.exit = exit;
+    match.trip_count = *trip_count;
+    match.blocks = std::move(blocks);
+    match.header_phi_values = std::move(header_phi_values);
+    return match;
+}
+
+void replace_terminator_with_mapped_branch(oir::BasicBlock *clone,
+                                           const oir::BranchInst &original_branch,
+                                           const ValueMap &map) {
+    if (original_branch.is_conditional()) {
+        replace_terminator_with_cond_br(
+            clone, map_value(original_branch.cond(), map),
+            static_cast<oir::BasicBlock *>(map_value(original_branch.true_bb(), map)),
+            static_cast<oir::BasicBlock *>(map_value(original_branch.false_bb(), map)));
+        return;
+    }
+    replace_terminator_with_br(
+        clone, static_cast<oir::BasicBlock *>(map_value(original_branch.target_bb(), map)));
+}
+
+bool clone_unroll_iteration(oir::Function &function, const SmallConstantUnrollMatch &match,
+                            IterationClone &iteration, const ValueMap &current_values,
+                            const char *suffix) {
+    for (auto *block : match.blocks) {
+        auto *clone = function.create_block("unr." + block->name());
+        iteration.blocks[block] = clone;
+        iteration.values[block] = clone;
+        iteration.ordered_blocks.push_back(clone);
+        if (block == match.header) {
+            iteration.header = clone;
+        }
+        if (block == match.latch) {
+            iteration.latch = clone;
+        }
+    }
+
+    for (const auto &[value, mapped] : current_values) {
+        iteration.values[value] = mapped;
+    }
+
+    for (auto *block : match.blocks) {
+        auto *clone_block = iteration.blocks.at(block);
+        for (const auto &inst : block->instructions()) {
+            if (block == match.header && dynamic_cast<oir::PhiInst *>(inst.get()) != nullptr) {
+                continue;
+            }
+            auto clone = clone_instruction(*inst, iteration.values, clone_block, suffix);
+            if (clone == nullptr) {
+                return false;
+            }
+            auto *raw = clone.get();
+            clone_block->append_instruction(std::move(clone));
+            iteration.values[inst.get()] = raw;
+        }
+    }
+
+    fix_cloned_operands(iteration.ordered_blocks, iteration.values);
+    return iteration.header != nullptr && iteration.latch != nullptr;
+}
+
+void wire_unroll_iteration(const SmallConstantUnrollMatch &match, IterationClone &iteration,
+                           oir::BasicBlock *next_header) {
+    for (auto *orig : match.blocks) {
+        auto *clone = iteration.blocks.at(orig);
+        if (orig == match.header) {
+            replace_terminator_with_br(clone, iteration.blocks.at(match.body_entry));
+            continue;
+        }
+        if (orig == match.latch) {
+            replace_terminator_with_br(clone, next_header == nullptr ? match.exit : next_header);
+            continue;
+        }
+
+        auto *branch = dynamic_cast<oir::BranchInst *>(clone->terminator());
+        if (branch == nullptr) {
+            continue;
+        }
+        replace_terminator_with_mapped_branch(clone, *branch, iteration.values);
+    }
+}
+
+void replace_exit_uses_after_unroll(const SmallConstantUnrollMatch &match,
+                                    const ValueMap &final_values, oir::BasicBlock *final_pred) {
+    for (auto &inst : match.exit->instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
+            const auto &incoming = phi->incoming()[i];
+            if (incoming.second != match.header) {
+                continue;
+            }
+            phi->set_operand(i * 2, map_value(incoming.first, final_values));
+            phi->set_operand(i * 2 + 1, final_pred);
+        }
+    }
+
+    for (const auto &[phi, values] : match.header_phi_values) {
+        (void)values;
+        auto *replacement = map_value(phi, final_values);
+        replace_non_phi_uses_in_block(match.exit, phi, replacement);
+        replace_phi_uses_on_successor_edges(match.exit, phi, replacement);
+    }
+}
+
+void detach_original_loop_blocks(const SmallConstantUnrollMatch &match) {
+    for (auto *block : match.blocks) {
+        auto preds = block->predecessors();
+        for (auto *pred : preds) {
+            oir::cfg::remove_edge_no_phi_update(pred, block);
+        }
+        auto succs = block->successors();
+        for (auto *succ : succs) {
+            oir::cfg::remove_edge_no_phi_update(block, succ);
+        }
+    }
+}
+
+bool rewrite_small_constant_unroll_loop(oir::Function &function,
+                                        const SmallConstantUnrollMatch &match, Stats &stats) {
+    std::vector<IterationClone> iterations(static_cast<std::size_t>(match.trip_count));
+    ValueMap current_values;
+    for (const auto &[phi, values] : match.header_phi_values) {
+        current_values[phi] = values.outside;
+    }
+
+    for (std::int64_t i = 0; i < match.trip_count; ++i) {
+        const auto suffix = ".unr" + std::to_string(i);
+        auto &iteration = iterations[static_cast<std::size_t>(i)];
+        if (!clone_unroll_iteration(function, match, iteration, current_values, suffix.c_str())) {
+            for (auto &created : iterations) {
+                for (auto *block : created.ordered_blocks) {
+                    function.erase_block(block);
+                }
+            }
+            return false;
+        }
+
+        ValueMap next_values;
+        for (const auto &[phi, values] : match.header_phi_values) {
+            next_values[phi] = map_value(values.latch, iteration.values);
+        }
+        current_values = std::move(next_values);
+    }
+
+    for (std::size_t i = 0; i < iterations.size(); ++i) {
+        auto *next_header = i + 1 < iterations.size() ? iterations[i + 1].header : nullptr;
+        wire_unroll_iteration(match, iterations[i], next_header);
+    }
+
+    auto *preheader_branch = dynamic_cast<oir::BranchInst *>(match.preheader->terminator());
+    if (preheader_branch == nullptr ||
+        !oir::cfg::replace_branch_target(*preheader_branch, match.header,
+                                         iterations.front().header)) {
+        return false;
+    }
+    oir::cfg::remove_edge_no_phi_update(match.preheader, match.header);
+    oir::cfg::add_edge(match.preheader, iterations.front().header);
+
+    ValueMap final_values = iterations.back().values;
+    for (const auto &[value, mapped] : current_values) {
+        final_values[value] = mapped;
+    }
+    replace_exit_uses_after_unroll(match, final_values, iterations.back().latch);
+    detach_original_loop_blocks(match);
+    for (auto *block : match.blocks) {
+        function.erase_block(block);
+    }
+
+    ++stats.loop_unroll;
+    ++stats.cfg;
+    return true;
+}
+
+bool unroll_small_constant_loops_in_function(oir::Function &function, Stats &stats) {
+    bool changed = false;
+    constexpr unsigned kMaxUnrollsPerFunction = 32;
+    for (unsigned iteration = 0; iteration < kMaxUnrollsPerFunction; ++iteration) {
+        oir::DominatorTree dom_tree(function);
+        oir::LoopInfo loop_info(function, dom_tree);
+        oir::ScalarEvolution scev(function, loop_info);
+        auto loops = loop_info.loops();
+        std::sort(loops.begin(), loops.end(), [](const oir::Loop &lhs, const oir::Loop &rhs) {
+            return lhs.blocks.size() < rhs.blocks.size();
+        });
+
+        bool unrolled = false;
+        for (const auto &loop : loops) {
+            auto match = match_small_constant_unroll_loop(function, loop, loops, scev);
+            if (!match.has_value()) {
+                continue;
+            }
+            if (rewrite_small_constant_unroll_loop(function, *match, stats)) {
+                changed = true;
+                unrolled = true;
+                break;
+            }
+        }
+        if (!unrolled) {
+            break;
+        }
+    }
+    return changed;
 }
 
 struct NormalizedCmp {
@@ -1105,10 +1467,9 @@ std::optional<std::uint8_t> repeated_byte_store_value(oir::Value *value) {
         }
         const auto word = static_cast<std::uint32_t>(*int_zero);
         const auto byte = static_cast<std::uint8_t>(word & 0xffU);
-        const auto repeated = static_cast<std::uint32_t>(byte) |
-                              (static_cast<std::uint32_t>(byte) << 8U) |
-                              (static_cast<std::uint32_t>(byte) << 16U) |
-                              (static_cast<std::uint32_t>(byte) << 24U);
+        const auto repeated =
+            static_cast<std::uint32_t>(byte) | (static_cast<std::uint32_t>(byte) << 8U) |
+            (static_cast<std::uint32_t>(byte) << 16U) | (static_cast<std::uint32_t>(byte) << 24U);
         if (word == repeated) {
             return byte;
         }
@@ -1172,8 +1533,7 @@ bool loop_defs_have_no_external_uses(const oir::Loop &loop) {
     return true;
 }
 
-oir::StoreInst *single_byte_pattern_store(const oir::BasicBlock &block,
-                                          std::uint64_t &element_size,
+oir::StoreInst *single_byte_pattern_store(const oir::BasicBlock &block, std::uint64_t &element_size,
                                           std::uint8_t &byte_value) {
     oir::StoreInst *store = nullptr;
     for (const auto &inst : block.instructions()) {
@@ -1227,7 +1587,8 @@ bool is_i32_value(oir::Value *value) {
 }
 
 oir::BasicBlock *unconditional_branch_target(oir::BasicBlock *block) {
-    auto *branch = block == nullptr ? nullptr : dynamic_cast<oir::BranchInst *>(block->terminator());
+    auto *branch =
+        block == nullptr ? nullptr : dynamic_cast<oir::BranchInst *>(block->terminator());
     if (branch == nullptr || branch->is_conditional()) {
         return nullptr;
     }
@@ -1275,9 +1636,9 @@ bool block_has_only_guard_progress(const oir::BasicBlock &block) {
     return true;
 }
 
-std::optional<GuardedLoopBoundMatch> match_monotonic_guarded_loop_bound(
-    const oir::Loop &loop) {
-    if (loop.header == nullptr || loop.blocks.size() > 8 || !loop_defs_have_no_external_uses(loop)) {
+std::optional<GuardedLoopBoundMatch> match_monotonic_guarded_loop_bound(const oir::Loop &loop) {
+    if (loop.header == nullptr || loop.blocks.size() > 8 ||
+        !loop_defs_have_no_external_uses(loop)) {
         return std::nullopt;
     }
 
@@ -1394,9 +1755,8 @@ bool rewrite_monotonic_guarded_loop_bound(oir::Function &function,
     builder.create_cond_br(use_tight_bound, plus_block, merge_block);
 
     builder.set_insert_point(plus_block);
-    auto *limit_next =
-        builder.create_binary(oir::Instruction::OpID::Add, match.limit, module->create_i32(1),
-                              "loop.bound.next");
+    auto *limit_next = builder.create_binary(oir::Instruction::OpID::Add, match.limit,
+                                             module->create_i32(1), "loop.bound.next");
     builder.create_br(merge_block);
 
     builder.set_insert_point(merge_block);
@@ -1573,15 +1933,16 @@ oir::Value *materialize_byte_count(oir::Module &module, oir::BasicBlock *block,
                                       "memzero.count");
     }
     if (match.element_size != 1) {
-        count = builder.create_binary(oir::Instruction::OpID::Mul, count,
-                                      module.create_i32(static_cast<std::int64_t>(match.element_size)),
-                                      "memzero.bytes");
+        count = builder.create_binary(
+            oir::Instruction::OpID::Mul, count,
+            module.create_i32(static_cast<std::int64_t>(match.element_size)), "memzero.bytes");
     }
     return count;
 }
 
 std::optional<ZeroStoreLoopMatch> match_zero_store_loop(const oir::Loop &loop) {
-    if (loop.blocks.size() != 1 || loop.header == nullptr || !loop_defs_have_no_external_uses(loop)) {
+    if (loop.blocks.size() != 1 || loop.header == nullptr ||
+        !loop_defs_have_no_external_uses(loop)) {
         return std::nullopt;
     }
 
@@ -1646,9 +2007,9 @@ bool rewrite_zero_store_loop(oir::Function &function, const ZeroStoreLoopMatch &
     if (match.byte_value == 0) {
         builder.create_memzero(match.start_ptr, byte_count);
     } else {
-        builder.create_memset(match.start_ptr,
-                              function.parent()->create_i32(static_cast<std::int64_t>(match.byte_value)),
-                              byte_count);
+        builder.create_memset(
+            match.start_ptr,
+            function.parent()->create_i32(static_cast<std::int64_t>(match.byte_value)), byte_count);
     }
     builder.create_br(match.exit);
 
@@ -1816,6 +2177,17 @@ bool tighten_monotonic_guarded_loop_bounds(oir::Module &module, Stats &stats) {
             continue;
         }
         changed |= tighten_guarded_loop_bounds_in_function(*function, stats);
+    }
+    return changed;
+}
+
+bool unroll_small_constant_loops(oir::Module &module, Stats &stats) {
+    bool changed = false;
+    for (auto &function : module.functions()) {
+        if (function->is_external() || function->entry_block() == nullptr) {
+            continue;
+        }
+        changed |= unroll_small_constant_loops_in_function(*function, stats);
     }
     return changed;
 }

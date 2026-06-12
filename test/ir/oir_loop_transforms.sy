@@ -24,8 +24,24 @@ int unswitch_sum(int n, int flag) {
   return sum;
 }
 
+int small_guarded_kernel(int A[], int flag) {
+  int i = 0;
+  int sum = 0;
+  while (i < 5) {
+    if (flag != 0) {
+      int x = A[i];
+      if (x > 0) {
+        sum = sum + x;
+      }
+    }
+    i = i + 1;
+  }
+  return sum;
+}
+
 int main() {
-  return rotated_sum(5) + unswitch_sum(4, 1);
+  int A[5] = {1, -2, 3, 4, -5};
+  return rotated_sum(5) + unswitch_sum(4, 1) + small_guarded_kernel(A, 1);
 }
 
 // OIR-LABEL: define i32 @rotated_sum
@@ -37,3 +53,8 @@ int main() {
 // OIR: br i1
 // OIR: .usw.exit = phi
 // OIR: usw.
+
+// OIR-LABEL: define i32 @small_guarded_kernel
+// OIR: unr.
+// OIR-NOT: icmp lt i32 %{{.*}}, 5
+// OIR: ret i32

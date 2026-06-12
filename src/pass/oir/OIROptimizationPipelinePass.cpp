@@ -133,6 +133,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= tighten_monotonic_guarded_loop_bounds(module, stats);
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
+    changed |= unroll_small_constant_loops(module, stats);
     changed |= eliminate_overwritten_countdown_loops(module, stats);
     changed |= lower_counted_zero_store_loops_to_memzero(module, stats);
     changed |= propagate_global_constants(module, stats);
