@@ -5,6 +5,15 @@ on:
     branches:
       - "**"
   workflow_dispatch:
+    inputs:
+      perf_baseline:
+        description: "GCC/Clang++ comparison baseline"
+        required: false
+        default: fastest
+        type: choice
+        options:
+          - fastest
+          - o3
 
 permissions:
   contents: read
@@ -161,6 +170,7 @@ jobs:
         continue-on-error: true
         env:
           PERF_TEST_DIRS: test/performance,test/bsb-final
+          PERF_BASELINE_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.perf_baseline || 'fastest' }}
           PERF_EXCLUDE_CASES: |
             test/performance/h-10-02.sy
             test/performance/h-10-03.sy
@@ -596,6 +606,8 @@ jobs:
               status_emoji = perf_payload.get("status_emoji", "✅" if perf_status == "PASS" else "❌")
               lines.append(f"- Status: {status_emoji} {perf_status}")
               lines.append(f"- Compiler opt: `{perf_payload.get('compiler_opt', '-O1')}`")
+              lines.append(f"- Baseline mode: `{perf_payload.get('baseline_mode', 'o3')}`")
+              lines.append(f"- Baseline: `{perf_payload.get('baseline_label', 'GCC/Clang++ -O3')}`")
               lines.append(f"- Generated: {perf_payload.get('generated_utc', 'unknown')}")
               lines.append(f"- Cases: {perf_payload.get('cases', len(rows))}")
               perf_failures = perf_payload.get('failures', 'unknown')
@@ -604,19 +616,19 @@ jobs:
               insn_summary = perf_payload.get("instruction_count_summary", {})
               if isinstance(insn_summary, dict):
                   lines.append(f"- QEMU dynamic instruction count: {insn_summary.get('status', 'UNKNOWN')}")
-              gcc_o3_geomean = perf_payload.get("gcc_o3_geomean")
-              clang_o3_geomean = perf_payload.get("clang_o3_geomean")
-              gcc_o3_faster_cases = perf_payload.get("gcc_o3_faster_cases")
-              clang_o3_faster_cases = perf_payload.get("clang_o3_faster_cases")
-              if isinstance(gcc_o3_geomean, (int, float)) or isinstance(clang_o3_geomean, (int, float)):
+              gcc_baseline_geomean = perf_payload.get("gcc_baseline_geomean", perf_payload.get("gcc_o3_geomean"))
+              clang_baseline_geomean = perf_payload.get("clang_baseline_geomean", perf_payload.get("clang_o3_geomean"))
+              gcc_baseline_faster_cases = perf_payload.get("gcc_baseline_faster_cases", perf_payload.get("gcc_o3_faster_cases"))
+              clang_baseline_faster_cases = perf_payload.get("clang_baseline_faster_cases", perf_payload.get("clang_o3_faster_cases"))
+              if isinstance(gcc_baseline_geomean, (int, float)) or isinstance(clang_baseline_geomean, (int, float)):
                   lines.append(
                       "- 🧮 Geomean speedup: "
-                      f"GCC {format_speedup(gcc_o3_geomean)} / Clang++ {format_speedup(clang_o3_geomean)}"
+                      f"GCC {format_speedup(gcc_baseline_geomean)} / Clang++ {format_speedup(clang_baseline_geomean)}"
                   )
                   lines.append(
                       "- 🏁 Beats GCC: "
-                      f"{gcc_o3_faster_cases if isinstance(gcc_o3_faster_cases, int) else 'N/A'} / "
-                      f"Clang++: {clang_o3_faster_cases if isinstance(clang_o3_faster_cases, int) else 'N/A'}"
+                      f"{gcc_baseline_faster_cases if isinstance(gcc_baseline_faster_cases, int) else 'N/A'} / "
+                      f"Clang++: {clang_baseline_faster_cases if isinstance(clang_baseline_faster_cases, int) else 'N/A'}"
                   )
               lines.extend(["", "| Case | GCC | Clang++ | Compiler | Status |", "| --- | --- | --- | --- | --- |"])
 
@@ -1029,6 +1041,11 @@ jobs:
               baseline_commit += f" {baseline_title}"
           current_yoolang_runtime_total = delta.get("current_compiler_total")
           baseline_yoolang_runtime_total = delta.get("baseline_compiler_total")
+          compiler_baseline_label = str(perf.get("baseline_label") or "GCC/Clang++ -O3")
+          gcc_baseline_geomean = perf.get("gcc_baseline_geomean", perf.get("gcc_o3_geomean"))
+          clang_baseline_geomean = perf.get("clang_baseline_geomean", perf.get("clang_o3_geomean"))
+          gcc_baseline_faster_cases = perf.get("gcc_baseline_faster_cases", perf.get("gcc_o3_faster_cases", "N/A"))
+          clang_baseline_faster_cases = perf.get("clang_baseline_faster_cases", perf.get("clang_o3_faster_cases", "N/A"))
 
           lines = [
               f"{status_emoji} 🚀 提交者：{os.environ.get('ACTOR', 'unknown')}",
@@ -1049,11 +1066,11 @@ jobs:
               f"📍 基线: {baseline_commit}",
               f"⏱️ case 胜负: 🚀 {fast} 胜 / ⚠️ {slow} 负 / ✅ {stable} 平 / ❌ {perf.get('failures', 0)} 失败",
               "",
-              "⚡ 目标程序运行速度:",
+              f"⚡ 目标程序运行速度（{compiler_baseline_label}）:",
               f"yoolang {fmt_seconds(compiler_total_value)} / GCC {fmt_seconds(gcc_total_value)} / Clang++ {fmt_seconds(clang_total_value)}",
               f"📐 总时间加速比: GCC {fmt_speedup(gcc_total_value, compiler_total_value)} / Clang++ {fmt_speedup(clang_total_value, compiler_total_value)}",
-              f"🧮 几何平均加速比: GCC {fmt_optional_speedup(perf.get('gcc_o3_geomean'))} / Clang++ {fmt_optional_speedup(perf.get('clang_o3_geomean'))}",
-              f"🏁 单 case 更快: GCC {perf.get('gcc_o3_faster_cases', 'N/A')}个 / Clang++ {perf.get('clang_o3_faster_cases', 'N/A')}个",
+              f"🧮 几何平均加速比: GCC {fmt_optional_speedup(gcc_baseline_geomean)} / Clang++ {fmt_optional_speedup(clang_baseline_geomean)}",
+              f"🏁 单 case 更快: GCC {gcc_baseline_faster_cases}个 / Clang++ {clang_baseline_faster_cases}个",
           ]
 
           if insn_delta.get("status") == "OK":

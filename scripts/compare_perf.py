@@ -45,6 +45,7 @@ QEMU_INSN_TIMEOUT = int(os.environ.get("QEMU_INSN_TIMEOUT", "30"))
 ENABLE_QEMU_INSN_COUNT = os.environ.get("ENABLE_QEMU_INSN_COUNT", "0").strip().lower() in {"1", "true", "yes", "on"}
 QEMU_INSN_STRICT = os.environ.get("QEMU_INSN_STRICT", "0").strip().lower() in {"1", "true", "yes", "on"}
 RISCV_CODE_MODEL_FLAGS = ["-mcmodel=medany"]
+CLANG_RISCV_TARGET_FLAGS = ["--target=riscv64-linux-gnu", "--sysroot=/usr/riscv64-linux-gnu"]
 REPORT_DIR = WORKSPACE / "build" / "perf-ci"
 REPORT_MD = REPORT_DIR / "perf-report.md"
 REPORT_JSON = REPORT_DIR / "perf-report.json"
@@ -57,6 +58,44 @@ STATUS_EMOJI = {
     "TIMEOUT": "⏱️",
 }
 INSN_RE = re.compile(r"QEMU_INSN_COUNT\s+total_instructions=(\d+)")
+
+
+def _resolve_baseline_mode() -> str:
+    raw_mode = os.environ.get("PERF_BASELINE_MODE", "o3").strip().lower()
+    aliases = {
+        "": "o3",
+        "default": "o3",
+        "o3": "o3",
+        "fast": "fastest",
+        "fastest": "fastest",
+        "ofast": "fastest",
+    }
+    if raw_mode not in aliases:
+        valid = ", ".join(sorted(name for name in aliases if name))
+        raise SystemExit(f"invalid PERF_BASELINE_MODE={raw_mode!r}; expected one of: {valid}")
+    return aliases[raw_mode]
+
+
+BASELINE_MODE = _resolve_baseline_mode()
+BASELINE_LABELS = {
+    "o3": "GCC/Clang++ -O3",
+    "fastest": "GCC/Clang++ fastest (-Ofast -flto -funroll-loops)",
+}
+BASELINE_LABEL = BASELINE_LABELS[BASELINE_MODE]
+BASELINE_OPT_FLAGS = ["-Ofast", "-flto", "-funroll-loops"] if BASELINE_MODE == "fastest" else ["-O3"]
+GCC_BASELINE_COMPILE_FLAGS = [*BASELINE_OPT_FLAGS, *RISCV_CODE_MODEL_FLAGS]
+CLANG_BASELINE_COMPILE_FLAGS = [*BASELINE_OPT_FLAGS, *RISCV_CODE_MODEL_FLAGS, *CLANG_RISCV_TARGET_FLAGS]
+GCC_BASELINE_LINK_FLAGS = [*BASELINE_OPT_FLAGS, *RISCV_CODE_MODEL_FLAGS] if BASELINE_MODE == "fastest" else [*RISCV_CODE_MODEL_FLAGS]
+CLANG_BASELINE_LINK_FLAGS = [*BASELINE_OPT_FLAGS, *RISCV_CODE_MODEL_FLAGS, *CLANG_RISCV_TARGET_FLAGS]
+
+
+def _asm_flags(flags: list[str]) -> list[str]:
+    # LTO happens at link time; keep per-case .s artifacts readable.
+    return [flag for flag in flags if flag != "-flto"]
+
+
+def _format_flags(flags: list[str]) -> str:
+    return " ".join(flags)
 
 
 @dataclass
@@ -413,8 +452,7 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
     exe = out_dir / f"{src.stem}.gcc.riscv"
     compile_cmd = [
         GCC_BIN,
-        "-O3",
-        *RISCV_CODE_MODEL_FLAGS,
+        *GCC_BASELINE_COMPILE_FLAGS,
         "-std=gnu++17",
         "-include",
         str(RUNTIME_WRAPPER),
@@ -422,9 +460,19 @@ def _compile_gcc(src: Path, out_dir: Path) -> tuple[Path, str]:
         "c++",
         str(baseline_src),
     ]
-    subprocess.run([*compile_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
+    asm_cmd = [
+        GCC_BIN,
+        *_asm_flags(GCC_BASELINE_COMPILE_FLAGS),
+        "-std=gnu++17",
+        "-include",
+        str(RUNTIME_WRAPPER),
+        "-x",
+        "c++",
+        str(baseline_src),
+    ]
+    subprocess.run([*asm_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
     subprocess.run([*compile_cmd, "-c", "-o", str(obj)], check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([GCC_BIN, "-static", *GCC_BASELINE_LINK_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -435,20 +483,30 @@ def _compile_clang(src: Path, out_dir: Path) -> tuple[Path, str]:
     exe = out_dir / f"{src.stem}.clang.riscv"
     compile_cmd = [
         CLANG_BIN,
-        "-O3",
-        *RISCV_CODE_MODEL_FLAGS,
+        *CLANG_BASELINE_COMPILE_FLAGS,
         "-std=gnu++17",
-        "--target=riscv64-linux-gnu",
-        "--sysroot=/usr/riscv64-linux-gnu",
         "-include",
         str(RUNTIME_WRAPPER),
         "-x",
         "c++",
         str(baseline_src),
     ]
-    subprocess.run([*compile_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
+    asm_cmd = [
+        CLANG_BIN,
+        *_asm_flags(CLANG_BASELINE_COMPILE_FLAGS),
+        "-std=gnu++17",
+        "-include",
+        str(RUNTIME_WRAPPER),
+        "-x",
+        "c++",
+        str(baseline_src),
+    ]
+    subprocess.run([*asm_cmd, "-S", "-o", str(asm)], check=True, capture_output=True, text=True)
     subprocess.run([*compile_cmd, "-c", "-o", str(obj)], check=True, capture_output=True, text=True)
-    subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    if BASELINE_MODE == "fastest":
+        subprocess.run([CLANG_BIN, *CLANG_BASELINE_LINK_FLAGS, "-static", str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
+    else:
+        subprocess.run([GCC_BIN, "-static", *RISCV_CODE_MODEL_FLAGS, str(obj), str(RUNTIME_LIB), "-o", str(exe)], check=True, capture_output=True, text=True)
     return exe, "OK"
 
 
@@ -742,6 +800,9 @@ def _print_header() -> None:
         print(f"HY compiler binary: {HY_COMPILER_BIN}")
     print(f"Runtime lib: {RUNTIME_LIB}")
     print(f"Runtime wrapper: {RUNTIME_WRAPPER}")
+    print(f"Baseline mode: {BASELINE_MODE} ({BASELINE_LABEL})")
+    print(f"GCC baseline flags: {_format_flags(GCC_BASELINE_COMPILE_FLAGS)}")
+    print(f"Clang++ baseline flags: {_format_flags(CLANG_BASELINE_COMPILE_FLAGS)}")
     print(f"Test dirs: {', '.join(str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS)}")
     print(f"Cases: {len(CASES)}")
     print(f"Timeout per qemu run: {TIMEOUT_SEC}s")
@@ -774,7 +835,7 @@ def _format_ratio(value: Optional[float]) -> str:
     return "N/A" if value is None else f"{value:.2f}x"
 
 
-def _compiler_vs_o3_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
+def _compiler_vs_baseline_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
     gcc_ratios: list[float] = []
     clang_ratios: list[float] = []
     gcc_faster_cases = 0
@@ -796,10 +857,10 @@ def _compiler_vs_o3_stats(rows: list[dict]) -> dict[str, Optional[float] | int]:
                 clang_faster_cases += 1
 
     return {
-        "gcc_o3_geomean": _geomean(gcc_ratios),
-        "clang_o3_geomean": _geomean(clang_ratios),
-        "gcc_o3_faster_cases": gcc_faster_cases,
-        "clang_o3_faster_cases": clang_faster_cases,
+        "gcc_baseline_geomean": _geomean(gcc_ratios),
+        "clang_baseline_geomean": _geomean(clang_ratios),
+        "gcc_baseline_faster_cases": gcc_faster_cases,
+        "clang_baseline_faster_cases": clang_faster_cases,
     }
 
 
@@ -933,7 +994,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
 
     status = "PASS" if failures == 0 else "FAIL"
     generated = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-    o3_stats = _compiler_vs_o3_stats(rows)
+    baseline_stats = _compiler_vs_baseline_stats(rows)
     hy_stats = _hy_vs_compiler_stats(rows) if HY_COMPILER_BIN is not None else None
     insn_summary = _instruction_count_summary(rows)
     mir_stage_summary = _mir_stage_metric_summary(rows)
@@ -946,9 +1007,12 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         f"- Cases: {len(rows)}",
         f"- Failed: {failures}",
         "- Compiler opt: `-O1`",
+        f"- Baseline mode: `{BASELINE_MODE}` ({BASELINE_LABEL})",
+        f"- GCC baseline flags: `{_format_flags(GCC_BASELINE_COMPILE_FLAGS)}`",
+        f"- Clang++ baseline flags: `{_format_flags(CLANG_BASELINE_COMPILE_FLAGS)}`",
         f"- Total runtime (s): {total_runtime:.4f}",
-        f"- 🧮 Geomean speedup: GCC {_format_ratio(o3_stats['gcc_o3_geomean'])} / Clang++ {_format_ratio(o3_stats['clang_o3_geomean'])}",
-        f"- 🏁 Faster cases: GCC {o3_stats['gcc_o3_faster_cases']} / Clang++ {o3_stats['clang_o3_faster_cases']}",
+        f"- 🧮 Geomean speedup vs baseline: GCC {_format_ratio(baseline_stats['gcc_baseline_geomean'])} / Clang++ {_format_ratio(baseline_stats['clang_baseline_geomean'])}",
+        f"- 🏁 Faster cases vs baseline: GCC {baseline_stats['gcc_baseline_faster_cases']} / Clang++ {baseline_stats['clang_baseline_faster_cases']}",
         f"- QEMU dynamic instruction count: {insn_summary['status']}",
         f"- MIR stage metrics: {mir_stage_summary['status']} ({mir_stage_summary['counted_cases']} cases)",
         f"- Compiler binary: {COMPILER_BIN}",
@@ -1064,16 +1128,24 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         "compiler_binary": str(COMPILER_BIN),
         "hy_compiler_binary": str(HY_COMPILER_BIN) if HY_COMPILER_BIN is not None else "",
         "compiler_opt": "-O1",
+        "baseline_mode": BASELINE_MODE,
+        "baseline_label": BASELINE_LABEL,
+        "gcc_baseline_flags": GCC_BASELINE_COMPILE_FLAGS,
+        "clang_baseline_flags": CLANG_BASELINE_COMPILE_FLAGS,
         "runtime_lib": str(RUNTIME_LIB),
         "test_dirs": [str(root.relative_to(WORKSPACE)) for root in TEST_ROOTS],
         "cases": len(rows),
         "failures": failures,
         "total_runtime_sec": total_runtime,
         "compiler_total_sec": compiler_total_runtime,
-        "gcc_o3_geomean": o3_stats["gcc_o3_geomean"],
-        "clang_o3_geomean": o3_stats["clang_o3_geomean"],
-        "gcc_o3_faster_cases": o3_stats["gcc_o3_faster_cases"],
-        "clang_o3_faster_cases": o3_stats["clang_o3_faster_cases"],
+        "gcc_baseline_geomean": baseline_stats["gcc_baseline_geomean"],
+        "clang_baseline_geomean": baseline_stats["clang_baseline_geomean"],
+        "gcc_baseline_faster_cases": baseline_stats["gcc_baseline_faster_cases"],
+        "clang_baseline_faster_cases": baseline_stats["clang_baseline_faster_cases"],
+        "gcc_o3_geomean": baseline_stats["gcc_baseline_geomean"],
+        "clang_o3_geomean": baseline_stats["clang_baseline_geomean"],
+        "gcc_o3_faster_cases": baseline_stats["gcc_baseline_faster_cases"],
+        "clang_o3_faster_cases": baseline_stats["clang_baseline_faster_cases"],
         "hy_vs_compiler_geomean": hy_stats["hy_vs_compiler_geomean"] if hy_stats else None,
         "hy_faster_cases": hy_stats["hy_faster_cases"] if hy_stats else 0,
         "instruction_count_summary": insn_summary,

@@ -119,6 +119,12 @@ def rows_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, str], report_index_url: str = "") -> dict[str, Any]:
     delta_rows = rows_by_case(delta)
+    compiler_baseline = {
+        "mode": str(perf.get("baseline_mode") or "o3"),
+        "label": str(perf.get("baseline_label") or "GCC/Clang++ -O3"),
+        "gcc_flags": perf.get("gcc_baseline_flags") if isinstance(perf.get("gcc_baseline_flags"), list) else [],
+        "clang_flags": perf.get("clang_baseline_flags") if isinstance(perf.get("clang_baseline_flags"), list) else [],
+    }
     rows: list[dict[str, Any]] = []
     for row in perf.get("rows", []):
         if not isinstance(row, dict):
@@ -227,6 +233,7 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
         "meta": meta,
         "status": perf.get("status", "UNKNOWN"),
         "report_index_url": report_index_url,
+        "compiler_baseline": compiler_baseline,
         "baseline": {
             "status": delta.get("status", "NO BASELINE"),
             "branch": delta.get("baseline_branch", ""),
@@ -250,8 +257,8 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
             "total_clang_sec": total_clang if ok_rows else None,
             "total_yoolang_vs_gcc_speedup": speedup(total_gcc, total_yoolang),
             "total_yoolang_vs_clang_speedup": speedup(total_clang, total_yoolang),
-            "gcc_geomean_speedup": perf.get("gcc_o3_geomean"),
-            "clang_geomean_speedup": perf.get("clang_o3_geomean"),
+            "gcc_geomean_speedup": perf.get("gcc_baseline_geomean", perf.get("gcc_o3_geomean")),
+            "clang_geomean_speedup": perf.get("clang_baseline_geomean", perf.get("clang_o3_geomean")),
             "computed_gcc_geomean_speedup": geometric_mean(
                 [row["yoolang_vs_gcc_speedup"] for row in ok_rows if isinstance(row["yoolang_vs_gcc_speedup"], float)]
             ),
@@ -907,6 +914,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       const stats = selected.summary;
 	      const meta = report.meta || {{}};
 	      const baseline = activeBaseline.kind === 'embedded' ? (report.baseline || {{}}) : activeBaseline;
+      const compilerBaseline = report.compiler_baseline || {{}};
 	      const status = report.status || 'UNKNOWN';
       const shortSha = meta.commit_sha ? String(meta.commit_sha).slice(0, 12) : 'unknown';
       const title = meta.commit_title ? ` ${{meta.commit_title}}` : '';
@@ -917,6 +925,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
 	        : `baseline: ${{baseline.status || activeBaseline.label || 'NO BASELINE'}}`;
       document.getElementById('chips').innerHTML = [
         `<span class="chip ${{status === 'PASS' ? 'ok' : 'fail'}}">状态: ${{escapeHtml(status)}}</span>`,
+        `<span class="chip">GCC/Clang 基线: ${{escapeHtml(compilerBaseline.label || 'GCC/Clang++ -O3')}}</span>`,
         `<span class="chip">统计范围: 已选 case</span>`,
         `<span class="chip">点击表头排序</span>`,
         `<span class="chip">绿色表示 yoolang 更快</span>`,
