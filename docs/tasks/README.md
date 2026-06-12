@@ -18,6 +18,8 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [OIR Loop Bound Tightening](2026-06-12-oir-loop-bound-tightening.md) | ready_for_review | `task/oir-loop-bound-tightening` | 2026-06-12 |
+| [Transpose2 and T03-61 Performance Gap Attribution](2026-06-12-transpose2-t03-61-perf-gap.md) | ready_for_review | `master` | 2026-06-12 |
 | [Huffman Follow-up Performance Regression Fix](2026-06-09-huffman-followup-regression-fix.md) | ready_for_review | `task/huffman-perf-gap` | 2026-06-09 |
 | [Huffman Performance Gap Plan](2026-06-09-huffman-perf-gap.md) | ready_for_review | `task/huffman-perf-gap` | 2026-06-09 |
 | [Pointer Loop Exit Regression Fix](2026-06-08-pointer-loop-exit-regression.md) | ready_for_review | `task/pointer-loop-exit-regression` | 2026-06-08 |

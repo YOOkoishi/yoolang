@@ -29,6 +29,9 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::eliminate_dead_stores(module, stats);
     changed |= oir_opt::loop_invariant_code_motion(module, stats);
     changed |= oir_opt::reduce_gep_strength(module, stats);
+    changed |= oir_opt::tighten_monotonic_guarded_loop_bounds(module, stats);
+    changed |= oir_opt::simplify_branches(module, stats);
+    changed |= oir_opt::cleanup_cfg(module, stats);
     changed |= oir_opt::unswitch_loops(module, stats);
     changed |= oir_opt::rotate_loops(module, stats);
     changed |= oir_opt::eliminate_overwritten_countdown_loops(module, stats);
@@ -127,6 +130,9 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= cleanup_cfg(module, stats);
     changed |= reduce_gep_strength(module, stats);
     changed |= value_range_propagation(module, stats);
+    changed |= tighten_monotonic_guarded_loop_bounds(module, stats);
+    changed |= simplify_branches(module, stats);
+    changed |= cleanup_cfg(module, stats);
     changed |= eliminate_overwritten_countdown_loops(module, stats);
     changed |= lower_counted_zero_store_loops_to_memzero(module, stats);
     changed |= propagate_global_constants(module, stats);

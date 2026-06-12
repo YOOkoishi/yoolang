@@ -11,7 +11,8 @@ bool Stats::changed() const {
            mem2reg != 0 || licm != 0 || loop_rotate != 0 || loop_unswitch != 0 ||
            inlined != 0 || globals != 0 || tail_recursion != 0 || lsr != 0 ||
            loop_canonicalize != 0 || sroa != 0 || dse != 0 || dle != 0 || adce != 0 ||
-           jump_threading != 0 || dae != 0 || memzero != 0 || specialized != 0;
+           jump_threading != 0 || dae != 0 || memzero != 0 ||
+           loop_bound_tighten != 0 || specialized != 0;
 }
 
 std::string Stats::message() const {
@@ -23,7 +24,8 @@ std::string Stats::message() const {
         << " tailrec=" << tail_recursion << " lsr=" << lsr
         << " loopcanon=" << loop_canonicalize << " sroa=" << sroa << " dse=" << dse
         << " dle=" << dle << " adce=" << adce << " jumpthread=" << jump_threading
-        << " dae=" << dae << " memzero=" << memzero << " specialized=" << specialized;
+        << " dae=" << dae << " memzero=" << memzero
+        << " looptighten=" << loop_bound_tighten << " specialized=" << specialized;
     return oss.str();
 }
 

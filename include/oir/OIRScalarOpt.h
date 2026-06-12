@@ -34,6 +34,7 @@ struct Stats {
     unsigned jump_threading = 0;
     unsigned dae = 0;
     unsigned memzero = 0;
+    unsigned loop_bound_tighten = 0;
     unsigned specialized = 0;
 
     bool changed() const;
@@ -78,6 +79,7 @@ bool eliminate_dead_loads(oir::Module &module, Stats &stats);
 bool loop_invariant_code_motion(oir::Module &module, Stats &stats);
 bool rotate_loops(oir::Module &module, Stats &stats);
 bool unswitch_loops(oir::Module &module, Stats &stats);
+bool tighten_monotonic_guarded_loop_bounds(oir::Module &module, Stats &stats);
 bool lower_counted_zero_store_loops_to_memzero(oir::Module &module, Stats &stats);
 bool eliminate_overwritten_countdown_loops(oir::Module &module, Stats &stats);
 bool global_value_numbering(oir::Module &module, Stats &stats);

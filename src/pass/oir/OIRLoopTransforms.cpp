@@ -1028,6 +1028,20 @@ struct ZeroStoreLoopMatch {
     std::uint64_t element_size = 0;
 };
 
+struct GuardedLoopBoundMatch {
+    oir::BasicBlock *header = nullptr;
+    oir::BasicBlock *preheader = nullptr;
+    oir::BasicBlock *body = nullptr;
+    oir::BasicBlock *exit = nullptr;
+    oir::BasicBlock *skipped = nullptr;
+    oir::BasicBlock *active = nullptr;
+    oir::BasicBlock *latch = nullptr;
+    oir::PhiInst *iv = nullptr;
+    oir::CmpInst *header_cmp = nullptr;
+    oir::Value *upper = nullptr;
+    oir::Value *limit = nullptr;
+};
+
 oir::CmpPred negate_predicate(oir::CmpPred pred) {
     switch (pred) {
     case oir::CmpPred::EQ:
@@ -1205,6 +1219,212 @@ oir::BinaryInst *match_increment_by_one(oir::Value *value, oir::PhiInst *phi) {
         return binary;
     }
     return nullptr;
+}
+
+bool is_i32_value(oir::Value *value) {
+    auto *type = value == nullptr ? nullptr : dynamic_cast<oir::IntegerType *>(value->type());
+    return type != nullptr && type->bit_width() == 32;
+}
+
+oir::BasicBlock *unconditional_branch_target(oir::BasicBlock *block) {
+    auto *branch = block == nullptr ? nullptr : dynamic_cast<oir::BranchInst *>(block->terminator());
+    if (branch == nullptr || branch->is_conditional()) {
+        return nullptr;
+    }
+    return branch->target_bb();
+}
+
+bool is_loop_local_unit_increment(oir::Value *value, oir::PhiInst *iv,
+                                  std::unordered_set<oir::Value *> &active) {
+    if (match_increment_by_one(value, iv) != nullptr) {
+        return true;
+    }
+
+    auto *phi = dynamic_cast<oir::PhiInst *>(value);
+    if (phi == nullptr || phi->incoming().empty()) {
+        return false;
+    }
+    if (!active.insert(value).second) {
+        return false;
+    }
+    for (const auto &[incoming_value, pred] : phi->incoming()) {
+        (void)pred;
+        if (!is_loop_local_unit_increment(incoming_value, iv, active)) {
+            active.erase(value);
+            return false;
+        }
+    }
+    active.erase(value);
+    return true;
+}
+
+bool is_loop_local_unit_increment(oir::Value *value, oir::PhiInst *iv) {
+    std::unordered_set<oir::Value *> active;
+    return is_loop_local_unit_increment(value, iv, active);
+}
+
+bool block_has_only_guard_progress(const oir::BasicBlock &block) {
+    for (const auto &inst : block.instructions()) {
+        if (dynamic_cast<const oir::PhiInst *>(inst.get()) != nullptr || inst->is_terminator()) {
+            continue;
+        }
+        if (!is_allowed_zero_loop_instruction(*inst)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<GuardedLoopBoundMatch> match_monotonic_guarded_loop_bound(
+    const oir::Loop &loop) {
+    if (loop.header == nullptr || loop.blocks.size() > 8 || !loop_defs_have_no_external_uses(loop)) {
+        return std::nullopt;
+    }
+
+    auto *header = mutable_block(loop.header);
+    auto outside = outside_predecessors(loop);
+    auto *latch = single_latch(loop);
+    if (outside.size() != 1 || latch == nullptr || unconditional_branch_target(latch) != header ||
+        !block_has_only_guard_progress(*latch)) {
+        return std::nullopt;
+    }
+    auto *preheader = outside.front();
+
+    auto *header_branch = dynamic_cast<oir::BranchInst *>(header->terminator());
+    if (header_branch == nullptr || !header_branch->is_conditional()) {
+        return std::nullopt;
+    }
+    auto *header_cmp = dynamic_cast<oir::CmpInst *>(header_branch->cond());
+    if (header_cmp == nullptr || header_cmp->op() != oir::Instruction::OpID::ICmp ||
+        header_cmp->pred() != oir::CmpPred::LT) {
+        return std::nullopt;
+    }
+
+    auto *iv = dynamic_cast<oir::PhiInst *>(header_cmp->lhs());
+    auto *upper = header_cmp->rhs();
+    if (iv == nullptr || iv->parent() != header || !is_i32_value(iv) || !is_i32_value(upper) ||
+        value_defined_in_loop(upper, loop)) {
+        return std::nullopt;
+    }
+
+    if (!contains_block(loop, header_branch->true_bb()) ||
+        contains_block(loop, header_branch->false_bb())) {
+        return std::nullopt;
+    }
+    auto *body = header_branch->true_bb();
+    auto *exit = header_branch->false_bb();
+    if (body == latch || contains_block(loop, exit) || body->predecessors().size() != 1 ||
+        body->predecessors().front() != header) {
+        return std::nullopt;
+    }
+
+    auto *start = incoming_value_from(*iv, preheader);
+    auto *back = incoming_value_from(*iv, latch);
+    if (start == nullptr || back == nullptr || value_defined_in_loop(start, loop) ||
+        !is_loop_local_unit_increment(back, iv)) {
+        return std::nullopt;
+    }
+
+    auto *body_branch = dynamic_cast<oir::BranchInst *>(body->terminator());
+    if (body_branch == nullptr || !body_branch->is_conditional() ||
+        !contains_block(loop, body_branch->true_bb()) ||
+        !contains_block(loop, body_branch->false_bb())) {
+        return std::nullopt;
+    }
+    auto *guard_cmp = dynamic_cast<oir::CmpInst *>(body_branch->cond());
+    if (guard_cmp == nullptr || guard_cmp->op() != oir::Instruction::OpID::ICmp) {
+        return std::nullopt;
+    }
+
+    oir::Value *limit = nullptr;
+    if (guard_cmp->pred() == oir::CmpPred::LT && guard_cmp->rhs() == iv) {
+        limit = guard_cmp->lhs();
+    } else if (guard_cmp->pred() == oir::CmpPred::GT && guard_cmp->lhs() == iv) {
+        limit = guard_cmp->rhs();
+    } else {
+        return std::nullopt;
+    }
+    if (!is_i32_value(limit) || value_defined_in_loop(limit, loop)) {
+        return std::nullopt;
+    }
+
+    auto *skipped = body_branch->true_bb();
+    auto *active = body_branch->false_bb();
+    if (skipped == active || unconditional_branch_target(skipped) != latch ||
+        unconditional_branch_target(active) != latch || !block_has_only_guard_progress(*skipped)) {
+        return std::nullopt;
+    }
+
+    GuardedLoopBoundMatch match;
+    match.header = header;
+    match.preheader = preheader;
+    match.body = body;
+    match.exit = exit;
+    match.skipped = skipped;
+    match.active = active;
+    match.latch = latch;
+    match.iv = iv;
+    match.header_cmp = header_cmp;
+    match.upper = upper;
+    match.limit = limit;
+    return match;
+}
+
+void force_guard_to_active_path(const GuardedLoopBoundMatch &match) {
+    oir::cfg::remove_edge(match.body, match.skipped);
+    replace_terminator_with_br(match.body, match.active);
+}
+
+bool rewrite_monotonic_guarded_loop_bound(oir::Function &function,
+                                          const GuardedLoopBoundMatch &match, Stats &stats) {
+    auto *preheader_branch = dynamic_cast<oir::BranchInst *>(match.preheader->terminator());
+    if (preheader_branch == nullptr) {
+        return false;
+    }
+
+    auto *module = function.parent();
+    auto *test_block = function.create_block("loop.bound.test");
+    auto *plus_block = function.create_block("loop.bound.plus");
+    auto *merge_block = function.create_block("loop.bound.merge");
+
+    oir::IRBuilder builder(module);
+    builder.set_insert_point(test_block);
+    auto *use_tight_bound =
+        builder.create_icmp(oir::CmpPred::LT, match.limit, match.upper, "loop.bound.tight");
+    builder.create_cond_br(use_tight_bound, plus_block, merge_block);
+
+    builder.set_insert_point(plus_block);
+    auto *limit_next =
+        builder.create_binary(oir::Instruction::OpID::Add, match.limit, module->create_i32(1),
+                              "loop.bound.next");
+    builder.create_br(merge_block);
+
+    builder.set_insert_point(merge_block);
+    auto *effective_upper = builder.create_phi(match.upper->type(), "loop.bound");
+    effective_upper->add_incoming(limit_next, plus_block);
+    effective_upper->add_incoming(match.upper, test_block);
+    builder.create_br(match.header);
+
+    if (!oir::cfg::replace_branch_target(*preheader_branch, match.header, test_block)) {
+        oir::cfg::remove_edge_no_phi_update(test_block, plus_block);
+        oir::cfg::remove_edge_no_phi_update(test_block, merge_block);
+        oir::cfg::remove_edge_no_phi_update(plus_block, merge_block);
+        oir::cfg::remove_edge_no_phi_update(merge_block, match.header);
+        function.erase_block(test_block);
+        function.erase_block(plus_block);
+        function.erase_block(merge_block);
+        return false;
+    }
+
+    oir::cfg::remove_edge_no_phi_update(match.preheader, match.header);
+    oir::cfg::add_edge(match.preheader, test_block);
+    oir::cfg::replace_phi_incoming_block(match.header, match.preheader, merge_block);
+    match.header_cmp->set_operand(1, effective_upper);
+    force_guard_to_active_path(match);
+
+    ++stats.loop_bound_tighten;
+    ++stats.cfg;
+    return true;
 }
 
 std::optional<NormalizedCmp> normalized_continue_cmp(const oir::BranchInst &branch,
@@ -1535,6 +1755,36 @@ bool unswitch_loops_in_function(oir::Function &function, Stats &stats) {
     return changed;
 }
 
+bool tighten_guarded_loop_bounds_in_function(oir::Function &function, Stats &stats) {
+    bool changed = false;
+    constexpr unsigned kMaxTightensPerFunction = 32;
+    for (unsigned iteration = 0; iteration < kMaxTightensPerFunction; ++iteration) {
+        oir::DominatorTree dom_tree(function);
+        oir::LoopInfo loop_info(function, dom_tree);
+        auto loops = loop_info.loops();
+        std::sort(loops.begin(), loops.end(), [](const oir::Loop &lhs, const oir::Loop &rhs) {
+            return lhs.blocks.size() < rhs.blocks.size();
+        });
+
+        bool tightened = false;
+        for (const auto &loop : loops) {
+            auto match = match_monotonic_guarded_loop_bound(loop);
+            if (!match.has_value()) {
+                continue;
+            }
+            if (rewrite_monotonic_guarded_loop_bound(function, *match, stats)) {
+                changed = true;
+                tightened = true;
+                break;
+            }
+        }
+        if (!tightened) {
+            break;
+        }
+    }
+    return changed;
+}
+
 } // namespace
 
 bool rotate_loops(oir::Module &module, Stats &stats) {
@@ -1555,6 +1805,17 @@ bool unswitch_loops(oir::Module &module, Stats &stats) {
             continue;
         }
         changed |= unswitch_loops_in_function(*function, stats);
+    }
+    return changed;
+}
+
+bool tighten_monotonic_guarded_loop_bounds(oir::Module &module, Stats &stats) {
+    bool changed = false;
+    for (auto &function : module.functions()) {
+        if (function->is_external() || function->entry_block() == nullptr) {
+            continue;
+        }
+        changed |= tighten_guarded_loop_bounds_in_function(*function, stats);
     }
     return changed;
 }
