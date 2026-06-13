@@ -30,6 +30,7 @@
 #include "pass/yir/YIRPolyhedralPipelinePass.h"
 #include "pass/yir/YIRPolyhedralTransformPass.h"
 #include "pass/yir/YIRToOIRPass.h"
+#include "pass/yir/YIRViewPass.h"
 #include "yir/YIRPrinter.h"
 
 #include <cstdint>
@@ -264,6 +265,7 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
         pm.add_pass<pass::ASTSemanticAnalysisPass>();
         pm.add_pass<pass::ASTToYIRPass>();
         if (optimizations_enabled(options)) {
+            pm.add_pass<pass::YIRViewPass>();
             if (polyhedral_enabled(options)) {
                 if (options.emit_poly) {
                     pm.add_pass<pass::YIRPolyhedralPipelinePass>(

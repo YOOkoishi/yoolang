@@ -18,6 +18,14 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [YIR View / Reshape Elimination](2026-06-13-yir-view-pass.md) | ready_for_review | `task/yir-view-pass` | 2026-06-13 |
+| [YIR Column-major Layout Conversion](2026-06-13-yir-column-major-layout.md) | proposed | `not used yet` | 2026-06-13 |
+| [YIR Tidy Memory Forwarding](2026-06-13-yir-tidy-memory-forwarding.md) | proposed | `not used yet` | 2026-06-13 |
+| [OIR Global Code Motion](2026-06-13-oir-global-code-motion.md) | proposed | `not used yet` | 2026-06-13 |
+| [Const Array Formula Synthesis](2026-06-13-const-array-formula-synthesis.md) | proposed | `not used yet` | 2026-06-13 |
+| [Affine Recurrence and LSR Linkup](2026-06-13-affine-recurrence-lsr-linkup.md) | proposed | `not used yet` | 2026-06-13 |
+| [OIR If-conversion and Select](2026-06-13-oir-if-conversion-select.md) | proposed | `not used yet` | 2026-06-13 |
+| [At-most-once Inline and Recursion Follow-up](2026-06-13-at-most-once-inline-recursion.md) | proposed | `not used yet` | 2026-06-13 |
 | [OIR Loop Bound Tightening](2026-06-12-oir-loop-bound-tightening.md) | ready_for_review | `task/oir-loop-bound-tightening` | 2026-06-12 |
 | [Transpose2 and T03-61 Performance Gap Attribution](2026-06-12-transpose2-t03-61-perf-gap.md) | ready_for_review | `master` | 2026-06-12 |
 | [Huffman Follow-up Performance Regression Fix](2026-06-09-huffman-followup-regression-fix.md) | ready_for_review | `task/huffman-perf-gap` | 2026-06-09 |
