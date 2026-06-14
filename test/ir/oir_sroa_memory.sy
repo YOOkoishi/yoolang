@@ -111,9 +111,10 @@ int main() {
 // OIR: ret i32 %x.arg
 
 // OIR-LABEL: define i32 @dynamic_skip
-// OIR: alloca [4 x i32]
-// OIR: gep [4 x i32]* %a, i32 0, i32 %i.arg
-// OIR: ret i32
+// OIR-NOT: alloca [4 x i32]
+// OIR-NOT: load i32
+// OIR-NOT: store i32
+// OIR: ret i32 %x.arg
 
 // OIR-LABEL: define i32 @call_escape
 // OIR: alloca [2 x i32]

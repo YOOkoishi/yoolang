@@ -4,6 +4,7 @@
 #include "oir/OIRScalarOpt.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -17,6 +18,123 @@ struct MemoryEntry {
     bool is_store = false;
     bool is_load = false;
 };
+
+const oir::AllocaInst *alloca_base(const oir::Value *value) {
+    if (auto *alloca = dynamic_cast<const oir::AllocaInst *>(value)) {
+        return alloca;
+    }
+    if (auto *gep = dynamic_cast<const oir::GetElementPtrInst *>(value)) {
+        return alloca_base(gep->base_ptr());
+    }
+    return nullptr;
+}
+
+oir::AllocaInst *alloca_base(oir::Value *value) {
+    return const_cast<oir::AllocaInst *>(alloca_base(static_cast<const oir::Value *>(value)));
+}
+
+struct AllocaWriteOnlyState {
+    bool read = false;
+    bool escaped = false;
+    std::vector<oir::Instruction *> writes;
+};
+
+void mark_pointer_operand_escapes(oir::Instruction &inst, oir::Value *operand,
+                                  std::unordered_map<oir::AllocaInst *,
+                                                     AllocaWriteOnlyState> &states) {
+    auto *base = alloca_base(operand);
+    if (base == nullptr) {
+        return;
+    }
+
+    if (auto *gep = dynamic_cast<oir::GetElementPtrInst *>(&inst)) {
+        if (gep->base_ptr() == operand) {
+            return;
+        }
+    }
+    if (auto *load = dynamic_cast<oir::LoadInst *>(&inst)) {
+        if (load->ptr() == operand) {
+            return;
+        }
+    }
+    if (auto *store = dynamic_cast<oir::StoreInst *>(&inst)) {
+        if (store->ptr() == operand) {
+            return;
+        }
+    }
+    if (auto *memzero = dynamic_cast<oir::MemZeroInst *>(&inst)) {
+        if (memzero->ptr() == operand || memzero->byte_count() == operand ||
+            memzero->byte_value() == operand) {
+            return;
+        }
+    }
+
+    states[base].escaped = true;
+}
+
+void collect_write_only_alloca_state(
+    oir::Function &function,
+    std::unordered_map<oir::AllocaInst *, AllocaWriteOnlyState> &states) {
+    for (auto &block : function.blocks()) {
+        for (auto &inst_ptr : block->instructions()) {
+            auto *inst = inst_ptr.get();
+            if (auto *alloca = dynamic_cast<oir::AllocaInst *>(inst)) {
+                states.try_emplace(alloca);
+            }
+
+            if (auto *load = dynamic_cast<oir::LoadInst *>(inst)) {
+                if (auto *base = alloca_base(load->ptr())) {
+                    states[base].read = true;
+                }
+            } else if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
+                if (auto *base = alloca_base(store->ptr())) {
+                    states[base].writes.push_back(store);
+                }
+                if (auto *base = alloca_base(store->value())) {
+                    states[base].escaped = true;
+                }
+            } else if (auto *memzero = dynamic_cast<oir::MemZeroInst *>(inst)) {
+                if (auto *base = alloca_base(memzero->ptr())) {
+                    states[base].writes.push_back(memzero);
+                }
+            } else if (auto *ret = dynamic_cast<oir::ReturnInst *>(inst)) {
+                if (ret->has_value()) {
+                    if (auto *base = alloca_base(ret->value())) {
+                        states[base].escaped = true;
+                    }
+                }
+            } else if (auto *call = dynamic_cast<oir::CallInst *>(inst)) {
+                for (auto *arg : call->args()) {
+                    if (auto *base = alloca_base(arg)) {
+                        states[base].escaped = true;
+                    }
+                }
+            }
+
+            for (auto *operand : inst->operands()) {
+                mark_pointer_operand_escapes(*inst, operand, states);
+            }
+        }
+    }
+}
+
+bool collect_dead_write_only_alloca_stores(
+    oir::Function &function, std::unordered_set<oir::Instruction *> &dead) {
+    std::unordered_map<oir::AllocaInst *, AllocaWriteOnlyState> states;
+    collect_write_only_alloca_state(function, states);
+
+    bool changed = false;
+    for (auto &[alloca, state] : states) {
+        (void)alloca;
+        if (state.read || state.escaped) {
+            continue;
+        }
+        for (auto *write : state.writes) {
+            changed = dead.insert(write).second || changed;
+        }
+    }
+    return changed;
+}
 
 bool erase_instructions(oir::Function &function,
                         const std::unordered_set<oir::Instruction *> &dead) {
@@ -203,6 +321,7 @@ bool eliminate_dead_stores(oir::Module &module, Stats &stats) {
                 dse_block(*block, aa, modref, dead);
             }
         }
+        collect_dead_write_only_alloca_stores(*function, dead);
         collect_redundant_loaded_value_writebacks(*function, aa, modref, dead);
         if (erase_instructions(*function, dead)) {
             stats.dse += static_cast<unsigned>(dead.size());

@@ -1,4 +1,6 @@
 // RUN: %compiler --emit-yir -O1 %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-mir -O1 %s | FileCheck %s --check-prefix=MIR
 
 int positive() {
   int src[2][3] = {{1, 2, 3}, {4, 5, 6}};
@@ -67,3 +69,27 @@ int main() {
 // YIR: yir.muli %x,
 // YIR: yir.addi {{.*}}, %y
 // YIR: yir.array_load %src, [%{{.*}}] : i32
+
+// OIR-LABEL: define i32 @positive()
+// OIR-NOT: alloca [3 x [2 x i32]]
+// OIR: ret i32 6
+
+// OIR-LABEL: define i32 @negative_source_write()
+// OIR: %view = alloca [2 x i32]
+// OIR: %view.1 = load i32, i32* %view.1.addr
+
+// OIR-LABEL: define i32 @positive_flatten()
+// OIR-NOT: alloca [2 x [3 x i32]]
+// OIR: ret i32 6
+
+// MIR-LABEL: func @positive() -> i32
+// MIR: frame align=16 size=0 outgoing=0
+// MIR: LI a0, 6
+
+// MIR-LABEL: func @negative_source_write() -> i32
+// MIR: frame objects:
+// MIR: view.obj
+
+// MIR-LABEL: func @positive_flatten() -> i32
+// MIR: frame align=16 size=0 outgoing=0
+// MIR: LI a0, 6

@@ -722,6 +722,71 @@ bool op_invalidates_candidate(const yir::Operation &op, const ViewCandidate &can
     return false;
 }
 
+bool op_references_value_outside_root(const yir::Operation &op, const yir::Operation *root,
+                                      const yir::Value *value);
+
+bool region_references_value_outside_root(const yir::Region &region, const yir::Operation *root,
+                                          const yir::Value *value) {
+    return std::any_of(region.operations().begin(), region.operations().end(),
+                       [&](const std::unique_ptr<yir::Operation> &op) {
+                           return op_references_value_outside_root(*op, root, value);
+                       });
+}
+
+bool op_references_value_outside_root(const yir::Operation &op, const yir::Operation *root,
+                                      const yir::Value *value) {
+    if (&op == root) {
+        return false;
+    }
+    if (std::find(op.operands().begin(), op.operands().end(), value) != op.operands().end()) {
+        return true;
+    }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        return region_references_value_outside_root(if_op->then_region(), root, value) ||
+               (if_op->has_else() &&
+                region_references_value_outside_root(if_op->else_region(), root, value));
+    }
+    if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        return region_references_value_outside_root(while_op->cond_region(), root, value) ||
+               region_references_value_outside_root(while_op->body_region(), root, value);
+    }
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        return region_references_value_outside_root(for_op->body_region(), root, value);
+    }
+    return false;
+}
+
+bool region_references_value(const yir::Region &region, const yir::Value *value) {
+    return region_references_value_outside_root(region, nullptr, value);
+}
+
+bool erase_ops_by_pointer(yir::Region &region, const std::unordered_set<const yir::Operation *> &dead) {
+    auto &ops = region.operations();
+    const auto old_size = ops.size();
+    ops.erase(std::remove_if(ops.begin(), ops.end(),
+                             [&](const std::unique_ptr<yir::Operation> &op) {
+                                 return dead.find(op.get()) != dead.end();
+                             }),
+              ops.end());
+    return ops.size() != old_size;
+}
+
+bool erase_unreferenced_array_var(yir::Region &region, const yir::Value *array) {
+    auto &ops = region.operations();
+    for (auto it = ops.begin(); it != ops.end(); ++it) {
+        auto *array_var = dynamic_cast<yir::ArrayVarOp *>(it->get());
+        if (array_var == nullptr || array_var->result() != array) {
+            continue;
+        }
+        if (region_references_value(region, array)) {
+            return false;
+        }
+        ops.erase(it);
+        return true;
+    }
+    return false;
+}
+
 template <typename OpT, typename... Args>
 yir::Value *insert_before(OpList &ops, std::size_t &index, Args &&...args) {
     auto op = std::make_unique<OpT>(std::forward<Args>(args)...);
@@ -845,6 +910,7 @@ class Rewriter final {
         ValueSet written;
         ValueSet escaped;
         rewrite_region(function.body(), active, written, escaped, true);
+        erase_dead_view_initializers(function);
     }
 
     void rewrite_region(yir::Region &region, ActiveCandidates &active, ValueSet &written,
@@ -896,6 +962,32 @@ class Rewriter final {
 
             collect_written_arrays(*op, written);
             collect_escaped_arrays(*op, escaped);
+        }
+    }
+
+    void erase_dead_view_initializers(yir::Function &function) {
+        std::unordered_set<const yir::Operation *> dead_roots;
+        std::vector<yir::Value *> dead_views;
+        for (const auto &candidate : candidates_) {
+            if (candidate.root == nullptr || candidate.view == nullptr) {
+                continue;
+            }
+            if (region_references_value_outside_root(function.body(), candidate.root,
+                                                     candidate.view)) {
+                continue;
+            }
+            dead_roots.insert(candidate.root);
+            dead_views.push_back(candidate.view);
+        }
+
+        if (!erase_ops_by_pointer(function.body(), dead_roots)) {
+            return;
+        }
+        changed_ = true;
+        for (auto *view : dead_views) {
+            if (erase_unreferenced_array_var(function.body(), view)) {
+                changed_ = true;
+            }
         }
     }
 
