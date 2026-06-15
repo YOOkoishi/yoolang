@@ -26,6 +26,7 @@
 #include "pass/PassManager.h"
 #include "pass/yir/YIRLoopAnalysisPass.h"
 #include "pass/yir/YIRLoopOptimizationPass.h"
+#include "pass/yir/YIRMemoryForwardingPass.h"
 #include "pass/yir/YIRPolyhedralDumpPass.h"
 #include "pass/yir/YIRPolyhedralPipelinePass.h"
 #include "pass/yir/YIRPolyhedralTransformPass.h"
@@ -281,6 +282,7 @@ void add_ast_pipeline(pass::PassManager &pm, const CommandLineOptions &options, 
                 }
             }
             if (needs_post_poly_yir_pipeline(options)) {
+                pm.add_pass<pass::YIRMemoryForwardingPass>();
                 pm.add_pass<pass::YIRLoopOptimizationPass>();
                 pm.add_pass<pass::YIRLoopAnalysisPass>();
             }
