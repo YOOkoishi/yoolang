@@ -1,0 +1,51 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int column() {
+  int a[3][2];
+  int i = 0;
+  int j = 0;
+  while (j < 2) {
+    i = 0;
+    while (i < 3) {
+      a[i][j] = i + j;
+      i = i + 1;
+    }
+    j = j + 1;
+  }
+  return a[2][1];
+}
+
+int row() {
+  int a[3][2];
+  int i = 0;
+  int j = 0;
+  while (i < 3) {
+    j = 0;
+    while (j < 2) {
+      a[i][j] = i + j;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return a[2][1];
+}
+
+int escaped() {
+  int a[3][2];
+  getarray(a[0]);
+  return a[2][1];
+}
+
+int main() {
+  return column() + row();
+}
+
+// OIR-LABEL: define i32 @column()
+// OIR: %a = alloca [2 x [3 x i32]]
+// OIR: gep [2 x [3 x i32]]* %a, i32 0, i32 1, i32 2
+
+// OIR-LABEL: define i32 @row()
+// OIR: %a = alloca [3 x [2 x i32]]
+
+// OIR-LABEL: define i32 @escaped()
+// OIR: %a = alloca [3 x [2 x i32]]

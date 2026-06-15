@@ -41,6 +41,276 @@ yir::TypePtr scalar_element_type(yir::TypePtr type) {
     return type;
 }
 
+std::vector<std::uint64_t> static_array_dimensions(yir::TypePtr type) {
+    std::vector<std::uint64_t> dims;
+    while (type != nullptr && type->is_array()) {
+        dims.push_back(type->count());
+        type = type->element();
+    }
+    return dims;
+}
+
+bool is_zero_initializer(const std::string &initializer) {
+    return initializer.empty() || initializer == "zero";
+}
+
+bool is_layout_candidate_type(const yir::TypePtr &type) {
+    return yir::array_rank(type) >= 2 && is_scalar_type(scalar_element_type(type));
+}
+
+const yir::Value *strip_to_bool(const yir::Value *value) {
+    if (value == nullptr) {
+        return nullptr;
+    }
+    if (auto *to_bool = dynamic_cast<const yir::ToBoolOp *>(value->defining_op())) {
+        return to_bool->operands()[0];
+    }
+    return value;
+}
+
+const yir::Value *while_condition_induction_candidate(const yir::WhileOp &op) {
+    if (op.cond_region().operations().empty()) {
+        return nullptr;
+    }
+    auto *cond = dynamic_cast<const yir::CondOp *>(op.cond_region().operations().back().get());
+    if (cond == nullptr) {
+        return nullptr;
+    }
+    auto *condition = strip_to_bool(cond->condition());
+    auto *icmp = condition == nullptr
+                     ? nullptr
+                     : dynamic_cast<const yir::ICmpOp *>(condition->defining_op());
+    if (icmp == nullptr) {
+        return nullptr;
+    }
+    if (icmp->predicate() == yir::ICmpOp::Predicate::Gt ||
+        icmp->predicate() == yir::ICmpOp::Predicate::Ge) {
+        return icmp->rhs();
+    }
+    return icmp->lhs();
+}
+
+bool value_expr_contains(const yir::Value *expr, const yir::Value *needle,
+                         std::unordered_set<const yir::Value *> &active) {
+    if (expr == nullptr || needle == nullptr) {
+        return false;
+    }
+    if (expr == needle) {
+        return true;
+    }
+    if (!active.insert(expr).second) {
+        return false;
+    }
+
+    bool contains = false;
+    if (auto *binary = dynamic_cast<const yir::BinaryOpBase *>(expr->defining_op())) {
+        contains = value_expr_contains(binary->lhs(), needle, active) ||
+                   value_expr_contains(binary->rhs(), needle, active);
+    } else if (auto *zext = dynamic_cast<const yir::ZExtI1ToI32Op *>(expr->defining_op())) {
+        contains = value_expr_contains(zext->operands()[0], needle, active);
+    } else if (auto *trunc = dynamic_cast<const yir::TruncI32ToI1Op *>(expr->defining_op())) {
+        contains = value_expr_contains(trunc->operands()[0], needle, active);
+    }
+
+    active.erase(expr);
+    return contains;
+}
+
+bool value_expr_contains(const yir::Value *expr, const yir::Value *needle) {
+    std::unordered_set<const yir::Value *> active;
+    return value_expr_contains(expr, needle, active);
+}
+
+class ColumnMajorLayoutAnalyzer final {
+  public:
+    std::unordered_set<const yir::Value *> analyze(const yir::Module &module) {
+        candidates_.clear();
+        escaped_.clear();
+        scores_.clear();
+        loop_stack_.clear();
+
+        for (const auto &global : module.globals()) {
+            if (is_layout_candidate_type(global->storage_type()) &&
+                is_zero_initializer(global->initializer())) {
+                candidates_.insert(global->address());
+            }
+        }
+
+        for (const auto &function : module.functions()) {
+            collect_local_candidates(function->body());
+        }
+        for (const auto &function : module.functions()) {
+            scan_region(function->body());
+        }
+
+        std::unordered_set<const yir::Value *> selected;
+        for (auto *candidate : candidates_) {
+            if (escaped_.find(candidate) != escaped_.end()) {
+                continue;
+            }
+            auto score = scores_[candidate];
+            if (score.column > score.row) {
+                selected.insert(candidate);
+            }
+        }
+        return selected;
+    }
+
+  private:
+    struct Score {
+        std::int64_t column = 0;
+        std::int64_t row = 0;
+    };
+
+    void collect_local_candidates(const yir::Region &region) {
+        for (const auto &op : region.operations()) {
+            if (auto *array_var = dynamic_cast<const yir::ArrayVarOp *>(op.get())) {
+                if (is_layout_candidate_type(array_var->result()->type())) {
+                    candidates_.insert(array_var->result());
+                }
+                continue;
+            }
+            if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+                collect_local_candidates(if_op->then_region());
+                if (if_op->has_else()) {
+                    collect_local_candidates(if_op->else_region());
+                }
+                continue;
+            }
+            if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+                collect_local_candidates(while_op->cond_region());
+                collect_local_candidates(while_op->body_region());
+                continue;
+            }
+            if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+                collect_local_candidates(for_op->body_region());
+            }
+        }
+    }
+
+    void scan_region(const yir::Region &region) {
+        for (const auto &op : region.operations()) {
+            scan_op(*op);
+        }
+    }
+
+    void scan_op(const yir::Operation &op) {
+        if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(&op)) {
+            note_access(load->array(), load->indices());
+            return;
+        }
+        if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(&op)) {
+            note_access(store->array(), store->indices());
+            return;
+        }
+        if (auto *init = dynamic_cast<const yir::ArrayInitOp *>(&op)) {
+            mark_if_candidate(init->array());
+            return;
+        }
+        if (auto *decay = dynamic_cast<const yir::DecayOp *>(&op)) {
+            escape(decay->array_address());
+            return;
+        }
+        if (auto *elem_addr = dynamic_cast<const yir::ElemAddrOp *>(&op)) {
+            escape(elem_addr->base());
+            return;
+        }
+        if (auto *call = dynamic_cast<const yir::CallOp *>(&op)) {
+            for (auto *arg : call->args()) {
+                if (arg != nullptr && arg->type() != nullptr &&
+                    (arg->type()->is_array() || arg->type()->is_ptr())) {
+                    escape(arg);
+                }
+            }
+            return;
+        }
+        if (auto *ret = dynamic_cast<const yir::ReturnOp *>(&op)) {
+            if (ret->has_value()) {
+                escape(ret->value());
+            }
+            return;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+            scan_region(if_op->then_region());
+            if (if_op->has_else()) {
+                scan_region(if_op->else_region());
+            }
+            return;
+        }
+        if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+            scan_region(while_op->cond_region());
+            auto *iv = while_condition_induction_candidate(*while_op);
+            push_loop(iv);
+            scan_region(while_op->body_region());
+            pop_loop(iv);
+            return;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+            push_loop(for_op->induction_var());
+            scan_region(for_op->body_region());
+            pop_loop(for_op->induction_var());
+        }
+    }
+
+    void push_loop(const yir::Value *iv) {
+        if (iv != nullptr) {
+            loop_stack_.push_back(iv);
+        }
+    }
+
+    void pop_loop(const yir::Value *iv) {
+        if (iv != nullptr && !loop_stack_.empty()) {
+            loop_stack_.pop_back();
+        }
+    }
+
+    void mark_if_candidate(const yir::Value *value) {
+        if (candidates_.find(value) == candidates_.end()) {
+            return;
+        }
+        (void)scores_[value];
+    }
+
+    void escape(const yir::Value *value) {
+        if (value != nullptr && candidates_.find(value) != candidates_.end()) {
+            escaped_.insert(value);
+        }
+    }
+
+    void note_access(const yir::Value *array, const std::vector<yir::Value *> &indices) {
+        if (candidates_.find(array) == candidates_.end()) {
+            return;
+        }
+        if (indices.size() < 2 || loop_stack_.empty()) {
+            return;
+        }
+
+        const auto *inner_iv = loop_stack_.back();
+        std::size_t varying_dim = indices.size();
+        for (std::size_t dim = 0; dim < indices.size(); ++dim) {
+            if (!value_expr_contains(indices[dim], inner_iv)) {
+                continue;
+            }
+            if (varying_dim != indices.size()) {
+                return;
+            }
+            varying_dim = dim;
+        }
+        if (varying_dim == indices.size()) {
+            return;
+        }
+
+        auto &score = scores_[array];
+        score.column += static_cast<std::int64_t>(indices.size() - 1 - varying_dim);
+        score.row += static_cast<std::int64_t>(varying_dim);
+    }
+
+    std::unordered_set<const yir::Value *> candidates_;
+    std::unordered_set<const yir::Value *> escaped_;
+    std::unordered_map<const yir::Value *, Score> scores_;
+    std::vector<const yir::Value *> loop_stack_;
+};
+
 class AssignmentCollector final {
   public:
     std::unordered_set<const yir::Value *> collect(const yir::Region &region) {
@@ -103,6 +373,7 @@ class Lowerer final {
     std::unique_ptr<oir::Module> lower(const yir::Module &module) {
         module_ = std::make_unique<oir::Module>("yoolang.oir");
         builder_ = std::make_unique<oir::IRBuilder>(module_.get());
+        column_major_arrays_ = ColumnMajorLayoutAnalyzer().analyze(module);
 
         lower_globals(module);
         declare_functions(module);
@@ -162,13 +433,41 @@ class Lowerer final {
         return out;
     }
 
+    oir::Type *lower_column_major_array_type(const yir::TypePtr &type) {
+        auto key = "column:" + type->str();
+        auto found = type_cache_.find(key);
+        if (found != type_cache_.end()) {
+            return found->second;
+        }
+
+        auto dims = static_array_dimensions(type);
+        auto *out = lower_type(scalar_element_type(type));
+        for (std::uint64_t dim : dims) {
+            out = types().array_ty(out, static_cast<std::size_t>(dim));
+        }
+
+        type_cache_[std::move(key)] = out;
+        return out;
+    }
+
+    bool uses_column_major_layout(const yir::Value *value) const {
+        return value != nullptr && column_major_arrays_.find(value) != column_major_arrays_.end();
+    }
+
+    oir::Type *storage_type_for(const yir::Value *value, const yir::TypePtr &logical_type) {
+        if (uses_column_major_layout(value)) {
+            return lower_column_major_array_type(logical_type);
+        }
+        return lower_type(logical_type);
+    }
+
     oir::TypeContext &types() {
         return module_->types();
     }
 
     void lower_globals(const yir::Module &module) {
         for (const auto &global : module.globals()) {
-            auto *value_type = lower_type(global->storage_type());
+            auto *value_type = storage_type_for(global->address(), global->storage_type());
             auto *out = module_->create_global(global->name(), value_type, global->is_const());
             out->set_initializer_literal(global->initializer().empty() ? "zero"
                                                                        : global->initializer());
@@ -395,7 +694,7 @@ class Lowerer final {
     }
 
     void lower_array_var(const yir::Operation &op) {
-        auto *array_type = lower_type(op.result()->type());
+        auto *array_type = storage_type_for(op.result(), op.result()->type());
         auto *alloca = builder_->create_alloca(array_type, result_name(op.result(), "array"));
         memory_addresses_[op.result()] = alloca;
         value_map_[op.result()] = alloca;
@@ -405,7 +704,7 @@ class Lowerer final {
         auto *element_type = lower_type(scalar_element_type(op.array_type()));
 
         if (op.default_zero()) {
-            auto *array_type = lower_type(op.array_type());
+            auto *array_type = storage_type_for(op.array(), op.array_type());
             builder_->create_store(module_->create_zero(array_type), address_for(op.array()));
         }
 
@@ -911,7 +1210,11 @@ class Lowerer final {
         if (base->type()->is_array()) {
             indices.push_back(module_->create_i32(0));
         }
-        indices.insert(indices.end(), lowered_indices.begin(), lowered_indices.end());
+        if (uses_column_major_layout(base)) {
+            indices.insert(indices.end(), lowered_indices.rbegin(), lowered_indices.rend());
+        } else {
+            indices.insert(indices.end(), lowered_indices.begin(), lowered_indices.end());
+        }
         return builder_->create_gep(address_for(base), result_ptr_type, indices, name);
     }
 
@@ -1095,6 +1398,7 @@ class Lowerer final {
     std::unordered_map<const yir::Function *, oir::Function *> functions_;
     std::unordered_map<const yir::Value *, oir::Value *> value_map_;
     std::unordered_map<const yir::Value *, oir::Value *> memory_addresses_;
+    std::unordered_set<const yir::Value *> column_major_arrays_;
     std::unordered_set<const yir::Value *> ssa_vars_;
     std::unordered_map<std::string, unsigned> name_counts_;
     std::unordered_set<std::string> used_names_;
