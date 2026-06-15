@@ -621,33 +621,52 @@ oir::Value *insert_condition_mask(oir::Module &module, oir::BasicBlock &block,
     return mask_raw;
 }
 
-oir::Value *insert_i32_select_expr(
+oir::Value *insert_zext_condition(oir::Module &module, oir::BasicBlock &block,
+                                  std::list<std::unique_ptr<oir::Instruction>>::iterator before,
+                                  oir::Value *condition, bool use_true_arm,
+                                  const std::string &name) {
+    oir::Value *selected = condition;
+    if (!use_true_arm) {
+        selected = insert_bool_not(module, block, before, condition, "ifc.not");
+    }
+
+    auto zext = std::make_unique<oir::CastInst>(module.types().int32_ty(),
+                                                oir::Instruction::OpID::ZExt, selected, &block,
+                                                name);
+    auto *zext_raw = zext.get();
+    zext_raw->set_parent(&block);
+    block.instructions().insert(before, std::move(zext));
+    return zext_raw;
+}
+
+oir::Value *insert_profitable_i32_select_expr(
     oir::Module &module, oir::BasicBlock &block,
     std::list<std::unique_ptr<oir::Instruction>>::iterator before, oir::Value *condition,
     oir::Value *true_value, oir::Value *false_value, const std::string &name) {
-    auto *mask = insert_condition_mask(module, block, before, condition, true);
+    auto true_constant = int_constant(true_value);
+    auto false_constant = int_constant(false_value);
+    if (!true_constant || !false_constant) {
+        return nullptr;
+    }
 
-    auto delta = std::make_unique<oir::BinaryInst>(module.types().int32_ty(),
-                                                   oir::Instruction::OpID::Sub, true_value,
-                                                   false_value, &block, "ifc.delta");
-    auto *delta_raw = delta.get();
-    delta_raw->set_parent(&block);
-    block.instructions().insert(before, std::move(delta));
+    if (*true_constant == 1 && *false_constant == 0) {
+        return insert_zext_condition(module, block, before, condition, true, name);
+    }
+    if (*true_constant == 0 && *false_constant == 1) {
+        return insert_zext_condition(module, block, before, condition, false, name);
+    }
+    if (*true_constant == -1 && *false_constant == 0) {
+        auto *mask = insert_condition_mask(module, block, before, condition, true);
+        mask->set_name(name);
+        return mask;
+    }
+    if (*true_constant == 0 && *false_constant == -1) {
+        auto *mask = insert_condition_mask(module, block, before, condition, false);
+        mask->set_name(name);
+        return mask;
+    }
 
-    auto masked_delta = std::make_unique<oir::BinaryInst>(
-        module.types().int32_ty(), oir::Instruction::OpID::And, delta_raw, mask, &block,
-        "ifc.selected.delta");
-    auto *masked_raw = masked_delta.get();
-    masked_raw->set_parent(&block);
-    block.instructions().insert(before, std::move(masked_delta));
-
-    auto selected = std::make_unique<oir::BinaryInst>(module.types().int32_ty(),
-                                                      oir::Instruction::OpID::Add, false_value,
-                                                      masked_raw, &block, name);
-    auto *selected_raw = selected.get();
-    selected_raw->set_parent(&block);
-    block.instructions().insert(before, std::move(selected));
-    return selected_raw;
+    return nullptr;
 }
 
 oir::Value *insert_arm_condition(oir::Module &module, oir::BasicBlock &block,
@@ -783,9 +802,12 @@ bool convert_value_select(oir::Module &module, oir::BasicBlock &block,
                           std::list<std::unique_ptr<oir::Instruction>>::iterator term_it,
                           ValueSelectDiamond &diamond, Stats &stats) {
     auto *branch = static_cast<oir::BranchInst *>(term_it->get());
-    auto *selected = insert_i32_select_expr(
+    auto *selected = insert_profitable_i32_select_expr(
         module, block, term_it, branch->cond(), diamond.true_value, diamond.false_value,
         diamond.phi->name().empty() ? "ifc.select" : diamond.phi->name() + ".ifc");
+    if (selected == nullptr) {
+        return false;
+    }
 
     ReplacementMap replacements;
     replacements[diamond.phi] = selected;

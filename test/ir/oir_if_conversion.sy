@@ -24,6 +24,22 @@ int select_const_else(int c) {
   return x;
 }
 
+int select_bool01(int c) {
+  int x = 0;
+  if (c != 0) {
+    x = 1;
+  }
+  return x;
+}
+
+int select_mask(int c) {
+  int x = 0;
+  if (c != 0) {
+    x = -1;
+  }
+  return x;
+}
+
 int no_select_call(int x, int c) {
   if (c != 0) {
     x = getint();
@@ -43,31 +59,34 @@ int no_select_store(int a[], int c) {
 int main() {
   int a[1] = {0};
   return select_arg(1, 2, 3) + select_arg_false_arm(4, 5, 0) +
-         select_const_else(1) + no_select_call(6, 0) + no_select_store(a, 1);
+         select_const_else(1) + select_bool01(1) + select_mask(1) +
+         no_select_call(6, 0) + no_select_store(a, 1);
 }
 
 // OIR-LABEL: define i32 @select_arg
-// OIR-NOT: br i1
-// OIR: zext i1
-// OIR: sub i32 0
-// OIR: sub i32 %y.arg, %x.arg
-// OIR: and i32
-// OIR: add i32 %x.arg
+// OIR: br i1
+// OIR: phi
 
 // OIR-LABEL: define i32 @select_arg_false_arm
-// OIR-NOT: br i1
-// OIR: zext i1
-// OIR: sub i32 0
-// OIR: sub i32 %y.arg, %x.arg
-// OIR: and i32
-// OIR: add i32 %x.arg
+// OIR: br i1
+// OIR: phi
 
 // OIR-LABEL: define i32 @select_const_else
+// OIR: br i1
+// OIR: phi
+
+// OIR-LABEL: define i32 @select_bool01
+// OIR-NOT: br i1
+// OIR: zext i1
+// OIR-NOT: br i1
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @select_mask
 // OIR-NOT: br i1
 // OIR: zext i1
 // OIR: sub i32 0
-// OIR: and i32
-// OIR: add i32
+// OIR-NOT: br i1
+// OIR: ret i32
 
 // OIR-LABEL: define i32 @no_select_call
 // OIR: br i1
