@@ -25,7 +25,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 | [OIR Global Code Motion](2026-06-13-oir-global-code-motion.md) | proposed | `not used yet` | 2026-06-13 |
 | [Const Array Formula Synthesis](2026-06-13-const-array-formula-synthesis.md) | proposed | `not used yet` | 2026-06-13 |
 | [Affine Recurrence and LSR Linkup](2026-06-13-affine-recurrence-lsr-linkup.md) | proposed | `not used yet` | 2026-06-13 |
-| [OIR If-conversion and Select](2026-06-13-oir-if-conversion-select.md) | proposed | `not used yet` | 2026-06-13 |
+| [OIR If-conversion and Select](2026-06-13-oir-if-conversion-select.md) | ready_for_review | `task/oir-if-conversion-select` | 2026-06-15 |
 | [At-most-once Inline and Recursion Follow-up](2026-06-13-at-most-once-inline-recursion.md) | proposed | `not used yet` | 2026-06-13 |
 | [OIR Loop Bound Tightening](2026-06-12-oir-loop-bound-tightening.md) | ready_for_review | `task/oir-loop-bound-tightening` | 2026-06-12 |
 | [Transpose2 and T03-61 Performance Gap Attribution](2026-06-12-transpose2-t03-61-perf-gap.md) | ready_for_review | `master` | 2026-06-12 |

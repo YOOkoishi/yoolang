@@ -6,6 +6,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace pass::oir_opt {
 
@@ -353,6 +354,16 @@ struct ShortCircuitBoolDiamond {
     bool pred_value = false;
 };
 
+struct ValueSelectDiamond {
+    oir::BasicBlock *true_source = nullptr;
+    oir::BasicBlock *false_source = nullptr;
+    oir::BasicBlock *merge = nullptr;
+    oir::PhiInst *phi = nullptr;
+    oir::Value *true_value = nullptr;
+    oir::Value *false_value = nullptr;
+    std::vector<oir::BasicBlock *> removed_blocks;
+};
+
 bool has_single_phi(oir::BasicBlock &block) {
     bool seen_phi = false;
     for (auto &inst : block.instructions()) {
@@ -365,6 +376,24 @@ bool has_single_phi(oir::BasicBlock &block) {
         seen_phi = true;
     }
     return seen_phi;
+}
+
+bool has_successor(oir::BasicBlock &block, oir::BasicBlock *succ) {
+    for (auto *candidate : block.successors()) {
+        if (candidate == succ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_predecessor(oir::BasicBlock &block, oir::BasicBlock *pred) {
+    for (auto *candidate : block.predecessors()) {
+        if (candidate == pred) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool match_add_arm(oir::BasicBlock &pred, oir::BasicBlock *arm, oir::BasicBlock *merge,
@@ -488,6 +517,86 @@ bool match_short_circuit_bool_diamond(oir::BasicBlock &block, oir::BranchInst &b
     return match_bool_arm(block, branch.false_bb(), branch.true_bb(), false, out);
 }
 
+oir::BasicBlock *empty_select_arm_target(oir::BasicBlock &pred, oir::BasicBlock *arm) {
+    if (arm == nullptr || arm == &pred || arm->predecessors().size() != 1 ||
+        arm->predecessors().front() != &pred || arm->instructions().size() != 1) {
+        return nullptr;
+    }
+
+    auto *arm_branch = dynamic_cast<oir::BranchInst *>(arm->instructions().front().get());
+    if (arm_branch == nullptr || arm_branch->is_conditional()) {
+        return nullptr;
+    }
+    return arm_branch->target_bb();
+}
+
+oir::Value *phi_incoming_from(oir::PhiInst &phi, oir::BasicBlock *from) {
+    oir::Value *value = nullptr;
+    for (const auto &[incoming_value, incoming_block] : phi.incoming()) {
+        if (incoming_block != from) {
+            continue;
+        }
+        if (value != nullptr) {
+            return nullptr;
+        }
+        value = incoming_value;
+    }
+    return value;
+}
+
+bool finish_value_select_match(oir::BasicBlock &block, oir::BasicBlock *true_source,
+                               oir::BasicBlock *false_source, oir::BasicBlock *merge,
+                               std::vector<oir::BasicBlock *> removed_blocks,
+                               ValueSelectDiamond &out) {
+    auto *i32 = block.parent()->parent()->types().int32_ty();
+    if (true_source == nullptr || false_source == nullptr || true_source == false_source ||
+        merge == nullptr || !has_single_phi(*merge) || merge->instructions().empty()) {
+        return false;
+    }
+
+    auto *phi = dynamic_cast<oir::PhiInst *>(merge->instructions().front().get());
+    if (phi == nullptr || phi->type() != i32 || phi->incoming().size() != 2) {
+        return false;
+    }
+
+    auto *true_value = phi_incoming_from(*phi, true_source);
+    auto *false_value = phi_incoming_from(*phi, false_source);
+    if (true_value == nullptr || false_value == nullptr || true_value->type() != i32 ||
+        false_value->type() != i32 || true_value == false_value) {
+        return false;
+    }
+
+    out = {true_source, false_source, merge, phi, true_value, false_value, removed_blocks};
+    return true;
+}
+
+bool match_value_select_diamond(oir::BasicBlock &block, oir::BranchInst &branch,
+                                ValueSelectDiamond &out) {
+    if (!branch.is_conditional() || branch.cond() == nullptr ||
+        branch.cond()->type() != block.parent()->parent()->types().int1_ty()) {
+        return false;
+    }
+
+    auto *true_target = branch.true_bb();
+    auto *false_target = branch.false_bb();
+    if (empty_select_arm_target(block, true_target) == false_target) {
+        return finish_value_select_match(block, true_target, &block, false_target, {true_target},
+                                         out);
+    }
+    if (empty_select_arm_target(block, false_target) == true_target) {
+        return finish_value_select_match(block, &block, false_target, true_target, {false_target},
+                                         out);
+    }
+
+    auto *true_merge = empty_select_arm_target(block, true_target);
+    auto *false_merge = empty_select_arm_target(block, false_target);
+    if (true_merge == nullptr || true_merge != false_merge) {
+        return false;
+    }
+    return finish_value_select_match(block, true_target, false_target, true_merge,
+                                     {true_target, false_target}, out);
+}
+
 oir::Value *insert_condition_mask(oir::Module &module, oir::BasicBlock &block,
                                   std::list<std::unique_ptr<oir::Instruction>>::iterator before,
                                   oir::Value *condition, bool use_true_arm) {
@@ -510,6 +619,35 @@ oir::Value *insert_condition_mask(oir::Module &module, oir::BasicBlock &block,
     mask_raw->set_parent(&block);
     block.instructions().insert(before, std::move(mask));
     return mask_raw;
+}
+
+oir::Value *insert_i32_select_expr(
+    oir::Module &module, oir::BasicBlock &block,
+    std::list<std::unique_ptr<oir::Instruction>>::iterator before, oir::Value *condition,
+    oir::Value *true_value, oir::Value *false_value, const std::string &name) {
+    auto *mask = insert_condition_mask(module, block, before, condition, true);
+
+    auto delta = std::make_unique<oir::BinaryInst>(module.types().int32_ty(),
+                                                   oir::Instruction::OpID::Sub, true_value,
+                                                   false_value, &block, "ifc.delta");
+    auto *delta_raw = delta.get();
+    delta_raw->set_parent(&block);
+    block.instructions().insert(before, std::move(delta));
+
+    auto masked_delta = std::make_unique<oir::BinaryInst>(
+        module.types().int32_ty(), oir::Instruction::OpID::And, delta_raw, mask, &block,
+        "ifc.selected.delta");
+    auto *masked_raw = masked_delta.get();
+    masked_raw->set_parent(&block);
+    block.instructions().insert(before, std::move(masked_delta));
+
+    auto selected = std::make_unique<oir::BinaryInst>(module.types().int32_ty(),
+                                                      oir::Instruction::OpID::Add, false_value,
+                                                      masked_raw, &block, name);
+    auto *selected_raw = selected.get();
+    selected_raw->set_parent(&block);
+    block.instructions().insert(before, std::move(selected));
+    return selected_raw;
 }
 
 oir::Value *insert_arm_condition(oir::Module &module, oir::BasicBlock &block,
@@ -539,6 +677,26 @@ void replace_conditional_branch_with_merge(oir::Module &module, oir::BasicBlock 
                                            oir::BasicBlock *removed,
                                            oir::BasicBlock *merge) {
     remove_edge(&block, removed);
+    auto replacement = std::make_unique<oir::BranchInst>(module.types().void_ty(), merge, &block);
+    replacement->set_parent(&block);
+    (*term_it)->drop_all_operands();
+    *term_it = std::move(replacement);
+}
+
+void replace_conditional_branch_with_merge(
+    oir::Module &module, oir::BasicBlock &block,
+    std::list<std::unique_ptr<oir::Instruction>>::iterator term_it,
+    const std::vector<oir::BasicBlock *> &removed_blocks, oir::BasicBlock *merge) {
+    for (auto *removed : removed_blocks) {
+        remove_edge(&block, removed);
+    }
+    if (!has_successor(block, merge)) {
+        block.add_successor(merge);
+    }
+    if (!has_predecessor(*merge, &block)) {
+        merge->add_predecessor(&block);
+    }
+
     auto replacement = std::make_unique<oir::BranchInst>(module.types().void_ty(), merge, &block);
     replacement->set_parent(&block);
     (*term_it)->drop_all_operands();
@@ -621,6 +779,25 @@ bool convert_conditional_add(oir::Module &module, oir::BasicBlock &block,
     return true;
 }
 
+bool convert_value_select(oir::Module &module, oir::BasicBlock &block,
+                          std::list<std::unique_ptr<oir::Instruction>>::iterator term_it,
+                          ValueSelectDiamond &diamond, Stats &stats) {
+    auto *branch = static_cast<oir::BranchInst *>(term_it->get());
+    auto *selected = insert_i32_select_expr(
+        module, block, term_it, branch->cond(), diamond.true_value, diamond.false_value,
+        diamond.phi->name().empty() ? "ifc.select" : diamond.phi->name() + ".ifc");
+
+    ReplacementMap replacements;
+    replacements[diamond.phi] = selected;
+    apply_replacements(module, replacements);
+    erase_phi(*diamond.merge, *diamond.phi);
+
+    replace_conditional_branch_with_merge(module, block, term_it, diamond.removed_blocks,
+                                          diamond.merge);
+    ++stats.branches;
+    return true;
+}
+
 bool if_convert_conditional_adds(oir::Module &module, Stats &stats) {
     bool changed = false;
     for (auto &function : module.functions()) {
@@ -643,6 +820,10 @@ bool if_convert_conditional_adds(oir::Module &module, Stats &stats) {
             }
             ConditionalAddDiamond diamond;
             if (!match_conditional_add_diamond(*block, *branch, diamond)) {
+                ValueSelectDiamond select_diamond;
+                if (match_value_select_diamond(*block, *branch, select_diamond)) {
+                    changed |= convert_value_select(module, *block, term_it, select_diamond, stats);
+                }
                 continue;
             }
             changed |= convert_conditional_add(module, *block, term_it, diamond, stats);

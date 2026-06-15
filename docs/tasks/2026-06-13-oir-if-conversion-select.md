@@ -1,11 +1,11 @@
 # Task: OIR If-conversion and Select
 
-Status: proposed
+Status: ready_for_review
 Created: 2026-06-13
-Last update: 2026-06-13
+Last update: 2026-06-15
 Owner: Codex
-Branch: not used yet
-Base commit: df20afe
+Branch: task/oir-if-conversion-select
+Base commit: f615d9e
 
 ## Goal
 
@@ -61,15 +61,16 @@ Do not read unless explicitly needed:
 | `include/oir/OIR.h` | PHI, branch, compare, arithmetic APIs | matcher and possible `SelectInst` design | yes | keep |
 | `src/pass/oir/OIROptimizationPipelinePass.cpp` | current if-conversion placement | pipeline hook | yes | keep |
 | `src/pass/oir/OIRToMIRPass.cpp` | phase 2 select lowering if added | conditional | yes | phase 2 only |
+| `test/ir/oir_if_conversion.sy` | full | focused FileCheck coverage for this task | yes | new |
 
 ## Branch
 
-Decision: not used for task creation
+Decision: task branch
 
 Reason:
 
 ```text
-This file only scopes future work. Create task/oir-if-conversion-select before implementation.
+Implementation touches OIR optimization logic and tests; use a task branch.
 ```
 
 Commands:
@@ -83,9 +84,9 @@ git branch --show-current
 Observed:
 
 ```text
-status before docs creation: clean
-base commit: df20afe
-branch: master
+status before implementation: clean
+base commit: f615d9e
+created branch: task/oir-if-conversion-select
 ```
 
 ## Invariants And Risks
@@ -112,22 +113,23 @@ Risk areas:
 
 | Patch | Intent | Files | Verifier/Test | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| P1 | Audit current conditional-add conversion and add tests for existing behavior | existing OIR pass/tests | FileCheck | pending | establish baseline |
-| P2 | Add phase-1 diamond PHI conversion using existing arithmetic/logic instructions | OIR pass + tests | OIR/MIR/e2e | pending | i1/i32 only |
-| P3 | Add profitability and negative cases for side effects, calls, stores, and complex PHIs | pass + tests | full optimized | pending | prevent unsafe conversion |
-| P4 | Design and optionally implement `SelectInst` plus MIR lowering | OIR/MIR files + tests | full stage/e2e/perf | pending | only after P1-P3 evidence |
+| P1 | Audit current conditional-add conversion and add tests for existing behavior | existing OIR pass/tests | FileCheck | done | Existing conditional-add and short-circuit bool coverage remains in `oir_huffman_gap`; new focused file adds value-select baseline. |
+| P2 | Add phase-1 diamond PHI conversion using existing arithmetic/logic instructions | `src/pass/oir/OIRLocalSimplify.cpp`, `test/ir/oir_if_conversion.sy` | OIR/MIR/e2e | done | Converts empty-arm i32 PHI selects with `false + ((true - false) & mask)`; no new IR instruction. |
+| P3 | Add profitability and negative cases for side effects, calls, stores, and complex PHIs | pass + tests | full optimized | done | Matcher only accepts empty arms and a single i32 PHI; call/store arms stay branched in FileCheck. |
+| P4 | Design and optionally implement `SelectInst` plus MIR lowering | OIR/MIR files + tests | full stage/e2e/perf | deferred | Phase 1 is sufficient for now; `SelectInst` would require verifier/printer/lowering work and is not justified by this narrow result. |
 
 ## Verification Matrix
 
 | Gate | Command | Required? | Result | Notes |
 | --- | --- | --- | --- | --- |
-| Build | `xmake` | yes | NOT_RUN | |
-| Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter if_conversion --jobs 1` | yes | NOT_RUN | add cases |
-| OIR stage | `python3 scripts/run_tests.py --suite stage --stage oir --filter if_conversion --jobs 1 --o1` | yes | NOT_RUN | |
-| MIR/ASM stage | `python3 scripts/run_tests.py --suite stage --stage mir --stage asm --filter if_conversion --jobs 1 --o1` | yes | NOT_RUN | |
-| E2E | `python3 scripts/run_tests.py --suite e2e --filter if_conversion --jobs 1 --o1` | yes | NOT_RUN | |
-| Full optimized | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | before finalization | NOT_RUN | |
-| Performance | `PERF_TEST_DIRS=test/performance,test/bsb-final python3 scripts/compare_perf.py` | before claiming speedup | NOT_RUN | branch count and spills matter |
+| Build | `xmake` | yes | PASS | |
+| Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter if_conversion --jobs 1` | yes | PASS | 1 passed |
+| OIR stage | `python3 scripts/run_tests.py --suite stage --stage oir --filter if_conversion --jobs 1 --o1` | yes | PASS | 0 matched by stage runner; direct `--emit-oir -O1 test/ir/oir_if_conversion.sy` passed verifier |
+| MIR/ASM stage | `python3 scripts/run_tests.py --suite stage --stage mir --stage asm --filter if_conversion --jobs 1 --o1` | yes | PASS | direct `--emit-mir-stage=pre-ra -O1` and `-S -O1` for `test/ir/oir_if_conversion.sy` passed |
+| E2E | `python3 scripts/run_tests.py --suite e2e --filter if_conversion --jobs 1 --o1` | yes | PASS | 0 matched by e2e runner; covered by full optimized e2e |
+| OIR FileCheck sweep | `python3 scripts/run_tests.py --suite filecheck --filter oir_ --jobs 1` | no | PASS | 10 passed |
+| Full optimized | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | before finalization | PASS | 1434 passed, 0 failed, 1 skipped |
+| Performance | `PERF_TEST_DIRS=test/performance,test/bsb-final python3 scripts/compare_perf.py` | before claiming speedup | PASS | 119 cases, 0 failed; GCC geomean 0.92x, Clang++ geomean 0.98x; MIR metrics OK; instruction count disabled |
 
 ## Alternatives
 
@@ -140,28 +142,31 @@ Risk areas:
 ## Change Log
 
 - 2026-06-13: created proposed task from the 2025 T0 vs yoolang gap comparison.
+- 2026-06-15: implemented conservative empty-arm i32 value-select if-conversion and focused FileCheck coverage; deferred first-class `SelectInst`.
+- 2026-06-15: completed full optimized and performance verification; marked ready for review.
 
 ## Open Questions
 
-- Which phase-1 patterns are profitable on current RISC-V output without adding a select instruction?
-- Should `SelectInst` be represented in OIR only, or also as a dedicated MIR pseudo before final lowering?
+- Phase-1 result is intentionally narrow: empty-arm i32 PHI selects are profitable enough to remove branch/PHI without speculating side effects.
+- `SelectInst` remains deferred. A first-class instruction would be cleaner but needs complete OIR verifier/printer/lowering integration and more evidence that non-empty arms should be represented before final arithmetic lowering.
 
 ## Handoff Note
 
 Current state:
 
-- Task is scoped but not implemented.
-- Priority: P2.
+- Implementation is complete and verified on branch `task/oir-if-conversion-select`.
+- `src/pass/oir/OIRLocalSimplify.cpp` now recognizes empty-arm i32 value-select diamonds after the existing short-circuit bool and conditional-add special cases.
+- `test/ir/oir_if_conversion.sy` covers one-arm value selects, two-arm constant selects, and call/store negative cases.
+- No first-class `SelectInst` was added; the decision is deferred.
 
 Next action:
 
-- Create `task/oir-if-conversion-select`, inspect the existing conditional-add conversion, then add a baseline FileCheck before broadening it.
+- Review and merge if acceptable.
 
 Read next:
 
 - `docs/task-system.md`
 - `docs/tasks/2026-06-13-oir-if-conversion-select.md`
 - `include/oir/OIRScalarOpt.h`
-- `include/oir/OIR.h`
-- `src/pass/oir/OIROptimizationPipelinePass.cpp`
-
+- `src/pass/oir/OIRLocalSimplify.cpp`
+- `test/ir/oir_if_conversion.sy`
