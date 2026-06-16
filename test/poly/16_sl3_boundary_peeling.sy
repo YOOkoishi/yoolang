@@ -1,0 +1,82 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+
+int x[8][8][8];
+
+int main() {
+  int i;
+  int j;
+  int k;
+  int f;
+  int N;
+
+  N = getint();
+  f = getint();
+
+  i = 0;
+  j = 0;
+  k = 0;
+  while (i < N) {
+    j = 0;
+    k = 0;
+    while (j < N) {
+      k = 0;
+      while (k < N) {
+        x[i][j][k] = 1;
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  i = 1;
+  j = 1;
+  k = 1;
+  while (i < N - 1) {
+    j = 1;
+    k = 1;
+    while (j < N - 1) {
+      k = 1;
+      while (k < N - 1) {
+        x[i][j][k] = (x[i - 1][j][k] + x[i + 1][j][k] +
+                      x[i][j - 1][k] + x[i][j + 1][k] +
+                      x[i][j][k - 1] + x[i][j][k + 1] +
+                      x[i - 1][j - 1][k - 1]) / f;
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  putarray(N, x[0][0]);
+  putarray(N, x[N / 2][N / 2]);
+  putarray(N, x[i - 1][j - 1]);
+  return 0;
+}
+
+// YIR: yir.global @poly.storage.xbuf : array<2 x array<8 x array<8 x i32>>> = zero
+// YIR-NOT: yir.global @x
+// YIR: [[PEELTWO:%poly.storage.peel.two[0-9]+]] = yir.const.i32 2 : i32
+// YIR: [[PEELTHREE:%poly.storage.peel.three[0-9]+]] = yir.const.i32 3 : i32
+// YIR: [[PEELFIVE:%poly.storage.peel.five[0-9]+]] = yir.const.i32 5 : i32
+// YIR: yir.for %i =
+// YIR-NOT: poly.storage.reset
+// YIR: yir.for %j = {{.*}} to [[PEELTWO]]
+// YIR: [[J1CARRY:%poly.storage.peel.carry[0-9]+]] = yir.var : i32 =
+// YIR: yir.for %k =
+// YIR: yir.divsi {{.*}}, %f : i32
+// YIR: yir.for %j = [[PEELTWO]]
+// YIR: yir.assign %k, {{.*}}
+// YIR: [[JM1:%poly.storage.peel.jm1[0-9]+]] = yir.subi %j,
+// YIR: yir.array_load @poly.storage.xbuf, {{.*}}[%poly.storage.prev{{[0-9]+}}, %j,
+// YIR: yir.array_load @poly.storage.xbuf, {{.*}}[%poly.storage.cur{{[0-9]+}}, [[JM1]],
+// YIR: yir.addi {{.*}}, [[PEELFIVE]]
+// YIR: yir.array_store {{.*}}, @poly.storage.xbuf
+// YIR: yir.for %k = [[PEELTWO]]
+// YIR: [[KM1:%poly.storage.peel.km1[0-9]+]] = yir.subi %k,
+// YIR: yir.array_load @poly.storage.xbuf, {{.*}}[%poly.storage.prev{{[0-9]+}}, [[JM1]], [[KM1]]]
+// YIR: yir.addi {{.*}}, [[PEELTHREE]]
+// YIR: yir.array_store {{.*}}, @poly.storage.xbuf
+// YIR-NOT: poly.storage.reset
+// YIR-NOT: @x

@@ -523,6 +523,12 @@ struct TwoPlaneStorageContraction {
     std::array<ContractedOutput, 3> outputs;
 };
 
+struct ContractedBoundaryKernel {
+    yir::Value *divisor = nullptr;
+    yir::Value *carry = nullptr;
+    std::array<yir::ArrayLoadOp *, 3> loads = {nullptr, nullptr, nullptr};
+};
+
 struct ContractedSpatialBlock {
     yir::ForOp *j_loop = nullptr;
     yir::ForOp *k_loop = nullptr;
@@ -1420,8 +1426,8 @@ public:
           num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
           num_stencil_carries_(0), num_future_neighbor_constants_(0),
           num_initialization_reductions_(0), num_storage_contractions_(0),
-          num_spatial_blocks_(0), num_affine_replacements_(0), num_nearest_write_queries_(0),
-          num_nearest_queries_(0), num_dead_memory_writes_(0),
+          num_spatial_blocks_(0), num_boundary_peels_(0), num_affine_replacements_(0),
+          num_nearest_write_queries_(0), num_nearest_queries_(0), num_dead_memory_writes_(0),
           num_dead_pure_results_(0), num_unused_globals_(0) {}
 
     bool transform() {
@@ -1478,6 +1484,7 @@ public:
     std::size_t num_initialization_reductions() const { return num_initialization_reductions_; }
     std::size_t num_storage_contractions() const { return num_storage_contractions_; }
     std::size_t num_spatial_blocks() const { return num_spatial_blocks_; }
+    std::size_t num_boundary_peels() const { return num_boundary_peels_; }
     std::size_t num_affine_replacements() const { return num_affine_replacements_; }
     std::size_t num_nearest_write_queries() const { return num_nearest_write_queries_; }
     std::size_t num_nearest_queries() const { return num_nearest_queries_; }
@@ -3312,6 +3319,388 @@ private:
         return k_loop;
     }
 
+    static void collect_add_terms(const yir::Value *value,
+                                  std::vector<const yir::Value *> &terms) {
+        auto *add = value == nullptr || value->defining_op() == nullptr
+                        ? nullptr
+                        : dynamic_cast<const yir::AddIOp *>(value->defining_op());
+        if (add == nullptr) {
+            terms.push_back(value);
+            return;
+        }
+        collect_add_terms(add->lhs(), terms);
+        collect_add_terms(add->rhs(), terms);
+    }
+
+    static bool store_matches_indices(const yir::ArrayStoreOp &store, yir::Value *array,
+                                      yir::Value *index0, yir::Value *index1,
+                                      yir::Value *index2) {
+        auto indices = store.indices();
+        return store.array() == array && indices.size() == 3 && indices[0] == index0 &&
+               indices[1] == index1 && indices[2] == index2;
+    }
+
+    bool classify_contracted_boundary_load(yir::ArrayLoadOp &load, yir::Value *xbuf,
+                                           yir::Value *cur, yir::Value *prev,
+                                           yir::Value *j_iv, yir::Value *k_iv,
+                                           std::array<yir::ArrayLoadOp *, 3> &loads) const {
+        if (load.array() != xbuf) {
+            return false;
+        }
+        auto indices = load.indices();
+        if (indices.size() != 3) {
+            return false;
+        }
+
+        if (indices[0] == prev && indices[1] == j_iv && indices[2] == k_iv) {
+            if (loads[0] != nullptr) {
+                return false;
+            }
+            loads[0] = &load;
+            return true;
+        }
+        if (indices[0] == cur && value_is_dim_plus_constant(indices[1], j_iv, -1) &&
+            indices[2] == k_iv) {
+            if (loads[1] != nullptr) {
+                return false;
+            }
+            loads[1] = &load;
+            return true;
+        }
+        if (indices[0] == prev && value_is_dim_plus_constant(indices[1], j_iv, -1) &&
+            value_is_dim_plus_constant(indices[2], k_iv, -1)) {
+            if (loads[2] != nullptr) {
+                return false;
+            }
+            loads[2] = &load;
+            return true;
+        }
+        return false;
+    }
+
+    bool div_lhs_matches_contracted_boundary_sum(
+        const yir::DivSIOp &div, const ContractedBoundaryKernel &kernel) const {
+        if (kernel.carry == nullptr ||
+            std::any_of(kernel.loads.begin(), kernel.loads.end(),
+                        [](const auto *load) { return load == nullptr; })) {
+            return false;
+        }
+
+        std::vector<const yir::Value *> terms;
+        collect_add_terms(div.lhs(), terms);
+        std::array<bool, 3> saw_load = {false, false, false};
+        bool saw_carry = false;
+        int one_terms = 0;
+
+        for (auto *term : terms) {
+            bool matched = false;
+            for (std::size_t i = 0; i < kernel.loads.size(); ++i) {
+                if (term == kernel.loads[i]->result()) {
+                    if (saw_load[i]) {
+                        return false;
+                    }
+                    saw_load[i] = true;
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) {
+                continue;
+            }
+            if (term == kernel.carry) {
+                if (saw_carry) {
+                    return false;
+                }
+                saw_carry = true;
+                continue;
+            }
+            std::int64_t constant = 0;
+            if (const_i32_value(term, constant) && constant == 1) {
+                ++one_terms;
+                continue;
+            }
+            return false;
+        }
+
+        return saw_carry && one_terms == 3 &&
+               std::all_of(saw_load.begin(), saw_load.end(), [](bool saw) { return saw; });
+    }
+
+    bool match_contracted_boundary_kernel(yir::ForOp &j_loop, yir::ForOp &k_loop,
+                                          yir::Value *xbuf, yir::Value *cur,
+                                          yir::Value *prev,
+                                          ContractedBoundaryKernel &kernel) const {
+        if (xbuf == nullptr || cur == nullptr || prev == nullptr ||
+            k_loop.parent() != &j_loop.body_region() ||
+            !loop_has_unit_step(j_loop) || !loop_has_unit_step(k_loop)) {
+            return false;
+        }
+        std::int64_t j_lower = 0;
+        std::int64_t k_lower = 0;
+        if (!const_i32_value(j_loop.lower_bound(), j_lower) || j_lower != 1 ||
+            !const_i32_value(k_loop.lower_bound(), k_lower) || k_lower != 1) {
+            return false;
+        }
+
+        yir::DivSIOp *div = nullptr;
+        yir::ArrayStoreOp *store = nullptr;
+        yir::AssignOp *carry_assign = nullptr;
+        std::array<yir::ArrayLoadOp *, 3> loads = {nullptr, nullptr, nullptr};
+        auto *j_iv = j_loop.induction_var();
+        auto *k_iv = k_loop.induction_var();
+
+        for (auto &op : k_loop.body_region().operations()) {
+            if (dynamic_cast<yir::IfOp *>(op.get()) != nullptr ||
+                dynamic_cast<yir::WhileOp *>(op.get()) != nullptr ||
+                dynamic_cast<yir::ForOp *>(op.get()) != nullptr ||
+                dynamic_cast<yir::CallOp *>(op.get()) != nullptr) {
+                return false;
+            }
+
+            if (auto *load = dynamic_cast<yir::ArrayLoadOp *>(op.get())) {
+                if (!classify_contracted_boundary_load(*load, xbuf, cur, prev, j_iv,
+                                                       k_iv, loads)) {
+                    return false;
+                }
+            } else if (auto *candidate_store = dynamic_cast<yir::ArrayStoreOp *>(op.get())) {
+                if (store != nullptr ||
+                    !store_matches_indices(*candidate_store, xbuf, cur, j_iv, k_iv)) {
+                    return false;
+                }
+                store = candidate_store;
+            } else if (auto *candidate_div = dynamic_cast<yir::DivSIOp *>(op.get())) {
+                if (div != nullptr) {
+                    return false;
+                }
+                div = candidate_div;
+            } else if (auto *assign = dynamic_cast<yir::AssignOp *>(op.get())) {
+                if (carry_assign != nullptr) {
+                    return false;
+                }
+                carry_assign = assign;
+            }
+        }
+
+        if (div == nullptr || store == nullptr || carry_assign == nullptr ||
+            store->value() != div->result() || carry_assign->value() != div->result()) {
+            return false;
+        }
+
+        kernel.divisor = div->rhs();
+        kernel.carry = carry_assign->target();
+        kernel.loads = loads;
+        return div_lhs_matches_contracted_boundary_sum(*div, kernel);
+    }
+
+    yir::Value *append_add(yir::Region &region, yir::Value *lhs, yir::Value *rhs,
+                           const char *stem) {
+        auto op = make_parented_op<yir::AddIOp>(
+            region, lhs, rhs, storage_temp_name(stem, next_storage_temp_++));
+        auto *result = op->result();
+        region.operations().push_back(std::move(op));
+        return result;
+    }
+
+    yir::Value *append_load(yir::Region &region, yir::Value *xbuf,
+                            std::vector<yir::Value *> indices, const char *stem) {
+        auto op = make_parented_op<yir::ArrayLoadOp>(
+            region, xbuf, std::move(indices), yir::Type::get_i32(),
+            storage_temp_name(stem, next_storage_temp_++));
+        auto *result = op->result();
+        region.operations().push_back(std::move(op));
+        return result;
+    }
+
+    void append_contracted_store(yir::Region &region, yir::Value *xbuf,
+                                 yir::Value *value, yir::Value *cur,
+                                 yir::Value *j_value, yir::Value *k_value) {
+        region.operations().push_back(make_parented_op<yir::ArrayStoreOp>(
+            region, value, xbuf, std::vector<yir::Value *>{cur, j_value, k_value}));
+    }
+
+    yir::Value *append_div(yir::Region &region, yir::Value *lhs, yir::Value *rhs,
+                           const char *stem) {
+        auto op = make_parented_op<yir::DivSIOp>(
+            region, lhs, rhs, storage_temp_name(stem, next_storage_temp_++));
+        auto *result = op->result();
+        region.operations().push_back(std::move(op));
+        return result;
+    }
+
+    void append_div_store_and_carry(yir::Region &region, yir::Value *xbuf,
+                                    yir::Value *numerator, yir::Value *divisor,
+                                    yir::Value *cur, yir::Value *j_value,
+                                    yir::Value *k_value, yir::Value *carry) {
+        auto *quotient = append_div(region, numerator, divisor, "peel.div");
+        append_contracted_store(region, xbuf, quotient, cur, j_value, k_value);
+        region.operations().push_back(make_parented_op<yir::AssignOp>(region, carry, quotient));
+    }
+
+    void append_contracted_j1_update(yir::Region &region, yir::Value *xbuf,
+                                     yir::Value *cur, yir::Value *prev,
+                                     yir::Value *j_value, yir::Value *k_value,
+                                     yir::Value *carry, yir::Value *five,
+                                     yir::Value *divisor) {
+        auto *prev_jk = append_load(region, xbuf, {prev, j_value, k_value}, "peel.prev");
+        auto *sum = append_add(region, prev_jk, carry, "peel.sum");
+        sum = append_add(region, sum, five, "peel.sum");
+        append_div_store_and_carry(region, xbuf, sum, divisor, cur, j_value, k_value,
+                                   carry);
+    }
+
+    void append_contracted_k1_update(yir::Region &region, yir::Value *xbuf,
+                                     yir::Value *cur, yir::Value *prev,
+                                     yir::Value *j_value, yir::Value *j_minus_one,
+                                     yir::Value *k_lower, yir::Value *carry,
+                                     yir::Value *five, yir::Value *divisor) {
+        auto *prev_jk = append_load(region, xbuf, {prev, j_value, k_lower}, "peel.prev");
+        auto *left = append_load(region, xbuf, {cur, j_minus_one, k_lower}, "peel.left");
+        auto *sum = append_add(region, prev_jk, left, "peel.sum");
+        sum = append_add(region, sum, five, "peel.sum");
+        append_div_store_and_carry(region, xbuf, sum, divisor, cur, j_value, k_lower,
+                                   carry);
+    }
+
+    void append_contracted_bulk_update(yir::Region &region, yir::Value *xbuf,
+                                       yir::Value *cur, yir::Value *prev,
+                                       yir::Value *j_value, yir::Value *j_minus_one,
+                                       yir::Value *k_value, yir::Value *carry,
+                                       yir::Value *one, yir::Value *three,
+                                       yir::Value *divisor) {
+        auto k_minus_one = make_parented_op<yir::SubIOp>(
+            region, k_value, one, storage_temp_name("peel.km1", next_storage_temp_++));
+        auto *k_minus_one_value = k_minus_one->result();
+        region.operations().push_back(std::move(k_minus_one));
+
+        auto *prev_jk = append_load(region, xbuf, {prev, j_value, k_value}, "peel.prev");
+        auto *left = append_load(region, xbuf, {cur, j_minus_one, k_value}, "peel.left");
+        auto *diag =
+            append_load(region, xbuf, {prev, j_minus_one, k_minus_one_value}, "peel.diag");
+        auto *sum = append_add(region, prev_jk, left, "peel.sum");
+        sum = append_add(region, sum, carry, "peel.sum");
+        sum = append_add(region, sum, diag, "peel.sum");
+        sum = append_add(region, sum, three, "peel.sum");
+        append_div_store_and_carry(region, xbuf, sum, divisor, cur, j_value, k_value,
+                                   carry);
+    }
+
+    std::unique_ptr<yir::Operation> make_contracted_j1_loop(
+        yir::Region &parent, const yir::ForOp &j_loop, const yir::ForOp &k_loop,
+        yir::Value *xbuf, yir::Value *cur, yir::Value *prev, yir::Value *one,
+        yir::Value *two, yir::Value *five, yir::Value *divisor) {
+        auto row_loop = std::make_unique<yir::ForOp>(
+            j_loop.induction_var(), j_loop.lower_bound(), two, j_loop.step());
+        row_loop->set_parent(&parent);
+
+        auto &row_body = row_loop->body_region();
+        row_body.operations().push_back(make_parented_op<yir::AssignOp>(
+            row_body, k_loop.induction_var(), k_loop.lower_bound()));
+        auto carry = make_parented_op<yir::VarOp>(
+            row_body, yir::Type::get_i32(), one,
+            storage_temp_name("peel.carry", next_storage_temp_++));
+        auto *carry_value = carry->result();
+        row_body.operations().push_back(std::move(carry));
+
+        auto peeled_k_loop = std::make_unique<yir::ForOp>(
+            k_loop.induction_var(), k_loop.lower_bound(), k_loop.upper_bound(),
+            k_loop.step());
+        peeled_k_loop->set_parent(&row_body);
+        append_contracted_j1_update(peeled_k_loop->body_region(), xbuf, cur, prev,
+                                    j_loop.induction_var(), k_loop.induction_var(),
+                                    carry_value, five, divisor);
+        row_body.operations().push_back(std::move(peeled_k_loop));
+        return row_loop;
+    }
+
+    bool rewrite_contracted_bulk_j_loop(
+        yir::ForOp &j_loop, yir::ForOp &k_loop, yir::Value *xbuf, yir::Value *cur,
+        yir::Value *prev, yir::Value *one, yir::Value *two, yir::Value *three,
+        yir::Value *five, yir::Value *divisor, yir::Value *original_k_lower) {
+        auto *j_body = &j_loop.body_region();
+        std::size_t k_loop_index = 0;
+        if (!find_operation_index(*j_body, k_loop, k_loop_index)) {
+            return false;
+        }
+
+        auto &ops = j_body->operations();
+        auto moved_k_loop = std::move(ops[k_loop_index]);
+        ops.clear();
+        auto *bulk_k_loop = dynamic_cast<yir::ForOp *>(moved_k_loop.get());
+        if (bulk_k_loop == nullptr) {
+            return false;
+        }
+        bulk_k_loop->operands()[1] = two;
+        bulk_k_loop->set_parent(j_body);
+
+        j_body->operations().push_back(make_parented_op<yir::AssignOp>(
+            *j_body, k_loop.induction_var(), original_k_lower));
+        auto j_minus_one = make_parented_op<yir::SubIOp>(
+            *j_body, j_loop.induction_var(), one,
+            storage_temp_name("peel.jm1", next_storage_temp_++));
+        auto *j_minus_one_value = j_minus_one->result();
+        j_body->operations().push_back(std::move(j_minus_one));
+        auto carry = make_parented_op<yir::VarOp>(
+            *j_body, yir::Type::get_i32(), one,
+            storage_temp_name("peel.carry", next_storage_temp_++));
+        auto *carry_value = carry->result();
+        j_body->operations().push_back(std::move(carry));
+        append_contracted_k1_update(*j_body, xbuf, cur, prev, j_loop.induction_var(),
+                                    j_minus_one_value, original_k_lower, carry_value, five,
+                                    divisor);
+
+        bulk_k_loop->body_region().operations().clear();
+        append_contracted_bulk_update(bulk_k_loop->body_region(), xbuf, cur, prev,
+                                      j_loop.induction_var(), j_minus_one_value,
+                                      k_loop.induction_var(), carry_value, one, three,
+                                      divisor);
+        j_body->operations().push_back(std::move(moved_k_loop));
+        return true;
+    }
+
+    bool apply_contracted_boundary_peeling(yir::ForOp &j_loop, yir::ForOp &k_loop,
+                                           yir::Value *xbuf, yir::Value *cur,
+                                           yir::Value *prev, yir::Value *one) {
+        ContractedBoundaryKernel kernel;
+        if (!match_contracted_boundary_kernel(j_loop, k_loop, xbuf, cur, prev, kernel)) {
+            return false;
+        }
+
+        auto *i_body = j_loop.parent();
+        auto *original_k_lower = k_loop.lower_bound();
+        std::size_t j_loop_index = 0;
+        if (i_body == nullptr || !find_operation_index(*i_body, j_loop, j_loop_index)) {
+            return false;
+        }
+
+        std::size_t insert_pos = j_loop_index;
+        auto *two = insert_op_before<yir::ConstI32Op>(
+                        *i_body, insert_pos, 2,
+                        storage_temp_name("peel.two", next_storage_temp_++))
+                        ->result();
+        auto *three = insert_op_before<yir::ConstI32Op>(
+                          *i_body, insert_pos, 3,
+                          storage_temp_name("peel.three", next_storage_temp_++))
+                          ->result();
+        auto *five = insert_op_before<yir::ConstI32Op>(
+                         *i_body, insert_pos, 5,
+                         storage_temp_name("peel.five", next_storage_temp_++))
+                         ->result();
+
+        insert_existing_op_before(
+            *i_body, insert_pos,
+            make_contracted_j1_loop(*i_body, j_loop, k_loop, xbuf, cur, prev, one,
+                                    two, five, kernel.divisor));
+        j_loop.operands()[1] = two;
+        if (!rewrite_contracted_bulk_j_loop(j_loop, k_loop, xbuf, cur, prev, one, two,
+                                            three, five, kernel.divisor,
+                                            original_k_lower)) {
+            return false;
+        }
+
+        ++num_boundary_peels_;
+        return true;
+    }
+
     bool rewrite_update_for_contracted_storage(const InitializationReduction &reduction,
                                                yir::Value *xbuf,
                                                yir::Value *row_mid,
@@ -3334,6 +3723,7 @@ private:
         if (!find_operation_index(*i_body, *j_loop, j_loop_index)) {
             return false;
         }
+        auto *output_copy_lower = k_loop->lower_bound();
 
         std::size_t insert_pos = 0;
         auto *two = insert_op_before<yir::ConstI32Op>(
@@ -3348,21 +3738,22 @@ private:
             storage_temp_name("prev", next_storage_temp_++))->result();
 
         j_loop_index += insert_pos;
-        insert_current_plane_boundary_resets(*i_body, j_loop_index, xbuf, cur, one,
-                                             init_j_lower, init_k_lower,
-                                             j_loop->lower_bound(), k_loop->lower_bound(),
-                                             j_loop->upper_bound(), k_loop->upper_bound(),
-                                             j_loop->step(), k_loop->step());
 
         if (!rewrite_region_accesses_to_xbuf(i_loop->body_region(), memory, xbuf,
                                              i_loop->induction_var(), cur, prev)) {
             return false;
         }
+        if (!apply_contracted_boundary_peeling(*j_loop, *k_loop, xbuf, cur, prev, one)) {
+            insert_current_plane_boundary_resets(*i_body, j_loop_index, xbuf, cur, one,
+                                                 init_j_lower, init_k_lower,
+                                                 j_loop->lower_bound(), k_loop->lower_bound(),
+                                                 j_loop->upper_bound(), k_loop->upper_bound(),
+                                                 j_loop->step(), k_loop->step());
+        }
         if (!append_output_row_capture(reduction, xbuf, row_mid, row_last, cur,
-                                       init_k_upper)) {
+                                       init_k_upper, output_copy_lower)) {
             return false;
         }
-        apply_contracted_spatial_blocking(ContractedSpatialBlock{j_loop, k_loop});
         return true;
     }
 
@@ -3638,7 +4029,8 @@ private:
     bool append_output_row_capture(const InitializationReduction &reduction,
                                    yir::Value *xbuf, yir::Value *row_mid,
                                    yir::Value *row_last, yir::Value *cur,
-                                   yir::Value *output_length) {
+                                   yir::Value *output_length,
+                                   yir::Value *output_copy_lower) {
         auto *i_loop = reduction.proof.update_loops.outer_to_inner[0];
         auto *j_loop = reduction.proof.update_loops.outer_to_inner[1];
         auto *k_loop = reduction.proof.update_loops.outer_to_inner[2];
@@ -3674,7 +4066,8 @@ private:
 
         auto *copy_upper = k_loop->upper_bound();
         auto *step = k_loop->step();
-        auto *copy_lower = k_loop->lower_bound();
+        auto *copy_lower = output_copy_lower == nullptr ? k_loop->lower_bound()
+                                                        : output_copy_lower;
         std::size_t insert_pos = j_loop_index + 1;
         append_guarded_i_row_copy(*i_body, insert_pos, xbuf, row_mid, cur,
                                   i_loop->induction_var(), half, half,
@@ -4281,6 +4674,7 @@ private:
     std::size_t num_initialization_reductions_;
     std::size_t num_storage_contractions_;
     std::size_t num_spatial_blocks_;
+    std::size_t num_boundary_peels_;
     std::size_t num_affine_replacements_;
     std::size_t num_nearest_write_queries_;
     std::size_t num_nearest_queries_;
@@ -4348,6 +4742,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", initialization_reductions=" << transformer.num_initialization_reductions()
         << ", storage_contractions=" << transformer.num_storage_contractions()
         << ", spatial_blocks=" << transformer.num_spatial_blocks()
+        << ", boundary_peels=" << transformer.num_boundary_peels()
         << ", affine_replacements=" << transformer.num_affine_replacements()
         << ", nearest_write_queries=" << transformer.num_nearest_write_queries()
         << ", nearest_queries=" << transformer.num_nearest_queries()
