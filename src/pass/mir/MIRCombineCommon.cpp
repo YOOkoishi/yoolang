@@ -69,9 +69,11 @@ bool is_pure_def(mir::Opcode opcode) {
     case mir::Opcode::AddW:
     case mir::Opcode::AddI:
     case mir::Opcode::AddIW:
+    case mir::Opcode::Sub:
     case mir::Opcode::SubW:
     case mir::Opcode::Mul:
     case mir::Opcode::MulW:
+    case mir::Opcode::DivU:
     case mir::Opcode::DivW:
     case mir::Opcode::RemW:
     case mir::Opcode::And:
@@ -80,10 +82,12 @@ bool is_pure_def(mir::Opcode opcode) {
     case mir::Opcode::SllIW:
     case mir::Opcode::SraI:
     case mir::Opcode::SraIW:
+    case mir::Opcode::Srli:
     case mir::Opcode::SrliW:
     case mir::Opcode::Xor:
     case mir::Opcode::XorI:
     case mir::Opcode::Slt:
+    case mir::Opcode::Sltu:
     case mir::Opcode::SeqZ:
     case mir::Opcode::Snez:
     case mir::Opcode::FeqS:

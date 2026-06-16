@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -31,6 +32,19 @@ struct DefUseInfo {
 struct MoveLoc {
     Block *block = nullptr;
     std::size_t index = 0;
+};
+
+struct DivLoc {
+    Block *block = nullptr;
+    std::size_t index = 0;
+};
+
+struct DivReciprocal {
+    mir::Register divisor32;
+    mir::Register abs_divisor;
+    mir::Register magic;
+    mir::Register zero_mask;
+    mir::Register neg_one;
 };
 
 bool contains(const BlockSet &blocks, Block *block) {
@@ -224,6 +238,7 @@ bool is_licm_candidate(mir::Opcode opcode) {
     case mir::Opcode::AddW:
     case mir::Opcode::AddI:
     case mir::Opcode::AddIW:
+    case mir::Opcode::Sub:
     case mir::Opcode::SubW:
     case mir::Opcode::Mul:
     case mir::Opcode::MulW:
@@ -233,10 +248,12 @@ bool is_licm_candidate(mir::Opcode opcode) {
     case mir::Opcode::SllIW:
     case mir::Opcode::SraI:
     case mir::Opcode::SraIW:
+    case mir::Opcode::Srli:
     case mir::Opcode::SrliW:
     case mir::Opcode::Xor:
     case mir::Opcode::XorI:
     case mir::Opcode::Slt:
+    case mir::Opcode::Sltu:
     case mir::Opcode::SeqZ:
     case mir::Opcode::Snez:
         return true;
@@ -255,6 +272,35 @@ bool loop_contains_call(const Loop &loop) {
     }
     return false;
 }
+
+mir::Register create_gpr(mir::MachineFunction &function,
+                         mir::ValueType type = mir::ValueType::I32) {
+    return function.regs().create_virtual(mir::RegisterClass::GPR, type);
+}
+
+mir::Register create_gpr64(mir::MachineFunction &function) {
+    return create_gpr(function, mir::ValueType::Ptr);
+}
+
+mir::Register zero_reg() {
+    return mir::Register::physical("zero", mir::RegisterClass::GPR);
+}
+
+mir::MachineOperand def(mir::Register reg) {
+    return mir::MachineOperand::reg_def(reg);
+}
+
+mir::MachineOperand use(mir::Register reg) {
+    return mir::MachineOperand::reg_use(reg);
+}
+
+mir::MachineOperand imm(std::int64_t value) {
+    return mir::MachineOperand::imm(value);
+}
+
+bool operand_available_in_preheader(const DefUseInfo &info,
+                                    const std::map<Block *, BlockSet> &dom, const Loop &loop,
+                                    Block *preheader, const mir::MachineOperand &operand);
 
 DefUseInfo collect_def_use_info(mir::MachineFunction &function) {
     DefUseInfo info;
@@ -276,6 +322,190 @@ DefUseInfo collect_def_use_info(mir::MachineFunction &function) {
         }
     }
     return info;
+}
+
+std::vector<DivLoc> collect_loop_divisions(const Loop &loop, const DefUseInfo &info,
+                                           const std::map<Block *, BlockSet> &dom,
+                                           Block *preheader, mir::Register *divisor) {
+    std::vector<DivLoc> divs;
+    std::optional<mir::Register> candidate_divisor;
+
+    for (auto *block : loop.blocks) {
+        const auto &instrs = block->instructions();
+        for (std::size_t index = 0; index < instrs.size(); ++index) {
+            const auto &instr = instrs[index];
+            if (instr.opcode() != mir::Opcode::DivW) {
+                continue;
+            }
+
+            const auto &ops = instr.operands();
+            if (ops.size() < 3 || !ops[0].is_reg() || !ops[1].is_reg() || !ops[2].is_reg() ||
+                !ops[0].is_def() || !ops[1].is_use() || !ops[2].is_use() ||
+                !ops[0].reg_value().is_virtual()) {
+                return {};
+            }
+
+            const auto &rhs = ops[2].reg_value();
+            if (rhs.is_physical()) {
+                return {};
+            }
+            if (!operand_available_in_preheader(info, dom, loop, preheader, ops[2])) {
+                return {};
+            }
+            if (candidate_divisor && !same_reg(*candidate_divisor, rhs)) {
+                return {};
+            }
+            candidate_divisor = rhs;
+            divs.push_back({block, index});
+        }
+    }
+
+    if (!candidate_divisor || divs.empty()) {
+        return {};
+    }
+    *divisor = *candidate_divisor;
+    return divs;
+}
+
+DivReciprocal insert_divisor_reciprocal_setup(mir::MachineFunction &function, Block *preheader,
+                                              mir::Register divisor) {
+    DivReciprocal rec;
+    rec.divisor32 = create_gpr(function);
+    auto sign = create_gpr64(function);
+    auto abs_xor = create_gpr64(function);
+    rec.abs_divisor = create_gpr64(function);
+    auto numerator = create_gpr64(function);
+    rec.magic = create_gpr64(function);
+    auto zero_flag = create_gpr(function);
+    rec.zero_mask = create_gpr64(function);
+    rec.neg_one = create_gpr64(function);
+
+    std::vector<mir::MachineInstr> setup;
+    setup.reserve(9);
+    setup.emplace_back(mir::Opcode::AddIW, std::vector<mir::MachineOperand>{
+                                             def(rec.divisor32), use(divisor), imm(0)});
+    setup.emplace_back(mir::Opcode::SraI, std::vector<mir::MachineOperand>{
+                                            def(sign), use(rec.divisor32), imm(31)});
+    setup.emplace_back(mir::Opcode::Xor, std::vector<mir::MachineOperand>{
+                                           def(abs_xor), use(rec.divisor32), use(sign)});
+    setup.emplace_back(mir::Opcode::Sub, std::vector<mir::MachineOperand>{
+                                           def(rec.abs_divisor), use(abs_xor), use(sign)});
+    setup.emplace_back(mir::Opcode::LoadImm, std::vector<mir::MachineOperand>{
+                                               def(numerator), imm(0x100000000LL)});
+    setup.emplace_back(mir::Opcode::DivU, std::vector<mir::MachineOperand>{
+                                            def(rec.magic), use(numerator), use(rec.abs_divisor)});
+    setup.emplace_back(mir::Opcode::SeqZ, std::vector<mir::MachineOperand>{
+                                            def(zero_flag), use(rec.divisor32)});
+    setup.emplace_back(mir::Opcode::Sub, std::vector<mir::MachineOperand>{
+                                           def(rec.zero_mask), use(zero_reg()), use(zero_flag)});
+    setup.emplace_back(mir::Opcode::LoadImm, std::vector<mir::MachineOperand>{
+                                               def(rec.neg_one), imm(-1)});
+
+    auto insert = insertion_point(preheader);
+    preheader->instructions().insert(insert, setup.begin(), setup.end());
+    return rec;
+}
+
+std::vector<mir::MachineInstr> make_div_reciprocal_sequence(mir::MachineFunction &function,
+                                                            const mir::MachineInstr &div,
+                                                            const DivReciprocal &rec) {
+    const auto &ops = div.operands();
+    const auto dst = ops[0].reg_value();
+    const auto numerator = ops[1].reg_value();
+
+    auto numerator32 = create_gpr(function);
+    auto sign_n = create_gpr64(function);
+    auto abs_n_xor = create_gpr64(function);
+    auto abs_n = create_gpr64(function);
+    auto product = create_gpr64(function);
+    auto q0 = create_gpr64(function);
+    auto q_product = create_gpr64(function);
+    auto rem = create_gpr64(function);
+    auto rem_lt_divisor = create_gpr(function);
+    auto needs_correction = create_gpr(function);
+    auto q_abs = create_gpr64(function);
+    auto sign_xor = create_gpr(function);
+    auto sign_q = create_gpr64(function);
+    auto signed_xor = create_gpr64(function);
+    auto signed64 = create_gpr64(function);
+    auto signed32 = create_gpr(function);
+    auto zero_xor = create_gpr64(function);
+    auto zero_adjust = create_gpr64(function);
+
+    std::vector<mir::MachineInstr> seq;
+    seq.reserve(19);
+    seq.emplace_back(mir::Opcode::AddIW, std::vector<mir::MachineOperand>{
+                                             def(numerator32), use(numerator), imm(0)});
+    seq.emplace_back(mir::Opcode::SraI, std::vector<mir::MachineOperand>{
+                                            def(sign_n), use(numerator32), imm(31)});
+    seq.emplace_back(mir::Opcode::Xor, std::vector<mir::MachineOperand>{
+                                           def(abs_n_xor), use(numerator32), use(sign_n)});
+    seq.emplace_back(mir::Opcode::Sub, std::vector<mir::MachineOperand>{
+                                           def(abs_n), use(abs_n_xor), use(sign_n)});
+    seq.emplace_back(mir::Opcode::Mul, std::vector<mir::MachineOperand>{
+                                           def(product), use(abs_n), use(rec.magic)});
+    seq.emplace_back(mir::Opcode::Srli, std::vector<mir::MachineOperand>{
+                                            def(q0), use(product), imm(32)});
+    seq.emplace_back(mir::Opcode::Mul, std::vector<mir::MachineOperand>{
+                                           def(q_product), use(q0), use(rec.abs_divisor)});
+    seq.emplace_back(mir::Opcode::Sub, std::vector<mir::MachineOperand>{
+                                           def(rem), use(abs_n), use(q_product)});
+    seq.emplace_back(mir::Opcode::Sltu, std::vector<mir::MachineOperand>{
+                                            def(rem_lt_divisor), use(rem), use(rec.abs_divisor)});
+    seq.emplace_back(mir::Opcode::XorI, std::vector<mir::MachineOperand>{
+                                            def(needs_correction), use(rem_lt_divisor), imm(1)});
+    seq.emplace_back(mir::Opcode::Add, std::vector<mir::MachineOperand>{
+                                           def(q_abs), use(q0), use(needs_correction)});
+    seq.emplace_back(mir::Opcode::Xor, std::vector<mir::MachineOperand>{
+                                           def(sign_xor), use(numerator32), use(rec.divisor32)});
+    seq.emplace_back(mir::Opcode::SraI, std::vector<mir::MachineOperand>{
+                                            def(sign_q), use(sign_xor), imm(31)});
+    seq.emplace_back(mir::Opcode::Xor, std::vector<mir::MachineOperand>{
+                                           def(signed_xor), use(q_abs), use(sign_q)});
+    seq.emplace_back(mir::Opcode::Sub, std::vector<mir::MachineOperand>{
+                                           def(signed64), use(signed_xor), use(sign_q)});
+    seq.emplace_back(mir::Opcode::AddW, std::vector<mir::MachineOperand>{
+                                            def(signed32), use(signed64), use(zero_reg())});
+    seq.emplace_back(mir::Opcode::Xor, std::vector<mir::MachineOperand>{
+                                           def(zero_xor), use(signed32), use(rec.neg_one)});
+    seq.emplace_back(mir::Opcode::And, std::vector<mir::MachineOperand>{
+                                           def(zero_adjust), use(zero_xor), use(rec.zero_mask)});
+    seq.emplace_back(mir::Opcode::Xor, std::vector<mir::MachineOperand>{
+                                           def(dst), use(signed32), use(zero_adjust)});
+    return seq;
+}
+
+bool reduce_loop_divisions(mir::MachineFunction &function, const Loop &loop,
+                           const std::map<Block *, BlockSet> &dom, Stats &stats) {
+    if (loop_contains_call(loop)) {
+        return false;
+    }
+    auto *preheader = find_preheader(loop);
+    if (preheader == nullptr) {
+        return false;
+    }
+
+    auto info = collect_def_use_info(function);
+    mir::Register divisor;
+    auto divs = collect_loop_divisions(loop, info, dom, preheader, &divisor);
+    if (divs.empty()) {
+        return false;
+    }
+
+    auto reciprocal = insert_divisor_reciprocal_setup(function, preheader, divisor);
+    for (auto it = divs.rbegin(); it != divs.rend(); ++it) {
+        auto &instrs = it->block->instructions();
+        if (it->index >= instrs.size()) {
+            continue;
+        }
+        auto replacement = make_div_reciprocal_sequence(function, instrs[it->index], reciprocal);
+        auto pos = instrs.begin() + static_cast<std::ptrdiff_t>(it->index);
+        pos = instrs.erase(pos);
+        instrs.insert(pos, replacement.begin(), replacement.end());
+    }
+
+    stats.arithmetic += static_cast<unsigned>(divs.size());
+    return true;
 }
 
 bool all_uses_inside_loop(const DefUseInfo &info, const mir::Register &reg, const Loop &loop) {
@@ -412,6 +642,14 @@ bool hoist_loop_invariants(mir::MachineFunction &function, bool post_ra, Stats &
     auto loops = collect_loops(function, dom);
 
     bool changed = false;
+    auto div_loops = loops;
+    std::sort(div_loops.begin(), div_loops.end(), [](const Loop &lhs, const Loop &rhs) {
+        return lhs.blocks.size() > rhs.blocks.size();
+    });
+    for (const auto &loop : div_loops) {
+        changed |= reduce_loop_divisions(function, loop, dom, stats);
+    }
+
     for (const auto &loop : loops) {
         changed |= hoist_from_loop(function, loop, dom, stats);
     }

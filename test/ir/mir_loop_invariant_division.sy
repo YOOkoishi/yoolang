@@ -1,0 +1,28 @@
+// RUN: %compiler --emit-mir-stage=pre-ra -O1 %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+
+int loop_div(int n, int d) {
+  int i = 0;
+  int sum = 0;
+  while (i < n) {
+    sum = sum + (i * 17 - 33) / d;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return loop_div(getint(), getint());
+}
+
+// MIR-LABEL: func @loop_div
+// MIR: DIVU
+// MIR: SRLI
+// MIR: SLTU
+// MIR-NOT: DIVW
+
+// ASM-LABEL: loop_div:
+// ASM: divu
+// ASM: srli
+// ASM: sltu
+// ASM-NOT: divw

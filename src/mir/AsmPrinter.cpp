@@ -183,6 +183,10 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\taddiw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";
         break;
+    case Opcode::Sub:
+        out_ << "\tsub " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
     case Opcode::SubW:
         out_ << "\tsubw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].string_value() << "\n";
@@ -193,6 +197,10 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         break;
     case Opcode::MulW:
         out_ << "\tmulw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
+    case Opcode::DivU:
+        out_ << "\tdivu " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].string_value() << "\n";
         break;
     case Opcode::DivW:
@@ -227,6 +235,10 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\tsraiw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";
         break;
+    case Opcode::Srli:
+        out_ << "\tsrli " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].int_value() << "\n";
+        break;
     case Opcode::SrliW:
         out_ << "\tsrliw " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].int_value() << "\n";
@@ -241,6 +253,10 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         break;
     case Opcode::Slt:
         out_ << "\tslt " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
+             << ops[2].string_value() << "\n";
+        break;
+    case Opcode::Sltu:
+        out_ << "\tsltu " << ops[0].string_value() << ", " << ops[1].string_value() << ", "
              << ops[2].string_value() << "\n";
         break;
     case Opcode::SeqZ:

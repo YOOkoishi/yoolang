@@ -120,6 +120,7 @@ unsigned opcode_latency(mir::Opcode opcode) {
     case mir::Opcode::FmvWX:
         return 3;
     case mir::Opcode::DivW:
+    case mir::Opcode::DivU:
     case mir::Opcode::RemW:
         return 12;
     case mir::Opcode::FDivS:

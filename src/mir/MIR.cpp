@@ -748,12 +748,16 @@ const char *opcode_name(Opcode opcode) {
         return "ADDI";
     case Opcode::AddIW:
         return "ADDIW";
+    case Opcode::Sub:
+        return "SUB";
     case Opcode::SubW:
         return "SUBW";
     case Opcode::Mul:
         return "MUL";
     case Opcode::MulW:
         return "MULW";
+    case Opcode::DivU:
+        return "DIVU";
     case Opcode::DivW:
         return "DIVW";
     case Opcode::RemW:
@@ -770,6 +774,8 @@ const char *opcode_name(Opcode opcode) {
         return "SRAI";
     case Opcode::SraIW:
         return "SRAIW";
+    case Opcode::Srli:
+        return "SRLI";
     case Opcode::SrliW:
         return "SRLIW";
     case Opcode::Xor:
@@ -778,6 +784,8 @@ const char *opcode_name(Opcode opcode) {
         return "XORI";
     case Opcode::Slt:
         return "SLT";
+    case Opcode::Sltu:
+        return "SLTU";
     case Opcode::SeqZ:
         return "SEQZ";
     case Opcode::Snez:
