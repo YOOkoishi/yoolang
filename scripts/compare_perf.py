@@ -565,27 +565,39 @@ def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, object]:
 
 def _run_qemu(exe: Path, input_file: Optional[Path]) -> tuple[bool, float, str, str, Optional[int], str]:
     stdin_data = input_file.read_bytes() if input_file and input_file.exists() else None
-    start = time.perf_counter()
-    try:
-        result = subprocess.run(
-            [QEMU_BIN, "-L", "/usr/riscv64-linux-gnu", str(exe)],
-            input=stdin_data,
-            capture_output=True,
-            text=False,
-            timeout=TIMEOUT_SEC,
-            check=False,
-        )
-        elapsed = time.perf_counter() - start
-        stdout = result.stdout.decode(errors="replace") if result.stdout else ""
-        stderr = result.stderr.decode(errors="replace") if result.stderr else ""
-        ok = result.returncode == 0
-        return ok, elapsed, stdout, stderr, result.returncode, "OK" if ok else f"exit={result.returncode}"
-    except subprocess.TimeoutExpired:
-        elapsed = time.perf_counter() - start
-        return False, elapsed, "", "", None, "TIMEOUT"
-    except Exception as exc:  # pragma: no cover
-        elapsed = time.perf_counter() - start
-        return False, elapsed, "", "", None, f"ERR: {exc}"
+    times = []
+    last_result = None
+
+    for _ in range(3):
+        start = time.perf_counter()
+        try:
+            result = subprocess.run(
+                [QEMU_BIN, "-L", "/usr/riscv64-linux-gnu", str(exe)],
+                input=stdin_data,
+                capture_output=True,
+                text=False,
+                timeout=TIMEOUT_SEC,
+                check=False,
+            )
+            elapsed = time.perf_counter() - start
+            times.append(elapsed)
+            last_result = result
+            if result.returncode != 0:
+                break
+        except subprocess.TimeoutExpired:
+            elapsed = time.perf_counter() - start
+            return False, elapsed, "", "", None, "TIMEOUT"
+        except Exception as exc:  # pragma: no cover
+            elapsed = time.perf_counter() - start
+            return False, elapsed, "", "", None, f"ERR: {exc}"
+
+    times.sort()
+    median_elapsed = times[len(times) // 2]
+
+    stdout = last_result.stdout.decode(errors="replace") if last_result.stdout else ""
+    stderr = last_result.stderr.decode(errors="replace") if last_result.stderr else ""
+    ok = last_result.returncode == 0
+    return ok, median_elapsed, stdout, stderr, last_result.returncode, "OK" if ok else f"exit={last_result.returncode}"
 
 
 def _expected_input(case: Path) -> Optional[Path]:
