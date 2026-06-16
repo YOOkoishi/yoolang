@@ -149,6 +149,23 @@ bool clone_wave_unroll_region_into(const yir::Region &source, yir::Region &dest,
     return true;
 }
 
+bool clone_wave_unroll_region_into(const yir::Region &source, yir::Region &dest,
+                                   ValueMap map, ValueMap &out_map) {
+    for (const auto &op : source.operations()) {
+        auto clone = clone_wave_unroll_op(*op, map);
+        if (clone == nullptr) {
+            return false;
+        }
+        clone->set_parent(&dest);
+        if (op->result() != nullptr && clone->result() != nullptr) {
+            map[op->result()] = clone->result();
+        }
+        dest.operations().push_back(std::move(clone));
+    }
+    out_map = std::move(map);
+    return true;
+}
+
 std::unique_ptr<yir::Operation> clone_wave_unroll_op(const yir::Operation &op,
                                                      const ValueMap &map) {
     if (auto *constant = dynamic_cast<const yir::ConstI32Op *>(&op)) {
@@ -3701,6 +3718,99 @@ private:
         return true;
     }
 
+    bool replace_contracted_plane_loads_with_value(yir::Region &region,
+                                                   yir::Value *xbuf,
+                                                   yir::Value *plane,
+                                                   yir::Value *replacement) {
+        bool changed = false;
+        auto &ops = region.operations();
+        for (std::size_t i = 0; i < ops.size();) {
+            if (auto *load = dynamic_cast<yir::ArrayLoadOp *>(ops[i].get())) {
+                auto indices = load->indices();
+                if (load->array() == xbuf && indices.size() == 3 &&
+                    indices[0] == plane) {
+                    replace_value_after(region, i + 1, load->result(), replacement);
+                    ops.erase(ops.begin() + static_cast<std::ptrdiff_t>(i));
+                    changed = true;
+                    continue;
+                }
+            }
+
+            if (auto *if_op = dynamic_cast<yir::IfOp *>(ops[i].get())) {
+                changed |= replace_contracted_plane_loads_with_value(
+                    if_op->then_region(), xbuf, plane, replacement);
+                if (if_op->has_else()) {
+                    changed |= replace_contracted_plane_loads_with_value(
+                        if_op->else_region(), xbuf, plane, replacement);
+                }
+            } else if (auto *while_op = dynamic_cast<yir::WhileOp *>(ops[i].get())) {
+                changed |= replace_contracted_plane_loads_with_value(
+                    while_op->cond_region(), xbuf, plane, replacement);
+                changed |= replace_contracted_plane_loads_with_value(
+                    while_op->body_region(), xbuf, plane, replacement);
+            } else if (auto *for_op = dynamic_cast<yir::ForOp *>(ops[i].get())) {
+                changed |= replace_contracted_plane_loads_with_value(
+                    for_op->body_region(), xbuf, plane, replacement);
+            }
+            ++i;
+        }
+        return changed;
+    }
+
+    bool apply_contracted_first_plane_split(yir::ForOp &i_loop, yir::Value *xbuf,
+                                            yir::Value *prev, yir::Value *one) {
+        auto *parent = i_loop.parent();
+        std::size_t i_loop_index = 0;
+        if (parent == nullptr || xbuf == nullptr || prev == nullptr || one == nullptr ||
+            !loop_has_unit_step(i_loop) ||
+            !find_operation_index(*parent, i_loop, i_loop_index)) {
+            return false;
+        }
+
+        auto *first_lower = i_loop.lower_bound();
+        auto *first_upper = i_loop.upper_bound();
+        auto *step = i_loop.step();
+        std::size_t insert_pos = i_loop_index;
+        auto *split_upper_op = insert_op_before<yir::VarOp>(
+            *parent, insert_pos, yir::Type::get_i32(), first_lower,
+            storage_temp_name("first.upper", next_storage_temp_++));
+        auto *split_upper = split_upper_op->result();
+        auto *has_first = insert_op_before<yir::ICmpOp>(
+            *parent, insert_pos, yir::ICmpOp::Predicate::Lt, first_lower, first_upper,
+            storage_temp_name("first.has", next_storage_temp_++));
+        auto *guard = insert_op_before<yir::IfOp>(*parent, insert_pos,
+                                                 has_first->result());
+        auto next = make_parented_op<yir::AddIOp>(
+            guard->then_region(), first_lower, step,
+            storage_temp_name("first.next", next_storage_temp_++));
+        auto *next_value = next->result();
+        guard->then_region().operations().push_back(std::move(next));
+        guard->then_region().operations().push_back(make_parented_op<yir::AssignOp>(
+            guard->then_region(), split_upper, next_value));
+
+        auto first_loop = std::make_unique<yir::ForOp>(
+            i_loop.induction_var(), first_lower, split_upper, step);
+        first_loop->set_parent(parent);
+        first_loop->set_parallel(i_loop.is_parallel());
+
+        ValueMap clone_map;
+        if (!clone_wave_unroll_region_into(i_loop.body_region(),
+                                           first_loop->body_region(), {}, clone_map)) {
+            return false;
+        }
+        auto prev_it = clone_map.find(prev);
+        auto one_it = clone_map.find(one);
+        if (prev_it == clone_map.end() || one_it == clone_map.end() ||
+            !replace_contracted_plane_loads_with_value(first_loop->body_region(), xbuf,
+                                                       prev_it->second, one_it->second)) {
+            return false;
+        }
+
+        insert_existing_op_before(*parent, insert_pos, std::move(first_loop));
+        i_loop.operands()[1] = split_upper;
+        return true;
+    }
+
     bool rewrite_update_for_contracted_storage(const InitializationReduction &reduction,
                                                yir::Value *xbuf,
                                                yir::Value *row_mid,
@@ -3743,7 +3853,9 @@ private:
                                              i_loop->induction_var(), cur, prev)) {
             return false;
         }
-        if (!apply_contracted_boundary_peeling(*j_loop, *k_loop, xbuf, cur, prev, one)) {
+        const bool peeled_boundaries =
+            apply_contracted_boundary_peeling(*j_loop, *k_loop, xbuf, cur, prev, one);
+        if (!peeled_boundaries) {
             insert_current_plane_boundary_resets(*i_body, j_loop_index, xbuf, cur, one,
                                                  init_j_lower, init_k_lower,
                                                  j_loop->lower_bound(), k_loop->lower_bound(),
@@ -3752,6 +3864,10 @@ private:
         }
         if (!append_output_row_capture(reduction, xbuf, row_mid, row_last, cur,
                                        init_k_upper, output_copy_lower)) {
+            return false;
+        }
+        if (peeled_boundaries &&
+            !apply_contracted_first_plane_split(*i_loop, xbuf, prev, one)) {
             return false;
         }
         return true;

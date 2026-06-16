@@ -57,10 +57,16 @@ int main() {
 
 // YIR: yir.global @poly.storage.xbuf : array<2 x array<8 x array<8 x i32>>> = zero
 // YIR-NOT: yir.global @x
+// YIR: [[FIRSTUP:%poly.storage.first.upper[0-9]+]] = yir.var : i32 =
+// YIR: [[FIRSTHAS:%poly.storage.first.has[0-9]+]] = yir.icmp lt
+// YIR: yir.if [[FIRSTHAS]]
+// YIR: yir.assign [[FIRSTUP]],
 // YIR: [[PEELTWO:%poly.storage.peel.two[0-9]+]] = yir.const.i32 2 : i32
 // YIR: [[PEELTHREE:%poly.storage.peel.three[0-9]+]] = yir.const.i32 3 : i32
 // YIR: [[PEELFIVE:%poly.storage.peel.five[0-9]+]] = yir.const.i32 5 : i32
-// YIR: yir.for %i =
+// YIR: yir.for %i = {{.*}} to [[FIRSTUP]]
+// YIR-NOT: yir.array_load @poly.storage.xbuf, {{.*}}%poly.storage.prev
+// YIR: yir.for %i = [[FIRSTUP]]
 // YIR-NOT: poly.storage.reset
 // YIR: yir.for %j = {{.*}} to [[PEELTWO]]
 // YIR: [[J1CARRY:%poly.storage.peel.carry[0-9]+]] = yir.var : i32 =
