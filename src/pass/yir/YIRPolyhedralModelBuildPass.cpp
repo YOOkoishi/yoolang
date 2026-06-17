@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace pass {
@@ -132,8 +133,10 @@ public:
             PolyScop poly_scop;
             poly_scop.id = scop.id;
 
+            std::unordered_set<const yir::Value*> params;
             for (auto* sym : scop.symbols) {
                 poly_scop.params.push_back(sym);
+                params.insert(sym);
             }
 
             for (const auto& stmt : scop.statements) {
@@ -144,7 +147,7 @@ public:
                 poly_stmt.lexical_id = stmt.id;
 
                 extract_domain(poly_stmt, stmt.enclosing_loops);
-                extract_accesses(*stmt.op, poly_stmt.reads, poly_stmt.writes);
+                extract_accesses(*stmt.op, params, poly_stmt.reads, poly_stmt.writes);
 
                 if (!poly_stmt.reads.empty() || !poly_stmt.writes.empty()) {
                     poly_scop.statements.push_back(std::move(poly_stmt));
@@ -172,16 +175,81 @@ private:
         }
     }
 
-    void extract_accesses(const yir::Operation& op, std::vector<PolyAccess>& reads,
-                          std::vector<PolyAccess>& writes) {
+    // Try to delinearize a flattened 1D access `e = high * stride + low` where `stride`
+    // is a SCoP parameter and `high`/`low` are independently affine in the loop IVs and
+    // symbols. On success, fills `out_dims` with [high_expr, low_expr] (high-order first)
+    // and returns true. Conservative — only handles a single stride factor. Used to
+    // recover `A[i*N + j]` as `A[i][j]`.
+    static bool try_delinearize_1d(const yir::Value* index,
+                                   const std::unordered_set<const yir::Value*>& params,
+                                   std::vector<PolyAffineExpr>& out_dims) {
+        if (index == nullptr || index->defining_op() == nullptr) {
+            return false;
+        }
+        auto* add = dynamic_cast<const yir::AddIOp*>(index->defining_op());
+        if (add == nullptr) {
+            return false;
+        }
+
+        const auto try_split = [&](const yir::Value* mul_side, const yir::Value* low_side) {
+            auto* mul = mul_side == nullptr
+                            ? nullptr
+                            : dynamic_cast<const yir::MulIOp*>(mul_side->defining_op());
+            if (mul == nullptr) {
+                return false;
+            }
+            const yir::Value* stride = nullptr;
+            const yir::Value* high_side = nullptr;
+            if (params.count(mul->lhs()) != 0) {
+                stride = mul->lhs();
+                high_side = mul->rhs();
+            } else if (params.count(mul->rhs()) != 0) {
+                stride = mul->rhs();
+                high_side = mul->lhs();
+            } else {
+                return false;
+            }
+
+            AffineExtractor extractor;
+            auto high_expr = extractor.extract(high_side);
+            auto low_expr = extractor.extract(low_side);
+            if (!high_expr.valid || !low_expr.valid) {
+                return false;
+            }
+
+            out_dims.clear();
+            out_dims.push_back(std::move(high_expr));
+            out_dims.push_back(std::move(low_expr));
+            (void)stride;
+            return true;
+        };
+
+        return try_split(add->lhs(), add->rhs()) || try_split(add->rhs(), add->lhs());
+    }
+
+    void extract_accesses(const yir::Operation& op,
+                          const std::unordered_set<const yir::Value*>& params,
+                          std::vector<PolyAccess>& reads, std::vector<PolyAccess>& writes) {
         AffineExtractor extractor;
+        const auto fill_indices = [&](const std::vector<yir::Value*>& index_values,
+                                      std::vector<PolyAffineExpr>& dest) {
+            if (index_values.size() == 1) {
+                std::vector<PolyAffineExpr> delinearized;
+                if (try_delinearize_1d(index_values.front(), params, delinearized)) {
+                    dest = std::move(delinearized);
+                    return;
+                }
+            }
+            for (auto* index_val : index_values) {
+                dest.push_back(extractor.extract(index_val));
+            }
+        };
+
         if (auto* load = dynamic_cast<const yir::ArrayLoadOp*>(&op)) {
             PolyAccess access;
             access.kind = PolyAccess::Kind::Read;
             access.memory = load->array();
-            for (auto* index_val : load->indices()) {
-                access.indices.push_back(extractor.extract(index_val));
-            }
+            fill_indices(load->indices(), access.indices);
             reads.push_back(std::move(access));
             return;
         }
@@ -190,9 +258,7 @@ private:
             PolyAccess access;
             access.kind = PolyAccess::Kind::Write;
             access.memory = store->array();
-            for (auto* index_val : store->indices()) {
-                access.indices.push_back(extractor.extract(index_val));
-            }
+            fill_indices(store->indices(), access.indices);
             writes.push_back(std::move(access));
         }
     }

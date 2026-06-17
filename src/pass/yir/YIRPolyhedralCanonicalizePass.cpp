@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -32,10 +33,11 @@ struct Stats {
     std::size_t invariants_hoisted = 0;
     std::size_t dead_ops_removed = 0;
     std::size_t symbols_detected = 0;
+    std::size_t guards_demoted = 0;
 
     bool changed() const {
         return loops_normalized != 0 || affine_operands_canonicalized != 0 ||
-               invariants_hoisted != 0 || dead_ops_removed != 0;
+               invariants_hoisted != 0 || dead_ops_removed != 0 || guards_demoted != 0;
     }
 
     std::string message() const {
@@ -44,7 +46,8 @@ struct Stats {
             << ", affine_operands_canonicalized=" << affine_operands_canonicalized
             << ", invariants_hoisted=" << invariants_hoisted
             << ", dead_ops_removed=" << dead_ops_removed
-            << ", symbols_detected=" << symbols_detected;
+            << ", symbols_detected=" << symbols_detected
+            << ", guards_demoted=" << guards_demoted;
         return oss.str();
     }
 };
@@ -722,11 +725,174 @@ class Canonicalizer final {
             } else if (auto *while_op = dynamic_cast<yir::WhileOp *>(ops[i].get())) {
                 normalize_loops(while_op->cond_region());
                 normalize_loops(while_op->body_region());
+                try_demote_continue_guard(*while_op);
                 try_normalize_while(ops, i);
             } else if (auto *for_op = dynamic_cast<yir::ForOp *>(ops[i].get())) {
                 normalize_loops(for_op->body_region());
             }
         }
+    }
+
+    bool try_demote_continue_guard(yir::WhileOp &while_op) {
+        auto &body_ops = while_op.body_region().operations();
+        if (body_ops.size() < 3) {
+            return false;
+        }
+
+        // Find the leading IfOp, allowing only pure prefix ops before it (typically
+        // the ICmp that produced the guard condition and any constants it consumes).
+        std::size_t guard_index = 0;
+        while (guard_index < body_ops.size()) {
+            if (dynamic_cast<yir::IfOp *>(body_ops[guard_index].get()) != nullptr) {
+                break;
+            }
+            if (!is_condition_pure_op(*body_ops[guard_index])) {
+                return false;
+            }
+            ++guard_index;
+        }
+        if (guard_index >= body_ops.size()) {
+            return false;
+        }
+        auto *guard_if = dynamic_cast<yir::IfOp *>(body_ops[guard_index].get());
+        if (guard_if == nullptr || guard_if->has_else()) {
+            return false;
+        }
+
+        auto *guard_icmp =
+            guard_if->condition() == nullptr
+                ? nullptr
+                : dynamic_cast<yir::ICmpOp *>(guard_if->condition()->defining_op());
+        if (guard_icmp == nullptr) {
+            return false;
+        }
+
+        // The guard then-arm must contain exactly: addi iv,step ; assign iv ; continue,
+        // optionally preceded by pure ops (e.g. a const.i32 step) that the latch uses.
+        auto &then_ops = guard_if->then_region().operations();
+        if (then_ops.size() < 3) {
+            return false;
+        }
+        if (dynamic_cast<yir::ContinueOp *>(then_ops.back().get()) == nullptr) {
+            return false;
+        }
+        const std::size_t then_count = then_ops.size();
+        auto *then_assign = dynamic_cast<yir::AssignOp *>(then_ops[then_count - 2].get());
+        auto *then_add = dynamic_cast<yir::AddIOp *>(then_ops[then_count - 3].get());
+        if (then_assign == nullptr || then_add == nullptr ||
+            then_assign->value()->defining_op() != then_add) {
+            return false;
+        }
+        for (std::size_t k = 0; k + 3 < then_count; ++k) {
+            if (!is_condition_pure_op(*then_ops[k])) {
+                return false;
+            }
+        }
+        yir::Value *iv = then_assign->target();
+        if (iv == nullptr) {
+            return false;
+        }
+        yir::Value *guard_step = nullptr;
+        if (then_add->lhs() == iv) {
+            guard_step = then_add->rhs();
+        } else if (then_add->rhs() == iv) {
+            guard_step = then_add->lhs();
+        } else {
+            return false;
+        }
+
+        // The body must end in the same shape latch on the same iv.
+        LatchInfo body_latch;
+        if (!find_positive_latch_update(while_op.body_region(), iv, body_latch)) {
+            return false;
+        }
+
+        // Step values must be the same constant.
+        AffineParser parser({&while_op.cond_region(), &while_op.body_region()});
+        auto guard_step_expr = parser.parse(guard_step);
+        auto body_step_expr = parser.parse(body_latch.step);
+        if (!guard_step_expr.valid || !body_step_expr.valid ||
+            !guard_step_expr.terms.empty() || !body_step_expr.terms.empty() ||
+            guard_step_expr.constant <= 0 ||
+            guard_step_expr.constant != body_step_expr.constant) {
+            return false;
+        }
+
+        // Reject if the residual body still has any abrupt control flow we cannot
+        // safely fold under a single residual `if` (a break or continue would change
+        // semantics if it ends up nested).
+        for (std::size_t i = guard_index + 1; i < body_ops.size(); ++i) {
+            auto *op = body_ops[i].get();
+            if (op == body_latch.step_op || op == body_latch.assign) {
+                continue;
+            }
+            if (dynamic_cast<yir::BreakOp *>(op) != nullptr ||
+                dynamic_cast<yir::ContinueOp *>(op) != nullptr) {
+                return false;
+            }
+        }
+
+        using Predicate = yir::ICmpOp::Predicate;
+        const Predicate inverted = [](Predicate p) {
+            switch (p) {
+            case Predicate::Eq:
+                return Predicate::Ne;
+            case Predicate::Ne:
+                return Predicate::Eq;
+            case Predicate::Lt:
+                return Predicate::Ge;
+            case Predicate::Le:
+                return Predicate::Gt;
+            case Predicate::Gt:
+                return Predicate::Le;
+            case Predicate::Ge:
+                return Predicate::Lt;
+            }
+            return p;
+        }(guard_icmp->predicate());
+
+        std::string flip_name = std::string("poly.guard.flip") +
+                                std::to_string(stats_.guards_demoted);
+        auto inverted_icmp = std::make_unique<yir::ICmpOp>(
+            inverted, guard_icmp->lhs(), guard_icmp->rhs(), std::move(flip_name));
+        inverted_icmp->set_parent(&while_op.body_region());
+        auto *inverted_value = inverted_icmp->result();
+
+        auto residual_if = std::make_unique<yir::IfOp>(inverted_value);
+        residual_if->set_parent(&while_op.body_region());
+        auto &residual_then = residual_if->then_region();
+
+        OpList replacement;
+        replacement.reserve(body_ops.size() + 2);
+        // Preserve any pure prefix ops (e.g. the original icmp + constants), then
+        // emit the inverted icmp + residual if.
+        for (std::size_t i = 0; i < guard_index; ++i) {
+            body_ops[i]->set_parent(&while_op.body_region());
+            replacement.push_back(std::move(body_ops[i]));
+        }
+        replacement.push_back(std::move(inverted_icmp));
+        replacement.push_back(std::move(residual_if));
+
+        // Move every body op except the trailing latch into the residual then-arm,
+        // skipping the original guard if (which we are dropping in favour of its
+        // residual). The trailing latch ops stay at the body level so the existing
+        // while->for canonicalizer recognizes them.
+        auto *residual_if_raw = dynamic_cast<yir::IfOp *>(replacement.back().get());
+        for (std::size_t i = guard_index + 1; i < body_ops.size(); ++i) {
+            auto &op = body_ops[i];
+            if (op.get() == body_latch.step_op || op.get() == body_latch.assign) {
+                op->set_parent(&while_op.body_region());
+                replacement.push_back(std::move(op));
+                continue;
+            }
+            op->set_parent(&residual_if_raw->then_region());
+            residual_if_raw->then_region().operations().push_back(std::move(op));
+        }
+
+        body_ops = std::move(replacement);
+        ++stats_.guards_demoted;
+        (void)residual_then;
+        return true;
     }
 
     bool try_normalize_while(OpList &ops, std::size_t &index) {
@@ -735,7 +901,6 @@ class Canonicalizer final {
             !condition_region_is_side_effect_free(while_op->cond_region())) {
             return false;
         }
-
         auto *icmp = condition_compare(*while_op);
         if (icmp == nullptr) {
             return false;
