@@ -104,6 +104,154 @@ bool find_all_replaceable_uses(
     return false;
 }
 
+bool has_side_effects(const mir::MachineInstr &instr) {
+    switch (instr.opcode()) {
+    case mir::Opcode::Call:
+    case mir::Opcode::LoadMem:
+    case mir::Opcode::StoreMem:
+    case mir::Opcode::LoadMemOffset:
+    case mir::Opcode::StoreMemOffset:
+    case mir::Opcode::MemZero:
+    case mir::Opcode::LoadSlot:
+    case mir::Opcode::StoreSlot:
+    case mir::Opcode::StoreOutgoingArg:
+    case mir::Opcode::LoadIncomingArg:
+    case mir::Opcode::BranchNonZero:
+    case mir::Opcode::BranchZero:
+    case mir::Opcode::BranchEq:
+    case mir::Opcode::BranchNe:
+    case mir::Opcode::BranchLT:
+    case mir::Opcode::BranchGE:
+    case mir::Opcode::Jump:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Retarget the def of an MV-source producer. For `MV vdst, vsrc` where:
+//   - both regs are virtual,
+//   - vsrc has exactly one def in this block, exactly one use (the MV),
+//   - vdst has exactly one def (the MV),
+//   - the producer of vsrc is a non-side-effecting instr defining only vsrc and
+//     not using vdst,
+//   - no instruction between the producer and the MV reads vdst,
+// rewrite the producer to define vdst directly and erase the MV.
+bool elide_move_via_def_retarget(mir::MachineFunction &function, Stats &stats) {
+    auto counts = count_vregs(function);
+    bool changed = false;
+
+    for (auto &block_ptr : function.blocks()) {
+        auto &instrs = block_ptr->instructions();
+        for (std::size_t i = 0; i < instrs.size();) {
+            auto &instr = instrs[i];
+            const auto &ops = instr.operands();
+            if (!is_move(instr.opcode()) || ops.size() < 2 || !ops[0].is_reg() ||
+                !ops[1].is_reg()) {
+                ++i;
+                continue;
+            }
+            auto dst = ops[0].reg_value();
+            auto src = ops[1].reg_value();
+            if (!dst.is_virtual() || !src.is_virtual() || same_reg(dst, src)) {
+                ++i;
+                continue;
+            }
+            if (def_count(counts, dst) != 1 || def_count(counts, src) != 1 ||
+                use_count(counts, src) != 1) {
+                ++i;
+                continue;
+            }
+
+            // Find the unique def of src in this block, scanning back.
+            std::size_t producer_index = 0;
+            bool found_producer = false;
+            for (std::size_t k = i; k > 0; --k) {
+                auto &candidate = instrs[k - 1];
+                if (defines_reg(candidate, src)) {
+                    producer_index = k - 1;
+                    found_producer = true;
+                    break;
+                }
+            }
+            if (!found_producer) {
+                ++i;
+                continue;
+            }
+            auto &producer = instrs[producer_index];
+            if (has_side_effects(producer)) {
+                ++i;
+                continue;
+            }
+            // The producer must define src and only src among virtual defs.
+            std::size_t src_def_slot = ops.size();
+            bool only_src_virtual_def = true;
+            const auto &producer_ops = producer.operands();
+            for (std::size_t op_idx = 0; op_idx < producer_ops.size(); ++op_idx) {
+                const auto &op = producer_ops[op_idx];
+                if (!op.is_reg() || !op.is_def()) {
+                    continue;
+                }
+                if (op.is_implicit() && op.reg_value().is_physical()) {
+                    continue;
+                }
+                if (op.reg_value().is_virtual() && same_reg(op.reg_value(), src)) {
+                    src_def_slot = op_idx;
+                    continue;
+                }
+                only_src_virtual_def = false;
+                break;
+            }
+            if (src_def_slot >= producer_ops.size() || !only_src_virtual_def) {
+                ++i;
+                continue;
+            }
+
+            // Producer must not read dst (would create a self-use cycle).
+            bool producer_reads_dst = false;
+            for (const auto &op : producer_ops) {
+                if (op.is_reg() && op.is_use() && !op.is_implicit() &&
+                    same_reg(op.reg_value(), dst)) {
+                    producer_reads_dst = true;
+                    break;
+                }
+            }
+            if (producer_reads_dst) {
+                ++i;
+                continue;
+            }
+
+            // No instruction between producer and the MV may read dst.
+            bool intervening_reads_dst = false;
+            for (std::size_t k = producer_index + 1; k < i; ++k) {
+                if (has_reg_use(instrs[k], dst) || defines_reg(instrs[k], dst)) {
+                    intervening_reads_dst = true;
+                    break;
+                }
+            }
+            if (intervening_reads_dst) {
+                ++i;
+                continue;
+            }
+
+            // Rewrite producer's def from src to dst.
+            auto new_operands = producer.operands();
+            new_operands[src_def_slot].set_reg(dst);
+            producer = mir::MachineInstr(producer.opcode(), std::move(new_operands));
+
+            // Erase the MV.
+            instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(i));
+            ++stats.copies;
+            changed = true;
+            counts = count_vregs(function);
+            // Restart from producer position to allow chained eliminations.
+            i = producer_index;
+        }
+    }
+
+    return changed;
+}
+
 bool coalesce_copies_once(mir::MachineFunction &function, Stats &stats) {
     auto counts = count_vregs(function);
     auto indices = block_indices(function);
@@ -168,7 +316,9 @@ bool coalesce_copies(mir::MachineFunction &function, bool post_ra, Stats &stats)
 
     bool changed = false;
     for (int iteration = 0; iteration < 8; ++iteration) {
-        if (!coalesce_copies_once(function, stats)) {
+        bool iter_changed = coalesce_copies_once(function, stats);
+        iter_changed |= elide_move_via_def_retarget(function, stats);
+        if (!iter_changed) {
             break;
         }
         changed = true;
