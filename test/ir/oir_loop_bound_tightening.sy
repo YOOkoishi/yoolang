@@ -15,6 +15,28 @@ int guarded_copy(int n, int limit) {
     return 0;
 }
 
+int guarded_copy_active(int n, int limit) {
+    int j = 0;
+    while (j < n) {
+        if (j <= limit) {
+            out[j] = j;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+int guarded_copy_active_ge(int n, int limit) {
+    int j = 0;
+    while (j < n) {
+        if (limit >= j) {
+            out[j] = j;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
 int liveout_counter(int n, int limit) {
     int j = 0;
     while (j < n) {
@@ -33,6 +55,21 @@ int liveout_counter(int n, int limit) {
 // OIR: loop.bound = phi
 // OIR-NOT: icmp lt i32 %limit.arg, %j.loop
 
+// OIR-LABEL: define i32 @guarded_copy_active
+// OIR-NOT: icmp lt i32 %limit.arg, %j.loop
+// OIR: loop.bound.tight = icmp lt i32 %limit.arg, %n.arg
+// OIR: loop.bound.next = add i32 %limit.arg, 1
+// OIR: loop.bound = phi
+// OIR-NOT: icmp le i32 %j.loop
+
+// OIR-LABEL: define i32 @guarded_copy_active_ge
+// OIR-NOT: icmp le i32 %j.loop
+// OIR: loop.bound.tight = icmp lt i32 %limit.arg, %n.arg
+// OIR: loop.bound.next = add i32 %limit.arg, 1
+// OIR: loop.bound = phi
+// OIR-NOT: icmp ge i32 %limit.arg, %j.loop
+
 // OIR-LABEL: define i32 @liveout_counter
+// OIR-NOT: icmp ge i32 %limit.arg, %j.loop
 // OIR-NOT: loop.bound.tight
 // OIR: ret i32

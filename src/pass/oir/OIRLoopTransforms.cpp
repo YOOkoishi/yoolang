@@ -1275,6 +1275,40 @@ bool block_has_only_guard_progress(const oir::BasicBlock &block) {
     return true;
 }
 
+bool match_guarded_upper_limit(const oir::CmpInst &cmp, oir::PhiInst *iv, oir::Value *&limit,
+                               bool &active_on_true) {
+    if (cmp.pred() == oir::CmpPred::LT && cmp.rhs() == iv) {
+        limit = cmp.lhs();
+        active_on_true = false;
+        return true;
+    }
+    if (cmp.pred() == oir::CmpPred::GT && cmp.lhs() == iv) {
+        limit = cmp.rhs();
+        active_on_true = false;
+        return true;
+    }
+    if (cmp.pred() == oir::CmpPred::LE && cmp.lhs() == iv) {
+        limit = cmp.rhs();
+        active_on_true = true;
+        return true;
+    }
+    if (cmp.pred() == oir::CmpPred::GE && cmp.rhs() == iv) {
+        limit = cmp.lhs();
+        active_on_true = true;
+        return true;
+    }
+    return false;
+}
+
+bool guard_path_flows_to_latch(oir::BasicBlock *block, oir::BasicBlock *latch) {
+    return block == latch || unconditional_branch_target(block) == latch;
+}
+
+bool skipped_guard_path_is_empty(oir::BasicBlock *block, oir::BasicBlock *latch) {
+    return block == latch ||
+           (unconditional_branch_target(block) == latch && block_has_only_guard_progress(*block));
+}
+
 std::optional<GuardedLoopBoundMatch> match_monotonic_guarded_loop_bound(
     const oir::Loop &loop) {
     if (loop.header == nullptr || loop.blocks.size() > 8 || !loop_defs_have_no_external_uses(loop)) {
@@ -1337,21 +1371,18 @@ std::optional<GuardedLoopBoundMatch> match_monotonic_guarded_loop_bound(
     }
 
     oir::Value *limit = nullptr;
-    if (guard_cmp->pred() == oir::CmpPred::LT && guard_cmp->rhs() == iv) {
-        limit = guard_cmp->lhs();
-    } else if (guard_cmp->pred() == oir::CmpPred::GT && guard_cmp->lhs() == iv) {
-        limit = guard_cmp->rhs();
-    } else {
+    bool active_on_true = false;
+    if (!match_guarded_upper_limit(*guard_cmp, iv, limit, active_on_true)) {
         return std::nullopt;
     }
     if (!is_i32_value(limit) || value_defined_in_loop(limit, loop)) {
         return std::nullopt;
     }
 
-    auto *skipped = body_branch->true_bb();
-    auto *active = body_branch->false_bb();
-    if (skipped == active || unconditional_branch_target(skipped) != latch ||
-        unconditional_branch_target(active) != latch || !block_has_only_guard_progress(*skipped)) {
+    auto *active = active_on_true ? body_branch->true_bb() : body_branch->false_bb();
+    auto *skipped = active_on_true ? body_branch->false_bb() : body_branch->true_bb();
+    if (skipped == active || active == latch || !guard_path_flows_to_latch(active, latch) ||
+        !skipped_guard_path_is_empty(skipped, latch)) {
         return std::nullopt;
     }
 
