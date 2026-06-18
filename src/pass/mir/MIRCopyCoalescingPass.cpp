@@ -50,6 +50,21 @@ block_indices(const mir::MachineFunction &function) {
     return out;
 }
 
+bool function_has_layout_backedge(
+    const mir::MachineFunction &function,
+    const std::map<const mir::MachineBasicBlock *, std::size_t> &indices) {
+    for (std::size_t index = 0; index < function.blocks().size(); ++index) {
+        const auto *block = function.blocks()[index].get();
+        for (const auto *succ : block->successors()) {
+            auto found = indices.find(succ);
+            if (found != indices.end() && found->second <= index) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool find_all_replaceable_uses(
     mir::MachineFunction &function,
     const std::map<const mir::MachineBasicBlock *, std::size_t> &indices,
@@ -178,6 +193,7 @@ bool elide_move_via_def_retarget(mir::MachineFunction &function, Stats &stats) {
                 ++i;
                 continue;
             }
+
             auto &producer = instrs[producer_index];
             if (has_side_effects(producer)) {
                 ++i;
@@ -312,12 +328,16 @@ bool coalesce_copies_once(mir::MachineFunction &function, Stats &stats) {
 } // namespace
 
 bool coalesce_copies(mir::MachineFunction &function, bool post_ra, Stats &stats) {
-    (void)post_ra;
+    const auto indices = block_indices(function);
+    const bool allow_def_retarget =
+        !post_ra && !function_has_layout_backedge(function, indices);
 
     bool changed = false;
     for (int iteration = 0; iteration < 8; ++iteration) {
         bool iter_changed = coalesce_copies_once(function, stats);
-        iter_changed |= elide_move_via_def_retarget(function, stats);
+        if (allow_def_retarget) {
+            iter_changed |= elide_move_via_def_retarget(function, stats);
+        }
         if (!iter_changed) {
             break;
         }
