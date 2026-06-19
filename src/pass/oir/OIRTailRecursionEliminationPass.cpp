@@ -12,32 +12,120 @@
 namespace pass::oir_opt {
 namespace {
 
-oir::CallInst *tail_self_call(oir::Function &function, oir::BasicBlock &block) {
-    if (block.instructions().size() < 2) {
-        return nullptr;
+struct TailSelfCall {
+    oir::CallInst *call = nullptr;
+    oir::BasicBlock *return_block = nullptr;
+};
+
+bool return_block_has_only_phis_and_return(const oir::BasicBlock &block) {
+    if (block.instructions().empty()) {
+        return false;
     }
 
-    auto ret_it = std::prev(block.instructions().end());
-    auto *ret = dynamic_cast<oir::ReturnInst *>(ret_it->get());
+    auto *ret = dynamic_cast<oir::ReturnInst *>(block.terminator());
     if (ret == nullptr) {
-        return nullptr;
+        return false;
     }
 
-    auto call_it = std::prev(ret_it);
+    for (const auto &inst : block.instructions()) {
+        if (inst.get() == ret) {
+            return true;
+        }
+        if (dynamic_cast<oir::PhiInst *>(inst.get()) == nullptr) {
+            return false;
+        }
+    }
+    return false;
+}
+
+oir::Value *phi_incoming_from(const oir::PhiInst &phi, const oir::BasicBlock *pred) {
+    for (const auto &[value, from] : phi.incoming()) {
+        if (from == pred) {
+            return value;
+        }
+    }
+    return nullptr;
+}
+
+bool uses_only_return_edge_phis(const oir::CallInst &call, const oir::BasicBlock &pred,
+                                const oir::BasicBlock &return_block) {
+    for (const auto &use : call.uses()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(use.user);
+        if (phi == nullptr || phi->parent() != &return_block || use.operand_index % 2 != 0) {
+            return false;
+        }
+
+        const std::size_t incoming_index = use.operand_index / 2;
+        if (incoming_index >= phi->incoming().size() ||
+            phi->incoming()[incoming_index].first != &call ||
+            phi->incoming()[incoming_index].second != &pred) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TailSelfCall tail_self_call(oir::Function &function, oir::BasicBlock &block) {
+    if (block.instructions().size() < 2) {
+        return {};
+    }
+
+    auto term_it = std::prev(block.instructions().end());
+    if (auto *ret = dynamic_cast<oir::ReturnInst *>(term_it->get())) {
+        auto call_it = std::prev(term_it);
+        auto *call = dynamic_cast<oir::CallInst *>(call_it->get());
+        if (call == nullptr || call->callee() != &function) {
+            return {};
+        }
+
+        if (ret->has_value()) {
+            if (ret->value() == call && call->use_count() == 1) {
+                return {call, nullptr};
+            }
+            return {};
+        }
+        return call->type()->is_void() && call->use_count() == 0 ? TailSelfCall{call, nullptr}
+                                                                 : TailSelfCall{};
+    }
+
+    auto *branch = dynamic_cast<oir::BranchInst *>(term_it->get());
+    if (branch == nullptr || branch->is_conditional()) {
+        return {};
+    }
+
+    auto call_it = std::prev(term_it);
     auto *call = dynamic_cast<oir::CallInst *>(call_it->get());
     if (call == nullptr || call->callee() != &function) {
-        return nullptr;
+        return {};
     }
 
-    if (ret->has_value()) {
-        return ret->value() == call ? call : nullptr;
+    auto *return_block = branch->target_bb();
+    if (return_block == nullptr || return_block == &block ||
+        !return_block_has_only_phis_and_return(*return_block)) {
+        return {};
     }
-    return call->type()->is_void() ? call : nullptr;
+
+    auto *ret = static_cast<oir::ReturnInst *>(return_block->terminator());
+    if (ret->has_value()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(ret->value());
+        if (ret->value() != call &&
+            (phi == nullptr || phi->parent() != return_block ||
+             phi_incoming_from(*phi, &block) != call)) {
+            return {};
+        }
+        if (!uses_only_return_edge_phis(*call, block, *return_block)) {
+            return {};
+        }
+        return {call, return_block};
+    }
+
+    return call->type()->is_void() && call->use_count() == 0 ? TailSelfCall{call, return_block}
+                                                             : TailSelfCall{};
 }
 
 bool has_tail_self_call(oir::Function &function) {
     for (auto &block : function.blocks()) {
-        if (tail_self_call(function, *block) != nullptr) {
+        if (tail_self_call(function, *block).call != nullptr) {
             return true;
         }
     }
@@ -109,11 +197,12 @@ bool rewrite_tail_calls(oir::Function &function, const TailRecLoop &loop, Stats 
     }
 
     for (auto *block : blocks) {
-        auto *call = tail_self_call(function, *block);
-        if (call == nullptr) {
+        auto tail_call = tail_self_call(function, *block);
+        if (tail_call.call == nullptr) {
             continue;
         }
 
+        auto *call = tail_call.call;
         auto args = call->args();
         if (args.size() != loop.arg_phis.size()) {
             continue;
@@ -124,6 +213,9 @@ bool rewrite_tail_calls(oir::Function &function, const TailRecLoop &loop, Stats 
         }
 
         auto &insts = block->instructions();
+        if (tail_call.return_block != nullptr) {
+            oir::cfg::remove_edge(block, tail_call.return_block);
+        }
         insts.back()->drop_all_operands();
         insts.pop_back();
         insts.back()->drop_all_operands();
@@ -138,8 +230,7 @@ bool rewrite_tail_calls(oir::Function &function, const TailRecLoop &loop, Stats 
 }
 
 bool run_on_function(oir::Function &function, Stats &stats) {
-    if (function.is_external() || function.entry_block() == nullptr || function.args().empty() ||
-        !has_tail_self_call(function)) {
+    if (function.is_external() || function.entry_block() == nullptr || !has_tail_self_call(function)) {
         return false;
     }
 

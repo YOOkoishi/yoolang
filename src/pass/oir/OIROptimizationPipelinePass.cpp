@@ -65,6 +65,17 @@ bool cleanup_after_call_specialization(oir::Module &module, oir_opt::Stats &stat
     return changed;
 }
 
+bool cleanup_after_tail_recursion(oir::Module &module, oir_opt::Stats &stats) {
+    bool changed = false;
+    changed |= oir_opt::run_sccp(module, stats);
+    changed |= oir_opt::value_range_propagation(module, stats);
+    changed |= oir_opt::global_value_numbering(module, stats);
+    changed |= oir_opt::eliminate_dead_code(module, stats);
+    changed |= oir_opt::if_convert_conditional_adds(module, stats);
+    changed |= oir_opt::cleanup_cfg(module, stats);
+    return changed;
+}
+
 bool run_call_specialization_window(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
     constexpr unsigned kMaxRounds = 4;
@@ -105,6 +116,10 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
         changed |= eliminate_dead_code(module, stats);
         changed |= if_convert_conditional_adds(module, stats);
         changed |= cleanup_cfg(module, stats);
+        if (eliminate_tail_recursion(module, stats)) {
+            changed = true;
+            changed |= cleanup_after_tail_recursion(module, stats);
+        }
     }
     changed |= run_call_specialization_window(module, stats);
     if (inline_functions(module, stats)) {
@@ -115,6 +130,9 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
         changed |= eliminate_dead_code(module, stats);
         changed |= if_convert_conditional_adds(module, stats);
         changed |= cleanup_cfg(module, stats);
+        if (eliminate_tail_recursion(module, stats)) {
+            changed |= cleanup_after_tail_recursion(module, stats);
+        }
     }
 
     constexpr unsigned kMaxIterations = 8;

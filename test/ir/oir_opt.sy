@@ -1,6 +1,7 @@
 // RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
 
 const int C = 16;
+int G;
 
 int algebra(int x) {
   int a = x + 0;
@@ -54,9 +55,40 @@ int tail_sum(int n, int acc) {
   return tail_sum(n - 1, acc + n);
 }
 
+int tail_sum_merged_return(int n, int acc) {
+  int result;
+  if (n == 0) {
+    result = acc;
+  } else {
+    result = tail_sum_merged_return(n - 1, acc + n);
+  }
+  return result;
+}
+
+int tail_global_countdown() {
+  if (G == 0) {
+    return 0;
+  }
+  G = G - 1;
+  return tail_global_countdown();
+}
+
+int passthrough(int x) {
+  return x;
+}
+
+int tail_sum_wrapped(int n, int acc) {
+  if (n == 0) {
+    return acc;
+  }
+  return passthrough(tail_sum_wrapped(n - 1, acc + n));
+}
+
 int main() {
+  G = 3;
   return algebra(42) + folded_branch() + zext_cmp(3) + global_const(99) +
-         range_gated_rem(23) + range_gated_negative_divisor_rem(23) + tail_sum(4, 0);
+         range_gated_rem(23) + range_gated_negative_divisor_rem(23) + tail_sum(4, 0) +
+         tail_sum_merged_return(4, 0) + tail_global_countdown() + tail_sum_wrapped(4, 0);
 }
 
 // OIR-LABEL: define i32 @algebra
@@ -93,4 +125,17 @@ int main() {
 // OIR-LABEL: define i32 @tail_sum
 // OIR: %n.arg.tail = phi
 // OIR-NOT: call i32 @tail_sum
-// OIR: ret i32
+
+// OIR-LABEL: define i32 @tail_sum_merged_return
+// OIR: %n.arg.tail = phi
+// OIR-NOT: call i32 @tail_sum_merged_return
+
+// OIR-LABEL: define i32 @tail_global_countdown
+// OIR: %G.slot.ssa = phi
+// OIR-NOT: call i32 @tail_global_countdown
+
+// OIR-LABEL: define i32 @tail_sum_wrapped
+// OIR: %n.arg.tail = phi
+// OIR-NOT: call i32 @tail_sum_wrapped
+
+// OIR-LABEL: define i32 @main
