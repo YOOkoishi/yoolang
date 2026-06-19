@@ -177,6 +177,26 @@ jobs:
           mkdir -p build/github-actions
           python3 scripts/compare_perf.py 2>&1 | tee build/github-actions/perf-tests.log
 
+      - name: Run static instruction diff (GCC/Clang vs yoolang)
+        id: static_diff
+        if: always()
+        continue-on-error: true
+        env:
+          PERF_TIMEOUT_SEC: "60"
+        run: |
+          set -o pipefail
+          mkdir -p build/gcc-clang-diff
+          python3 tools/gcc-clang-diff/gcc_clang_diff.py \
+            --summary \
+            --json-out build/gcc-clang-diff/summary.json \
+            --summary-out build/gcc-clang-diff/summary.txt \
+            --output-dir build/gcc-clang-diff \
+            2>&1 | tee build/github-actions/static-diff.log
+          python3 scripts/merge_gcc_clang_diff.py \
+            --perf-report build/perf-ci/perf-report.json \
+            --diff-json build/gcc-clang-diff/summary.json \
+            --out build/perf-ci/perf-report.json
+
       - name: Compare perf against local main baseline
         if: always()
         continue-on-error: true
@@ -662,11 +682,14 @@ jobs:
           path: |
             build/github-actions/functional-tests.log
             build/github-actions/perf-tests.log
+            build/github-actions/static-diff.log
             build/perf-ci/perf-report.md
             build/perf-ci/perf-report.json
             build/perf-ci/perf-delta.md
             build/perf-ci/perf-delta.json
             build/perf-ci/instruction-count-compare.json
+            build/gcc-clang-diff/summary.json
+            build/gcc-clang-diff/summary.txt
             ci-result/instruction_count_compare.json
             ci-result/perf_compare.json
             public/instruction-report/index.html
@@ -1055,6 +1078,19 @@ jobs:
               f"🧮 几何平均加速比: GCC {fmt_optional_speedup(perf.get('gcc_o3_geomean'))} / Clang++ {fmt_optional_speedup(perf.get('clang_o3_geomean'))}",
               f"🏁 单 case 更快: GCC {perf.get('gcc_o3_faster_cases', 'N/A')}个 / Clang++ {perf.get('clang_o3_faster_cases', 'N/A')}个",
           ]
+
+          static_diff = perf.get("static_instruction_diff", {})
+          if static_diff and static_diff.get("status") == "OK":
+              gcc_sr = static_diff.get("gcc_static_ratio")
+              clang_sr = static_diff.get("clang_static_ratio")
+              lines.append("")
+              lines.append("📝 静态指令数 (反汇编统计):")
+              lines.append(f"yoolang {static_diff.get('yoolang_total_static_insns', 0):,} / "
+                           f"GCC {static_diff.get('gcc_total_static_insns', 0):,} / "
+                           f"Clang {static_diff.get('clang_total_static_insns', 0):,}")
+              lines.append(f"📐 静态指令比: GCC {gcc_sr:.2f}x / Clang {clang_sr:.2f}x"
+                           if isinstance(gcc_sr, (int, float)) and isinstance(clang_sr, (int, float))
+                           else "📐 静态指令比: N/A")
 
           if insn_delta.get("status") == "OK":
               lines.extend(
