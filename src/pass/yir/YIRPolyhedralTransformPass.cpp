@@ -551,6 +551,13 @@ struct ContractedSpatialBlock {
     yir::ForOp *k_loop = nullptr;
 };
 
+struct PolyBandTileCandidate {
+    yir::ForOp *outer_loop = nullptr;
+    yir::ForOp *inner_loop = nullptr;
+    const yir::Value *outer_iv = nullptr;
+    const yir::Value *inner_iv = nullptr;
+};
+
 bool is_valid_affine_access(const PolyAccess &access) {
     return access.memory != nullptr && std::all_of(access.indices.begin(), access.indices.end(),
                                                    [](const PolyAffineExpr &expr) {
@@ -1352,6 +1359,10 @@ std::string wave_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.wave.") + stem + std::to_string(id);
 }
 
+std::string tile_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.tile.") + stem + std::to_string(id);
+}
+
 std::string storage_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.storage.") + stem + std::to_string(id);
 }
@@ -1428,6 +1439,40 @@ std::unordered_map<const yir::Region *, yir::ForOp *> collect_for_body_owners(yi
     std::unordered_map<const yir::Region *, yir::ForOp *> owners;
     for (auto &function : module.functions()) {
         collect_for_body_owners(function->body(), owners);
+    }
+    return owners;
+}
+
+void collect_enclosing_for_region_owners(
+    yir::Region &region, yir::ForOp *enclosing_for,
+    std::unordered_map<const yir::Region *, yir::ForOp *> &owners) {
+    if (enclosing_for != nullptr) {
+        owners[&region] = enclosing_for;
+    }
+    for (auto &op : region.operations()) {
+        if (auto *for_op = dynamic_cast<yir::ForOp *>(op.get())) {
+            collect_enclosing_for_region_owners(for_op->body_region(), for_op, owners);
+            continue;
+        }
+        if (auto *if_op = dynamic_cast<yir::IfOp *>(op.get())) {
+            collect_enclosing_for_region_owners(if_op->then_region(), enclosing_for, owners);
+            if (if_op->has_else()) {
+                collect_enclosing_for_region_owners(if_op->else_region(), enclosing_for, owners);
+            }
+            continue;
+        }
+        if (auto *while_op = dynamic_cast<yir::WhileOp *>(op.get())) {
+            collect_enclosing_for_region_owners(while_op->cond_region(), enclosing_for, owners);
+            collect_enclosing_for_region_owners(while_op->body_region(), enclosing_for, owners);
+        }
+    }
+}
+
+std::unordered_map<const yir::Region *, yir::ForOp *>
+collect_enclosing_for_region_owners(yir::Module &module) {
+    std::unordered_map<const yir::Region *, yir::ForOp *> owners;
+    for (auto &function : module.functions()) {
+        collect_enclosing_for_region_owners(function->body(), nullptr, owners);
     }
     return owners;
 }
@@ -1511,11 +1556,363 @@ public:
 
 private:
     bool try_interchange_or_tile(const PolyScop& scop) {
-        (void)scop;
-        (void)dep_info_;
         (void)canonical_info_;
-        // TODO(polyhedral): use dependence directions to legalize schedule transforms.
+        auto for_body_owners = collect_enclosing_for_region_owners(module_);
+        PolyBandTileCandidate candidate;
+        if (!find_poly_band_tile_candidate(scop, for_body_owners, candidate) ||
+            !poly_band_tile_is_legal(scop, candidate) ||
+            !apply_poly_band_tiling(candidate)) {
+            return false;
+        }
+        ++num_tiled_;
+        return true;
+    }
+
+    bool find_poly_band_tile_candidate(
+        const PolyScop &scop,
+        const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
+        PolyBandTileCandidate &candidate) const {
+        std::size_t num_reads = 0;
+        std::size_t num_writes = 0;
+        std::size_t max_schedule_depth = 0;
+        const PolyStmt *anchor = nullptr;
+        for (const auto &stmt : scop.statements) {
+            num_reads += stmt.reads.size();
+            num_writes += stmt.writes.size();
+            max_schedule_depth = std::max(max_schedule_depth, stmt.schedule_dims.size());
+            if (anchor == nullptr && !stmt.writes.empty() && stmt.schedule_dims.size() == 2 &&
+                stmt.domain.size() == 2) {
+                anchor = &stmt;
+            }
+        }
+        if (anchor == nullptr || max_schedule_depth < 3 || num_reads == 0 || num_writes == 0 ||
+            anchor->op == nullptr || anchor->op->parent() == nullptr) {
+            return false;
+        }
+
+        auto anchor_loops = collect_enclosing_loop_nest(
+            const_cast<yir::Operation *>(anchor->op)->parent(), for_body_owners);
+        if (anchor_loops.outer_to_inner.size() < 2) {
+            return false;
+        }
+
+        auto *outer_loop = anchor_loops.outer_to_inner[0];
+        auto *inner_loop = anchor_loops.outer_to_inner[1];
+        if (outer_loop == nullptr || inner_loop == nullptr ||
+            inner_loop->parent() != &outer_loop->body_region() ||
+            outer_loop->induction_var() != anchor->schedule_dims[0] ||
+            inner_loop->induction_var() != anchor->schedule_dims[1] ||
+            !loop_has_unit_step(*outer_loop) || !loop_has_unit_step(*inner_loop)) {
+            return false;
+        }
+
+        auto *outer_parent = outer_loop->parent();
+        std::size_t ignored_outer_index = 0;
+        std::size_t inner_index = 0;
+        if (outer_parent == nullptr ||
+            !find_operation_index(*outer_parent, *outer_loop, ignored_outer_index) ||
+            !find_operation_index(outer_loop->body_region(), *inner_loop, inner_index) ||
+            inner_index != 0 ||
+            inner_index + 1 != outer_loop->body_region().operations().size()) {
+            return false;
+        }
+
+        if (poly_band_region_has_unsupported_control(outer_loop->body_region()) ||
+            region_contains_call(outer_loop->body_region())) {
+            return false;
+        }
+
+        const auto *outer_iv = outer_loop->induction_var();
+        const auto *inner_iv = inner_loop->induction_var();
+        for (const auto &stmt : scop.statements) {
+            if (stmt.op == nullptr || stmt.op->parent() == nullptr ||
+                stmt.schedule_dims.size() < 2 || stmt.domain.size() < 2 ||
+                stmt.schedule_dims[0] != outer_iv || stmt.schedule_dims[1] != inner_iv ||
+                stmt.domain[0].iv != outer_iv || stmt.domain[1].iv != inner_iv) {
+                return false;
+            }
+
+            auto stmt_loops = collect_enclosing_loop_nest(
+                const_cast<yir::Operation *>(stmt.op)->parent(), for_body_owners);
+            if (stmt_loops.outer_to_inner.size() < 2 ||
+                stmt_loops.outer_to_inner[0] != outer_loop ||
+                stmt_loops.outer_to_inner[1] != inner_loop) {
+                return false;
+            }
+        }
+
+        candidate.outer_loop = outer_loop;
+        candidate.inner_loop = inner_loop;
+        candidate.outer_iv = outer_iv;
+        candidate.inner_iv = inner_iv;
+        return true;
+    }
+
+    static bool poly_band_region_has_unsupported_control(const yir::Region &region) {
+        for (const auto &op : region.operations()) {
+            if (dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ContinueOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ReturnOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::CondOp *>(op.get()) != nullptr) {
+                return true;
+            }
+            if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+                if (poly_band_region_has_unsupported_control(if_op->then_region()) ||
+                    (if_op->has_else() &&
+                     poly_band_region_has_unsupported_control(if_op->else_region()))) {
+                    return true;
+                }
+                continue;
+            }
+            if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+                if (poly_band_region_has_unsupported_control(for_op->body_region())) {
+                    return true;
+                }
+            }
+        }
         return false;
+    }
+
+    bool poly_band_tile_is_legal(const PolyScop &scop,
+                                 const PolyBandTileCandidate &candidate) const {
+        if (candidate.outer_iv == nullptr || candidate.inner_iv == nullptr) {
+            return false;
+        }
+
+        for (const auto &dep : dep_info_.dependences) {
+            if (!dep.is_dependent) {
+                continue;
+            }
+            const auto *source = find_stmt_by_id(scop, dep.source_stmt_id);
+            const auto *target = find_stmt_by_id(scop, dep.target_stmt_id);
+            if (source == nullptr || target == nullptr) {
+                continue;
+            }
+
+            if (dep.distance_kind == PolyDependence::DistanceKind::SameIteration) {
+                continue;
+            }
+            if (dep.distance_kind == PolyDependence::DistanceKind::LoopCarriedConstant) {
+                if (dep.distance.size() < 2) {
+                    return false;
+                }
+                if (dep.distance[0] > 0 && dep.distance[1] < 0) {
+                    return false;
+                }
+                continue;
+            }
+            if (!unknown_dependence_is_inner_partitioned(*source, *target, dep,
+                                                         candidate.inner_iv)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool unknown_dependence_is_inner_partitioned(const PolyStmt &source,
+                                                       const PolyStmt &target,
+                                                       const PolyDependence &dep,
+                                                       const yir::Value *inner_iv) {
+        std::vector<const PolyAccess *> source_accesses;
+        std::vector<const PolyAccess *> target_accesses;
+        switch (dep.kind) {
+        case PolyDependence::Kind::RAW:
+            collect_accesses_for_memory(source.writes, dep.memory, source_accesses);
+            collect_accesses_for_memory(target.reads, dep.memory, target_accesses);
+            break;
+        case PolyDependence::Kind::WAR:
+            collect_accesses_for_memory(source.reads, dep.memory, source_accesses);
+            collect_accesses_for_memory(target.writes, dep.memory, target_accesses);
+            break;
+        case PolyDependence::Kind::WAW:
+            collect_accesses_for_memory(source.writes, dep.memory, source_accesses);
+            collect_accesses_for_memory(target.writes, dep.memory, target_accesses);
+            break;
+        case PolyDependence::Kind::RAR:
+            return true;
+        }
+
+        if (source_accesses.empty() || target_accesses.empty()) {
+            return false;
+        }
+        for (const auto *source_access : source_accesses) {
+            for (const auto *target_access : target_accesses) {
+                if (!accesses_share_exact_inner_partition(*source_access, *target_access,
+                                                          inner_iv)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    static void collect_accesses_for_memory(const std::vector<PolyAccess> &accesses,
+                                            const yir::Value *memory,
+                                            std::vector<const PolyAccess *> &out) {
+        for (const auto &access : accesses) {
+            if (access.memory == memory) {
+                out.push_back(&access);
+            }
+        }
+    }
+
+    static bool accesses_share_exact_inner_partition(const PolyAccess &source,
+                                                     const PolyAccess &target,
+                                                     const yir::Value *inner_iv) {
+        if (source.memory != target.memory || source.indices.size() != target.indices.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < source.indices.size(); ++i) {
+            if (is_exact_dim(source.indices[i], inner_iv) &&
+                is_exact_dim(target.indices[i], inner_iv)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool is_exact_dim(const PolyAffineExpr &expr, const yir::Value *dim) {
+        if (!expr.valid || expr.constant != 0 || dim == nullptr || expr.terms.size() != 1) {
+            return false;
+        }
+        return expr.terms.front().first == dim && expr.terms.front().second == 1;
+    }
+
+    bool apply_poly_band_tiling(const PolyBandTileCandidate &candidate) {
+        auto *outer_loop = candidate.outer_loop;
+        auto *inner_loop = candidate.inner_loop;
+        if (outer_loop == nullptr || inner_loop == nullptr || outer_loop->parent() == nullptr ||
+            inner_loop->parent() != &outer_loop->body_region()) {
+            return false;
+        }
+
+        auto *parent = outer_loop->parent();
+        std::size_t outer_index = 0;
+        if (!find_operation_index(*parent, *outer_loop, outer_index)) {
+            return false;
+        }
+
+        const int tile_size = choose_poly_band_tile_size(*outer_loop, *inner_loop);
+        if (tile_size == 0) {
+            return false;
+        }
+
+        auto *outer_iv = outer_loop->induction_var();
+        auto *inner_iv = inner_loop->induction_var();
+        auto *outer_lower = outer_loop->lower_bound();
+        auto *outer_upper = outer_loop->upper_bound();
+        auto *outer_step = outer_loop->step();
+        auto *inner_lower = inner_loop->lower_bound();
+        auto *inner_upper = inner_loop->upper_bound();
+        auto *inner_step = inner_loop->step();
+
+        std::size_t insert_pos = outer_index;
+        auto *tile_step_value = insert_op_before<yir::ConstI32Op>(
+            *parent, insert_pos, tile_size, tile_temp_name("step", next_tile_temp_++))->result();
+        auto *outer_tile_var = insert_op_before<yir::VarOp>(
+            *parent, insert_pos, yir::Type::get_i32(), outer_lower,
+            tile_temp_name("outer", next_tile_temp_++));
+        auto *inner_tile_var = insert_op_before<yir::VarOp>(
+            *parent, insert_pos, yir::Type::get_i32(), inner_lower,
+            tile_temp_name("inner", next_tile_temp_++));
+
+        auto outer_tile = std::make_unique<yir::ForOp>(
+            outer_tile_var->result(), outer_lower, outer_upper, tile_step_value);
+        outer_tile->set_parent(parent);
+        auto *outer_tile_raw = outer_tile.get();
+
+        auto *outer_limit = append_poly_tile_upper(
+            outer_tile_raw->body_region(), outer_tile_var->result(), tile_step_value,
+            outer_upper, !can_omit_poly_tile_clamp(*outer_loop, tile_size), "outer.limit");
+
+        auto inner_tile = std::make_unique<yir::ForOp>(
+            inner_tile_var->result(), inner_lower, inner_upper, tile_step_value);
+        inner_tile->set_parent(&outer_tile_raw->body_region());
+        auto *inner_tile_raw = inner_tile.get();
+        outer_tile_raw->body_region().operations().push_back(std::move(inner_tile));
+
+        auto *inner_limit = append_poly_tile_upper(
+            inner_tile_raw->body_region(), inner_tile_var->result(), tile_step_value,
+            inner_upper, !can_omit_poly_tile_clamp(*inner_loop, tile_size), "inner.limit");
+
+        outer_loop->operands()[1] = outer_tile_var->result();
+        outer_loop->operands()[2] = outer_limit;
+        outer_loop->operands()[3] = outer_step;
+        inner_loop->operands()[1] = inner_tile_var->result();
+        inner_loop->operands()[2] = inner_limit;
+        inner_loop->operands()[3] = inner_step;
+
+        auto &parent_ops = parent->operations();
+        auto moved_outer = std::move(parent_ops[insert_pos]);
+        moved_outer->set_parent(&inner_tile_raw->body_region());
+        inner_tile_raw->body_region().operations().push_back(std::move(moved_outer));
+        parent_ops[insert_pos] = std::move(outer_tile);
+        return true;
+    }
+
+    static int choose_poly_band_tile_size(const yir::ForOp &outer_loop,
+                                          const yir::ForOp &inner_loop) {
+        std::int64_t outer_lower = 0;
+        std::int64_t outer_upper = 0;
+        std::int64_t inner_lower = 0;
+        std::int64_t inner_upper = 0;
+        if (const_i32_value(outer_loop.lower_bound(), outer_lower) &&
+            const_i32_value(outer_loop.upper_bound(), outer_upper) &&
+            const_i32_value(inner_loop.lower_bound(), inner_lower) &&
+            const_i32_value(inner_loop.upper_bound(), inner_upper)) {
+            const auto outer_trip = outer_upper - outer_lower;
+            const auto inner_trip = inner_upper - inner_lower;
+            if (outer_trip < 64 || inner_trip < 64) {
+                return 0;
+            }
+            for (int candidate : {20, 16, 10, 8}) {
+                if (outer_trip % candidate == 0 && inner_trip % candidate == 0) {
+                    return candidate;
+                }
+            }
+            return 0;
+        }
+        return 16;
+    }
+
+    static bool can_omit_poly_tile_clamp(const yir::ForOp &loop, int tile_size) {
+        std::int64_t lower = 0;
+        std::int64_t upper = 0;
+        std::int64_t step = 0;
+        if (tile_size <= 0 || !const_i32_value(loop.lower_bound(), lower) ||
+            !const_i32_value(loop.upper_bound(), upper) ||
+            !const_i32_value(loop.step(), step) || step != 1 || upper < lower) {
+            return false;
+        }
+        return (upper - lower) % tile_size == 0;
+    }
+
+    yir::Value *append_poly_tile_upper(yir::Region &region, yir::Value *tile_iv,
+                                       yir::Value *tile_step, yir::Value *upper,
+                                       bool needs_clamp, const char *stem) {
+        auto add = make_parented_op<yir::AddIOp>(
+            region, tile_iv, tile_step, tile_temp_name(stem, next_tile_temp_++));
+        auto *tile_end = add->result();
+        region.operations().push_back(std::move(add));
+        if (!needs_clamp) {
+            return tile_end;
+        }
+
+        auto limit = make_parented_op<yir::VarOp>(
+            region, yir::Type::get_i32(), tile_end, tile_temp_name(stem, next_tile_temp_++));
+        auto *limit_value = limit->result();
+        region.operations().push_back(std::move(limit));
+
+        auto cmp = make_parented_op<yir::ICmpOp>(
+            region, yir::ICmpOp::Predicate::Gt, limit_value, upper,
+            tile_temp_name("gt", next_tile_temp_++));
+        auto clamp = make_parented_op<yir::IfOp>(region, cmp->result());
+        clamp->then_region().operations().push_back(
+            make_parented_op<yir::AssignOp>(clamp->then_region(), limit_value, upper));
+        region.operations().push_back(std::move(cmp));
+        region.operations().push_back(std::move(clamp));
+        return limit_value;
     }
 
     bool apply_first_serial_wavefront(
@@ -4801,6 +5198,7 @@ private:
     std::size_t next_future_temp_ = 0;
     std::size_t next_init_temp_ = 0;
     std::size_t next_wave_temp_ = 0;
+    std::size_t next_tile_temp_ = 0;
     std::size_t next_storage_temp_ = 0;
 };
 

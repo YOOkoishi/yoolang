@@ -192,6 +192,154 @@ struct PolyhedralProfitabilityEstimate {
     std::size_t best_distinct_offsets = 0;
 };
 
+struct LoopBandAccessStats {
+    std::size_t affine_loads = 0;
+    std::size_t distinct_load_memories = 0;
+    std::size_t deeper_loop_loads = 0;
+    bool has_extra_loop_depth = false;
+    std::vector<const yir::Value *> load_memories;
+    std::vector<const yir::Value *> covered_band_dims;
+};
+
+bool region_has_nested_loop(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ForOp *>(op.get()) != nullptr) {
+            return true;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (region_has_nested_loop(if_op->then_region()) ||
+                (if_op->has_else() && region_has_nested_loop(if_op->else_region()))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool access_uses_dim(const std::vector<yir::Value *> &indices, const yir::Value *dim) {
+    return std::any_of(indices.begin(), indices.end(), [dim](const yir::Value *index) {
+        AffineDimOffset parsed;
+        return parse_dim_offset(index, parsed) && parsed.dim == dim;
+    });
+}
+
+bool affine_multidim_access(const yir::ArrayLoadOp &load) {
+    const auto rank = array_rank_of_value(load.array());
+    const auto indices = load.indices();
+    if (rank < 2 || indices.size() != rank) {
+        return false;
+    }
+    return std::all_of(indices.begin(), indices.end(), [](const yir::Value *index) {
+        AffineDimOffset parsed;
+        return parse_dim_offset(index, parsed) && parsed.dim != nullptr;
+    });
+}
+
+void collect_loop_band_access_stats(const yir::Region &region,
+                                    const std::vector<const yir::Value *> &band_dims,
+                                    int loop_depth,
+                                    LoopBandAccessStats &stats) {
+    for (const auto &op : region.operations()) {
+        if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(op.get())) {
+            if (affine_multidim_access(*load)) {
+                const auto indices = load->indices();
+                bool covers_band_dim = false;
+                for (const auto *dim : band_dims) {
+                    if (access_uses_dim(indices, dim)) {
+                        covers_band_dim = true;
+                        push_unique_value(stats.covered_band_dims, dim);
+                    }
+                }
+                if (!covers_band_dim) {
+                    continue;
+                }
+                ++stats.affine_loads;
+                push_unique_value(stats.load_memories, load->array());
+                stats.distinct_load_memories = stats.load_memories.size();
+                if (loop_depth > 0) {
+                    ++stats.deeper_loop_loads;
+                }
+            }
+            continue;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            collect_loop_band_access_stats(if_op->then_region(), band_dims, loop_depth, stats);
+            if (if_op->has_else()) {
+                collect_loop_band_access_stats(if_op->else_region(), band_dims, loop_depth, stats);
+            }
+            continue;
+        }
+        if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            stats.has_extra_loop_depth = true;
+            collect_loop_band_access_stats(while_op->body_region(), band_dims, loop_depth + 1,
+                                           stats);
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            stats.has_extra_loop_depth = true;
+            collect_loop_band_access_stats(for_op->body_region(), band_dims, loop_depth + 1,
+                                           stats);
+        }
+    }
+}
+
+PolyhedralProfitabilityEstimate estimate_loop_band_profitability(
+    const yir::ArrayStoreOp &store) {
+    PolyhedralProfitabilityEstimate estimate;
+    if (store.parent() == nullptr) {
+        return estimate;
+    }
+
+    const auto store_indices = store.indices();
+    const auto rank = array_rank_of_value(store.array());
+    if (rank < 2 || store_indices.size() != rank) {
+        return estimate;
+    }
+
+    std::vector<const yir::Value *> band_dims;
+    band_dims.reserve(2);
+    for (std::size_t i = 0; i < 2; ++i) {
+        AffineDimOffset parsed;
+        if (!parse_dim_offset(store_indices[i], parsed) || parsed.dim == nullptr ||
+            vector_contains_value(band_dims, parsed.dim)) {
+            return estimate;
+        }
+        band_dims.push_back(parsed.dim);
+    }
+
+    if (!region_has_nested_loop(*store.parent())) {
+        return estimate;
+    }
+
+    LoopBandAccessStats stats;
+    collect_loop_band_access_stats(*store.parent(), band_dims, 0, stats);
+    if (!stats.has_extra_loop_depth || stats.affine_loads < 2 ||
+        stats.covered_band_dims.size() < band_dims.size() ||
+        stats.distinct_load_memories < 2 || stats.deeper_loop_loads == 0) {
+        return estimate;
+    }
+
+    int score = 96;
+    score += static_cast<int>(std::min<std::size_t>(stats.affine_loads, 8) * 8);
+    score += static_cast<int>(std::min<std::size_t>(stats.distinct_load_memories, 4) * 12);
+    score += static_cast<int>(std::min<std::size_t>(stats.deeper_loop_loads, 4) * 10);
+
+    const auto elements = bounded_array_element_count(store.array());
+    if (elements >= 1'000'000) {
+        score += 24;
+    } else if (elements >= 65'536) {
+        score += 12;
+    }
+
+    estimate.score = score;
+    estimate.best_rank = rank;
+    estimate.best_affine_loads = stats.affine_loads;
+    estimate.best_unit_neighbor_loads = 0;
+    estimate.best_distinct_offsets = stats.distinct_load_memories;
+    return estimate;
+}
+
 PolyhedralProfitabilityEstimate estimate_store_profitability(
     const yir::ArrayStoreOp &store,
     const std::vector<const yir::Value *> &constant_initialized_arrays) {
@@ -325,6 +473,10 @@ void estimate_region_profitability(
             auto candidate = estimate_store_profitability(*store, constant_initialized_arrays);
             if (candidate.score > estimate.score) {
                 estimate = candidate;
+            }
+            auto band_candidate = estimate_loop_band_profitability(*store);
+            if (band_candidate.score > estimate.score) {
+                estimate = band_candidate;
             }
         }
         if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {

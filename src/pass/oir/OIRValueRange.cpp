@@ -172,6 +172,8 @@ IntRange eval_binary(const oir::BinaryInst &inst, const RangeMap &ranges,
         }
         return full_range();
     }
+    case oir::Instruction::OpID::Xor:
+        return full_range();
     case oir::Instruction::OpID::SDiv: {
         auto divisor = constant_int_value(inst.rhs());
         if (!divisor || *divisor == 0 ||

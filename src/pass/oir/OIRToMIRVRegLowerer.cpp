@@ -289,6 +289,8 @@ class VRegLowerer final {
             }
             return full_range_for_type(inst.type());
         }
+        case oir::Instruction::OpID::Xor:
+            return full_range_for_type(inst.type());
         case oir::Instruction::OpID::SDiv: {
             std::int64_t divisor = 0;
             if (!exact_constant_range(rhs, &divisor) || divisor == 0) {
@@ -345,6 +347,7 @@ class VRegLowerer final {
         case oir::Instruction::OpID::Sub:
         case oir::Instruction::OpID::Mul:
         case oir::Instruction::OpID::And:
+        case oir::Instruction::OpID::Xor:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
             return eval_binary_range(static_cast<const oir::BinaryInst &>(inst), local,
@@ -816,6 +819,7 @@ class VRegLowerer final {
         case oir::Instruction::OpID::Sub:
         case oir::Instruction::OpID::Mul:
         case oir::Instruction::OpID::And:
+        case oir::Instruction::OpID::Xor:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
             lower_int_binary(static_cast<const oir::BinaryInst &>(inst));
@@ -1400,6 +1404,9 @@ class VRegLowerer final {
             break;
         case oir::Instruction::OpID::And:
             opcode = mir::Opcode::And;
+            break;
+        case oir::Instruction::OpID::Xor:
+            opcode = mir::Opcode::Xor;
             break;
         case oir::Instruction::OpID::SDiv:
             opcode = mir::Opcode::DivW;

@@ -246,6 +246,7 @@ class Lowerer final {
         case oir::Instruction::OpID::Sub:
         case oir::Instruction::OpID::Mul:
         case oir::Instruction::OpID::And:
+        case oir::Instruction::OpID::Xor:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
             lower_int_binary(static_cast<const oir::BinaryInst &>(inst));
@@ -456,6 +457,9 @@ class Lowerer final {
             break;
         case oir::Instruction::OpID::And:
             opcode = mir::Opcode::And;
+            break;
+        case oir::Instruction::OpID::Xor:
+            opcode = mir::Opcode::Xor;
             break;
         case oir::Instruction::OpID::SDiv:
             opcode = mir::Opcode::DivW;

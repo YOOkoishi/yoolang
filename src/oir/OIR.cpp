@@ -67,6 +67,8 @@ std::string op_to_string(Instruction::OpID op) {
         return "phi";
     case Instruction::OpID::And:
         return "and";
+    case Instruction::OpID::Xor:
+        return "xor";
     }
     return "unknown";
 }
@@ -1884,6 +1886,7 @@ VerifyResult Verifier::verify_module(const Module &module) {
                 case Instruction::OpID::Sub:
                 case Instruction::OpID::Mul:
                 case Instruction::OpID::And:
+                case Instruction::OpID::Xor:
                 case Instruction::OpID::SDiv:
                 case Instruction::OpID::SRem:
                 case Instruction::OpID::FAdd:
@@ -1899,8 +1902,10 @@ VerifyResult Verifier::verify_module(const Module &module) {
                         return fail("binary instruction " + inst_ref(bin) +
                                     " type mismatch between operands and result");
                     }
-                    if (inst->op() == Instruction::OpID::And && !bin->type()->is_integer()) {
-                        return fail("and instruction " + inst_ref(bin) +
+                    if ((inst->op() == Instruction::OpID::And ||
+                         inst->op() == Instruction::OpID::Xor) &&
+                        !bin->type()->is_integer()) {
+                        return fail(op_to_string(inst->op()) + " instruction " + inst_ref(bin) +
                                     " operands must be integer");
                     }
                     break;

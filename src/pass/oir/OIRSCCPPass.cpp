@@ -4,10 +4,25 @@
 
 #include "oir/OIRAnalysis.h"
 
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace pass::oir_opt {
+
+static std::optional<std::int64_t> all_ones_constant_for_type(oir::Type *type) {
+    auto *integer = dynamic_cast<oir::IntegerType *>(type);
+    if (integer == nullptr) {
+        return std::nullopt;
+    }
+    if (integer->bit_width() == 1) {
+        return 1;
+    }
+    if (integer->bit_width() == 32) {
+        return -1;
+    }
+    return std::nullopt;
+}
 
 enum class LatticeKind { Unknown, Constant, Overdefined };
 
@@ -253,10 +268,20 @@ class SCCPSolver final {
                 (lhs.kind == LatticeKind::Constant && is_int_value(lhs.constant, 0))) {
                 return LatticeValue::constant_value(make_zero_constant(module_, inst.type()));
             }
-            if (rhs.kind == LatticeKind::Constant && is_int_value(rhs.constant, -1)) {
+            if (auto all_ones = all_ones_constant_for_type(inst.type())) {
+                if (rhs.kind == LatticeKind::Constant && is_int_value(rhs.constant, *all_ones)) {
+                    return lhs;
+                }
+                if (lhs.kind == LatticeKind::Constant && is_int_value(lhs.constant, *all_ones)) {
+                    return rhs;
+                }
+            }
+            break;
+        case oir::Instruction::OpID::Xor:
+            if (rhs.kind == LatticeKind::Constant && is_int_value(rhs.constant, 0)) {
                 return lhs;
             }
-            if (lhs.kind == LatticeKind::Constant && is_int_value(lhs.constant, -1)) {
+            if (lhs.kind == LatticeKind::Constant && is_int_value(lhs.constant, 0)) {
                 return rhs;
             }
             break;

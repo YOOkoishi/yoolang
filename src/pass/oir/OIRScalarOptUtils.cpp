@@ -150,6 +150,8 @@ std::optional<std::int64_t> fold_int_binary(oir::Instruction::OpID op, std::int6
         return static_cast<std::int32_t>(lhs * rhs);
     case oir::Instruction::OpID::And:
         return static_cast<std::int32_t>(lhs) & static_cast<std::int32_t>(rhs);
+    case oir::Instruction::OpID::Xor:
+        return static_cast<std::int32_t>(lhs) ^ static_cast<std::int32_t>(rhs);
     case oir::Instruction::OpID::SDiv:
         if (rhs == 0) {
             return std::nullopt;
@@ -198,6 +200,7 @@ bool is_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Xor:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
     case oir::Instruction::OpID::FAdd:

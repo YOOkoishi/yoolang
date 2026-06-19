@@ -226,12 +226,6 @@ int scanPunctuation() {
 
 } // namespace
 
-void reset_lexer_state() {
-    input.clear();
-    loc = 0;
-    loaded = false;
-}
-
 int nextToken() {
     loadInput();
     skipWhitespaceAndComments();

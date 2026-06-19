@@ -44,7 +44,3 @@ struct TokenValue {
 };
 
 extern TokenValue token_value;
-
-int nextToken();
-
-void reset_lexer_state();

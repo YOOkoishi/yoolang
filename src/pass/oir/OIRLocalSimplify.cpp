@@ -10,6 +10,20 @@
 
 namespace pass::oir_opt {
 
+static std::optional<std::int64_t> all_ones_constant_for_type(oir::Type *type) {
+    auto *integer = dynamic_cast<oir::IntegerType *>(type);
+    if (integer == nullptr) {
+        return std::nullopt;
+    }
+    if (integer->bit_width() == 1) {
+        return 1;
+    }
+    if (integer->bit_width() == 32) {
+        return -1;
+    }
+    return std::nullopt;
+}
+
 oir::CmpInst *as_zext_cmp(oir::Value *value) {
     auto *cast = dynamic_cast<oir::CastInst *>(value);
     if (cast == nullptr || cast->op() != oir::Instruction::OpID::ZExt) {
@@ -159,11 +173,24 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block,
             if (is_int_value(binary->rhs(), 0) || is_int_value(binary->lhs(), 0)) {
                 return make_zero_constant(module, inst.type());
             }
-            if (is_int_value(binary->rhs(), -1)) {
+            if (auto all_ones = all_ones_constant_for_type(inst.type())) {
+                if (is_int_value(binary->rhs(), *all_ones)) {
+                    return binary->lhs();
+                }
+                if (is_int_value(binary->lhs(), *all_ones)) {
+                    return binary->rhs();
+                }
+            }
+            break;
+        case oir::Instruction::OpID::Xor:
+            if (is_int_value(binary->rhs(), 0)) {
                 return binary->lhs();
             }
-            if (is_int_value(binary->lhs(), -1)) {
+            if (is_int_value(binary->lhs(), 0)) {
                 return binary->rhs();
+            }
+            if (binary->lhs() == binary->rhs()) {
+                return make_zero_constant(module, inst.type());
             }
             break;
         case oir::Instruction::OpID::SDiv:
