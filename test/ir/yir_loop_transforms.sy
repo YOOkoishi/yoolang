@@ -60,8 +60,34 @@ int lane_copy_sum() {
   return sum;
 }
 
+int repeat_invariant_sum(int n) {
+  int r = 0;
+  int i = 0;
+  int total = 7;
+  while (r < n) {
+    i = 0;
+    while (i < 64) {
+      total = total + flat_a[i] * flat_a[i];
+      i = i + 1;
+    }
+    r = r + 1;
+  }
+  return total;
+}
+
+int repeat_keeps_live_iv(int n) {
+  int r = 0;
+  int total = 0;
+  while (r < n) {
+    total = total + flat_a[0];
+    r = r + 1;
+  }
+  return total + r;
+}
+
 int main() {
-  return tiled_copy() + interchange_copy() + unroll_jam_copy() + lane_copy_sum();
+  return tiled_copy() + interchange_copy() + unroll_jam_copy() + lane_copy_sum() +
+         repeat_invariant_sum(3) + repeat_keeps_live_iv(3);
 }
 
 // YIR-LABEL: yir.func @tiled_copy
@@ -81,3 +107,16 @@ int main() {
 // YIR-LABEL: yir.func @lane_copy_sum
 // YIR: .vec.step = yir.const.i32 4
 // YIR: .vec.iv = yir.addi
+
+// YIR-LABEL: yir.func @repeat_invariant_sum
+// YIR: .repeat.has_trip = yir.icmp gt %n
+// YIR: yir.if
+// YIR: .repeat.delta = yir.var : i32
+// YIR: yir.for %i =
+// YIR: .repeat.scaled = yir.muli
+// YIR: yir.assign %total
+
+// YIR-LABEL: yir.func @repeat_keeps_live_iv
+// YIR: yir.for %r =
+// YIR-NOT: .repeat.scaled
+// YIR: yir.return

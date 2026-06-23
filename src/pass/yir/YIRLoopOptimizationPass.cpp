@@ -651,6 +651,218 @@ bool collect_reduction_infos(const yir::Region &region, const ValueSet &locals,
     return true;
 }
 
+bool collect_reduction_infos_recursive(
+    const yir::Region &region, const ValueSet &locals,
+    std::unordered_map<const yir::Value *, ReductionInfo> &reductions,
+    ValueSet &allowed_reduction_results,
+    std::unordered_set<const yir::Operation *> &allowed_reduction_ops,
+    std::unordered_set<const yir::AssignOp *> &allowed_assigns) {
+    for (const auto &op : region.operations()) {
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (!collect_reduction_infos_recursive(if_op->then_region(), locals, reductions,
+                                                   allowed_reduction_results,
+                                                   allowed_reduction_ops, allowed_assigns)) {
+                return false;
+            }
+            if (if_op->has_else() &&
+                !collect_reduction_infos_recursive(if_op->else_region(), locals, reductions,
+                                                   allowed_reduction_results,
+                                                   allowed_reduction_ops, allowed_assigns)) {
+                return false;
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (!collect_reduction_infos_recursive(for_op->body_region(), locals, reductions,
+                                                   allowed_reduction_results,
+                                                   allowed_reduction_ops, allowed_assigns)) {
+                return false;
+            }
+            continue;
+        }
+
+        auto *assign = dynamic_cast<const yir::AssignOp *>(op.get());
+        if (assign == nullptr) {
+            continue;
+        }
+        if (locals.find(assign->target()) != locals.end()) {
+            continue;
+        }
+
+        ReductionInfo info;
+        const yir::Operation *value_op = nullptr;
+        if (!supported_int_reduction(*assign, info, value_op)) {
+            return false;
+        }
+
+        auto found = reductions.find(assign->target());
+        if (found != reductions.end() && found->second.combine != info.combine) {
+            return false;
+        }
+        reductions[assign->target()] = info;
+        allowed_assigns.insert(assign);
+        allowed_reduction_ops.insert(value_op);
+        if (value_op != nullptr && value_op->result() != nullptr) {
+            allowed_reduction_results.insert(value_op->result());
+        }
+    }
+    return true;
+}
+
+void collect_nested_for_induction_vars(const yir::Region &region, ValueSet &locals) {
+    for (const auto &op : region.operations()) {
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            collect_nested_for_induction_vars(if_op->then_region(), locals);
+            if (if_op->has_else()) {
+                collect_nested_for_induction_vars(if_op->else_region(), locals);
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            locals.insert(for_op->induction_var());
+            collect_nested_for_induction_vars(for_op->body_region(), locals);
+            continue;
+        }
+    }
+}
+
+bool region_has_repeat_fold_barrier(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (dynamic_cast<const yir::CallOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ArrayStoreOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::StoreOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ArrayInitOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::CondOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ContinueOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ReturnOp *>(op.get()) != nullptr) {
+            return true;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (region_has_repeat_fold_barrier(if_op->then_region()) ||
+                (if_op->has_else() && region_has_repeat_fold_barrier(if_op->else_region()))) {
+                return true;
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (region_has_repeat_fold_barrier(for_op->body_region())) {
+                return true;
+            }
+            continue;
+        }
+    }
+    return false;
+}
+
+bool region_depends_on_value(const yir::Region &region, const yir::Value *needle) {
+    for (const auto &op : region.operations()) {
+        for (auto *operand : op->operands()) {
+            if (value_depends_on(operand, needle)) {
+                return true;
+            }
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (region_depends_on_value(if_op->then_region(), needle) ||
+                (if_op->has_else() && region_depends_on_value(if_op->else_region(), needle))) {
+                return true;
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (region_depends_on_value(for_op->body_region(), needle)) {
+                return true;
+            }
+            continue;
+        }
+    }
+    return false;
+}
+
+bool op_or_nested_region_depends_on_value(const yir::Operation &op,
+                                          const yir::Value *needle) {
+    for (auto *operand : op.operands()) {
+        if (value_depends_on(operand, needle)) {
+            return true;
+        }
+    }
+    if (auto *if_op = dynamic_cast<const yir::IfOp *>(&op)) {
+        return region_depends_on_value(if_op->then_region(), needle) ||
+               (if_op->has_else() && region_depends_on_value(if_op->else_region(), needle));
+    }
+    if (auto *while_op = dynamic_cast<const yir::WhileOp *>(&op)) {
+        return region_depends_on_value(while_op->cond_region(), needle) ||
+               region_depends_on_value(while_op->body_region(), needle);
+    }
+    if (auto *for_op = dynamic_cast<const yir::ForOp *>(&op)) {
+        return region_depends_on_value(for_op->body_region(), needle);
+    }
+    return false;
+}
+
+bool ops_after_depend_on_value(const OpList &ops, std::size_t index,
+                               const yir::Value *needle) {
+    for (std::size_t i = index + 1; i < ops.size(); ++i) {
+        if (op_or_nested_region_depends_on_value(*ops[i], needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool only_additive_reduction_ops(
+    const std::unordered_set<const yir::Operation *> &allowed_reduction_ops) {
+    return std::all_of(allowed_reduction_ops.begin(), allowed_reduction_ops.end(),
+                       [](const yir::Operation *op) {
+                           return dynamic_cast<const yir::AddIOp *>(op) != nullptr;
+                       });
+}
+
+void replace_value_in_region(yir::Region &region, yir::Value *old_value, yir::Value *new_value) {
+    for (auto &op : region.operations()) {
+        for (auto *&operand : op->operands()) {
+            if (operand == old_value) {
+                operand = new_value;
+            }
+        }
+        if (auto *if_op = dynamic_cast<yir::IfOp *>(op.get())) {
+            replace_value_in_region(if_op->then_region(), old_value, new_value);
+            if (if_op->has_else()) {
+                replace_value_in_region(if_op->else_region(), old_value, new_value);
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<yir::ForOp *>(op.get())) {
+            replace_value_in_region(for_op->body_region(), old_value, new_value);
+            continue;
+        }
+    }
+}
+
+void replace_value_in_ops(yir::Region::OpList &ops, std::size_t begin, yir::Value *old_value,
+                          yir::Value *new_value) {
+    for (std::size_t i = begin; i < ops.size(); ++i) {
+        auto &op = ops[i];
+        for (auto *&operand : op->operands()) {
+            if (operand == old_value) {
+                operand = new_value;
+            }
+        }
+        if (auto *if_op = dynamic_cast<yir::IfOp *>(op.get())) {
+            replace_value_in_region(if_op->then_region(), old_value, new_value);
+            if (if_op->has_else()) {
+                replace_value_in_region(if_op->else_region(), old_value, new_value);
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<yir::ForOp *>(op.get())) {
+            replace_value_in_region(for_op->body_region(), old_value, new_value);
+            continue;
+        }
+    }
+}
+
 bool reduction_target_uses_are_isolated(
     const yir::Region &region, const ValueSet &targets, const ValueSet &allowed_results,
     const std::unordered_set<const yir::Operation *> &allowed_reduction_ops,
@@ -665,6 +877,17 @@ bool reduction_target_uses_are_isolated(
                  !reduction_target_uses_are_isolated(if_op->else_region(), targets,
                                                      allowed_results, allowed_reduction_ops,
                                                      allowed_assigns))) {
+                return false;
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (value_set_contains_dependency(for_op->lower_bound(), targets) ||
+                value_set_contains_dependency(for_op->upper_bound(), targets) ||
+                value_set_contains_dependency(for_op->step(), targets) ||
+                !reduction_target_uses_are_isolated(for_op->body_region(), targets,
+                                                    allowed_results, allowed_reduction_ops,
+                                                    allowed_assigns)) {
                 return false;
             }
             continue;
@@ -1001,7 +1224,8 @@ class Optimizer final {
                     mark_changed(true);
                     continue;
                 }
-                if (try_interchange(ops, i, *for_op, analysis) ||
+                if (try_fold_repeated_additive_reduction(ops, i, *for_op) ||
+                    try_interchange(ops, i, *for_op, analysis) ||
                     try_tile_perfect_nest(ops, i, *for_op, analysis) ||
                     try_unroll_jam(ops, i, *for_op, analysis) ||
                     try_vectorize_inner_loop(ops, i, *for_op, analysis) ||
@@ -1144,6 +1368,133 @@ class Optimizer final {
         } else if (index > 0) {
             --index;
         }
+        return true;
+    }
+
+    bool try_fold_repeated_additive_reduction(OpList &ops, std::size_t &index,
+                                              yir::ForOp &for_op) {
+        std::int64_t lower = 0;
+        std::int64_t step = 0;
+        if (!const_i32_value(for_op.lower_bound(), lower) ||
+            !const_i32_value(for_op.step(), step) || lower != 0 || step != 1 ||
+            for_op.upper_bound() == nullptr ||
+            for_op.upper_bound()->type() != yir::Type::get_i32() ||
+            for_op.body_region().operations().empty()) {
+            return false;
+        }
+
+        if (value_depends_on(for_op.upper_bound(), for_op.induction_var()) ||
+            region_has_repeat_fold_barrier(for_op.body_region()) ||
+            region_depends_on_value(for_op.body_region(), for_op.induction_var()) ||
+            ops_after_depend_on_value(ops, index, for_op.induction_var())) {
+            return false;
+        }
+
+        ValueSet locals;
+        collect_local_scalar_vars_recursive(for_op.body_region(), locals);
+        collect_nested_for_induction_vars(for_op.body_region(), locals);
+        locals.insert(for_op.induction_var());
+
+        ValueSet assigned;
+        collect_assigned(for_op.body_region(), assigned);
+        for (auto *local : locals) {
+            assigned.erase(local);
+        }
+        if (value_set_contains_dependency(for_op.upper_bound(), assigned)) {
+            return false;
+        }
+
+        std::unordered_map<const yir::Value *, ReductionInfo> reductions;
+        ValueSet allowed_results;
+        std::unordered_set<const yir::Operation *> allowed_reduction_ops;
+        std::unordered_set<const yir::AssignOp *> allowed_assigns;
+        if (!collect_reduction_infos_recursive(for_op.body_region(), locals, reductions,
+                                               allowed_results, allowed_reduction_ops,
+                                               allowed_assigns) ||
+            reductions.size() != 1 || !only_additive_reduction_ops(allowed_reduction_ops)) {
+            return false;
+        }
+
+        auto reduction_it = reductions.begin();
+        if (reduction_it->second.combine != ReductionCombineKind::Add ||
+            reduction_it->second.identity != 0) {
+            return false;
+        }
+
+        auto *target = const_cast<yir::Value *>(reduction_it->first);
+        if (target == nullptr || target->type() != yir::Type::get_i32() ||
+            value_depends_on(for_op.upper_bound(), target)) {
+            return false;
+        }
+
+        ValueSet targets{target};
+        if (!reduction_target_uses_are_isolated(for_op.body_region(), targets, allowed_results,
+                                                allowed_reduction_ops, allowed_assigns)) {
+            return false;
+        }
+
+        auto *parent = ops[index]->parent();
+        auto zero_for_guard = std::make_unique<yir::ConstI32Op>(
+            0, derived_name(for_op.upper_bound(), ".repeat.zero", "repeat.zero"));
+        auto *zero_guard_value = zero_for_guard->result();
+        zero_for_guard->set_parent(parent);
+        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index), std::move(zero_for_guard));
+        ++index;
+
+        auto positive_trip = std::make_unique<yir::ICmpOp>(
+            yir::ICmpOp::Predicate::Gt, for_op.upper_bound(), zero_guard_value,
+            derived_name(for_op.upper_bound(), ".repeat.has_trip", "repeat.has_trip"));
+        auto *positive_trip_value = positive_trip->result();
+        positive_trip->set_parent(parent);
+        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index),
+                   std::move(positive_trip));
+        ++index;
+
+        auto folded = std::make_unique<yir::IfOp>(positive_trip_value);
+        folded->set_parent(parent);
+        auto *folded_if = folded.get();
+
+        auto delta_zero = std::make_unique<yir::ConstI32Op>(
+            0, derived_name(target, ".repeat.identity", "repeat.identity"));
+        auto *delta_zero_value = delta_zero->result();
+        delta_zero->set_parent(&folded_if->then_region());
+        folded_if->then_region().operations().push_back(std::move(delta_zero));
+
+        auto delta_var = std::make_unique<yir::VarOp>(
+            yir::Type::get_i32(), delta_zero_value,
+            derived_name(target, ".repeat.delta", "repeat.delta"));
+        auto *delta_value = delta_var->result();
+        delta_var->set_parent(&folded_if->then_region());
+        folded_if->then_region().operations().push_back(std::move(delta_var));
+
+        const std::size_t moved_body_begin = folded_if->then_region().operations().size();
+        auto &source_body = for_op.body_region().operations();
+        auto &then_ops = folded_if->then_region().operations();
+        for (auto &op : source_body) {
+            op->set_parent(&folded_if->then_region());
+            then_ops.push_back(std::move(op));
+        }
+        source_body.clear();
+        replace_value_in_ops(then_ops, moved_body_begin, target, delta_value);
+
+        auto scaled = std::make_unique<yir::MulIOp>(
+            delta_value, for_op.upper_bound(),
+            derived_name(target, ".repeat.scaled", "repeat.scaled"));
+        auto *scaled_value = scaled->result();
+        scaled->set_parent(&folded_if->then_region());
+        then_ops.push_back(std::move(scaled));
+
+        auto accumulated = std::make_unique<yir::AddIOp>(
+            target, scaled_value, derived_name(target, ".repeat.acc", "repeat.acc"));
+        auto *accumulated_value = accumulated->result();
+        accumulated->set_parent(&folded_if->then_region());
+        then_ops.push_back(std::move(accumulated));
+
+        auto assign_accumulated = std::make_unique<yir::AssignOp>(target, accumulated_value);
+        assign_accumulated->set_parent(&folded_if->then_region());
+        then_ops.push_back(std::move(assign_accumulated));
+
+        ops[index] = std::move(folded);
         return true;
     }
 
