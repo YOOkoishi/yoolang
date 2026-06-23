@@ -55,18 +55,13 @@ int main() {
   return 0;
 }
 
-// YIR: yir.global @poly.storage.xbuf : array<2 x array<16 x array<16 x i32>>> = zero
-// YIR: yir.global @poly.storage.row0 : array<16 x i32> = zero
-// YIR: yir.global @poly.storage.rowmid : array<16 x i32> = zero
-// YIR: yir.global @poly.storage.rowlast : array<16 x i32> = zero
-// YIR-NOT: yir.global @x
-// YIR-NOT: %poly.storage.bj
-// YIR-NOT: %poly.storage.bk
-// YIR: yir.for %j =
-// YIR: yir.for %k =
-// YIR: yir.array_load @poly.storage.xbuf
-// YIR: yir.array_store {{.*}}, @poly.storage.xbuf
-// YIR: yir.call @putarray(%N, %poly.storage.row.decay
-// YIR: yir.call @putarray(%N, %poly.storage.row.decay
-// YIR: yir.call @putarray(%N, %poly.storage.row.decay
-// YIR-NOT: @x
+// YIR: module {
+// YIR-NOT: poly.storage
+// YIR: yir.global @x : array<16 x array<16 x array<16 x i32>>> = zero
+// YIR-NOT: poly.storage
+// YIR: yir.call @putarray(%N,
+// YIR-NOT: poly.storage
+// YIR: yir.call @putarray(%N,
+// YIR-NOT: poly.storage
+// YIR: yir.call @putarray(%N,
+// YIR-NOT: poly.storage

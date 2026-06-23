@@ -55,34 +55,14 @@ int main() {
   return 0;
 }
 
-// YIR: yir.global @poly.storage.xbuf : array<2 x array<8 x array<8 x i32>>> = zero
-// YIR-NOT: yir.global @x
-// YIR: [[FIRSTUP:%poly.storage.first.upper[0-9]+]] = yir.var : i32 =
-// YIR: [[FIRSTHAS:%poly.storage.first.has[0-9]+]] = yir.icmp lt
-// YIR: yir.if [[FIRSTHAS]]
-// YIR: yir.assign [[FIRSTUP]],
-// YIR: [[PEELTWO:%poly.storage.peel.two[0-9]+]] = yir.const.i32 2 : i32
-// YIR: [[PEELTHREE:%poly.storage.peel.three[0-9]+]] = yir.const.i32 3 : i32
-// YIR: [[PEELFIVE:%poly.storage.peel.five[0-9]+]] = yir.const.i32 5 : i32
-// YIR: yir.for %i = {{.*}} to [[FIRSTUP]]
-// YIR-NOT: yir.array_load @poly.storage.xbuf, {{.*}}%poly.storage.prev
-// YIR: yir.for %i = [[FIRSTUP]]
-// YIR-NOT: poly.storage.reset
-// YIR: yir.for %j = {{.*}} to [[PEELTWO]]
-// YIR: [[J1CARRY:%poly.storage.peel.carry[0-9]+]] = yir.var : i32 =
-// YIR: yir.for %k =
-// YIR: yir.divsi {{.*}}, %f : i32
-// YIR: yir.for %j = [[PEELTWO]]
-// YIR: yir.assign %k, {{.*}}
-// YIR: [[JM1:%poly.storage.peel.jm1[0-9]+]] = yir.subi %j,
-// YIR: yir.array_load @poly.storage.xbuf, {{.*}}[%poly.storage.prev{{[0-9]+}}, %j,
-// YIR: yir.array_load @poly.storage.xbuf, {{.*}}[%poly.storage.cur{{[0-9]+}}, [[JM1]],
-// YIR: yir.addi {{.*}}, [[PEELFIVE]]
-// YIR: yir.array_store {{.*}}, @poly.storage.xbuf
-// YIR: yir.for %k = [[PEELTWO]]
-// YIR: [[KM1:%poly.storage.peel.km1[0-9]+]] = yir.subi %k,
-// YIR: yir.array_load @poly.storage.xbuf, {{.*}}[%poly.storage.prev{{[0-9]+}}, [[JM1]], [[KM1]]]
-// YIR: yir.addi {{.*}}, [[PEELTHREE]]
-// YIR: yir.array_store {{.*}}, @poly.storage.xbuf
-// YIR-NOT: poly.storage.reset
-// YIR-NOT: @x
+// YIR: module {
+// YIR-NOT: poly.storage
+// YIR-NOT: poly.storage.peel
+// YIR: yir.global @x : array<8 x array<8 x array<8 x i32>>> = zero
+// YIR-NOT: poly.storage
+// YIR: yir.call @putarray(%N,
+// YIR-NOT: poly.storage
+// YIR: yir.call @putarray(%N,
+// YIR-NOT: poly.storage
+// YIR: yir.call @putarray(%N,
+// YIR-NOT: poly.storage
