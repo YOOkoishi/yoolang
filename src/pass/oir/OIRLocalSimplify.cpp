@@ -25,6 +25,34 @@ static std::optional<std::int64_t> all_ones_constant_for_type(oir::Type *type) {
     return std::nullopt;
 }
 
+bool is_i32_type(oir::Type *type) {
+    auto *integer = dynamic_cast<oir::IntegerType *>(type);
+    return integer != nullptr && integer->bit_width() == 32;
+}
+
+oir::BinaryInst *insert_binary_before(
+    oir::BasicBlock &block, std::list<std::unique_ptr<oir::Instruction>>::iterator before,
+    oir::Type *type, oir::Instruction::OpID op, oir::Value *lhs, oir::Value *rhs,
+    const std::string &name) {
+    auto replacement = std::make_unique<oir::BinaryInst>(type, op, lhs, rhs, &block, name);
+    auto *raw = replacement.get();
+    raw->set_parent(&block);
+    block.instructions().insert(before, std::move(replacement));
+    return raw;
+}
+
+oir::BinaryInst *as_binary_op(oir::Value *value, oir::Instruction::OpID op) {
+    auto *binary = dynamic_cast<oir::BinaryInst *>(value);
+    return binary != nullptr && binary->op() == op ? binary : nullptr;
+}
+
+oir::Value *make_neg_before(oir::Module &module, oir::BasicBlock &block,
+                            std::list<std::unique_ptr<oir::Instruction>>::iterator before,
+                            oir::Value *value, const std::string &name) {
+    return insert_binary_before(block, before, value->type(), oir::Instruction::OpID::Sub,
+                                make_zero_constant(module, value->type()), value, name);
+}
+
 oir::CmpInst *as_zext_cmp(oir::Value *value) {
     auto *cast = dynamic_cast<oir::CastInst *>(value);
     if (cast == nullptr || cast->op() != oir::Instruction::OpID::ZExt) {
@@ -228,10 +256,65 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block,
             if (is_int_value(binary->lhs(), 0)) {
                 return binary->rhs();
             }
+            if (is_i32_type(inst.type())) {
+                if (auto *lhs_sub = as_binary_op(binary->lhs(), oir::Instruction::OpID::Sub)) {
+                    if (lhs_sub->rhs() == binary->rhs()) {
+                        return lhs_sub->lhs();
+                    }
+                }
+                if (auto *rhs_sub = as_binary_op(binary->rhs(), oir::Instruction::OpID::Sub)) {
+                    if (rhs_sub->rhs() == binary->lhs()) {
+                        return rhs_sub->lhs();
+                    }
+                }
+            }
             break;
         case oir::Instruction::OpID::Sub:
             if (is_int_value(binary->rhs(), 0)) {
                 return binary->lhs();
+            }
+            if (is_i32_type(inst.type()) && is_int_value(binary->lhs(), -1)) {
+                return insert_binary_before(
+                    block, before, inst.type(), oir::Instruction::OpID::Xor, binary->rhs(),
+                    make_int_constant(module, inst.type(), -1),
+                    inst.name().empty() ? "not" : inst.name() + ".not");
+            }
+            if (inst.type()->is_integer() && binary->lhs() == binary->rhs()) {
+                return make_zero_constant(module, inst.type());
+            }
+            if (is_i32_type(inst.type())) {
+                if (auto *rhs_add = as_binary_op(binary->rhs(), oir::Instruction::OpID::Add)) {
+                    if (rhs_add->lhs() == binary->lhs()) {
+                        return make_neg_before(
+                            module, block, before, rhs_add->rhs(),
+                            inst.name().empty() ? "sub.cancel.neg" : inst.name() + ".neg");
+                    }
+                    if (rhs_add->rhs() == binary->lhs()) {
+                        return make_neg_before(
+                            module, block, before, rhs_add->lhs(),
+                            inst.name().empty() ? "sub.cancel.neg" : inst.name() + ".neg");
+                    }
+                }
+                if (auto *lhs_add = as_binary_op(binary->lhs(), oir::Instruction::OpID::Add)) {
+                    if (lhs_add->lhs() == binary->rhs()) {
+                        return lhs_add->rhs();
+                    }
+                    if (lhs_add->rhs() == binary->rhs()) {
+                        return lhs_add->lhs();
+                    }
+                }
+                if (auto *rhs_sub = as_binary_op(binary->rhs(), oir::Instruction::OpID::Sub)) {
+                    if (rhs_sub->lhs() == binary->lhs()) {
+                        return rhs_sub->rhs();
+                    }
+                }
+                if (auto *lhs_sub = as_binary_op(binary->lhs(), oir::Instruction::OpID::Sub)) {
+                    if (lhs_sub->lhs() == binary->rhs()) {
+                        return make_neg_before(
+                            module, block, before, lhs_sub->rhs(),
+                            inst.name().empty() ? "sub.cancel.neg" : inst.name() + ".neg");
+                    }
+                }
             }
             break;
         case oir::Instruction::OpID::Mul:
@@ -244,10 +327,21 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block,
             if (is_int_value(binary->rhs(), 0) || is_int_value(binary->lhs(), 0)) {
                 return make_zero_constant(module, inst.type());
             }
+            if (is_i32_type(inst.type()) && is_int_value(binary->rhs(), -1)) {
+                return make_neg_before(module, block, before, binary->lhs(),
+                                       inst.name().empty() ? "neg" : inst.name() + ".neg");
+            }
+            if (is_i32_type(inst.type()) && is_int_value(binary->lhs(), -1)) {
+                return make_neg_before(module, block, before, binary->rhs(),
+                                       inst.name().empty() ? "neg" : inst.name() + ".neg");
+            }
             break;
         case oir::Instruction::OpID::And:
             if (is_int_value(binary->rhs(), 0) || is_int_value(binary->lhs(), 0)) {
                 return make_zero_constant(module, inst.type());
+            }
+            if (binary->lhs() == binary->rhs()) {
+                return binary->lhs();
             }
             if (auto all_ones = all_ones_constant_for_type(inst.type())) {
                 if (is_int_value(binary->rhs(), *all_ones)) {
@@ -970,9 +1064,12 @@ bool local_simplify(oir::Module &module, Stats &stats, SimplifyMode mode) {
         }
         for (auto &block : function->blocks()) {
             for (auto it = block->instructions().begin(); it != block->instructions().end(); ++it) {
+                if (!uses.has_uses(it->get())) {
+                    continue;
+                }
                 auto *replacement = simplify_instruction(module, *block, it, **it, mode);
                 if (replacement != nullptr && replacement != it->get() &&
-                    replacement->type() == (*it)->type() && uses.has_uses(it->get())) {
+                    replacement->type() == (*it)->type()) {
                     replacements[it->get()] = replacement;
                 }
             }

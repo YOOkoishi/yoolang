@@ -62,6 +62,26 @@ int product_even_remainder_branch(int x, int y) {
   return 0;
 }
 
+int negated_by_mul(int x) {
+  return x * -1;
+}
+
+int bitwise_not_by_sub(int x) {
+  return -1 - x;
+}
+
+int cancel_sub_add(int x, int y) {
+  return x - (x + y);
+}
+
+int cancel_add_sub(int x, int y) {
+  return (x - y) + y;
+}
+
+int cancel_sub_rhs(int x, int y) {
+  return (x + y) - y;
+}
+
 int tail_sum(int n, int acc) {
   if (n == 0) {
     return acc;
@@ -103,6 +123,8 @@ int main() {
   return algebra(42) + folded_branch() + zext_cmp(3) + global_const(99) +
          range_gated_rem(23) + range_gated_negative_divisor_rem(23) + tail_sum(4, 0) +
          even_remainder_branch(42) + product_even_remainder_branch(6, 7) +
+         negated_by_mul(5) + bitwise_not_by_sub(5) +
+         cancel_sub_add(7, 3) + cancel_add_sub(7, 3) + cancel_sub_rhs(7, 3) +
          tail_sum_merged_return(4, 0) + tail_global_countdown() + tail_sum_wrapped(4, 0);
 }
 
@@ -150,6 +172,28 @@ int main() {
 // OIR-NOT: mul i32
 // OIR-NOT: srem
 // OIR: br i1
+
+// OIR-LABEL: define i32 @negated_by_mul
+// OIR: sub i32 0, %x.arg
+// OIR-NOT: mul i32
+
+// OIR-LABEL: define i32 @bitwise_not_by_sub
+// OIR: xor i32 %x.arg, -1
+// OIR-NOT: sub i32 -1
+
+// OIR-LABEL: define i32 @cancel_sub_add
+// OIR: sub i32 0, %y.arg
+// OIR-NOT: add i32 %x.arg, %y.arg
+
+// OIR-LABEL: define i32 @cancel_add_sub
+// OIR: ret i32 %x.arg
+// OIR-NOT: add i32
+// OIR-NOT: sub i32
+
+// OIR-LABEL: define i32 @cancel_sub_rhs
+// OIR: ret i32 %x.arg
+// OIR-NOT: add i32
+// OIR-NOT: sub i32
 
 // OIR-LABEL: define i32 @tail_sum
 // OIR: %n.arg.tail = phi
