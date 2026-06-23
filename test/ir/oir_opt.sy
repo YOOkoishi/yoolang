@@ -48,6 +48,20 @@ int range_gated_negative_divisor_rem(int x) {
   return x % -8;
 }
 
+int even_remainder_branch(int x) {
+  if (x % 2 == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+int product_even_remainder_branch(int x, int y) {
+  if ((x * y) % 2 == 0) {
+    return 1;
+  }
+  return 0;
+}
+
 int tail_sum(int n, int acc) {
   if (n == 0) {
     return acc;
@@ -88,6 +102,7 @@ int main() {
   G = 3;
   return algebra(42) + folded_branch() + zext_cmp(3) + global_const(99) +
          range_gated_rem(23) + range_gated_negative_divisor_rem(23) + tail_sum(4, 0) +
+         even_remainder_branch(42) + product_even_remainder_branch(6, 7) +
          tail_sum_merged_return(4, 0) + tail_global_countdown() + tail_sum_wrapped(4, 0);
 }
 
@@ -121,6 +136,20 @@ int main() {
 // OIR-LABEL: define i32 @range_gated_negative_divisor_rem
 // OIR: and i32 %x.arg, 7
 // OIR: srem i32 %x.arg, -8
+
+// OIR-LABEL: define i32 @even_remainder_branch
+// OIR: and i32 %x.arg, 1
+// OIR: icmp eq i32
+// OIR-NOT: srem
+// OIR: br i1
+
+// OIR-LABEL: define i32 @product_even_remainder_branch
+// OIR: and i32 %x.arg, %y.arg
+// OIR: and i32 {{.*}}, 1
+// OIR: icmp eq i32
+// OIR-NOT: mul i32
+// OIR-NOT: srem
+// OIR: br i1
 
 // OIR-LABEL: define i32 @tail_sum
 // OIR: %n.arg.tail = phi

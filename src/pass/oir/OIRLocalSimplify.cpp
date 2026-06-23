@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -119,6 +120,81 @@ oir::Value *simplify_signed_odd_remainder_compare(
     return raw_cmp;
 }
 
+std::optional<std::int64_t> positive_power_of_two_abs(std::int64_t value) {
+    if (value == 0 || value == std::numeric_limits<std::int32_t>::min()) {
+        return std::nullopt;
+    }
+    const auto magnitude = value < 0 ? -value : value;
+    if ((magnitude & (magnitude - 1)) != 0) {
+        return std::nullopt;
+    }
+    return magnitude;
+}
+
+oir::Value *simplify_signed_remainder_zero_compare(
+    oir::Module &module, oir::BasicBlock &block,
+    std::list<std::unique_ptr<oir::Instruction>>::iterator before, oir::CmpInst &cmp) {
+    if (cmp.op() != oir::Instruction::OpID::ICmp ||
+        (cmp.pred() != oir::CmpPred::EQ && cmp.pred() != oir::CmpPred::NE)) {
+        return nullptr;
+    }
+
+    oir::BinaryInst *rem = nullptr;
+    std::optional<std::int64_t> constant;
+    if ((rem = dynamic_cast<oir::BinaryInst *>(cmp.lhs())) != nullptr) {
+        constant = int_constant(cmp.rhs());
+    } else if ((rem = dynamic_cast<oir::BinaryInst *>(cmp.rhs())) != nullptr) {
+        constant = int_constant(cmp.lhs());
+    }
+    if (rem == nullptr || rem->op() != oir::Instruction::OpID::SRem || !constant ||
+        *constant != 0) {
+        return nullptr;
+    }
+
+    auto *int_type = dynamic_cast<oir::IntegerType *>(rem->type());
+    auto divisor = int_constant(rem->rhs());
+    if (int_type == nullptr || int_type->bit_width() != 32 || !divisor) {
+        return nullptr;
+    }
+
+    auto magnitude = positive_power_of_two_abs(*divisor);
+    if (!magnitude || *magnitude <= 1) {
+        return nullptr;
+    }
+
+    oir::Value *mask_input = rem->lhs();
+    if (*magnitude == 2) {
+        auto *product = dynamic_cast<oir::BinaryInst *>(mask_input);
+        if (product != nullptr && product->op() == oir::Instruction::OpID::Mul &&
+            product->type() == rem->type()) {
+            auto low_product = std::make_unique<oir::BinaryInst>(
+                rem->type(), oir::Instruction::OpID::And, product->lhs(), product->rhs(), &block,
+                product->name().empty() ? "mul.lowbit" : product->name() + ".lowbit");
+            auto *raw_low_product = low_product.get();
+            raw_low_product->set_parent(&block);
+            mask_input = raw_low_product;
+            block.instructions().insert(before, std::move(low_product));
+        }
+    }
+
+    auto mask = std::make_unique<oir::BinaryInst>(
+        rem->type(), oir::Instruction::OpID::And, mask_input,
+        make_int_constant(module, rem->type(), *magnitude - 1), &block,
+        rem->name().empty() ? "srem.zero.mask" : rem->name() + ".zero.mask");
+    auto *raw_mask = mask.get();
+    raw_mask->set_parent(&block);
+    block.instructions().insert(before, std::move(mask));
+
+    auto replacement = std::make_unique<oir::CmpInst>(
+        cmp.type(), oir::Instruction::OpID::ICmp, cmp.pred(), raw_mask,
+        make_zero_constant(module, rem->type()), &block,
+        cmp.name().empty() ? "srem.zero" : cmp.name() + ".zero");
+    auto *raw_cmp = replacement.get();
+    raw_cmp->set_parent(&block);
+    block.instructions().insert(before, std::move(replacement));
+    return raw_cmp;
+}
+
 oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block,
                                  std::list<std::unique_ptr<oir::Instruction>>::iterator before,
                                  oir::Instruction &inst, SimplifyMode mode) {
@@ -211,6 +287,10 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block,
 
     if (auto *cmp = dynamic_cast<oir::CmpInst *>(&inst)) {
         if (mode == SimplifyMode::Algebraic) {
+            if (auto *replacement =
+                    simplify_signed_remainder_zero_compare(module, block, before, *cmp)) {
+                return replacement;
+            }
             if (auto *replacement =
                     simplify_signed_odd_remainder_compare(module, block, before, *cmp)) {
                 return replacement;
