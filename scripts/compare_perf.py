@@ -217,7 +217,7 @@ def _collect_cases() -> list[Path]:
     if env_dirs:
         roots = [WORKSPACE / item.strip() for item in env_dirs.split(",") if item.strip()]
     else:
-        preferred = ["test/perf_tests", "test/bsb-final", "test/bsb-perl"]
+        preferred = ["test/performance"]
         roots = [WORKSPACE / rel for rel in preferred if (WORKSPACE / rel).exists()]
         if not roots:
             roots = [WORKSPACE / "test"]
@@ -1103,7 +1103,7 @@ env_dirs = os.environ.get("PERF_TEST_DIRS", "").strip()
 if env_dirs:
     TEST_ROOTS = [WORKSPACE / item.strip() for item in env_dirs.split(",") if item.strip()]
 else:
-    for rel in ("test/perf_tests", "test/bsb-final", "test/bsb-perl"):
+    for rel in ("test/performance",):
         candidate = WORKSPACE / rel
         if candidate.exists():
             TEST_ROOTS.append(candidate)
