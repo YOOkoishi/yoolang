@@ -100,10 +100,10 @@ int main() {
 
 // COST-IFC: [cost-model] target=rv64gc/lp64d policy=balanced filter=IfConversion
 // COST-IFC: [cost-model] summary stage=OIR label=oir
-// COST-IFC: [cost-model] OIRLocalSimplify Accept transform=IfConversion
-// COST-IFC: reason=Profitable
+// COST-IFC: [cost-model] OIRLocalSimplify BypassProfitability transform=IfConversion
+// COST-IFC: reason=AlwaysOnLowRiskIfConversion
 
 // COST-IFC-CONS: [cost-model] target=rv64gc/lp64d policy=conservative filter=IfConversion
 // COST-IFC-CONS: [cost-model] summary stage=OIR label=oir
-// COST-IFC-CONS: [cost-model] OIRLocalSimplify Reject transform=IfConversion
-// COST-IFC-CONS: reason=LowConfidence
+// COST-IFC-CONS: [cost-model] OIRLocalSimplify BypassProfitability transform=IfConversion
+// COST-IFC-CONS: reason=AlwaysOnLowRiskIfConversion

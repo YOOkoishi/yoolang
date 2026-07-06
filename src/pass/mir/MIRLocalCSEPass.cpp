@@ -410,6 +410,10 @@ bool allows_cse_rewrite(Stats &stats, CSEScope scope) {
     estimate.after_instrs = 1;
     estimate.after_moves = 1;
     estimate.risk.register_pressure_growth = scope == CSEScope::Global ? 1 : 0;
+    if (scope == CSEScope::Local) {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "AlwaysOnLocalCleanup";
+    }
     return pass::mir_cost_model::allows_transform(stats.cost_model_report,
                                                   stats.cost_model_policy,
                                                   stats.cost_model_filter, estimate);

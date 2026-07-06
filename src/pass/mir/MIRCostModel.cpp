@@ -50,11 +50,15 @@ bool allows_transform(pass::cost_model::CostModelReport *report,
     candidate.after.stores = estimate.after_stores;
     candidate.after.branches = estimate.after_branches;
     candidate.risk = estimate.risk;
+    candidate.bypass_profitability = estimate.bypass_profitability;
+    candidate.bypass_reason = estimate.bypass_reason;
 
     auto decision = pass::cost_model::decide(
         candidate, pass::cost_model::policy_for_kind(policy), report->target);
     const bool accepted =
-        decision.action == pass::cost_model::DecisionAction::Accept && decision.legal &&
+        (decision.action == pass::cost_model::DecisionAction::Accept ||
+         decision.action == pass::cost_model::DecisionAction::BypassProfitability) &&
+        decision.legal &&
         decision.profitable;
     if (filter_matches(filter, estimate.kind, estimate.pass_name)) {
         report->decisions.push_back(std::move(decision));

@@ -59,6 +59,8 @@ struct OIRTransformCostEstimate {
     pass::cost_model::EGraphExtractCost egraph;
 
     pass::cost_model::RiskVector risk;
+    bool bypass_profitability = false;
+    std::string bypass_reason;
 };
 
 bool cost_model_allows_transform(Stats &stats, const OIRTransformCostEstimate &estimate);

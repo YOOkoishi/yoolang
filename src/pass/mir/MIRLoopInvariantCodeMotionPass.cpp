@@ -521,12 +521,15 @@ bool reduce_loop_divisions(mir::MachineFunction &function, const Loop &loop,
     if (divs.empty()) {
         return false;
     }
+    constexpr std::int64_t kUnknownTripCountProfitabilityScale = 4;
+    const auto div_count = static_cast<std::int64_t>(divs.size());
     if (!allows_mir_loop_transform(
             stats, pass::cost_model::TransformKind::StrengthReduction,
             "div-reciprocal." + std::to_string(stats.arithmetic + 1),
-            static_cast<std::int64_t>(divs.size()) * 12, 9,
-            static_cast<std::int64_t>(divs.size()) * 24, 18,
-            static_cast<std::int64_t>(divs.size()) + 2)) {
+            div_count * 12 * kUnknownTripCountProfitabilityScale,
+            div_count * 9 * kUnknownTripCountProfitabilityScale,
+            div_count * 24 * kUnknownTripCountProfitabilityScale,
+            div_count * 9 * kUnknownTripCountProfitabilityScale, div_count + 2)) {
         return false;
     }
 

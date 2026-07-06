@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace pass::oir_opt {
@@ -32,6 +33,11 @@ bool cost_model_allows_if_conversion(Stats &stats, const char *candidate_kind,
     estimate.after_branches = 0;
     estimate.risk.register_pressure_growth = register_pressure_growth;
     estimate.risk.live_range_growth = register_pressure_growth;
+    if (std::string_view(candidate_kind) == "conditional_add" ||
+        std::string_view(candidate_kind) == "value_select") {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "AlwaysOnLowRiskIfConversion";
+    }
     return cost_model_allows_transform(stats, estimate);
 }
 
@@ -203,6 +209,8 @@ bool cost_model_allows_egraph_mul_by_two(Stats &stats, oir::BinaryInst &mul,
     estimate.egraph.extraction_time_us = enodes / 100;
     estimate.egraph.risk.register_pressure_growth = 0;
     estimate.egraph.risk.compile_time_growth = budget_ok ? 0 : policy.max_compile_time_growth + 1;
+    estimate.bypass_profitability = budget_ok;
+    estimate.bypass_reason = "AlwaysOnFixedPeepholeRewrite";
     (void)mul;
     return cost_model_allows_transform(stats, estimate);
 }

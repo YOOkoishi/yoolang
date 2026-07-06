@@ -206,6 +206,8 @@ std::string_view to_string(DecisionAction action) {
         return "Accept";
     case DecisionAction::Reject:
         return "Reject";
+    case DecisionAction::BypassProfitability:
+        return "BypassProfitability";
     case DecisionAction::Defer:
         return "Defer";
     case DecisionAction::PreferAlternative:
@@ -430,6 +432,15 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
                                      ? RejectReason::Illegal
                                      : RejectReason::ProofUnknown;
         decision.reason = reason_for_reject(decision.reject_reason);
+        return decision;
+    }
+
+    if (candidate.bypass_profitability) {
+        decision.action = DecisionAction::BypassProfitability;
+        decision.reject_reason = RejectReason::None;
+        decision.profitable = true;
+        decision.reason = candidate.bypass_reason.empty() ? "ProfitabilityBypassed"
+                                                          : candidate.bypass_reason;
         return decision;
     }
 

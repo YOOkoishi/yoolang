@@ -16,13 +16,25 @@ int main() {
 }
 
 // MIR-LABEL: func @loop_div
-// MIR: DIVU
+// MIR-NOT: DIVW
+// MIR: while.body.2:
+// MIR-NOT: DIVW
 // MIR: SRLI
 // MIR: SLTU
 // MIR-NOT: DIVW
+// MIR: edge.entry.0.to.while.body.2:
+// MIR-NOT: DIVW
+// MIR: DIVU
+// MIR-NOT: DIVW
 
 // ASM-LABEL: loop_div:
-// ASM: divu
+// ASM-NOT: divw
+// ASM: .Lloop_div_while.body.2:
+// ASM-NOT: divw
 // ASM: srli
 // ASM: sltu
+// ASM-NOT: divw
+// ASM: .Lloop_div_edge.entry.0.to.while.body.2:
+// ASM-NOT: divw
+// ASM: divu
 // ASM-NOT: divw

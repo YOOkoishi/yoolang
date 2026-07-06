@@ -34,6 +34,8 @@ struct MIRTransformCostEstimate {
     std::int64_t after_branches = 0;
 
     pass::cost_model::RiskVector risk;
+    bool bypass_profitability = false;
+    std::string bypass_reason;
 };
 
 bool allows_transform(pass::cost_model::CostModelReport *report,

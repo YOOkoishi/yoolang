@@ -86,12 +86,16 @@ bool cost_model_allows_transform(Stats &stats, const OIRTransformCostEstimate &e
     candidate.risk.register_pressure_growth += estimate.egraph.risk.register_pressure_growth;
     candidate.risk.compile_time_growth += estimate.egraph.risk.compile_time_growth;
     candidate.risk.cleanup_dependency += estimate.egraph.risk.cleanup_dependency;
+    candidate.bypass_profitability = estimate.bypass_profitability;
+    candidate.bypass_reason = estimate.bypass_reason;
 
     auto decision = pass::cost_model::decide(
         candidate, pass::cost_model::policy_for_kind(stats.cost_model_policy),
         stats.cost_model_report->target);
     const bool accepted =
-        decision.action == pass::cost_model::DecisionAction::Accept && decision.legal &&
+        (decision.action == pass::cost_model::DecisionAction::Accept ||
+         decision.action == pass::cost_model::DecisionAction::BypassProfitability) &&
+        decision.legal &&
         decision.profitable;
     if (filter_matches(stats, estimate.kind, estimate.pass_name)) {
         stats.cost_model_report->decisions.push_back(std::move(decision));

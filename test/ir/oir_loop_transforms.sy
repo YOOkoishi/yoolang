@@ -41,8 +41,8 @@ int main() {
 // OIR: %sum.phi = phi
 
 // COST-ROTATE: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopRotate
-// COST-ROTATE: [cost-model] OIRLoopTransforms Accept transform=LoopRotate
-// COST-ROTATE: reason=Profitable
+// COST-ROTATE: [cost-model] OIRLoopTransforms BypassProfitability transform=LoopRotate
+// COST-ROTATE: reason=AlwaysOnCanonicalization
 
 // COST-UNSWITCH: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopUnswitch
 // COST-UNSWITCH: [cost-model] OIRLoopTransforms Reject transform=LoopUnswitch

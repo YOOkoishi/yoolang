@@ -58,8 +58,7 @@ int main() {
 // OIR: icmp ne i32
 
 // OIR-LABEL: define i32 @constprop_call
-// OIR-NOT: call i32 @constprop_many_returns
-// OIR: add i32 %x.arg, 6
+// OIR: call i32 @constprop_many_returns
 // OIR: ret i32
 
 // OIR-LABEL: define i32 @conditional_add
@@ -70,7 +69,8 @@ int main() {
 // OIR: add i32 %x.arg
 
 // OIR-LABEL: define i32 @short_and_add
-// OIR-NOT: br i1
-// OIR: and i1
+// OIR: br i1
+// OIR: phi
 // OIR: zext i1
+// OIR: and i32 %y.arg
 // OIR: add i32 %x.arg

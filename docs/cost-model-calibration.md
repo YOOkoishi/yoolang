@@ -23,6 +23,10 @@ testcase-identity decisions.
 - Default `-O1` uses the same non-printing cost-model report and decision engine as
   `--emit-cost-model`; diagnostic filtering only filters recorded output and must not change
   transform decisions.
+- Canonicalization, local cleanup, and fixed proof-bounded peepholes may use
+  `BypassProfitability` after legality is proven. These decisions are still recorded separately
+  from profitable accepts and must not be used for clone-producing or register-pressure-growing
+  transforms.
 - PreRA MIR transforms carry register-pressure risk unless the transform is known to be PostRA-only
   or not to increase live ranges.
 - Partial evaluation must charge clone/setup cost and cleanup dependency. Specialization budgets
@@ -56,12 +60,14 @@ Result:
 
 - Cases: 119
 - Failed: 0
-- Total runtime: 40.7021s
-- Geomean speedup: GCC 0.9779787144448093, Clang++ 1.0094285572486272
+- Total runtime: 46.1305s
+- Geomean speedup: GCC 0.7821686424741846, Clang++ 0.8109606792364373
 - MIR stage metrics: OK
 - QEMU dynamic instruction count: disabled
-- Cost-model decisions: 11625 total, 3191 accepted, 8434 rejected
-- Proof status totals: 8343 proven, 108 refuted, 3174 timeout
+- Cost-model decisions: 5705 total, 559 accepted, 1470 bypassed profitability, 3676 rejected
+- Proof status totals: 5501 proven, 204 refuted
+- MIR final totals: 26305 instructions, 6932 moves, 1789 branches, 2715 jumps, 1496 loads,
+  1218 stores, 210 spills, 264 stack slots
 
 The generated reports are `build/perf-ci/perf-report.md` and
 `build/perf-ci/perf-report.json`.

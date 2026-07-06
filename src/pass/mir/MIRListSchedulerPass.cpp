@@ -318,6 +318,10 @@ bool schedule_window(std::vector<mir::MachineInstr> &instrs, std::size_t begin,
     estimate.before_cycles = plan.serial_cycles;
     estimate.after_cycles = plan.scheduled_cycles;
     estimate.risk.register_pressure_growth = post_ra ? 0 : 1;
+    if (post_ra) {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "AlwaysOnPostRANoGrowthScheduling";
+    }
     if (!pass::mir_cost_model::allows_transform(stats.cost_model_report,
                                                 stats.cost_model_policy,
                                                 stats.cost_model_filter, estimate)) {

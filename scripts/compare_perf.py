@@ -494,10 +494,14 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
         "status": "NOT_RUN",
         "total_decisions": 0,
         "accepted": 0,
+        "bypassed": 0,
         "rejected": 0,
         "accepted_estimated_gain": 0,
         "accepted_risk_penalty": 0,
         "accepted_final_score": 0,
+        "bypassed_estimated_gain": 0,
+        "bypassed_risk_penalty": 0,
+        "bypassed_final_score": 0,
         "rejected_estimated_gain": 0,
         "rejected_risk_penalty": 0,
         "by_transform": {},
@@ -526,6 +530,7 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
     by_reject_reason: dict[str, int] = {}
     by_proof_status: dict[str, int] = {}
     accepted = 0
+    bypassed = 0
     rejected = 0
     for decision in decisions:
         if not isinstance(decision, dict):
@@ -544,6 +549,17 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
             summary["accepted_final_score"] = int(summary["accepted_final_score"]) + int(
                 decision.get("final_score", 0)
             )
+        elif action == "BypassProfitability":
+            bypassed += 1
+            summary["bypassed_estimated_gain"] = int(summary["bypassed_estimated_gain"]) + int(
+                decision.get("estimated_gain", 0)
+            )
+            summary["bypassed_risk_penalty"] = int(summary["bypassed_risk_penalty"]) + int(
+                decision.get("risk_penalty", 0)
+            )
+            summary["bypassed_final_score"] = int(summary["bypassed_final_score"]) + int(
+                decision.get("final_score", 0)
+            )
         elif action == "Reject":
             rejected += 1
             summary["rejected_estimated_gain"] = int(summary["rejected_estimated_gain"]) + int(
@@ -560,8 +576,9 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
             by_proof_status[status] = by_proof_status.get(status, 0) + 1
 
     summary["status"] = "OK"
-    summary["total_decisions"] = accepted + rejected
+    summary["total_decisions"] = accepted + bypassed + rejected
     summary["accepted"] = accepted
+    summary["bypassed"] = bypassed
     summary["rejected"] = rejected
     summary["by_transform"] = by_transform
     summary["by_reject_reason"] = by_reject_reason
@@ -1028,10 +1045,14 @@ def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
         "status": "NOT_RUN",
         "total_decisions": 0,
         "accepted": 0,
+        "bypassed": 0,
         "rejected": 0,
         "accepted_estimated_gain": 0,
         "accepted_risk_penalty": 0,
         "accepted_final_score": 0,
+        "bypassed_estimated_gain": 0,
+        "bypassed_risk_penalty": 0,
+        "bypassed_final_score": 0,
         "rejected_estimated_gain": 0,
         "rejected_risk_penalty": 0,
         "by_transform": {},
@@ -1058,11 +1079,15 @@ def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
             cost_summary.get("total_decisions", 0)
         )
         summary["accepted"] = int(summary["accepted"]) + int(cost_summary.get("accepted", 0))
+        summary["bypassed"] = int(summary["bypassed"]) + int(cost_summary.get("bypassed", 0))
         summary["rejected"] = int(summary["rejected"]) + int(cost_summary.get("rejected", 0))
         for total_key in (
             "accepted_estimated_gain",
             "accepted_risk_penalty",
             "accepted_final_score",
+            "bypassed_estimated_gain",
+            "bypassed_risk_penalty",
+            "bypassed_final_score",
             "rejected_estimated_gain",
             "rejected_risk_penalty",
         ):
@@ -1117,7 +1142,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         f"- 🏁 Faster cases: GCC {o3_stats['gcc_o3_faster_cases']} / Clang++ {o3_stats['clang_o3_faster_cases']}",
         f"- QEMU dynamic instruction count: {insn_summary['status']}",
         f"- MIR stage metrics: {mir_stage_summary['status']} ({mir_stage_summary['counted_cases']} cases)",
-        f"- Cost model decisions: {cost_model_summary['status']} ({cost_model_summary['accepted']} accepted / {cost_model_summary['rejected']} rejected)",
+        f"- Cost model decisions: {cost_model_summary['status']} ({cost_model_summary['accepted']} accepted / {cost_model_summary['bypassed']} bypassed / {cost_model_summary['rejected']} rejected)",
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
     ]
@@ -1202,10 +1227,14 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                 "",
                 f"- Total: {cost_model_summary['total_decisions']}",
                 f"- Accepted: {cost_model_summary['accepted']}",
+                f"- Bypassed profitability: {cost_model_summary['bypassed']}",
                 f"- Rejected: {cost_model_summary['rejected']}",
                 f"- Accepted estimated gain total: {cost_model_summary['accepted_estimated_gain']}",
                 f"- Accepted risk penalty total: {cost_model_summary['accepted_risk_penalty']}",
                 f"- Accepted final score total: {cost_model_summary['accepted_final_score']}",
+                f"- Bypassed estimated gain total: {cost_model_summary['bypassed_estimated_gain']}",
+                f"- Bypassed risk penalty total: {cost_model_summary['bypassed_risk_penalty']}",
+                f"- Bypassed final score total: {cost_model_summary['bypassed_final_score']}",
                 f"- Rejected estimated gain total: {cost_model_summary['rejected_estimated_gain']}",
                 f"- Rejected risk penalty total: {cost_model_summary['rejected_risk_penalty']}",
                 "",

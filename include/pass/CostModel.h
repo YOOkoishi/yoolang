@@ -77,6 +77,7 @@ enum class ProofStatus {
 enum class DecisionAction {
     Accept,
     Reject,
+    BypassProfitability,
     Defer,
     PreferAlternative,
     RequireLaterStageCheck,
@@ -237,6 +238,9 @@ struct TransformCandidate {
     CostVector after;
     CostVector setup;
     RiskVector risk;
+
+    bool bypass_profitability = false;
+    std::string bypass_reason;
 
     std::vector<std::string> required_cleanup_passes;
     std::vector<std::string> reason_hints;

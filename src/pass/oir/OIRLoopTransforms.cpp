@@ -63,6 +63,10 @@ bool cost_model_allows_loop_transform(Stats &stats, pass::cost_model::TransformK
     estimate.after_branches = after_branches;
     estimate.risk.code_growth = code_growth;
     estimate.risk.cleanup_dependency = code_growth > 0 ? 1 : 0;
+    if (kind == pass::cost_model::TransformKind::LoopRotate) {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "AlwaysOnCanonicalization";
+    }
     return cost_model_allows_transform(stats, estimate);
 }
 

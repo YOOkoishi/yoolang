@@ -28,7 +28,7 @@ int main() {
 // ASM-NEXT: addw
 
 // COST-SCHED: [cost-model] MIRPreRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=NegativeGain
-// COST-SCHED: [cost-model] MIRPostRAListSchedulerPass Accept transform=InstructionScheduling {{.*}} reason=Profitable
+// COST-SCHED: [cost-model] MIRPostRAListSchedulerPass BypassProfitability transform=InstructionScheduling {{.*}} reason=AlwaysOnPostRANoGrowthScheduling
 
 // COST-SCHED-CONS: [cost-model] MIRPreRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=LowConfidence
-// COST-SCHED-CONS: [cost-model] MIRPostRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=LowConfidence
+// COST-SCHED-CONS: [cost-model] MIRPostRAListSchedulerPass BypassProfitability transform=InstructionScheduling {{.*}} reason=AlwaysOnPostRANoGrowthScheduling
