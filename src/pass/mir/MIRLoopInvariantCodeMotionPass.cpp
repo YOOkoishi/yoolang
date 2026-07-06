@@ -1,5 +1,7 @@
 #include "pass/mir/MIRPeepholeCommon.h"
 
+#include "pass/mir/MIRCostModel.h"
+
 #include <algorithm>
 #include <iterator>
 #include <map>
@@ -273,6 +275,34 @@ bool loop_contains_call(const Loop &loop) {
     return false;
 }
 
+bool allows_mir_loop_transform(Stats &stats, pass::cost_model::TransformKind kind,
+                               const std::string &candidate_id,
+                               std::int64_t before_dynamic_instrs,
+                               std::int64_t after_dynamic_instrs,
+                               std::int64_t before_cycles,
+                               std::int64_t after_cycles,
+                               std::int64_t register_pressure_growth) {
+    pass::mir_cost_model::MIRTransformCostEstimate estimate;
+    estimate.kind = kind;
+    estimate.stage = pass::cost_model::CostIRStage::PreRAMIR;
+    estimate.pass_name = "MIRLoopInvariantCodeMotionPass";
+    estimate.candidate_id = candidate_id;
+    estimate.scope = "loop";
+    estimate.proof_summary = "preheader availability and loop-contained use checks";
+    estimate.confidence = kind == pass::cost_model::TransformKind::LoopInvariantCodeMotion
+                              ? 0.68
+                              : 0.62;
+    estimate.before_dynamic_instrs = before_dynamic_instrs;
+    estimate.after_dynamic_instrs = after_dynamic_instrs;
+    estimate.before_cycles = before_cycles;
+    estimate.after_cycles = after_cycles;
+    estimate.risk.register_pressure_growth = register_pressure_growth;
+    estimate.risk.live_range_growth = register_pressure_growth;
+    return pass::mir_cost_model::allows_transform(stats.cost_model_report,
+                                                  stats.cost_model_policy,
+                                                  stats.cost_model_filter, estimate);
+}
+
 mir::Register create_gpr(mir::MachineFunction &function,
                          mir::ValueType type = mir::ValueType::I32) {
     return function.regs().create_virtual(mir::RegisterClass::GPR, type);
@@ -491,6 +521,17 @@ bool reduce_loop_divisions(mir::MachineFunction &function, const Loop &loop,
     if (divs.empty()) {
         return false;
     }
+    constexpr std::int64_t kUnknownTripCountProfitabilityScale = 4;
+    const auto div_count = static_cast<std::int64_t>(divs.size());
+    if (!allows_mir_loop_transform(
+            stats, pass::cost_model::TransformKind::StrengthReduction,
+            "div-reciprocal." + std::to_string(stats.arithmetic + 1),
+            div_count * 12 * kUnknownTripCountProfitabilityScale,
+            div_count * 9 * kUnknownTripCountProfitabilityScale,
+            div_count * 24 * kUnknownTripCountProfitabilityScale,
+            div_count * 9 * kUnknownTripCountProfitabilityScale, div_count + 2)) {
+        return false;
+    }
 
     auto reciprocal = insert_divisor_reciprocal_setup(function, preheader, divisor);
     for (auto it = divs.rbegin(); it != divs.rend(); ++it) {
@@ -607,6 +648,16 @@ bool hoist_from_loop(mir::MachineFunction &function, const Loop &loop,
     }
 
     if (to_move.empty()) {
+        return false;
+    }
+    if (!allows_mir_loop_transform(
+            stats, pass::cost_model::TransformKind::LoopInvariantCodeMotion,
+            "licm." + std::to_string(stats.licm + 1),
+            static_cast<std::int64_t>(to_move.size()) * 4,
+            static_cast<std::int64_t>(to_move.size()),
+            static_cast<std::int64_t>(to_move.size()) * 4,
+            static_cast<std::int64_t>(to_move.size()),
+            static_cast<std::int64_t>(to_move.size() / 4))) {
         return false;
     }
 

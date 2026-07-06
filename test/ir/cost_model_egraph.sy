@@ -1,0 +1,22 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=EGraphRewrite -O1 %s | FileCheck %s --check-prefix=TEXT
+// RUN: %compiler --emit-cost-model --cost-model-policy=conservative --cost-model-filter=EGraphRewrite -O1 %s | FileCheck %s --check-prefix=TEXT-CONS
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=EGraphRewrite -O1 %s | FileCheck %s --check-prefix=JSON
+
+int twice(int x) {
+  return x * 2;
+}
+
+int main() {
+  return twice(getint());
+}
+
+// TEXT: [cost-model] OIRLocalSimplify BypassProfitability transform=EGraphRewrite {{.*}} reason=AlwaysOnFixedPeepholeRewrite
+
+// TEXT-CONS: [cost-model] OIRLocalSimplify Reject transform=EGraphRewrite {{.*}} reason=ProofUnknown
+
+// JSON: "transform": "EGraphRewrite"
+// JSON: "action": "BypassProfitability"
+// JSON: "kind": "EGraphEquality"
+// JSON: "status": "Proven"
+// JSON: "summary": "registered e-graph rule: x * 2 == x + x"
+// JSON: "rule_id": "egraph.bv32.mul2_to_add"

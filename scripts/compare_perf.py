@@ -489,6 +489,123 @@ def _compile_hy(src: Path, out_dir: Path) -> tuple[Path, str]:
     return exe, "OK"
 
 
+def _collect_cost_model_summary(src: Path) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "status": "NOT_RUN",
+        "total_decisions": 0,
+        "accepted": 0,
+        "bypassed": 0,
+        "rejected": 0,
+        "accepted_estimated_gain": 0,
+        "accepted_risk_penalty": 0,
+        "accepted_final_score": 0,
+        "bypassed_estimated_gain": 0,
+        "bypassed_risk_penalty": 0,
+        "bypassed_final_score": 0,
+        "rejected_estimated_gain": 0,
+        "rejected_risk_penalty": 0,
+        "by_transform": {},
+        "by_transform_action": {},
+        "by_transform_reject_reason": {},
+        "by_pass_transform_action": {},
+        "by_reject_reason": {},
+        "by_proof_status": {},
+    }
+    try:
+        proc = subprocess.run(
+            [str(COMPILER_BIN), str(src), "--emit-cost-model=json", "-O1"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_SEC,
+        )
+        payload = json.loads(proc.stdout)
+    except Exception as exc:
+        summary["status"] = f"FAILED: {exc}"
+        return summary
+
+    decisions = payload.get("decisions", [])
+    if not isinstance(decisions, list):
+        summary["status"] = "EMPTY"
+        return summary
+
+    by_transform: dict[str, int] = {}
+    by_transform_action: dict[str, int] = {}
+    by_transform_reject_reason: dict[str, int] = {}
+    by_pass_transform_action: dict[str, int] = {}
+    by_reject_reason: dict[str, int] = {}
+    by_proof_status: dict[str, int] = {}
+    accepted = 0
+    bypassed = 0
+    rejected = 0
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        transform = str(decision.get("transform", "Unknown"))
+        by_transform[transform] = by_transform.get(transform, 0) + 1
+        pass_name = str(decision.get("pass", "Unknown"))
+        action = str(decision.get("action", ""))
+        transform_action = f"{transform}/{action}"
+        by_transform_action[transform_action] = by_transform_action.get(transform_action, 0) + 1
+        pass_transform_action = f"{pass_name}/{transform}/{action}"
+        by_pass_transform_action[pass_transform_action] = (
+            by_pass_transform_action.get(pass_transform_action, 0) + 1
+        )
+        if action == "Accept":
+            accepted += 1
+            summary["accepted_estimated_gain"] = int(summary["accepted_estimated_gain"]) + int(
+                decision.get("estimated_gain", 0)
+            )
+            summary["accepted_risk_penalty"] = int(summary["accepted_risk_penalty"]) + int(
+                decision.get("risk_penalty", 0)
+            )
+            summary["accepted_final_score"] = int(summary["accepted_final_score"]) + int(
+                decision.get("final_score", 0)
+            )
+        elif action == "BypassProfitability":
+            bypassed += 1
+            summary["bypassed_estimated_gain"] = int(summary["bypassed_estimated_gain"]) + int(
+                decision.get("estimated_gain", 0)
+            )
+            summary["bypassed_risk_penalty"] = int(summary["bypassed_risk_penalty"]) + int(
+                decision.get("risk_penalty", 0)
+            )
+            summary["bypassed_final_score"] = int(summary["bypassed_final_score"]) + int(
+                decision.get("final_score", 0)
+            )
+        elif action == "Reject":
+            rejected += 1
+            summary["rejected_estimated_gain"] = int(summary["rejected_estimated_gain"]) + int(
+                decision.get("estimated_gain", 0)
+            )
+            summary["rejected_risk_penalty"] = int(summary["rejected_risk_penalty"]) + int(
+                decision.get("risk_penalty", 0)
+            )
+            reason = str(decision.get("reject_reason", "Unknown"))
+            by_reject_reason[reason] = by_reject_reason.get(reason, 0) + 1
+            transform_reject_reason = f"{transform}/{reason}"
+            by_transform_reject_reason[transform_reject_reason] = (
+                by_transform_reject_reason.get(transform_reject_reason, 0) + 1
+            )
+        proof = decision.get("proof")
+        if isinstance(proof, dict):
+            status = str(proof.get("status", "Unknown"))
+            by_proof_status[status] = by_proof_status.get(status, 0) + 1
+
+    summary["status"] = "OK"
+    summary["total_decisions"] = accepted + bypassed + rejected
+    summary["accepted"] = accepted
+    summary["bypassed"] = bypassed
+    summary["rejected"] = rejected
+    summary["by_transform"] = by_transform
+    summary["by_transform_action"] = by_transform_action
+    summary["by_transform_reject_reason"] = by_transform_reject_reason
+    summary["by_pass_transform_action"] = by_pass_transform_action
+    summary["by_reject_reason"] = by_reject_reason
+    summary["by_proof_status"] = by_proof_status
+    return summary
+
+
 def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, object]:
     asm_file = out_dir / f"{src.stem}.compiler.s"
     metrics: dict[str, object] = {
@@ -506,6 +623,7 @@ def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, object]:
         "asm_lines": 0,
         "mir_stage_metrics_status": "NOT_RUN",
         "mir_stages": {},
+        "cost_model_summary": _collect_cost_model_summary(src),
     }
 
     if asm_file.exists():
@@ -922,12 +1040,111 @@ def _mir_stage_metric_summary(rows: list[dict]) -> dict[str, object]:
         if stage not in ordered_totals:
             ordered_totals[stage] = totals[stage]
 
+    deltas: dict[str, dict[str, int]] = {}
+    previous_stage: str | None = None
+    for stage_name in ordered_totals:
+        if previous_stage is not None:
+            deltas[f"{previous_stage}->{stage_name}"] = {
+                key: ordered_totals[stage_name].get(key, 0)
+                - ordered_totals[previous_stage].get(key, 0)
+                for key in MIR_STAGE_METRIC_KEYS
+            }
+        previous_stage = stage_name
+
     return {
         "status": status,
         "counted_cases": counted_cases,
         "failed_cases": failed_cases,
         "stages": ordered_totals,
+        "deltas": deltas,
     }
+
+
+def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "status": "NOT_RUN",
+        "total_decisions": 0,
+        "accepted": 0,
+        "bypassed": 0,
+        "rejected": 0,
+        "accepted_estimated_gain": 0,
+        "accepted_risk_penalty": 0,
+        "accepted_final_score": 0,
+        "bypassed_estimated_gain": 0,
+        "bypassed_risk_penalty": 0,
+        "bypassed_final_score": 0,
+        "rejected_estimated_gain": 0,
+        "rejected_risk_penalty": 0,
+        "by_transform": {},
+        "by_transform_action": {},
+        "by_transform_reject_reason": {},
+        "by_pass_transform_action": {},
+        "by_reject_reason": {},
+        "by_proof_status": {},
+    }
+    by_transform: dict[str, int] = {}
+    by_transform_action: dict[str, int] = {}
+    by_transform_reject_reason: dict[str, int] = {}
+    by_pass_transform_action: dict[str, int] = {}
+    by_reject_reason: dict[str, int] = {}
+    by_proof_status: dict[str, int] = {}
+    statuses: list[str] = []
+
+    for row in rows:
+        codegen_metrics = row.get("codegen_metrics")
+        if not isinstance(codegen_metrics, dict):
+            continue
+        cost_summary = codegen_metrics.get("cost_model_summary")
+        if not isinstance(cost_summary, dict):
+            continue
+        status = str(cost_summary.get("status", "NOT_RUN"))
+        statuses.append(status)
+        if status != "OK":
+            continue
+        summary["total_decisions"] = int(summary["total_decisions"]) + int(
+            cost_summary.get("total_decisions", 0)
+        )
+        summary["accepted"] = int(summary["accepted"]) + int(cost_summary.get("accepted", 0))
+        summary["bypassed"] = int(summary["bypassed"]) + int(cost_summary.get("bypassed", 0))
+        summary["rejected"] = int(summary["rejected"]) + int(cost_summary.get("rejected", 0))
+        for total_key in (
+            "accepted_estimated_gain",
+            "accepted_risk_penalty",
+            "accepted_final_score",
+            "bypassed_estimated_gain",
+            "bypassed_risk_penalty",
+            "bypassed_final_score",
+            "rejected_estimated_gain",
+            "rejected_risk_penalty",
+        ):
+            summary[total_key] = int(summary[total_key]) + int(cost_summary.get(total_key, 0))
+        for key, value in (cost_summary.get("by_transform") or {}).items():
+            by_transform[str(key)] = by_transform.get(str(key), 0) + int(value)
+        for key, value in (cost_summary.get("by_transform_action") or {}).items():
+            by_transform_action[str(key)] = by_transform_action.get(str(key), 0) + int(value)
+        for key, value in (cost_summary.get("by_transform_reject_reason") or {}).items():
+            by_transform_reject_reason[str(key)] = (
+                by_transform_reject_reason.get(str(key), 0) + int(value)
+            )
+        for key, value in (cost_summary.get("by_pass_transform_action") or {}).items():
+            by_pass_transform_action[str(key)] = (
+                by_pass_transform_action.get(str(key), 0) + int(value)
+            )
+        for key, value in (cost_summary.get("by_reject_reason") or {}).items():
+            by_reject_reason[str(key)] = by_reject_reason.get(str(key), 0) + int(value)
+        for key, value in (cost_summary.get("by_proof_status") or {}).items():
+            by_proof_status[str(key)] = by_proof_status.get(str(key), 0) + int(value)
+
+    if statuses:
+        failures = [status for status in statuses if status != "OK"]
+        summary["status"] = "OK" if not failures else "; ".join(sorted(set(failures)))
+    summary["by_transform"] = by_transform
+    summary["by_transform_action"] = by_transform_action
+    summary["by_transform_reject_reason"] = by_transform_reject_reason
+    summary["by_pass_transform_action"] = by_pass_transform_action
+    summary["by_reject_reason"] = by_reject_reason
+    summary["by_proof_status"] = by_proof_status
+    return summary
 
 
 def _slow_compiler_rows(rows: list[dict], limit: int = 10) -> list[dict]:
@@ -949,6 +1166,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
     hy_stats = _hy_vs_compiler_stats(rows) if HY_COMPILER_BIN is not None else None
     insn_summary = _instruction_count_summary(rows)
     mir_stage_summary = _mir_stage_metric_summary(rows)
+    cost_model_summary = _cost_model_decision_summary(rows)
 
     md_lines = [
         "# 📊 RISC-V QEMU Perf Report",
@@ -963,6 +1181,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         f"- 🏁 Faster cases: GCC {o3_stats['gcc_o3_faster_cases']} / Clang++ {o3_stats['clang_o3_faster_cases']}",
         f"- QEMU dynamic instruction count: {insn_summary['status']}",
         f"- MIR stage metrics: {mir_stage_summary['status']} ({mir_stage_summary['counted_cases']} cases)",
+        f"- Cost model decisions: {cost_model_summary['status']} ({cost_model_summary['accepted']} accepted / {cost_model_summary['bypassed']} bypassed / {cost_model_summary['rejected']} rejected)",
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
     ]
@@ -1006,6 +1225,90 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                 )
                 + " |"
             )
+
+    stage_deltas = mir_stage_summary.get("deltas")
+    if isinstance(stage_deltas, dict) and stage_deltas:
+        md_lines.extend(
+            [
+                "",
+                "## MIR Stage Metric Deltas",
+                "",
+                "| Transition | Instrs | Moves | Branches | Jumps | Loads | Stores | Spills | Stack slots |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for transition, totals in stage_deltas.items():
+            if not isinstance(totals, dict):
+                continue
+            md_lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _md_escape(str(transition)),
+                        str(totals.get("instructions", 0)),
+                        str(totals.get("moves", 0)),
+                        str(totals.get("branches", 0)),
+                        str(totals.get("jumps", 0)),
+                        str(totals.get("loads", 0)),
+                        str(totals.get("stores", 0)),
+                        str(totals.get("spills", 0)),
+                        str(totals.get("stack_slots", 0)),
+                    ]
+                )
+                + " |"
+            )
+
+    if cost_model_summary.get("status") != "NOT_RUN":
+        md_lines.extend(
+            [
+                "",
+                "## Cost Model Decisions",
+                "",
+                f"- Total: {cost_model_summary['total_decisions']}",
+                f"- Accepted: {cost_model_summary['accepted']}",
+                f"- Bypassed profitability: {cost_model_summary['bypassed']}",
+                f"- Rejected: {cost_model_summary['rejected']}",
+                f"- Accepted estimated gain total: {cost_model_summary['accepted_estimated_gain']}",
+                f"- Accepted risk penalty total: {cost_model_summary['accepted_risk_penalty']}",
+                f"- Accepted final score total: {cost_model_summary['accepted_final_score']}",
+                f"- Bypassed estimated gain total: {cost_model_summary['bypassed_estimated_gain']}",
+                f"- Bypassed risk penalty total: {cost_model_summary['bypassed_risk_penalty']}",
+                f"- Bypassed final score total: {cost_model_summary['bypassed_final_score']}",
+                f"- Rejected estimated gain total: {cost_model_summary['rejected_estimated_gain']}",
+                f"- Rejected risk penalty total: {cost_model_summary['rejected_risk_penalty']}",
+                "",
+                "| Category | Name | Count |",
+                "| --- | --- | ---: |",
+            ]
+        )
+        for category, values in (
+            ("transform", cost_model_summary.get("by_transform", {})),
+            ("transform_action", cost_model_summary.get("by_transform_action", {})),
+            (
+                "transform_reject_reason",
+                cost_model_summary.get("by_transform_reject_reason", {}),
+            ),
+            (
+                "pass_transform_action",
+                cost_model_summary.get("by_pass_transform_action", {}),
+            ),
+            ("reject_reason", cost_model_summary.get("by_reject_reason", {})),
+            ("proof_status", cost_model_summary.get("by_proof_status", {})),
+        ):
+            if not isinstance(values, dict):
+                continue
+            for name, count in sorted(values.items()):
+                md_lines.append(
+                    "| "
+                    + " | ".join(
+                        [
+                            _md_escape(category),
+                            _md_escape(str(name)),
+                            str(count),
+                        ]
+                    )
+                    + " |"
+                )
 
     slow_rows = _slow_compiler_rows(rows)
     if slow_rows:
@@ -1090,6 +1393,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         "hy_faster_cases": hy_stats["hy_faster_cases"] if hy_stats else 0,
         "instruction_count_summary": insn_summary,
         "mir_stage_metric_summary": mir_stage_summary,
+        "cost_model_decision_summary": cost_model_summary,
         "rows": rows,
     }
     REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")

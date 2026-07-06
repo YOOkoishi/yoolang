@@ -1,0 +1,25 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=TEXT
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=JSON
+
+int choose(int x, int mode) {
+  if (mode > 3) {
+    return x + mode;
+  }
+  return x - mode;
+}
+
+int main() {
+  int x = getint();
+  return choose(x, 1) + choose(x, 2) + choose(x, 3) + choose(x, 4) +
+         choose(x, 5);
+}
+
+// TEXT: [cost-model] OIRInlinePass Accept transform=ConstantArgumentSpecialization {{.*}} reason=Profitable
+// TEXT: [cost-model] OIRInlinePass Reject transform=ConstantArgumentSpecialization {{.*}} reason=CodeGrowthTooHigh
+
+// JSON: "transform": "ConstantArgumentSpecialization"
+// JSON: "kind": "PartialEvaluation"
+// JSON: "summary": "constant arguments proven at callsite"
+// JSON: "cleanup_dependency": 1
+// JSON: "reject_reason": "CodeGrowthTooHigh"
+// JSON: "summary": "constant arguments proven at callsite; specialization budget exceeded"

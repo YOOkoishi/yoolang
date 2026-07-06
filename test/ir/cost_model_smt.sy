@@ -1,0 +1,51 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=AlgebraicSimplify -O1 %s | FileCheck %s --check-prefix=TEXT
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=AlgebraicSimplify -O1 %s | FileCheck %s --check-prefix=JSON
+
+int smt_proven(int a, int b) {
+  int t = a - b;
+  return t + b;
+}
+
+int smt_refuted(int a, int b, int c) {
+  int t = a - b;
+  return t + c;
+}
+
+int smt_timeout(int a, int b) {
+  int x0 = a + 1;
+  int x1 = x0 + 2;
+  int x2 = x1 + 3;
+  int x3 = x2 + 4;
+  int t = x3 - b;
+  return t + a;
+}
+
+int smt_unknown(int a, int b, int c) {
+  int q = a / b;
+  int t = q - c;
+  return t + b;
+}
+
+int main() {
+  int a = getint();
+  int b = getint();
+  int c = getint();
+  return smt_proven(a, b) + smt_refuted(a, b, c) + smt_timeout(a, b) +
+         smt_unknown(a, b, c);
+}
+
+// TEXT: [cost-model] OIRLocalSimplify Accept transform=AlgebraicSimplify {{.*}} reason=Profitable
+// TEXT: [cost-model] OIRLocalSimplify Reject transform=AlgebraicSimplify {{.*}} reason=Illegal
+// TEXT: [cost-model] OIRLocalSimplify Reject transform=AlgebraicSimplify {{.*}} reason=ProofTimeout
+// TEXT: [cost-model] OIRLocalSimplify Reject transform=AlgebraicSimplify {{.*}} reason=ProofUnknown
+
+// JSON: "transform": "AlgebraicSimplify"
+// JSON: "kind": "Structural"
+// JSON: "status": "Proven"
+// JSON: "rule_id": "structural.bv32.add_sub_cancel"
+// JSON: "kind": "SMT"
+// JSON: "solver_id": "yoolang-static-bv32-smt"
+// JSON: "obligations": 1
+// JSON: "status": "Refuted"
+// JSON: "status": "Timeout"
+// JSON: "status": "Unknown"

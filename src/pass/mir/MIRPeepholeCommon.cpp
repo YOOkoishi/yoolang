@@ -217,6 +217,13 @@ PassResult run_transform(PassContext &context, std::string_view pass_name, bool 
     }
 
     Stats total;
+    auto *cost_model_report =
+        context.get_artifact<cost_model::CostModelReport>(cost_model::kReportArtifactKey);
+    if (cost_model_report != nullptr) {
+        total.cost_model_report = cost_model_report;
+        total.cost_model_policy = cost_model_report->policy;
+        total.cost_model_filter = cost_model_report->filter;
+    }
     bool changed = false;
     for (auto &function : module->functions()) {
         if (function->is_external()) {

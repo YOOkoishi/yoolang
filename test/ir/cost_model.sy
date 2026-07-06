@@ -1,0 +1,38 @@
+// RUN: %compiler --emit-cost-model=json -O1 %s | FileCheck %s --check-prefix=JSON
+// RUN: %compiler --emit-cost-model --cost-model-policy=conservative --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=TEXT
+// RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+
+int add1(int x) {
+  return x + 1;
+}
+
+int main() {
+  int y = add1(2);
+  if (y > 2) {
+    return y;
+  }
+  return 0;
+}
+
+// JSON: "target": "rv64gc/lp64d"
+// JSON: "policy": "balanced"
+// JSON: "summaries":
+// JSON: "stage": "OIR"
+// JSON: "stage": "FinalMIR"
+// JSON: "decisions": [
+// JSON: "transform": "ConstantArgumentSpecialization"
+// JSON: "action": "Accept"
+// JSON: "kind": "PartialEvaluation"
+// JSON: "transform": "Inline"
+// JSON: "action": "Accept"
+
+// TEXT: [cost-model] target=rv64gc/lp64d policy=conservative filter=Inline
+// TEXT: [cost-model] summary stage=OIR
+// TEXT: [cost-model] summary stage=OIR label=oir functions={{[0-9]+}} blocks={{[0-9]+}} instrs={{[0-9]+}} loads=0 stores=0 branches={{[0-9]+}} calls=1
+// TEXT: [cost-model] summary stage=FinalMIR
+// TEXT: [cost-model] OIRInlinePass Reject transform=Inline
+// TEXT: reason=CodeGrowthTooHigh
+
+// ASM-NOT: [cost-model]
+// ASM-LABEL: main:
+// ASM: ret

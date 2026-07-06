@@ -4,6 +4,7 @@
 
 #include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
+#include "pass/oir/OIRCostModel.h"
 
 #include <algorithm>
 #include <list>
@@ -21,19 +22,15 @@ namespace {
 constexpr unsigned kMaxInlineRounds = 3;
 constexpr unsigned kMaxInlineSites = 128;
 constexpr unsigned kMaxCalleeBlocks = 12;
-constexpr unsigned kMaxCalleeCost = 45;
 constexpr unsigned kMaxCalleeReturns = 4;
 constexpr unsigned kMaxCalleeParams = 16;
 constexpr unsigned kMaxSpecializedInlineBlocks = 96;
-constexpr unsigned kMaxSpecializedInlineCost = 260;
 constexpr unsigned kMaxSpecializedInlineReturns = 8;
 constexpr unsigned kMaxSpecializationCalleeBlocks = 64;
-constexpr unsigned kMaxSpecializationCalleeCost = 180;
 constexpr unsigned kMaxSpecializedFunctions = 48;
 constexpr unsigned kMaxSpecializedCallSites = 128;
 constexpr unsigned kMaxRecursiveInlineDepth = 5;
 constexpr unsigned kMaxRecursiveCalleeBlocks = 16;
-constexpr unsigned kMaxRecursiveCalleeCost = 90;
 constexpr unsigned kMaxRecursiveCalleeReturns = 8;
 
 using ValueMap = std::unordered_map<oir::Value *, oir::Value *>;
@@ -43,6 +40,18 @@ struct CalleeInfo {
     unsigned blocks = 0;
     unsigned cost = 0;
     unsigned returns = 0;
+    unsigned static_instrs = 0;
+    unsigned int_alu = 0;
+    unsigned int_mul = 0;
+    unsigned int_div_rem = 0;
+    unsigned fp_alu = 0;
+    unsigned fp_div = 0;
+    unsigned loads = 0;
+    unsigned stores = 0;
+    unsigned pointer_arith = 0;
+    unsigned branches = 0;
+    unsigned calls = 0;
+    unsigned phis = 0;
 };
 
 struct InlineContext {
@@ -62,14 +71,49 @@ CalleeInfo inspect_callee(const oir::Function &function) {
     for (const auto &block : function.blocks()) {
         ++info.blocks;
         for (const auto &inst : block->instructions()) {
-            if (inst->op() == oir::Instruction::OpID::Ret) {
+            switch (inst->op()) {
+            case oir::Instruction::OpID::Ret:
                 ++info.returns;
+                ++info.branches;
                 continue;
-            }
-            if (inst->op() == oir::Instruction::OpID::Br ||
-                inst->op() == oir::Instruction::OpID::Phi) {
+            case oir::Instruction::OpID::Br:
+                ++info.branches;
                 continue;
+            case oir::Instruction::OpID::Phi:
+                ++info.phis;
+                continue;
+            case oir::Instruction::OpID::Mul:
+                ++info.int_mul;
+                break;
+            case oir::Instruction::OpID::SDiv:
+            case oir::Instruction::OpID::SRem:
+                ++info.int_div_rem;
+                break;
+            case oir::Instruction::OpID::FAdd:
+            case oir::Instruction::OpID::FSub:
+            case oir::Instruction::OpID::FMul:
+                ++info.fp_alu;
+                break;
+            case oir::Instruction::OpID::FDiv:
+                ++info.fp_div;
+                break;
+            case oir::Instruction::OpID::Load:
+                ++info.loads;
+                break;
+            case oir::Instruction::OpID::Store:
+                ++info.stores;
+                break;
+            case oir::Instruction::OpID::GetElementPtr:
+                ++info.pointer_arith;
+                break;
+            case oir::Instruction::OpID::Call:
+                ++info.calls;
+                break;
+            default:
+                ++info.int_alu;
+                break;
             }
+            ++info.static_instrs;
             ++info.cost;
             if (inst->op() == oir::Instruction::OpID::Call) {
                 info.cost += 4;
@@ -77,6 +121,48 @@ CalleeInfo inspect_callee(const oir::Function &function) {
         }
     }
     return info;
+}
+
+bool within_inline_resource_limit(const CalleeInfo &info,
+                                  const pass::cost_model::CostModelPolicy &policy) {
+    return info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost) &&
+           info.returns != 0 && info.returns <= kMaxCalleeReturns;
+}
+
+void fill_before_after_from_callee(OIRTransformCostEstimate &estimate, const CalleeInfo &info,
+                                   std::int64_t before_calls, std::int64_t after_calls) {
+    estimate.before_instrs = static_cast<std::int64_t>(info.static_instrs + before_calls);
+    estimate.before_code_bytes = estimate.before_instrs * 4;
+    estimate.before_int_alu = static_cast<std::int64_t>(info.int_alu);
+    estimate.before_int_mul = static_cast<std::int64_t>(info.int_mul);
+    estimate.before_int_div_rem = static_cast<std::int64_t>(info.int_div_rem);
+    estimate.before_fp_alu = static_cast<std::int64_t>(info.fp_alu);
+    estimate.before_fp_div = static_cast<std::int64_t>(info.fp_div);
+    estimate.before_loads = static_cast<std::int64_t>(info.loads);
+    estimate.before_stores = static_cast<std::int64_t>(info.stores);
+    estimate.before_pointer_arith = static_cast<std::int64_t>(info.pointer_arith);
+    estimate.before_branches = static_cast<std::int64_t>(info.branches);
+    estimate.before_calls = before_calls;
+    estimate.before_phis = static_cast<std::int64_t>(info.phis);
+    estimate.before_live_values = static_cast<std::int64_t>(info.static_instrs + info.phis);
+    estimate.before_max_live_values =
+        static_cast<std::int64_t>(std::min<unsigned>(info.static_instrs + info.phis, 24));
+
+    estimate.after_instrs = static_cast<std::int64_t>(info.static_instrs + after_calls);
+    estimate.after_code_bytes = estimate.before_code_bytes;
+    estimate.after_int_alu = estimate.before_int_alu;
+    estimate.after_int_mul = estimate.before_int_mul;
+    estimate.after_int_div_rem = estimate.before_int_div_rem;
+    estimate.after_fp_alu = estimate.before_fp_alu;
+    estimate.after_fp_div = estimate.before_fp_div;
+    estimate.after_loads = estimate.before_loads;
+    estimate.after_stores = estimate.before_stores;
+    estimate.after_pointer_arith = estimate.before_pointer_arith;
+    estimate.after_branches = estimate.before_branches;
+    estimate.after_calls = after_calls;
+    estimate.after_phis = estimate.before_phis;
+    estimate.after_live_values = estimate.before_live_values;
+    estimate.after_max_live_values = estimate.before_max_live_values;
 }
 
 bool contains_call_to(const oir::Function &function, const oir::Function &target) {
@@ -227,10 +313,10 @@ bool has_supported_recursive_body(const oir::Function &body, const oir::Function
 }
 
 bool is_eligible_non_recursive_call(const oir::Function &caller, const oir::CallInst &call,
-                                    oir::Function *callee) {
+                                    oir::Function *callee,
+                                    const pass::cost_model::CostModelPolicy &policy) {
     if (callee == nullptr || callee == &caller || callee->is_external() ||
-        callee->entry_block() == nullptr || callee->name() == "main" ||
-        !has_compatible_call_shape(call, *callee)) {
+        callee->entry_block() == nullptr || !has_compatible_call_shape(call, *callee)) {
         return false;
     }
     if (contains_call_to(*callee, *callee) || contains_call_to(*callee, caller)) {
@@ -240,17 +326,19 @@ bool is_eligible_non_recursive_call(const oir::Function &caller, const oir::Call
     auto info = inspect_callee(*callee);
     if (is_constprop_specialization(*callee)) {
         return info.blocks <= kMaxSpecializedInlineBlocks &&
-               info.cost <= kMaxSpecializedInlineCost && info.returns != 0 &&
+               info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost * 3) &&
+               info.returns != 0 &&
                info.returns <= kMaxSpecializedInlineReturns;
     }
-    return info.blocks <= kMaxCalleeBlocks && info.cost <= kMaxCalleeCost && info.returns != 0 &&
-           info.returns <= kMaxCalleeReturns;
+    return info.blocks <= kMaxCalleeBlocks && within_inline_resource_limit(info, policy);
 }
 
 bool is_eligible_recursive_call(const oir::Function &caller, const oir::BasicBlock &block,
-                                const oir::CallInst &call, const oir::Function &callee_template) {
+                                const oir::CallInst &call,
+                                const oir::Function &callee_template,
+                                const pass::cost_model::CostModelPolicy &policy) {
     if (call.callee() != &caller || caller.is_external() || caller.entry_block() == nullptr ||
-        caller.name() == "main" || !has_compatible_call_shape(call, callee_template) ||
+        !has_compatible_call_shape(call, callee_template) ||
         !has_scalar_recursive_signature(caller) ||
         !has_supported_recursive_body(callee_template, caller) ||
         recursive_inline_depth(caller, block) >= kMaxRecursiveInlineDepth) {
@@ -258,7 +346,8 @@ bool is_eligible_recursive_call(const oir::Function &caller, const oir::BasicBlo
     }
 
     auto info = inspect_callee(callee_template);
-    return info.blocks <= kMaxRecursiveCalleeBlocks && info.cost <= kMaxRecursiveCalleeCost &&
+    return info.blocks <= kMaxRecursiveCalleeBlocks &&
+           info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost * 2) &&
            info.returns != 0 && info.returns <= kMaxRecursiveCalleeReturns;
 }
 
@@ -467,6 +556,17 @@ bool is_constprop_specialization(const oir::Function &function) {
     return function.name().rfind("__yo_constprop.", 0) == 0;
 }
 
+unsigned existing_specialization_count(const oir::Module &module, const oir::Function &callee) {
+    const std::string prefix = "__yo_constprop." + callee.name() + ".";
+    unsigned count = 0;
+    for (const auto &function : module.functions()) {
+        if (function->name().rfind(prefix, 0) == 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 bool is_specializable_constant(oir::Value *value) {
     return int_constant(value).has_value() || float_constant(value).has_value();
 }
@@ -517,6 +617,16 @@ bool has_constant_argument(const oir::CallInst &call) {
     return false;
 }
 
+unsigned count_specializable_constants(const oir::CallInst &call) {
+    unsigned count = 0;
+    for (auto *arg : call.args()) {
+        if (is_specializable_constant(arg)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 bool has_live_pointer_argument_after_specialization(const oir::CallInst &call,
                                                     const oir::Function &callee) {
     auto args = call.args();
@@ -554,10 +664,10 @@ bool specialized_constant_argument_feeds_phi(const oir::CallInst &call,
 }
 
 bool is_eligible_for_constant_specialization(const oir::Function &caller, const oir::CallInst &call,
-                                             oir::Function *callee) {
+                                             oir::Function *callee,
+                                             const pass::cost_model::CostModelPolicy &policy) {
     if (callee == nullptr || callee == &caller || callee->is_external() ||
-        callee->entry_block() == nullptr || callee->name() == "main" ||
-        is_constprop_specialization(*callee) ||
+        callee->entry_block() == nullptr || is_constprop_specialization(*callee) ||
         !has_compatible_call_shape(call, *callee) || !has_constant_argument(call) ||
         specialized_constant_argument_feeds_phi(call, *callee) ||
         has_recursive_call_graph_dependency(*callee)) {
@@ -565,12 +675,14 @@ bool is_eligible_for_constant_specialization(const oir::Function &caller, const 
     }
 
     auto info = inspect_callee(*callee);
-    if ((info.blocks > kMaxCalleeBlocks || info.cost > kMaxCalleeCost) &&
+    if ((info.blocks > kMaxCalleeBlocks ||
+         info.cost > static_cast<unsigned>(policy.max_inline_callee_cost)) &&
         has_live_pointer_argument_after_specialization(call, *callee)) {
         return false;
     }
     return info.blocks <= kMaxSpecializationCalleeBlocks &&
-           info.cost <= kMaxSpecializationCalleeCost && info.returns != 0;
+           info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost * 3) &&
+           info.returns != 0;
 }
 
 oir::Function *clone_constant_specialization(oir::Module &module, oir::Function &callee,
@@ -828,17 +940,47 @@ void clone_callee_into_caller(oir::Module &module, oir::Function &caller, oir::F
 bool inline_call(oir::Module &module, InlineContext &context, oir::Function &caller,
                  oir::BasicBlock *block,
                  std::list<std::unique_ptr<oir::Instruction>>::iterator call_it,
-                 unsigned inline_index) {
+                 unsigned inline_index, Stats &stats) {
     auto *call = static_cast<oir::CallInst *>(call_it->get());
     auto *callee = dynamic_cast<oir::Function *>(call->callee());
     bool self_recursive = callee == &caller;
     oir::Function *clone_source = callee;
+    const auto policy = pass::cost_model::policy_for_kind(stats.cost_model_policy);
     if (self_recursive) {
         clone_source = &recursive_template_for(context, caller);
-        if (!is_eligible_recursive_call(caller, *block, *call, *clone_source)) {
+        if (!is_eligible_recursive_call(caller, *block, *call, *clone_source, policy)) {
             return false;
         }
-    } else if (!is_eligible_non_recursive_call(caller, *call, callee)) {
+    } else if (!is_eligible_non_recursive_call(caller, *call, callee, policy)) {
+        return false;
+    }
+
+    const auto info = inspect_callee(*clone_source);
+    OIRTransformCostEstimate estimate;
+    estimate.kind = pass::cost_model::TransformKind::Inline;
+    estimate.pass_name = "OIRInlinePass";
+    estimate.candidate_id = "inline." + std::to_string(inline_index);
+    estimate.scope = "call";
+    estimate.proof_kind = pass::cost_model::ProofKind::Structural;
+    estimate.proof_summary = "existing inline legality checks";
+    estimate.confidence = self_recursive ? 0.60 : 0.65;
+    fill_before_after_from_callee(estimate, info, 1, 0);
+    if (info.returns <= 1 && estimate.after_branches > 0) {
+        --estimate.after_branches;
+    }
+    estimate.after_live_values += static_cast<std::int64_t>(call->args().size());
+    estimate.after_max_live_values +=
+        static_cast<std::int64_t>(std::min<std::size_t>(call->args().size(), 4));
+    estimate.risk.code_growth = std::max<std::int64_t>(1, info.static_instrs);
+    estimate.risk.register_pressure_growth =
+        static_cast<std::int64_t>((info.loads + info.stores + call->args().size()) / 6);
+    estimate.risk.live_range_growth =
+        static_cast<std::int64_t>(std::min<std::size_t>(call->args().size(), 4)) +
+        (info.returns > 1 ? 1 : 0);
+    estimate.risk.memory_pressure_growth =
+        static_cast<std::int64_t>((info.loads + info.stores) / 6);
+    estimate.risk.cleanup_dependency = 1;
+    if (!cost_model_allows_transform(stats, estimate)) {
         return false;
     }
 
@@ -872,13 +1014,13 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
 }
 
 bool inline_one_call(oir::Module &module, InlineContext &context, oir::Function &function,
-                     unsigned inline_index) {
+                     unsigned inline_index, Stats &stats) {
     for (auto &block : function.blocks()) {
         for (auto it = block->instructions().begin(); it != block->instructions().end(); ++it) {
             if ((*it)->op() != oir::Instruction::OpID::Call) {
                 continue;
             }
-            if (inline_call(module, context, function, block.get(), it, inline_index)) {
+            if (inline_call(module, context, function, block.get(), it, inline_index, stats)) {
                 return true;
             }
         }
@@ -897,6 +1039,7 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
     };
 
     std::vector<Site> sites;
+    const auto policy = pass::cost_model::policy_for_kind(stats.cost_model_policy);
     for (auto &function : module.functions()) {
         if (function->is_external()) {
             continue;
@@ -908,7 +1051,7 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
                     continue;
                 }
                 auto *callee = dynamic_cast<oir::Function *>(call->callee());
-                if (!is_eligible_for_constant_specialization(*function, *call, callee)) {
+                if (!is_eligible_for_constant_specialization(*function, *call, callee, policy)) {
                     continue;
                 }
                 sites.push_back({function.get(), callee, call, specialization_key(*callee, *call)});
@@ -932,6 +1075,7 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
     bool changed = false;
     unsigned next_id = 0;
     std::unordered_map<std::string, oir::Function *> clones;
+    std::unordered_map<oir::Function *, unsigned> specializations_by_callee;
     for (auto &site : sites) {
         if (site.call == nullptr || site.callee == nullptr ||
             dynamic_cast<oir::Function *>(site.call->callee()) != site.callee) {
@@ -940,6 +1084,67 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
 
         auto found = clones.find(site.key);
         oir::Function *clone = nullptr;
+        const bool needs_new_clone = found == clones.end();
+        const unsigned existing_for_callee =
+            existing_specialization_count(module, *site.callee) +
+            specializations_by_callee[site.callee];
+        const bool exceeds_policy_specialization_budget =
+            stats.cost_model_report != nullptr && needs_new_clone &&
+            existing_for_callee >= policy.max_specializations_per_function;
+        const auto constant_arg_count = count_specializable_constants(*site.call);
+        const auto info = inspect_callee(*site.callee);
+        OIRTransformCostEstimate estimate;
+        estimate.kind = pass::cost_model::TransformKind::ConstantArgumentSpecialization;
+        estimate.pass_name = "OIRInlinePass";
+        estimate.candidate_id = "specialize." + std::to_string(++stats.cost_model_candidates);
+        estimate.scope = "call";
+        estimate.proof_kind = pass::cost_model::ProofKind::PartialEvaluation;
+        estimate.proof_summary = "constant arguments proven at callsite";
+        estimate.confidence = constant_arg_count == 0 ? 0.55 : 0.74;
+        fill_before_after_from_callee(estimate, info, 1, 0);
+        const std::int64_t eliminated_alu =
+            std::min<std::int64_t>(estimate.after_int_alu, constant_arg_count * 2);
+        const std::int64_t eliminated_branches =
+            std::min<std::int64_t>(estimate.after_branches, constant_arg_count);
+        estimate.after_instrs =
+            std::max<std::int64_t>(1, estimate.after_instrs - eliminated_alu - eliminated_branches);
+        estimate.after_int_alu -= eliminated_alu;
+        estimate.after_branches -= eliminated_branches;
+        estimate.after_code_bytes += needs_new_clone
+                                         ? static_cast<std::int64_t>(estimate.after_instrs * 4)
+                                         : 0;
+        estimate.after_live_values =
+            std::max<std::int64_t>(1, estimate.after_live_values - constant_arg_count);
+        estimate.after_max_live_values =
+            std::max<std::int64_t>(1, estimate.after_max_live_values - constant_arg_count);
+        estimate.risk.code_growth =
+            needs_new_clone
+                ? std::max<std::int64_t>(0,
+                                         (estimate.after_code_bytes - estimate.before_code_bytes) / 16)
+                : 0;
+        estimate.risk.register_pressure_growth =
+            needs_new_clone ? static_cast<std::int64_t>((info.loads + info.stores) / 4) : 0;
+        estimate.risk.live_range_growth = 0;
+        estimate.risk.memory_pressure_growth =
+            needs_new_clone ? static_cast<std::int64_t>((info.loads + info.stores) / 3) : 0;
+        estimate.risk.cleanup_dependency = 1;
+        estimate.partial_eval.cloned_functions = needs_new_clone ? 1 : 0;
+        estimate.partial_eval.cloned_blocks = needs_new_clone ? info.blocks : 0;
+        estimate.partial_eval.residual_instrs = estimate.after_instrs;
+        estimate.partial_eval.eliminated_instrs =
+            eliminated_alu + eliminated_branches;
+        estimate.partial_eval.eliminated_branches = eliminated_branches;
+        estimate.partial_eval.eliminated_calls = 0;
+        estimate.partial_eval.new_constants = constant_arg_count;
+        estimate.partial_eval.required_cleanup_rounds = 1;
+        if (exceeds_policy_specialization_budget) {
+            estimate.proof_summary =
+                "constant arguments proven at callsite; specialization budget exceeded";
+            estimate.risk.code_growth = policy.max_function_code_growth + 1;
+        }
+        if (!cost_model_allows_transform(stats, estimate)) {
+            continue;
+        }
         if (found != clones.end()) {
             clone = found->second;
         } else {
@@ -948,6 +1153,7 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
             }
             clone = clone_constant_specialization(module, *site.callee, *site.call, next_id);
             clones.emplace(site.key, clone);
+            ++specializations_by_callee[site.callee];
         }
         retarget_call_to_specialization(*site.call, *clone);
         ++stats.specialized;
@@ -971,7 +1177,7 @@ bool inline_functions(oir::Module &module, Stats &stats) {
             }
 
             while (inline_index < kMaxInlineSites &&
-                   inline_one_call(module, context, *function, inline_index + 1)) {
+                   inline_one_call(module, context, *function, inline_index + 1, stats)) {
                 ++inline_index;
                 ++stats.inlined;
                 changed = true;

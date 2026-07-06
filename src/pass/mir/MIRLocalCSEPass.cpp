@@ -1,5 +1,6 @@
 #include "pass/mir/MIRLocalCSEPass.h"
 
+#include "pass/mir/MIRCostModel.h"
 #include "pass/mir/MIRPeepholeCommon.h"
 
 #include <algorithm>
@@ -283,6 +284,8 @@ std::map<Block *, Block *> compute_idoms(mir::MachineFunction &function,
     return idom;
 }
 
+bool allows_cse_rewrite(Stats &stats, CSEScope scope);
+
 bool local_cse_blocks(mir::MachineFunction &function, Stats &stats) {
     bool changed = false;
     for (auto &block_ptr : function.blocks()) {
@@ -297,6 +300,9 @@ bool local_cse_blocks(mir::MachineFunction &function, Stats &stats) {
             if (key && defs.size() == 1) {
                 auto found = available.find(*key);
                 if (found != available.end()) {
+                    if (!allows_cse_rewrite(stats, CSEScope::Local)) {
+                        continue;
+                    }
                     instr = make_move_like(defs[0], found->second);
                     ++stats.cse;
                     changed = true;
@@ -360,6 +366,9 @@ bool global_cse_dominator_tree(mir::MachineFunction &function, Stats &stats) {
 
             auto found = available.find(*key);
             if (found != available.end() && found->second != defs[0]) {
+                if (!allows_cse_rewrite(stats, CSEScope::Global)) {
+                    continue;
+                }
                 instr = make_move_like(defs[0], found->second);
                 ++stats.cse;
                 changed = true;
@@ -380,6 +389,33 @@ bool global_cse_dominator_tree(mir::MachineFunction &function, Stats &stats) {
         }
     }
     return changed;
+}
+
+bool allows_cse_rewrite(Stats &stats, CSEScope scope) {
+    pass::mir_cost_model::MIRTransformCostEstimate estimate;
+    estimate.kind =
+        scope == CSEScope::Global ? pass::cost_model::TransformKind::GlobalCSE
+                                  : pass::cost_model::TransformKind::LocalCSE;
+    estimate.stage = pass::cost_model::CostIRStage::PreRAMIR;
+    estimate.pass_name = "MIRLocalCSEPass";
+    estimate.candidate_id =
+        std::string(scope == CSEScope::Global ? "global-cse." : "local-cse.") +
+        std::to_string(stats.cse + 1);
+    estimate.scope = scope == CSEScope::Global ? "dominator_tree" : "basic_block";
+    estimate.proof_summary = "single-def pure expression availability";
+    estimate.confidence = scope == CSEScope::Global ? 0.66 : 0.72;
+    estimate.before_cycles = 3;
+    estimate.after_cycles = 1;
+    estimate.before_instrs = 1;
+    estimate.after_instrs = 1;
+    estimate.after_moves = 1;
+    if (scope == CSEScope::Local) {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "AlwaysOnLocalCleanup";
+    }
+    return pass::mir_cost_model::allows_transform(stats.cost_model_report,
+                                                  stats.cost_model_policy,
+                                                  stats.cost_model_filter, estimate);
 }
 
 } // namespace
