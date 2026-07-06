@@ -965,22 +965,21 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     estimate.proof_summary = "existing inline legality checks";
     estimate.confidence = self_recursive ? 0.60 : 0.65;
     fill_before_after_from_callee(estimate, info, 1, 0);
-    estimate.after_code_bytes += static_cast<std::int64_t>(info.static_instrs * 4);
     if (info.returns <= 1 && estimate.after_branches > 0) {
         --estimate.after_branches;
     }
     estimate.after_live_values += static_cast<std::int64_t>(call->args().size());
     estimate.after_max_live_values +=
         static_cast<std::int64_t>(std::min<std::size_t>(call->args().size(), 4));
-    estimate.risk.code_growth =
-        std::max<std::int64_t>(0, (estimate.after_code_bytes - estimate.before_code_bytes) / 4);
+    estimate.risk.code_growth = std::max<std::int64_t>(1, info.static_instrs);
     estimate.risk.register_pressure_growth =
-        static_cast<std::int64_t>((info.loads + info.stores + info.calls + call->args().size()) / 3);
+        static_cast<std::int64_t>((info.loads + info.stores + call->args().size()) / 6);
     estimate.risk.live_range_growth =
-        static_cast<std::int64_t>(info.blocks + call->args().size());
+        static_cast<std::int64_t>(std::min<std::size_t>(call->args().size(), 4)) +
+        (info.returns > 1 ? 1 : 0);
     estimate.risk.memory_pressure_growth =
-        static_cast<std::int64_t>((info.loads + info.stores) / 2);
-    estimate.risk.cleanup_dependency = info.returns > 1 ? 2 : 1;
+        static_cast<std::int64_t>((info.loads + info.stores) / 6);
+    estimate.risk.cleanup_dependency = 1;
     if (!cost_model_allows_transform(stats, estimate)) {
         return false;
     }

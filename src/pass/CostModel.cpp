@@ -1,5 +1,6 @@
 #include "pass/CostModel.h"
 
+#include <algorithm>
 #include <ostream>
 #include <string>
 
@@ -288,6 +289,7 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
         policy.min_final_score = 8;
         policy.min_confidence = 0.70;
         policy.max_function_code_growth = 80;
+        policy.small_code_growth_allowance = 0;
         policy.max_module_code_growth_percent = 8;
         policy.max_register_pressure_growth = 4;
         policy.max_live_range_growth = 8;
@@ -307,6 +309,7 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
         policy.min_final_score = 0;
         policy.min_confidence = 0.45;
         policy.max_function_code_growth = 420;
+        policy.small_code_growth_allowance = 48;
         policy.max_module_code_growth_percent = 25;
         policy.max_register_pressure_growth = 14;
         policy.max_live_range_growth = 28;
@@ -385,9 +388,9 @@ std::int64_t weighted_cost(const CostVector &cost, const TargetCostProfile &targ
     return total;
 }
 
-std::int64_t weighted_risk(const RiskVector &risk) {
+std::int64_t weighted_risk(const RiskVector &risk, const CostModelPolicy &policy) {
     std::int64_t total = 0;
-    total += risk.code_growth;
+    total += std::max<std::int64_t>(0, risk.code_growth - policy.small_code_growth_allowance);
     total += risk.live_range_growth * 2;
     total += risk.register_pressure_growth * 6;
     total += risk.memory_pressure_growth * 4;
@@ -416,7 +419,7 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
     decision.estimated_gain =
         weighted_cost(candidate.before, target) - weighted_cost(candidate.after, target);
     decision.setup_cost = weighted_cost(candidate.setup, target);
-    decision.risk_penalty = weighted_risk(candidate.risk);
+    decision.risk_penalty = weighted_risk(candidate.risk, policy);
     decision.final_score =
         decision.estimated_gain - decision.setup_cost - decision.risk_penalty;
 
@@ -444,8 +447,11 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
         return decision;
     }
 
+    const bool small_inline_growth =
+        candidate.kind == TransformKind::Inline &&
+        candidate.risk.code_growth <= policy.small_code_growth_allowance;
     const bool exceeds_growth_percent =
-        candidate.before.static_instrs > 0 &&
+        !small_inline_growth && candidate.before.static_instrs > 0 &&
         candidate.risk.code_growth * 100 >
             candidate.before.static_instrs * policy.max_module_code_growth_percent;
 

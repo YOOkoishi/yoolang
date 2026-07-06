@@ -123,7 +123,7 @@ struct TargetCostProfile {
     int store = 4;
     int branch = 2;
     int unpredictable_branch = 8;
-    int call = 12;
+    int call = 18;
     int spill_load = 6;
     int spill_store = 6;
     int code_byte = 1;
@@ -304,6 +304,7 @@ struct CostModelPolicy {
     double min_confidence = 0.55;
 
     std::int64_t max_function_code_growth = 200;
+    std::int64_t small_code_growth_allowance = 24;
     std::int64_t max_module_code_growth_percent = 15;
     std::int64_t max_register_pressure_growth = 8;
     std::int64_t max_live_range_growth = 16;
@@ -354,7 +355,7 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind);
 
 CostVector subtract_cost(const CostVector &lhs, const CostVector &rhs);
 std::int64_t weighted_cost(const CostVector &cost, const TargetCostProfile &target);
-std::int64_t weighted_risk(const RiskVector &risk);
+std::int64_t weighted_risk(const RiskVector &risk, const CostModelPolicy &policy);
 TransformDecision decide(const TransformCandidate &candidate, const CostModelPolicy &policy,
                          const TargetCostProfile &target);
 
