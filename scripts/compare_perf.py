@@ -489,6 +489,66 @@ def _compile_hy(src: Path, out_dir: Path) -> tuple[Path, str]:
     return exe, "OK"
 
 
+def _collect_cost_model_summary(src: Path) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "status": "NOT_RUN",
+        "total_decisions": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "by_transform": {},
+        "by_reject_reason": {},
+        "by_proof_status": {},
+    }
+    try:
+        proc = subprocess.run(
+            [str(COMPILER_BIN), str(src), "--emit-cost-model=json", "-O1"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_SEC,
+        )
+        payload = json.loads(proc.stdout)
+    except Exception as exc:
+        summary["status"] = f"FAILED: {exc}"
+        return summary
+
+    decisions = payload.get("decisions", [])
+    if not isinstance(decisions, list):
+        summary["status"] = "EMPTY"
+        return summary
+
+    by_transform: dict[str, int] = {}
+    by_reject_reason: dict[str, int] = {}
+    by_proof_status: dict[str, int] = {}
+    accepted = 0
+    rejected = 0
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        transform = str(decision.get("transform", "Unknown"))
+        by_transform[transform] = by_transform.get(transform, 0) + 1
+        action = str(decision.get("action", ""))
+        if action == "Accept":
+            accepted += 1
+        elif action == "Reject":
+            rejected += 1
+            reason = str(decision.get("reject_reason", "Unknown"))
+            by_reject_reason[reason] = by_reject_reason.get(reason, 0) + 1
+        proof = decision.get("proof")
+        if isinstance(proof, dict):
+            status = str(proof.get("status", "Unknown"))
+            by_proof_status[status] = by_proof_status.get(status, 0) + 1
+
+    summary["status"] = "OK"
+    summary["total_decisions"] = accepted + rejected
+    summary["accepted"] = accepted
+    summary["rejected"] = rejected
+    summary["by_transform"] = by_transform
+    summary["by_reject_reason"] = by_reject_reason
+    summary["by_proof_status"] = by_proof_status
+    return summary
+
+
 def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, object]:
     asm_file = out_dir / f"{src.stem}.compiler.s"
     metrics: dict[str, object] = {
@@ -506,6 +566,7 @@ def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, object]:
         "asm_lines": 0,
         "mir_stage_metrics_status": "NOT_RUN",
         "mir_stages": {},
+        "cost_model_summary": _collect_cost_model_summary(src),
     }
 
     if asm_file.exists():
@@ -930,6 +991,53 @@ def _mir_stage_metric_summary(rows: list[dict]) -> dict[str, object]:
     }
 
 
+def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "status": "NOT_RUN",
+        "total_decisions": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "by_transform": {},
+        "by_reject_reason": {},
+        "by_proof_status": {},
+    }
+    by_transform: dict[str, int] = {}
+    by_reject_reason: dict[str, int] = {}
+    by_proof_status: dict[str, int] = {}
+    statuses: list[str] = []
+
+    for row in rows:
+        codegen_metrics = row.get("codegen_metrics")
+        if not isinstance(codegen_metrics, dict):
+            continue
+        cost_summary = codegen_metrics.get("cost_model_summary")
+        if not isinstance(cost_summary, dict):
+            continue
+        status = str(cost_summary.get("status", "NOT_RUN"))
+        statuses.append(status)
+        if status != "OK":
+            continue
+        summary["total_decisions"] = int(summary["total_decisions"]) + int(
+            cost_summary.get("total_decisions", 0)
+        )
+        summary["accepted"] = int(summary["accepted"]) + int(cost_summary.get("accepted", 0))
+        summary["rejected"] = int(summary["rejected"]) + int(cost_summary.get("rejected", 0))
+        for key, value in (cost_summary.get("by_transform") or {}).items():
+            by_transform[str(key)] = by_transform.get(str(key), 0) + int(value)
+        for key, value in (cost_summary.get("by_reject_reason") or {}).items():
+            by_reject_reason[str(key)] = by_reject_reason.get(str(key), 0) + int(value)
+        for key, value in (cost_summary.get("by_proof_status") or {}).items():
+            by_proof_status[str(key)] = by_proof_status.get(str(key), 0) + int(value)
+
+    if statuses:
+        failures = [status for status in statuses if status != "OK"]
+        summary["status"] = "OK" if not failures else "; ".join(sorted(set(failures)))
+    summary["by_transform"] = by_transform
+    summary["by_reject_reason"] = by_reject_reason
+    summary["by_proof_status"] = by_proof_status
+    return summary
+
+
 def _slow_compiler_rows(rows: list[dict], limit: int = 10) -> list[dict]:
     timed_rows = [
         (compiler_time, row)
@@ -949,6 +1057,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
     hy_stats = _hy_vs_compiler_stats(rows) if HY_COMPILER_BIN is not None else None
     insn_summary = _instruction_count_summary(rows)
     mir_stage_summary = _mir_stage_metric_summary(rows)
+    cost_model_summary = _cost_model_decision_summary(rows)
 
     md_lines = [
         "# 📊 RISC-V QEMU Perf Report",
@@ -963,6 +1072,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         f"- 🏁 Faster cases: GCC {o3_stats['gcc_o3_faster_cases']} / Clang++ {o3_stats['clang_o3_faster_cases']}",
         f"- QEMU dynamic instruction count: {insn_summary['status']}",
         f"- MIR stage metrics: {mir_stage_summary['status']} ({mir_stage_summary['counted_cases']} cases)",
+        f"- Cost model decisions: {cost_model_summary['status']} ({cost_model_summary['accepted']} accepted / {cost_model_summary['rejected']} rejected)",
         f"- Compiler binary: {COMPILER_BIN}",
         f"- Runtime lib: {RUNTIME_LIB}",
     ]
@@ -1006,6 +1116,40 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                 )
                 + " |"
             )
+
+    if cost_model_summary.get("status") != "NOT_RUN":
+        md_lines.extend(
+            [
+                "",
+                "## Cost Model Decisions",
+                "",
+                f"- Total: {cost_model_summary['total_decisions']}",
+                f"- Accepted: {cost_model_summary['accepted']}",
+                f"- Rejected: {cost_model_summary['rejected']}",
+                "",
+                "| Category | Name | Count |",
+                "| --- | --- | ---: |",
+            ]
+        )
+        for category, values in (
+            ("transform", cost_model_summary.get("by_transform", {})),
+            ("reject_reason", cost_model_summary.get("by_reject_reason", {})),
+            ("proof_status", cost_model_summary.get("by_proof_status", {})),
+        ):
+            if not isinstance(values, dict):
+                continue
+            for name, count in sorted(values.items()):
+                md_lines.append(
+                    "| "
+                    + " | ".join(
+                        [
+                            _md_escape(category),
+                            _md_escape(str(name)),
+                            str(count),
+                        ]
+                    )
+                    + " |"
+                )
 
     slow_rows = _slow_compiler_rows(rows)
     if slow_rows:
@@ -1090,6 +1234,7 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         "hy_faster_cases": hy_stats["hy_faster_cases"] if hy_stats else 0,
         "instruction_count_summary": insn_summary,
         "mir_stage_metric_summary": mir_stage_summary,
+        "cost_model_decision_summary": cost_model_summary,
         "rows": rows,
     }
     REPORT_JSON.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")

@@ -3,6 +3,8 @@
 #include "pass/ast/ASTDumpPass.h"
 #include "pass/ast/ASTSemanticAnalysisPass.h"
 #include "pass/ast/ASTToYIRPass.h"
+#include "pass/CostModel.h"
+#include "pass/CostModelDiagnosticsPass.h"
 #include "pass/mir/MIRCombinePipelinePass.h"
 #include "pass/mir/MIRDiagnosticsPass.h"
 #include "pass/mir/MIRListSchedulerPass.h"
@@ -55,12 +57,17 @@ struct CommandLineOptions {
     bool emit_oir = false;
     bool emit_mir = false;
     bool emit_mir_metrics = false;
+    bool emit_cost_model = false;
+    bool emit_cost_model_json = false;
     bool emit_asm = false;
     bool emit_poly = false;
     bool enable_polyhedral = true;
     bool force_polyhedral = false;
     bool show_help = false;
     std::string emit_mir_stage;
+    std::string cost_model_filter;
+    pass::cost_model::CostModelPolicyKind cost_model_policy =
+        pass::cost_model::CostModelPolicyKind::Balanced;
 };
 
 bool is_valid_mir_stage(const std::string &stage) {
@@ -86,6 +93,12 @@ void print_help(const char *program, std::ostream &out) {
         << "                   Dump MIR after lowered/post-combine/pre-ra/post-ra/final\n"
         << "  --emit-mir-metrics\n"
         << "                   Dump JSON MIR metrics for all recorded backend stages\n"
+        << "  --emit-cost-model[=json]\n"
+        << "                   Dump cost-model summaries and decisions without emitting assembly\n"
+        << "  --cost-model-filter=<pass-or-transform>\n"
+        << "                   Restrict cost-model decision diagnostics to a pass or transform name\n"
+        << "  --cost-model-policy=conservative|balanced|aggressive\n"
+        << "                   Select the cost-model profitability policy (default: balanced)\n"
         << "  --emit-poly      Dump YIR polyhedral SCoP/model/dependence artifacts\n";
 }
 
@@ -137,6 +150,55 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         }
         if (arg == "--emit-mir-metrics") {
             options.emit_mir_metrics = true;
+            continue;
+        }
+        if (arg == "--emit-cost-model") {
+            options.emit_cost_model = true;
+            continue;
+        }
+        const std::string emit_cost_model_prefix = "--emit-cost-model=";
+        if (arg.rfind(emit_cost_model_prefix, 0) == 0) {
+            const auto mode = arg.substr(emit_cost_model_prefix.size());
+            if (mode != "json" && mode != "text") {
+                error = "unknown cost-model emit mode: " + mode;
+                return false;
+            }
+            options.emit_cost_model = true;
+            options.emit_cost_model_json = mode == "json";
+            continue;
+        }
+        const std::string cost_model_filter_prefix = "--cost-model-filter=";
+        if (arg.rfind(cost_model_filter_prefix, 0) == 0) {
+            options.cost_model_filter = arg.substr(cost_model_filter_prefix.size());
+            continue;
+        }
+        if (arg == "--cost-model-filter") {
+            if (i + 1 >= argc) {
+                error = "--cost-model-filter requires a pass or transform name";
+                return false;
+            }
+            options.cost_model_filter = argv[++i];
+            continue;
+        }
+        const std::string cost_model_policy_prefix = "--cost-model-policy=";
+        if (arg.rfind(cost_model_policy_prefix, 0) == 0) {
+            const auto policy = arg.substr(cost_model_policy_prefix.size());
+            if (!pass::cost_model::parse_policy_kind(policy, options.cost_model_policy)) {
+                error = "unknown cost-model policy: " + policy;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--cost-model-policy") {
+            if (i + 1 >= argc) {
+                error = "--cost-model-policy requires conservative, balanced, or aggressive";
+                return false;
+            }
+            const std::string policy = argv[++i];
+            if (!pass::cost_model::parse_policy_kind(policy, options.cost_model_policy)) {
+                error = "unknown cost-model policy: " + policy;
+                return false;
+            }
             continue;
         }
         if (arg == "--emit-poly") {
@@ -196,9 +258,23 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         return false;
     }
 
+    if (!options.show_help && options.emit_cost_model &&
+        (options.emit_ast || options.emit_yir || options.emit_oir || options.emit_mir ||
+         options.emit_mir_metrics || options.emit_asm || options.emit_poly)) {
+        error = "--emit-cost-model cannot be combined with other emit options";
+        return false;
+    }
+
+    if (!options.show_help && !options.emit_cost_model &&
+        (!options.cost_model_filter.empty() ||
+         options.cost_model_policy != pass::cost_model::CostModelPolicyKind::Balanced)) {
+        error = "cost-model options require --emit-cost-model";
+        return false;
+    }
+
     if (!options.show_help && !options.emit_ast && !options.emit_yir && !options.emit_oir &&
-        !options.emit_mir && !options.emit_mir_metrics && !options.emit_asm &&
-        !options.emit_poly) {
+        !options.emit_mir && !options.emit_mir_metrics && !options.emit_cost_model &&
+        !options.emit_asm && !options.emit_poly) {
         options.emit_asm = true;
     }
 
@@ -207,20 +283,22 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
 
 bool needs_yir(const CommandLineOptions &options) {
     return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm ||
-           options.emit_poly || options.emit_mir_metrics;
+           options.emit_poly || options.emit_mir_metrics || options.emit_cost_model;
 }
 
 bool needs_oir(const CommandLineOptions &options) {
-    return options.emit_oir || options.emit_mir || options.emit_asm || options.emit_mir_metrics;
+    return options.emit_oir || options.emit_mir || options.emit_asm || options.emit_mir_metrics ||
+           options.emit_cost_model;
 }
 
 bool needs_post_poly_yir_pipeline(const CommandLineOptions &options) {
     return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm ||
-           options.emit_mir_metrics;
+           options.emit_mir_metrics || options.emit_cost_model;
 }
 
 bool needs_mir(const CommandLineOptions &options) {
-    return options.emit_mir || options.emit_asm || options.emit_mir_metrics;
+    return options.emit_mir || options.emit_asm || options.emit_mir_metrics ||
+           options.emit_cost_model;
 }
 
 bool optimizations_enabled(const CommandLineOptions &options) {
@@ -233,6 +311,10 @@ bool polyhedral_enabled(const CommandLineOptions &options) {
 
 bool mir_diagnostics_enabled(const CommandLineOptions &options) {
     return options.emit_mir_metrics || !options.emit_mir_stage.empty();
+}
+
+bool cost_model_diagnostics_enabled(const CommandLineOptions &options) {
+    return options.emit_cost_model;
 }
 
 std::unique_ptr<CompUnit> parse_ast_from_file(const std::string &input_path, std::ostream &err) {
@@ -296,8 +378,18 @@ void add_oir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
     }
 
     pm.add_pass<pass::YIRToOIRPass>();
+    if (cost_model_diagnostics_enabled(options)) {
+        pm.add_pass<pass::CostModelDiagnosticsPass>(
+            pass::cost_model::CostIRStage::OIR, "oir-before", options.cost_model_policy,
+            options.cost_model_filter);
+    }
     if (optimizations_enabled(options)) {
         pm.add_pass<pass::OIROptimizationPipelinePass>();
+    }
+    if (cost_model_diagnostics_enabled(options)) {
+        pm.add_pass<pass::CostModelDiagnosticsPass>(pass::cost_model::CostIRStage::OIR, "oir",
+                                                    options.cost_model_policy,
+                                                    options.cost_model_filter);
     }
 }
 
@@ -334,8 +426,17 @@ void add_mir_pipeline(pass::PassManager &pm, const CommandLineOptions &options) 
         if (record_diagnostics) {
             pm.add_pass<pass::MIRDiagnosticsPass>("final", mir::MIRVerificationStage::PostRA);
         }
+        if (cost_model_diagnostics_enabled(options)) {
+            pm.add_pass<pass::CostModelDiagnosticsPass>(
+                pass::cost_model::CostIRStage::FinalMIR, "final-mir",
+                options.cost_model_policy, options.cost_model_filter);
+        }
     } else if (record_diagnostics) {
         pm.add_pass<pass::MIRDiagnosticsPass>("final", mir::MIRVerificationStage::PreRA);
+    } else if (cost_model_diagnostics_enabled(options)) {
+        pm.add_pass<pass::CostModelDiagnosticsPass>(
+            pass::cost_model::CostIRStage::PreRAMIR, "lowered-mir", options.cost_model_policy,
+            options.cost_model_filter);
     }
 }
 
@@ -529,6 +630,20 @@ int main(int argc, char **argv) {
             return 1;
         }
         print_mir_metrics_json(*metrics, *out);
+    }
+
+    if (options.emit_cost_model) {
+        auto *report = context.get_artifact<pass::cost_model::CostModelReport>(
+            pass::CostModelDiagnosticsPass::kReportArtifactKey);
+        if (report == nullptr) {
+            std::cerr << "Cost model report was not produced\n";
+            return 1;
+        }
+        if (options.emit_cost_model_json) {
+            pass::cost_model::print_report_json(*report, *out);
+        } else {
+            pass::cost_model::print_report_text(*report, *out);
+        }
     }
 
     if (options.emit_asm) {

@@ -1,4 +1,5 @@
 // RUN: %compiler --emit-mir -O1 %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler --emit-cost-model -O1 %s | FileCheck %s --check-prefix=COST-LICM
 
 int G[4];
 
@@ -76,3 +77,6 @@ int main() {
 // MIR: LOAD_MEM
 // MIR-NOT: LA {{.*}}, @G
 // MIR: while.end
+
+// COST-LICM: [cost-model] MIRLoopInvariantCodeMotionPass Accept transform=LoopInvariantCodeMotion {{.*}} reason=Profitable
+// COST-LICM: [cost-model] MIRLocalCSEPass Reject transform=GlobalCSE {{.*}} reason=NegativeGain

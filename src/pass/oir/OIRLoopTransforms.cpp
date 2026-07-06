@@ -2,6 +2,7 @@
 
 #include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
+#include "pass/oir/OIRCostModel.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -38,6 +39,31 @@ bool starts_with(const std::string &value, const char *prefix) {
     const std::string prefix_string(prefix);
     return value.size() >= prefix_string.size() &&
            value.compare(0, prefix_string.size(), prefix_string) == 0;
+}
+
+bool cost_model_allows_loop_transform(Stats &stats, pass::cost_model::TransformKind kind,
+                                      const std::string &candidate_id,
+                                      std::int64_t before_instrs,
+                                      std::int64_t after_instrs,
+                                      std::int64_t before_branches,
+                                      std::int64_t after_branches,
+                                      std::int64_t code_growth,
+                                      double confidence) {
+    OIRTransformCostEstimate estimate;
+    estimate.kind = kind;
+    estimate.pass_name = "OIRLoopTransforms";
+    estimate.candidate_id = candidate_id;
+    estimate.scope = "loop";
+    estimate.proof_kind = pass::cost_model::ProofKind::Structural;
+    estimate.proof_summary = "loop shape, dominance, and side-exit checks";
+    estimate.confidence = confidence;
+    estimate.before_instrs = before_instrs;
+    estimate.after_instrs = after_instrs;
+    estimate.before_branches = before_branches;
+    estimate.after_branches = after_branches;
+    estimate.risk.code_growth = code_growth;
+    estimate.risk.cleanup_dependency = code_growth > 0 ? 1 : 0;
+    return cost_model_allows_transform(stats, estimate);
 }
 
 oir::BasicBlock *mutable_block(const oir::BasicBlock *block) {
@@ -595,6 +621,12 @@ bool rotate_loop(oir::Function &function, const oir::Loop &loop, const oir::Scal
         }
     }
 
+    if (!cost_model_allows_loop_transform(
+            stats, pass::cost_model::TransformKind::LoopRotate,
+            "rotate." + std::to_string(stats.loop_rotate + 1), 4, 3, 1, 1, 0, 0.66)) {
+        return false;
+    }
+
     ValueMap preheader_map;
     ValueMap latch_map;
     for (const auto &[phi, values] : header_phi_values) {
@@ -977,6 +1009,15 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
 
     auto *branch = find_unswitch_branch(loop, scev);
     if (branch == nullptr) {
+        return false;
+    }
+
+    const auto original_instrs =
+        static_cast<std::int64_t>(loop_instruction_count(original_blocks));
+    if (!cost_model_allows_loop_transform(
+            stats, pass::cost_model::TransformKind::LoopUnswitch,
+            "unswitch." + std::to_string(stats.loop_unswitch + 1), original_instrs + 6,
+            original_instrs, 1, 0, original_instrs / 2, 0.62)) {
         return false;
     }
 

@@ -4,6 +4,7 @@
 
 #include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
+#include "pass/oir/OIRCostModel.h"
 
 #include <algorithm>
 #include <list>
@@ -467,6 +468,17 @@ bool is_constprop_specialization(const oir::Function &function) {
     return function.name().rfind("__yo_constprop.", 0) == 0;
 }
 
+unsigned existing_specialization_count(const oir::Module &module, const oir::Function &callee) {
+    const std::string prefix = "__yo_constprop." + callee.name() + ".";
+    unsigned count = 0;
+    for (const auto &function : module.functions()) {
+        if (function->name().rfind(prefix, 0) == 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 bool is_specializable_constant(oir::Value *value) {
     return int_constant(value).has_value() || float_constant(value).has_value();
 }
@@ -515,6 +527,16 @@ bool has_constant_argument(const oir::CallInst &call) {
         }
     }
     return false;
+}
+
+unsigned count_specializable_constants(const oir::CallInst &call) {
+    unsigned count = 0;
+    for (auto *arg : call.args()) {
+        if (is_specializable_constant(arg)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 bool has_live_pointer_argument_after_specialization(const oir::CallInst &call,
@@ -828,7 +850,7 @@ void clone_callee_into_caller(oir::Module &module, oir::Function &caller, oir::F
 bool inline_call(oir::Module &module, InlineContext &context, oir::Function &caller,
                  oir::BasicBlock *block,
                  std::list<std::unique_ptr<oir::Instruction>>::iterator call_it,
-                 unsigned inline_index) {
+                 unsigned inline_index, Stats &stats) {
     auto *call = static_cast<oir::CallInst *>(call_it->get());
     auto *callee = dynamic_cast<oir::Function *>(call->callee());
     bool self_recursive = callee == &caller;
@@ -839,6 +861,28 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
             return false;
         }
     } else if (!is_eligible_non_recursive_call(caller, *call, callee)) {
+        return false;
+    }
+
+    const auto info = inspect_callee(*clone_source);
+    OIRTransformCostEstimate estimate;
+    estimate.kind = pass::cost_model::TransformKind::Inline;
+    estimate.pass_name = "OIRInlinePass";
+    estimate.candidate_id = "inline." + std::to_string(inline_index);
+    estimate.scope = "call";
+    estimate.proof_kind = pass::cost_model::ProofKind::Structural;
+    estimate.proof_summary = "existing inline legality checks";
+    estimate.confidence = 0.65;
+    estimate.before_instrs = static_cast<std::int64_t>(info.cost + 1);
+    estimate.before_branches = static_cast<std::int64_t>(info.returns);
+    estimate.before_calls = 1;
+    estimate.after_instrs = static_cast<std::int64_t>(info.cost / 2);
+    estimate.after_branches = static_cast<std::int64_t>(info.returns > 0 ? info.returns - 1 : 0);
+    estimate.risk.code_growth = static_cast<std::int64_t>(info.cost / 5);
+    estimate.risk.register_pressure_growth = static_cast<std::int64_t>(info.cost / 24);
+    estimate.risk.live_range_growth = static_cast<std::int64_t>(info.blocks);
+    estimate.risk.cleanup_dependency = 1;
+    if (!cost_model_allows_transform(stats, estimate)) {
         return false;
     }
 
@@ -872,13 +916,13 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
 }
 
 bool inline_one_call(oir::Module &module, InlineContext &context, oir::Function &function,
-                     unsigned inline_index) {
+                     unsigned inline_index, Stats &stats) {
     for (auto &block : function.blocks()) {
         for (auto it = block->instructions().begin(); it != block->instructions().end(); ++it) {
             if ((*it)->op() != oir::Instruction::OpID::Call) {
                 continue;
             }
-            if (inline_call(module, context, function, block.get(), it, inline_index)) {
+            if (inline_call(module, context, function, block.get(), it, inline_index, stats)) {
                 return true;
             }
         }
@@ -932,6 +976,7 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
     bool changed = false;
     unsigned next_id = 0;
     std::unordered_map<std::string, oir::Function *> clones;
+    std::unordered_map<oir::Function *, unsigned> specializations_by_callee;
     for (auto &site : sites) {
         if (site.call == nullptr || site.callee == nullptr ||
             dynamic_cast<oir::Function *>(site.call->callee()) != site.callee) {
@@ -940,6 +985,51 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
 
         auto found = clones.find(site.key);
         oir::Function *clone = nullptr;
+        const bool needs_new_clone = found == clones.end();
+        const auto policy = pass::cost_model::policy_for_kind(stats.cost_model_policy);
+        const unsigned existing_for_callee =
+            existing_specialization_count(module, *site.callee) +
+            specializations_by_callee[site.callee];
+        const bool exceeds_policy_specialization_budget =
+            stats.cost_model_report != nullptr && needs_new_clone &&
+            existing_for_callee >= policy.max_specializations_per_function;
+        const auto constant_arg_count = count_specializable_constants(*site.call);
+        const auto info = inspect_callee(*site.callee);
+        OIRTransformCostEstimate estimate;
+        estimate.kind = pass::cost_model::TransformKind::ConstantArgumentSpecialization;
+        estimate.pass_name = "OIRInlinePass";
+        estimate.candidate_id = "specialize." + std::to_string(++stats.cost_model_candidates);
+        estimate.scope = "call";
+        estimate.proof_kind = pass::cost_model::ProofKind::PartialEvaluation;
+        estimate.proof_summary = "constant arguments proven at callsite";
+        estimate.confidence = constant_arg_count == 0 ? 0.55 : 0.72;
+        estimate.before_instrs = static_cast<std::int64_t>(info.cost + 1);
+        estimate.before_branches = static_cast<std::int64_t>(info.returns);
+        estimate.before_calls = 1;
+        estimate.after_instrs = static_cast<std::int64_t>(info.cost / 3);
+        estimate.after_branches = static_cast<std::int64_t>(info.returns > 0 ? info.returns - 1 : 0);
+        estimate.risk.code_growth = static_cast<std::int64_t>(info.cost / 5);
+        estimate.risk.register_pressure_growth = static_cast<std::int64_t>(info.cost / 24);
+        estimate.risk.live_range_growth = static_cast<std::int64_t>(info.blocks);
+        estimate.risk.cleanup_dependency = 1;
+        estimate.partial_eval.cloned_functions = needs_new_clone ? 1 : 0;
+        estimate.partial_eval.cloned_blocks = needs_new_clone ? info.blocks : 0;
+        estimate.partial_eval.residual_instrs = static_cast<std::int64_t>(info.cost / 3);
+        estimate.partial_eval.eliminated_instrs =
+            static_cast<std::int64_t>(info.cost - info.cost / 3);
+        estimate.partial_eval.eliminated_branches =
+            static_cast<std::int64_t>(info.returns > 0 ? 1 : 0);
+        estimate.partial_eval.eliminated_calls = 1;
+        estimate.partial_eval.new_constants = constant_arg_count;
+        estimate.partial_eval.required_cleanup_rounds = 1;
+        if (exceeds_policy_specialization_budget) {
+            estimate.proof_summary =
+                "constant arguments proven at callsite; specialization budget exceeded";
+            estimate.risk.code_growth = policy.max_function_code_growth + 1;
+        }
+        if (!cost_model_allows_transform(stats, estimate)) {
+            continue;
+        }
         if (found != clones.end()) {
             clone = found->second;
         } else {
@@ -948,6 +1038,7 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
             }
             clone = clone_constant_specialization(module, *site.callee, *site.call, next_id);
             clones.emplace(site.key, clone);
+            ++specializations_by_callee[site.callee];
         }
         retarget_call_to_specialization(*site.call, *clone);
         ++stats.specialized;
@@ -971,7 +1062,7 @@ bool inline_functions(oir::Module &module, Stats &stats) {
             }
 
             while (inline_index < kMaxInlineSites &&
-                   inline_one_call(module, context, *function, inline_index + 1)) {
+                   inline_one_call(module, context, *function, inline_index + 1, stats)) {
                 ++inline_index;
                 ++stats.inlined;
                 changed = true;

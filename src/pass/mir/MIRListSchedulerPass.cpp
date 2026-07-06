@@ -1,6 +1,7 @@
 #include "pass/mir/MIRListSchedulerPass.h"
 
 #include "mir/MIRVerifier.h"
+#include "pass/mir/MIRCostModel.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -16,6 +17,10 @@ struct Stats {
     unsigned blocks = 0;
     unsigned regions = 0;
     unsigned instructions = 0;
+    cost_model::CostModelReport *cost_model_report = nullptr;
+    cost_model::CostModelPolicyKind cost_model_policy =
+        cost_model::CostModelPolicyKind::Balanced;
+    std::string cost_model_filter;
 
     std::string message() const {
         std::ostringstream oss;
@@ -33,6 +38,12 @@ struct SUnit {
     unsigned scheduled_cycle = 0;
     unsigned unscheduled_preds = 0;
     std::vector<std::size_t> succs;
+};
+
+struct SchedulePlan {
+    std::vector<std::size_t> order;
+    unsigned serial_cycles = 0;
+    unsigned scheduled_cycles = 0;
 };
 
 bool is_branch(mir::Opcode opcode) {
@@ -235,9 +246,15 @@ std::size_t pick_ready_node(const std::vector<SUnit> &nodes,
     return best;
 }
 
-std::vector<std::size_t> schedule_order(const std::vector<mir::MachineInstr> &instrs,
-                                        std::size_t begin, std::size_t end) {
+SchedulePlan schedule_order(const std::vector<mir::MachineInstr> &instrs,
+                            std::size_t begin, std::size_t end) {
     auto nodes = build_dag(instrs, begin, end);
+    SchedulePlan plan;
+    plan.order.reserve(nodes.size());
+    for (const auto &node : nodes) {
+        plan.serial_cycles += node.latency;
+    }
+
     std::vector<std::size_t> ready;
     ready.reserve(nodes.size());
     for (std::size_t i = 0; i < nodes.size(); ++i) {
@@ -246,15 +263,15 @@ std::vector<std::size_t> schedule_order(const std::vector<mir::MachineInstr> &in
         }
     }
 
-    std::vector<std::size_t> order;
-    order.reserve(nodes.size());
     unsigned cycle = 0;
     while (!ready.empty()) {
         const auto picked = pick_ready_node(nodes, ready, cycle);
         ready.erase(std::remove(ready.begin(), ready.end(), picked), ready.end());
 
         nodes[picked].scheduled_cycle = cycle;
-        order.push_back(picked);
+        plan.order.push_back(picked);
+        plan.scheduled_cycles =
+            std::max(plan.scheduled_cycles, cycle + nodes[picked].latency);
 
         const unsigned result_ready_cycle = cycle + nodes[picked].latency;
         for (auto succ : nodes[picked].succs) {
@@ -266,20 +283,20 @@ std::vector<std::size_t> schedule_order(const std::vector<mir::MachineInstr> &in
         }
         ++cycle;
     }
-    return order;
+    return plan;
 }
 
 bool schedule_window(std::vector<mir::MachineInstr> &instrs, std::size_t begin,
-                     std::size_t end, Stats &stats) {
+                     std::size_t end, bool post_ra, Stats &stats) {
     if (end - begin < 3) {
         return false;
     }
 
-    auto order = schedule_order(instrs, begin, end);
+    auto plan = schedule_order(instrs, begin, end);
     bool changed = false;
     unsigned moved = 0;
-    for (std::size_t i = 0; i < order.size(); ++i) {
-        if (order[i] != i) {
+    for (std::size_t i = 0; i < plan.order.size(); ++i) {
+        if (plan.order[i] != i) {
             changed = true;
             ++moved;
         }
@@ -287,10 +304,29 @@ bool schedule_window(std::vector<mir::MachineInstr> &instrs, std::size_t begin,
     if (!changed) {
         return false;
     }
+    pass::mir_cost_model::MIRTransformCostEstimate estimate;
+    estimate.kind = pass::cost_model::TransformKind::InstructionScheduling;
+    estimate.stage =
+        post_ra ? pass::cost_model::CostIRStage::PostRAMIR
+                : pass::cost_model::CostIRStage::PreRAMIR;
+    estimate.pass_name =
+        post_ra ? "MIRPostRAListSchedulerPass" : "MIRPreRAListSchedulerPass";
+    estimate.candidate_id = "schedule." + std::to_string(stats.regions + 1);
+    estimate.scope = post_ra ? "post_ra_block_window" : "pre_ra_block_window";
+    estimate.proof_summary = "register dependency DAG preserves side-effect order";
+    estimate.confidence = post_ra ? 0.60 : 0.64;
+    estimate.before_cycles = plan.serial_cycles;
+    estimate.after_cycles = plan.scheduled_cycles;
+    estimate.risk.register_pressure_growth = post_ra ? 0 : 1;
+    if (!pass::mir_cost_model::allows_transform(stats.cost_model_report,
+                                                stats.cost_model_policy,
+                                                stats.cost_model_filter, estimate)) {
+        return false;
+    }
 
     std::vector<mir::MachineInstr> scheduled;
-    scheduled.reserve(order.size());
-    for (auto local_index : order) {
+    scheduled.reserve(plan.order.size());
+    for (auto local_index : plan.order) {
         scheduled.push_back(std::move(instrs[begin + local_index]));
     }
     for (std::size_t i = 0; i < scheduled.size(); ++i) {
@@ -322,7 +358,7 @@ bool schedule_block(mir::MachineBasicBlock &block, bool post_ra, Stats &stats) {
         for (std::size_t chunk_begin = region_begin; chunk_begin < region_end;
              chunk_begin += max_window) {
             const auto chunk_end = std::min(region_end, chunk_begin + max_window);
-            changed |= schedule_window(instrs, chunk_begin, chunk_end, stats);
+            changed |= schedule_window(instrs, chunk_begin, chunk_end, post_ra, stats);
         }
     }
 
@@ -364,6 +400,13 @@ PassResult MIRListSchedulerPass::run(PassContext &context) {
     }
 
     Stats total;
+    auto *cost_model_report =
+        context.get_artifact<cost_model::CostModelReport>(cost_model::kReportArtifactKey);
+    if (cost_model_report != nullptr) {
+        total.cost_model_report = cost_model_report;
+        total.cost_model_policy = cost_model_report->policy;
+        total.cost_model_filter = cost_model_report->filter;
+    }
     bool changed = false;
     for (auto &function : module->functions()) {
         if (function->is_external()) {

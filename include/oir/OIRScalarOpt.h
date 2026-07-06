@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pass/CostModel.h"
 #include "pass/PassManager.h"
 
 #include <cstdint>
@@ -36,6 +37,12 @@ struct Stats {
     unsigned memzero = 0;
     unsigned loop_bound_tighten = 0;
     unsigned specialized = 0;
+    unsigned cost_model_candidates = 0;
+
+    pass::cost_model::CostModelReport *cost_model_report = nullptr;
+    pass::cost_model::CostModelPolicyKind cost_model_policy =
+        pass::cost_model::CostModelPolicyKind::Balanced;
+    std::string cost_model_filter;
 
     bool changed() const;
     std::string message() const;
@@ -104,6 +111,13 @@ PassResult run_oir_transform(PassContext &context, const std::string &missing_me
 
     try {
         Stats stats;
+        auto *cost_model_report =
+            context.get_artifact<cost_model::CostModelReport>(cost_model::kReportArtifactKey);
+        if (cost_model_report != nullptr) {
+            stats.cost_model_report = cost_model_report;
+            stats.cost_model_policy = cost_model_report->policy;
+            stats.cost_model_filter = cost_model_report->filter;
+        }
         bool changed = fn(*module, stats);
         if (changed) {
             context.invalidate_oir_analyses();

@@ -1,6 +1,7 @@
 #include "pass/mir/MIRPeepholePipelinePass.h"
 
 #include "mir/MIRVerifier.h"
+#include "pass/CostModel.h"
 #include "pass/mir/MIRPeepholeCommon.h"
 
 namespace pass {
@@ -61,6 +62,13 @@ PassResult MIRPeepholePipelinePass::run(PassContext &context) {
     }
 
     mir_peephole::Stats total;
+    auto *cost_model_report =
+        context.get_artifact<cost_model::CostModelReport>(cost_model::kReportArtifactKey);
+    if (cost_model_report != nullptr) {
+        total.cost_model_report = cost_model_report;
+        total.cost_model_policy = cost_model_report->policy;
+        total.cost_model_filter = cost_model_report->filter;
+    }
     bool changed = false;
     for (auto &function : module->functions()) {
         if (function->is_external()) {

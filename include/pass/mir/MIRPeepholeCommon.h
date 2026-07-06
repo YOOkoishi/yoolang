@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mir/MIR.h"
+#include "pass/CostModel.h"
 #include "pass/PassManager.h"
 
 #include <cstddef>
@@ -25,6 +26,11 @@ struct Stats {
     unsigned cse = 0;
     unsigned licm = 0;
     unsigned dead = 0;
+
+    pass::cost_model::CostModelReport *cost_model_report = nullptr;
+    pass::cost_model::CostModelPolicyKind cost_model_policy =
+        pass::cost_model::CostModelPolicyKind::Balanced;
+    std::string cost_model_filter;
 
     bool changed() const;
     std::string message() const;

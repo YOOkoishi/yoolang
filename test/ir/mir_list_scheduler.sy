@@ -1,5 +1,7 @@
 // RUN: %compiler --emit-mir -O1 %s | FileCheck %s --check-prefix=MIR
 // RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+// RUN: %compiler --emit-cost-model -O1 %s | FileCheck %s --check-prefix=COST-SCHED
+// RUN: %compiler --emit-cost-model --cost-model-policy=conservative -O1 %s | FileCheck %s --check-prefix=COST-SCHED-CONS
 
 int latency_gap(int a, int b, int c, int d, int e) {
   int q = a / b;
@@ -24,3 +26,9 @@ int main() {
 // ASM-NEXT: addw
 // ASM-NEXT: addiw
 // ASM-NEXT: addiw {{[a-z][a-z0-9]*}}, [[Q]], 1
+
+// COST-SCHED: [cost-model] MIRPreRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=NegativeGain
+// COST-SCHED: [cost-model] MIRPostRAListSchedulerPass Accept transform=InstructionScheduling {{.*}} reason=Profitable
+
+// COST-SCHED-CONS: [cost-model] MIRPreRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=LowConfidence
+// COST-SCHED-CONS: [cost-model] MIRPostRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=LowConfidence

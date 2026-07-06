@@ -1,4 +1,6 @@
 // RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model --cost-model-filter=IfConversion -O1 %s | FileCheck %s --check-prefix=COST-IFC
+// RUN: %compiler --emit-cost-model --cost-model-policy=conservative --cost-model-filter=IfConversion -O1 %s | FileCheck %s --check-prefix=COST-IFC-CONS
 
 int select_arg(int x, int y, int c) {
   if (c != 0) {
@@ -95,3 +97,13 @@ int main() {
 // OIR-LABEL: define i32 @no_select_store
 // OIR: br i1
 // OIR: store i32 1
+
+// COST-IFC: [cost-model] target=rv64gc/lp64d policy=balanced filter=IfConversion
+// COST-IFC: [cost-model] summary stage=OIR label=oir
+// COST-IFC: [cost-model] OIRLocalSimplify Accept transform=IfConversion
+// COST-IFC: reason=Profitable
+
+// COST-IFC-CONS: [cost-model] target=rv64gc/lp64d policy=conservative filter=IfConversion
+// COST-IFC-CONS: [cost-model] summary stage=OIR label=oir
+// COST-IFC-CONS: [cost-model] OIRLocalSimplify Reject transform=IfConversion
+// COST-IFC-CONS: reason=LowConfidence
