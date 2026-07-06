@@ -19,7 +19,7 @@ bool allows_transform(pass::cost_model::CostModelReport *report,
                       pass::cost_model::CostModelPolicyKind policy,
                       const std::string &filter,
                       const MIRTransformCostEstimate &estimate) {
-    if (report == nullptr || !filter_matches(filter, estimate.kind, estimate.pass_name)) {
+    if (report == nullptr) {
         return true;
     }
 
@@ -56,7 +56,9 @@ bool allows_transform(pass::cost_model::CostModelReport *report,
     const bool accepted =
         decision.action == pass::cost_model::DecisionAction::Accept && decision.legal &&
         decision.profitable;
-    report->decisions.push_back(std::move(decision));
+    if (filter_matches(filter, estimate.kind, estimate.pass_name)) {
+        report->decisions.push_back(std::move(decision));
+    }
     return accepted;
 }
 

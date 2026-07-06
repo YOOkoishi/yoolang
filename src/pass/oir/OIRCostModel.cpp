@@ -17,8 +17,7 @@ bool filter_matches(const Stats &stats, pass::cost_model::TransformKind kind,
 } // namespace
 
 bool cost_model_allows_transform(Stats &stats, const OIRTransformCostEstimate &estimate) {
-    if (stats.cost_model_report == nullptr ||
-        !filter_matches(stats, estimate.kind, estimate.pass_name)) {
+    if (stats.cost_model_report == nullptr) {
         return true;
     }
 
@@ -39,15 +38,39 @@ bool cost_model_allows_transform(Stats &stats, const OIRTransformCostEstimate &e
 
     candidate.before.static_instrs = estimate.before_instrs;
     candidate.before.dynamic_instrs = estimate.before_instrs;
-    candidate.before.int_alu = estimate.before_instrs;
+    candidate.before.code_bytes = estimate.before_code_bytes;
+    candidate.before.int_alu =
+        estimate.before_int_alu == 0 ? estimate.before_instrs : estimate.before_int_alu;
+    candidate.before.int_mul = estimate.before_int_mul;
+    candidate.before.int_div_rem = estimate.before_int_div_rem;
+    candidate.before.fp_alu = estimate.before_fp_alu;
+    candidate.before.fp_div = estimate.before_fp_div;
+    candidate.before.loads = estimate.before_loads;
+    candidate.before.stores = estimate.before_stores;
+    candidate.before.pointer_arith = estimate.before_pointer_arith;
     candidate.before.branches = estimate.before_branches;
     candidate.before.calls = estimate.before_calls;
+    candidate.before.phis = estimate.before_phis;
+    candidate.before.live_values = estimate.before_live_values;
+    candidate.before.max_live_values = estimate.before_max_live_values;
 
     candidate.after.static_instrs = estimate.after_instrs;
     candidate.after.dynamic_instrs = estimate.after_instrs;
-    candidate.after.int_alu = estimate.after_instrs;
+    candidate.after.code_bytes = estimate.after_code_bytes;
+    candidate.after.int_alu =
+        estimate.after_int_alu == 0 ? estimate.after_instrs : estimate.after_int_alu;
+    candidate.after.int_mul = estimate.after_int_mul;
+    candidate.after.int_div_rem = estimate.after_int_div_rem;
+    candidate.after.fp_alu = estimate.after_fp_alu;
+    candidate.after.fp_div = estimate.after_fp_div;
+    candidate.after.loads = estimate.after_loads;
+    candidate.after.stores = estimate.after_stores;
+    candidate.after.pointer_arith = estimate.after_pointer_arith;
     candidate.after.branches = estimate.after_branches;
     candidate.after.calls = estimate.after_calls;
+    candidate.after.phis = estimate.after_phis;
+    candidate.after.live_values = estimate.after_live_values;
+    candidate.after.max_live_values = estimate.after_max_live_values;
     candidate.setup.compile_time_units += estimate.partial_eval.cloned_functions;
     candidate.setup.compile_time_units += estimate.partial_eval.cloned_blocks / 4;
     candidate.setup.compile_time_units += estimate.partial_eval.required_cleanup_rounds;
@@ -70,7 +93,9 @@ bool cost_model_allows_transform(Stats &stats, const OIRTransformCostEstimate &e
     const bool accepted =
         decision.action == pass::cost_model::DecisionAction::Accept && decision.legal &&
         decision.profitable;
-    stats.cost_model_report->decisions.push_back(std::move(decision));
+    if (filter_matches(stats, estimate.kind, estimate.pass_name)) {
+        stats.cost_model_report->decisions.push_back(std::move(decision));
+    }
     return accepted;
 }
 

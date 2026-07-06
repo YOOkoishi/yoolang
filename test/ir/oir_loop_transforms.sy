@@ -37,8 +37,8 @@ int main() {
 
 // OIR-LABEL: define i32 @unswitch_sum
 // OIR: br i1
-// OIR: .usw.exit = phi
-// OIR: usw.
+// OIR-NOT: usw.
+// OIR: %sum.phi = phi
 
 // COST-ROTATE: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopRotate
 // COST-ROTATE: [cost-model] OIRLoopTransforms Accept transform=LoopRotate
@@ -46,4 +46,4 @@ int main() {
 
 // COST-UNSWITCH: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopUnswitch
 // COST-UNSWITCH: [cost-model] OIRLoopTransforms Reject transform=LoopUnswitch
-// COST-UNSWITCH: reason=NegativeGain
+// COST-UNSWITCH: reason=CodeGrowthTooHigh

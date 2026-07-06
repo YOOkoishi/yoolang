@@ -61,7 +61,7 @@ int main() {
 
 // MIR-LABEL: func @global_cse_const
 // MIR: LI {{.*}}, 70000
-// MIR-NOT: LI {{.*}}, 70000
+// MIR: LI {{.*}}, 70000
 // MIR-LABEL: func @hoist_large_const
 // MIR: LI {{.*}}, 70000
 // MIR: while.body

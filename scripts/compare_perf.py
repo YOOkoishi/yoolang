@@ -495,6 +495,11 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
         "total_decisions": 0,
         "accepted": 0,
         "rejected": 0,
+        "accepted_estimated_gain": 0,
+        "accepted_risk_penalty": 0,
+        "accepted_final_score": 0,
+        "rejected_estimated_gain": 0,
+        "rejected_risk_penalty": 0,
         "by_transform": {},
         "by_reject_reason": {},
         "by_proof_status": {},
@@ -530,8 +535,23 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
         action = str(decision.get("action", ""))
         if action == "Accept":
             accepted += 1
+            summary["accepted_estimated_gain"] = int(summary["accepted_estimated_gain"]) + int(
+                decision.get("estimated_gain", 0)
+            )
+            summary["accepted_risk_penalty"] = int(summary["accepted_risk_penalty"]) + int(
+                decision.get("risk_penalty", 0)
+            )
+            summary["accepted_final_score"] = int(summary["accepted_final_score"]) + int(
+                decision.get("final_score", 0)
+            )
         elif action == "Reject":
             rejected += 1
+            summary["rejected_estimated_gain"] = int(summary["rejected_estimated_gain"]) + int(
+                decision.get("estimated_gain", 0)
+            )
+            summary["rejected_risk_penalty"] = int(summary["rejected_risk_penalty"]) + int(
+                decision.get("risk_penalty", 0)
+            )
             reason = str(decision.get("reject_reason", "Unknown"))
             by_reject_reason[reason] = by_reject_reason.get(reason, 0) + 1
         proof = decision.get("proof")
@@ -983,11 +1003,23 @@ def _mir_stage_metric_summary(rows: list[dict]) -> dict[str, object]:
         if stage not in ordered_totals:
             ordered_totals[stage] = totals[stage]
 
+    deltas: dict[str, dict[str, int]] = {}
+    previous_stage: str | None = None
+    for stage_name in ordered_totals:
+        if previous_stage is not None:
+            deltas[f"{previous_stage}->{stage_name}"] = {
+                key: ordered_totals[stage_name].get(key, 0)
+                - ordered_totals[previous_stage].get(key, 0)
+                for key in MIR_STAGE_METRIC_KEYS
+            }
+        previous_stage = stage_name
+
     return {
         "status": status,
         "counted_cases": counted_cases,
         "failed_cases": failed_cases,
         "stages": ordered_totals,
+        "deltas": deltas,
     }
 
 
@@ -997,6 +1029,11 @@ def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
         "total_decisions": 0,
         "accepted": 0,
         "rejected": 0,
+        "accepted_estimated_gain": 0,
+        "accepted_risk_penalty": 0,
+        "accepted_final_score": 0,
+        "rejected_estimated_gain": 0,
+        "rejected_risk_penalty": 0,
         "by_transform": {},
         "by_reject_reason": {},
         "by_proof_status": {},
@@ -1022,6 +1059,14 @@ def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
         )
         summary["accepted"] = int(summary["accepted"]) + int(cost_summary.get("accepted", 0))
         summary["rejected"] = int(summary["rejected"]) + int(cost_summary.get("rejected", 0))
+        for total_key in (
+            "accepted_estimated_gain",
+            "accepted_risk_penalty",
+            "accepted_final_score",
+            "rejected_estimated_gain",
+            "rejected_risk_penalty",
+        ):
+            summary[total_key] = int(summary[total_key]) + int(cost_summary.get(total_key, 0))
         for key, value in (cost_summary.get("by_transform") or {}).items():
             by_transform[str(key)] = by_transform.get(str(key), 0) + int(value)
         for key, value in (cost_summary.get("by_reject_reason") or {}).items():
@@ -1117,6 +1162,38 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                 + " |"
             )
 
+    stage_deltas = mir_stage_summary.get("deltas")
+    if isinstance(stage_deltas, dict) and stage_deltas:
+        md_lines.extend(
+            [
+                "",
+                "## MIR Stage Metric Deltas",
+                "",
+                "| Transition | Instrs | Moves | Branches | Jumps | Loads | Stores | Spills | Stack slots |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for transition, totals in stage_deltas.items():
+            if not isinstance(totals, dict):
+                continue
+            md_lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _md_escape(str(transition)),
+                        str(totals.get("instructions", 0)),
+                        str(totals.get("moves", 0)),
+                        str(totals.get("branches", 0)),
+                        str(totals.get("jumps", 0)),
+                        str(totals.get("loads", 0)),
+                        str(totals.get("stores", 0)),
+                        str(totals.get("spills", 0)),
+                        str(totals.get("stack_slots", 0)),
+                    ]
+                )
+                + " |"
+            )
+
     if cost_model_summary.get("status") != "NOT_RUN":
         md_lines.extend(
             [
@@ -1126,6 +1203,11 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
                 f"- Total: {cost_model_summary['total_decisions']}",
                 f"- Accepted: {cost_model_summary['accepted']}",
                 f"- Rejected: {cost_model_summary['rejected']}",
+                f"- Accepted estimated gain total: {cost_model_summary['accepted_estimated_gain']}",
+                f"- Accepted risk penalty total: {cost_model_summary['accepted_risk_penalty']}",
+                f"- Accepted final score total: {cost_model_summary['accepted_final_score']}",
+                f"- Rejected estimated gain total: {cost_model_summary['rejected_estimated_gain']}",
+                f"- Rejected risk penalty total: {cost_model_summary['rejected_risk_penalty']}",
                 "",
                 "| Category | Name | Count |",
                 "| --- | --- | ---: |",

@@ -289,6 +289,7 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
         policy.max_module_code_growth_percent = 8;
         policy.max_register_pressure_growth = 4;
         policy.max_live_range_growth = 8;
+        policy.max_memory_pressure_growth = 8;
         policy.max_inline_callee_cost = 45;
         policy.max_specializations_per_function = 2;
         policy.max_egraph_nodes = 1500;
@@ -307,6 +308,7 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
         policy.max_module_code_growth_percent = 25;
         policy.max_register_pressure_growth = 14;
         policy.max_live_range_growth = 28;
+        policy.max_memory_pressure_growth = 28;
         policy.max_compile_time_growth = 25000;
         policy.max_inline_callee_cost = 140;
         policy.max_specializations_per_function = 8;
@@ -431,17 +433,32 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
         return decision;
     }
 
-    if (candidate.risk.code_growth > policy.max_function_code_growth) {
+    const bool exceeds_growth_percent =
+        candidate.before.static_instrs > 0 &&
+        candidate.risk.code_growth * 100 >
+            candidate.before.static_instrs * policy.max_module_code_growth_percent;
+
+    if (candidate.risk.code_growth > policy.max_function_code_growth || exceeds_growth_percent) {
         decision.reject_reason = RejectReason::CodeGrowthTooHigh;
     } else if (candidate.risk.register_pressure_growth >
                policy.max_register_pressure_growth) {
         decision.reject_reason = RejectReason::RegisterPressureTooHigh;
     } else if (candidate.risk.live_range_growth > policy.max_live_range_growth) {
         decision.reject_reason = RejectReason::RegisterPressureTooHigh;
-    } else if (candidate.risk.memory_pressure_growth > policy.max_register_pressure_growth) {
+    } else if (candidate.risk.memory_pressure_growth > policy.max_memory_pressure_growth) {
         decision.reject_reason = RejectReason::MemoryPressureTooHigh;
     } else if (candidate.risk.compile_time_growth > policy.max_compile_time_growth) {
         decision.reject_reason = RejectReason::CompileTimeTooHigh;
+    } else if (candidate.kind == TransformKind::LoopUnswitch && !policy.allow_loop_unswitch) {
+        decision.reject_reason = RejectReason::TargetUnsupported;
+    } else if ((candidate.kind == TransformKind::PartialEvaluation ||
+                candidate.kind == TransformKind::ConstantArgumentSpecialization) &&
+               !policy.allow_partial_eval) {
+        decision.reject_reason = RejectReason::TargetUnsupported;
+    } else if (candidate.kind == TransformKind::EGraphRewrite && !policy.allow_egraph) {
+        decision.reject_reason = RejectReason::TargetUnsupported;
+    } else if (candidate.proof.kind == ProofKind::SMT && !policy.allow_smt) {
+        decision.reject_reason = RejectReason::TargetUnsupported;
     } else if (decision.confidence < policy.min_confidence) {
         decision.reject_reason = RejectReason::LowConfidence;
     } else if (decision.final_score < policy.min_final_score) {

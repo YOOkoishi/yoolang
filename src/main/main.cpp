@@ -265,13 +265,6 @@ bool parse_command_line(int argc, char **argv, CommandLineOptions &options, std:
         return false;
     }
 
-    if (!options.show_help && !options.emit_cost_model &&
-        (!options.cost_model_filter.empty() ||
-         options.cost_model_policy != pass::cost_model::CostModelPolicyKind::Balanced)) {
-        error = "cost-model options require --emit-cost-model";
-        return false;
-    }
-
     if (!options.show_help && !options.emit_ast && !options.emit_yir && !options.emit_oir &&
         !options.emit_mir && !options.emit_mir_metrics && !options.emit_cost_model &&
         !options.emit_asm && !options.emit_poly) {
@@ -315,6 +308,21 @@ bool mir_diagnostics_enabled(const CommandLineOptions &options) {
 
 bool cost_model_diagnostics_enabled(const CommandLineOptions &options) {
     return options.emit_cost_model;
+}
+
+bool cost_model_active(const CommandLineOptions &options) {
+    return optimizations_enabled(options) || options.emit_cost_model;
+}
+
+void initialize_cost_model_report(pass::PassContext &context, const CommandLineOptions &options) {
+    if (!cost_model_active(options)) {
+        return;
+    }
+    pass::cost_model::CostModelReport report;
+    report.target = pass::cost_model::default_target_profile();
+    report.policy = options.cost_model_policy;
+    report.filter = options.cost_model_filter;
+    context.set_artifact(pass::cost_model::kReportArtifactKey, std::move(report));
 }
 
 std::unique_ptr<CompUnit> parse_ast_from_file(const std::string &input_path, std::ostream &err) {
@@ -560,6 +568,7 @@ int main(int argc, char **argv) {
 
     pass::PassContext context;
     context.set_ast(std::move(ast));
+    initialize_cost_model_report(context, options);
 
     std::ofstream output_file;
     std::ostream *out = &std::cout;

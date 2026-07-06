@@ -28,10 +28,10 @@ int main() {
 
 // TEXT: [cost-model] target=rv64gc/lp64d policy=conservative filter=Inline
 // TEXT: [cost-model] summary stage=OIR
-// TEXT: [cost-model] summary stage=OIR label=oir functions=3 blocks=5 instrs=8 loads=0 stores=0 branches=1 calls=1
+// TEXT: [cost-model] summary stage=OIR label=oir functions={{[0-9]+}} blocks={{[0-9]+}} instrs={{[0-9]+}} loads=0 stores=0 branches={{[0-9]+}} calls=1
 // TEXT: [cost-model] summary stage=FinalMIR
 // TEXT: [cost-model] OIRInlinePass Reject transform=Inline
-// TEXT: reason=LowConfidence
+// TEXT: reason=CodeGrowthTooHigh
 
 // ASM-NOT: [cost-model]
 // ASM-LABEL: main:

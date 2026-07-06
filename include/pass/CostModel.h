@@ -216,6 +216,13 @@ struct EquivalenceProof {
     std::int64_t obligations = 0;
 };
 
+struct AlternativeCost {
+    std::string alternative_id;
+    CostVector cost;
+    RiskVector risk;
+    EquivalenceProof proof;
+};
+
 struct TransformCandidate {
     TransformKind kind = TransformKind::Peephole;
     CostIRStage stage = CostIRStage::OIR;
@@ -233,6 +240,31 @@ struct TransformCandidate {
 
     std::vector<std::string> required_cleanup_passes;
     std::vector<std::string> reason_hints;
+    std::vector<AlternativeCost> alternatives;
+};
+
+struct CandidateProviderBudget {
+    std::int64_t max_candidates = 128;
+    std::int64_t max_compile_time_us = 10000;
+    std::int64_t max_smt_time_us = 5000;
+    std::int64_t max_egraph_nodes = 5000;
+    std::int64_t max_specializations_per_function = 4;
+};
+
+struct CandidateProviderRequest {
+    TransformKind kind = TransformKind::Peephole;
+    CostIRStage stage = CostIRStage::OIR;
+    std::string provider_name;
+    std::string scope;
+    TargetCostProfile target;
+    CostModelPolicyKind policy = CostModelPolicyKind::Balanced;
+    CandidateProviderBudget budget;
+};
+
+struct CandidateProviderResult {
+    std::vector<TransformCandidate> candidates;
+    bool budget_exhausted = false;
+    std::string note;
 };
 
 struct TransformDecision {
@@ -271,6 +303,7 @@ struct CostModelPolicy {
     std::int64_t max_module_code_growth_percent = 15;
     std::int64_t max_register_pressure_growth = 8;
     std::int64_t max_live_range_growth = 16;
+    std::int64_t max_memory_pressure_growth = 16;
     std::int64_t max_compile_time_growth = 10000;
 
     std::int64_t max_inline_callee_cost = 80;

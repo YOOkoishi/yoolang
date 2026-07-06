@@ -20,6 +20,9 @@ testcase-identity decisions.
 
 - Legal/proven status is mandatory. `Refuted`, `Timeout`, and `Unknown` proof states reject before
   profitability can commit a transform.
+- Default `-O1` uses the same non-printing cost-model report and decision engine as
+  `--emit-cost-model`; diagnostic filtering only filters recorded output and must not change
+  transform decisions.
 - PreRA MIR transforms carry register-pressure risk unless the transform is known to be PostRA-only
   or not to increase live ranges.
 - Partial evaluation must charge clone/setup cost and cleanup dependency. Specialization budgets
@@ -72,3 +75,22 @@ When estimates disagree with measured behavior, adjust only generic weights or r
   benefits.
 - Raise proof/setup costs when SMT or e-graph budget overhead dominates small local wins.
 - Do not add file, function, variable, input, or benchmark identity checks.
+
+## Provider Scope
+
+The production gates in this checkpoint are the existing OIR/MIR transforms wired through the
+shared decision engine, with OIR inline and constant-argument specialization carrying the most
+structured estimates.
+
+The current SMT, PE, and e-graph hooks are bounded scaffolding:
+
+- SMT records proof metadata, cache/timeout status, and proof cost for a deterministic i32 rewrite
+  adapter; it is not a general bitvector solver integration.
+- PE is constant-argument specialization plus clone/residual/cleanup accounting; it is not a
+  general residual-program provider.
+- E-graph is a small OIR expression-slice provider for registered integer rewrites; it is not full
+  equality saturation.
+
+Future providers should populate `CandidateProviderRequest`, `CandidateProviderBudget`,
+`TransformCandidate`, and `AlternativeCost` so proof metadata, setup cost, cleanup dependency,
+extraction/proof budgets, and alternative costs enter the same `decide()` path.
