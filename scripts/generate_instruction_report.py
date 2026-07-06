@@ -13,6 +13,8 @@ from posixpath import relpath as posix_relpath
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from report_theme import REPORT_THEME_BIND_SCRIPT, REPORT_THEME_CSS, REPORT_THEME_HEAD_SCRIPT, REPORT_THEME_TOGGLE_HTML
+
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -284,6 +286,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yoolang QEMU 动态指令数</title>
+{REPORT_THEME_HEAD_SCRIPT}
   <style>
     :root {{
       color-scheme: light;
@@ -489,6 +492,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
     .fail {{ color: var(--bad); font-weight: 600; }}
     .reason {{ color: var(--muted); max-width: 360px; }}
     .empty {{ padding: 24px; color: var(--muted); }}
+{REPORT_THEME_CSS}
     @media (max-width: 760px) {{
       header, main {{ padding-left: 16px; padding-right: 16px; }}
       .toolbar, .baseline-toolbar {{ grid-template-columns: 1fr; }}
@@ -499,7 +503,10 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
 </head>
 <body>
   <header>
-    <h1>Yoolang QEMU 动态指令数</h1>
+    <div class="header-row">
+      <h1>Yoolang QEMU 动态指令数</h1>
+      {REPORT_THEME_TOGGLE_HTML}
+    </div>
     <div class="meta">
       <div id="meta"></div>
       <div class="measure"><strong>测量方式:</strong> RISC-V 可执行文件通过 qemu-riscv64 TCG plugin 统计动态执行指令数；数值越小代表生成代码执行指令更少。</div>
@@ -570,6 +577,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       <div class="empty" id="empty" hidden>没有匹配的 case。</div>
     </section>
   </main>
+{REPORT_THEME_BIND_SCRIPT}
   <script id="report-data" type="application/json">{data}</script>
   <script>
     const report = JSON.parse(document.getElementById('report-data').textContent);

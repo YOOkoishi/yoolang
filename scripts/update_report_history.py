@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from report_theme import REPORT_THEME_BIND_SCRIPT, REPORT_THEME_CSS, REPORT_THEME_HEAD_SCRIPT, REPORT_THEME_TOGGLE_HTML
+
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 MAX_HISTORY = int(os.environ.get("YOOLANG_REPORT_HISTORY_LIMIT", "1000"))
@@ -194,7 +196,7 @@ def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str 
         f = row.get("failure_count")
         if isinstance(f, int):
             if f > 0:
-                return f'<span style="color:#d32f2f;font-weight:600">{f}</span>'
+                return f'<span class="fail-count">{f}</span>'
             return "0"
         return "N/A"
 
@@ -253,6 +255,7 @@ def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str 
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yoolang CI 报告历史</title>
+{REPORT_THEME_HEAD_SCRIPT}
   <style>
     :root {{
       color-scheme: light;
@@ -277,12 +280,17 @@ def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str 
     th, td {{ padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 14px; }}
     th {{ background: #edf2f8; white-space: nowrap; }}
     code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    .fail-count {{ color: var(--bad); font-weight: 600; }}
+{REPORT_THEME_CSS}
     @media (max-width: 760px) {{ header, main {{ padding-left: 16px; padding-right: 16px; }} }}
   </style>
 </head>
 <body>
   <header>
-    <h1>Yoolang CI 报告历史</h1>
+    <div class="header-row">
+      <h1>Yoolang CI 报告历史</h1>
+      {REPORT_THEME_TOGGLE_HTML}
+    </div>
     <div class="muted">保留最近 {MAX_HISTORY} 次 CI 的性能报告和 QEMU 动态指令数报告。</div>
     <div class="links">
       <a href="{main_perf}">最新性能报告 (main)</a>
@@ -314,6 +322,7 @@ def write_history_html(public_dir: Path, runs: list[dict[str, Any]], scope: str 
       </table>
     </section>
   </main>
+{REPORT_THEME_BIND_SCRIPT}
 </body>
 </html>
 """
