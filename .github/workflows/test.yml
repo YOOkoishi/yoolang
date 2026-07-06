@@ -16,6 +16,9 @@ jobs:
   functional-and-perf:
     runs-on: [self-hosted, linux, x64, yoolang]
     timeout-minutes: 60
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy_instruction_pages.outputs.page_url }}
     concurrency:
       group: ci-${{ github.ref }}
       cancel-in-progress: false
@@ -313,6 +316,8 @@ jobs:
         continue-on-error: true
         id: configure_pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Generate instruction count report page
         if: always()
