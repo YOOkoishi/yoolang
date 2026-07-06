@@ -409,7 +409,6 @@ bool allows_cse_rewrite(Stats &stats, CSEScope scope) {
     estimate.before_instrs = 1;
     estimate.after_instrs = 1;
     estimate.after_moves = 1;
-    estimate.risk.register_pressure_growth = scope == CSEScope::Global ? 1 : 0;
     if (scope == CSEScope::Local) {
         estimate.bypass_profitability = true;
         estimate.bypass_reason = "AlwaysOnLocalCleanup";

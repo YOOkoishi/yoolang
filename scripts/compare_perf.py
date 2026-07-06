@@ -505,6 +505,9 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
         "rejected_estimated_gain": 0,
         "rejected_risk_penalty": 0,
         "by_transform": {},
+        "by_transform_action": {},
+        "by_transform_reject_reason": {},
+        "by_pass_transform_action": {},
         "by_reject_reason": {},
         "by_proof_status": {},
     }
@@ -527,6 +530,9 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
         return summary
 
     by_transform: dict[str, int] = {}
+    by_transform_action: dict[str, int] = {}
+    by_transform_reject_reason: dict[str, int] = {}
+    by_pass_transform_action: dict[str, int] = {}
     by_reject_reason: dict[str, int] = {}
     by_proof_status: dict[str, int] = {}
     accepted = 0
@@ -537,7 +543,14 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
             continue
         transform = str(decision.get("transform", "Unknown"))
         by_transform[transform] = by_transform.get(transform, 0) + 1
+        pass_name = str(decision.get("pass", "Unknown"))
         action = str(decision.get("action", ""))
+        transform_action = f"{transform}/{action}"
+        by_transform_action[transform_action] = by_transform_action.get(transform_action, 0) + 1
+        pass_transform_action = f"{pass_name}/{transform}/{action}"
+        by_pass_transform_action[pass_transform_action] = (
+            by_pass_transform_action.get(pass_transform_action, 0) + 1
+        )
         if action == "Accept":
             accepted += 1
             summary["accepted_estimated_gain"] = int(summary["accepted_estimated_gain"]) + int(
@@ -570,6 +583,10 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
             )
             reason = str(decision.get("reject_reason", "Unknown"))
             by_reject_reason[reason] = by_reject_reason.get(reason, 0) + 1
+            transform_reject_reason = f"{transform}/{reason}"
+            by_transform_reject_reason[transform_reject_reason] = (
+                by_transform_reject_reason.get(transform_reject_reason, 0) + 1
+            )
         proof = decision.get("proof")
         if isinstance(proof, dict):
             status = str(proof.get("status", "Unknown"))
@@ -581,6 +598,9 @@ def _collect_cost_model_summary(src: Path) -> dict[str, object]:
     summary["bypassed"] = bypassed
     summary["rejected"] = rejected
     summary["by_transform"] = by_transform
+    summary["by_transform_action"] = by_transform_action
+    summary["by_transform_reject_reason"] = by_transform_reject_reason
+    summary["by_pass_transform_action"] = by_pass_transform_action
     summary["by_reject_reason"] = by_reject_reason
     summary["by_proof_status"] = by_proof_status
     return summary
@@ -1056,10 +1076,16 @@ def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
         "rejected_estimated_gain": 0,
         "rejected_risk_penalty": 0,
         "by_transform": {},
+        "by_transform_action": {},
+        "by_transform_reject_reason": {},
+        "by_pass_transform_action": {},
         "by_reject_reason": {},
         "by_proof_status": {},
     }
     by_transform: dict[str, int] = {}
+    by_transform_action: dict[str, int] = {}
+    by_transform_reject_reason: dict[str, int] = {}
+    by_pass_transform_action: dict[str, int] = {}
     by_reject_reason: dict[str, int] = {}
     by_proof_status: dict[str, int] = {}
     statuses: list[str] = []
@@ -1094,6 +1120,16 @@ def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
             summary[total_key] = int(summary[total_key]) + int(cost_summary.get(total_key, 0))
         for key, value in (cost_summary.get("by_transform") or {}).items():
             by_transform[str(key)] = by_transform.get(str(key), 0) + int(value)
+        for key, value in (cost_summary.get("by_transform_action") or {}).items():
+            by_transform_action[str(key)] = by_transform_action.get(str(key), 0) + int(value)
+        for key, value in (cost_summary.get("by_transform_reject_reason") or {}).items():
+            by_transform_reject_reason[str(key)] = (
+                by_transform_reject_reason.get(str(key), 0) + int(value)
+            )
+        for key, value in (cost_summary.get("by_pass_transform_action") or {}).items():
+            by_pass_transform_action[str(key)] = (
+                by_pass_transform_action.get(str(key), 0) + int(value)
+            )
         for key, value in (cost_summary.get("by_reject_reason") or {}).items():
             by_reject_reason[str(key)] = by_reject_reason.get(str(key), 0) + int(value)
         for key, value in (cost_summary.get("by_proof_status") or {}).items():
@@ -1103,6 +1139,9 @@ def _cost_model_decision_summary(rows: list[dict]) -> dict[str, object]:
         failures = [status for status in statuses if status != "OK"]
         summary["status"] = "OK" if not failures else "; ".join(sorted(set(failures)))
     summary["by_transform"] = by_transform
+    summary["by_transform_action"] = by_transform_action
+    summary["by_transform_reject_reason"] = by_transform_reject_reason
+    summary["by_pass_transform_action"] = by_pass_transform_action
     summary["by_reject_reason"] = by_reject_reason
     summary["by_proof_status"] = by_proof_status
     return summary
@@ -1244,6 +1283,15 @@ def _write_reports(rows: list[dict], failures: int, total_runtime: float, compil
         )
         for category, values in (
             ("transform", cost_model_summary.get("by_transform", {})),
+            ("transform_action", cost_model_summary.get("by_transform_action", {})),
+            (
+                "transform_reject_reason",
+                cost_model_summary.get("by_transform_reject_reason", {}),
+            ),
+            (
+                "pass_transform_action",
+                cost_model_summary.get("by_pass_transform_action", {}),
+            ),
             ("reject_reason", cost_model_summary.get("by_reject_reason", {})),
             ("proof_status", cost_model_summary.get("by_proof_status", {})),
         ):

@@ -18,6 +18,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [Cost Model Pass Activation](2026-07-07-cost-model-pass-activation.md) | ready_for_review | `task/cost-model-gating-scope` | 2026-07-07 |
 | [Cost Model Gating Scope](2026-07-07-cost-model-gating-scope.md) | ready_for_review | `task/cost-model-gating-scope` | 2026-07-07 |
 | [Cost Model Implementation](2026-07-05-cost-model-implementation.md) | ready_for_review | `task/cost-model-implementation` | 2026-07-06 |
 | [YIR View Full-pipeline Optimization](2026-06-14-yir-view-full-pipeline.md) | ready_for_review | `task/yir-view-full-pipeline` | 2026-06-14 |

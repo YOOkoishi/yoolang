@@ -317,7 +317,7 @@ bool schedule_window(std::vector<mir::MachineInstr> &instrs, std::size_t begin,
     estimate.confidence = post_ra ? 0.60 : 0.64;
     estimate.before_cycles = plan.serial_cycles;
     estimate.after_cycles = plan.scheduled_cycles;
-    estimate.risk.register_pressure_growth = post_ra ? 0 : 1;
+    estimate.risk.live_range_growth = post_ra ? 0 : moved / 8;
     if (post_ra) {
         estimate.bypass_profitability = true;
         estimate.bypass_reason = "AlwaysOnPostRANoGrowthScheduling";

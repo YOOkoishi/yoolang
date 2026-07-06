@@ -17,18 +17,19 @@ int main() {
 
 // MIR-LABEL: func @latency_gap
 // MIR: DIVW [[Q:[a-z][a-z0-9]*]], {{.*}}, {{.*}}
+// MIR-NEXT: ADDW
 // MIR-NEXT: ADDIW
 // MIR-NEXT: ADDIW {{[a-z][a-z0-9]*}}, [[Q]], 1
 // MIR-NEXT: ADDW
 
 // ASM-LABEL: latency_gap:
 // ASM: divw [[Q:[a-z][a-z0-9]*]], {{.*}}, {{.*}}
+// ASM-NEXT: addw
 // ASM-NEXT: addiw
 // ASM-NEXT: addiw {{[a-z][a-z0-9]*}}, [[Q]], 1
 // ASM-NEXT: addw
 
-// COST-SCHED: [cost-model] MIRPreRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=NegativeGain
-// COST-SCHED: [cost-model] MIRPostRAListSchedulerPass BypassProfitability transform=InstructionScheduling {{.*}} reason=AlwaysOnPostRANoGrowthScheduling
+// COST-SCHED: [cost-model] MIRPreRAListSchedulerPass Accept transform=InstructionScheduling {{.*}} reason=Profitable
 
 // COST-SCHED-CONS: [cost-model] MIRPreRAListSchedulerPass Reject transform=InstructionScheduling {{.*}} reason=LowConfidence
 // COST-SCHED-CONS: [cost-model] MIRPostRAListSchedulerPass BypassProfitability transform=InstructionScheduling {{.*}} reason=AlwaysOnPostRANoGrowthScheduling

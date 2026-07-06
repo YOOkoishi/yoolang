@@ -60,8 +60,10 @@ int main() {
 // MIR: while.end.6:
 
 // MIR-LABEL: func @global_cse_const
-// MIR: LI {{.*}}, 70000
-// MIR: LI {{.*}}, 70000
+// MIR: LI [[C:[a-z][a-z0-9]*]], 70000
+// MIR: ADDW {{.*}}, {{.*}}, [[C]]
+// MIR-NOT: LI {{.*}}, 70000
+// MIR: ADDW {{.*}}, {{.*}}, [[C]]
 // MIR-LABEL: func @hoist_large_const
 // MIR: LI {{.*}}, 70000
 // MIR: while.body
@@ -79,4 +81,4 @@ int main() {
 // MIR: while.end
 
 // COST-LICM: [cost-model] MIRLoopInvariantCodeMotionPass Accept transform=LoopInvariantCodeMotion {{.*}} reason=Profitable
-// COST-LICM: [cost-model] MIRLocalCSEPass Reject transform=GlobalCSE {{.*}} reason=NegativeGain
+// COST-LICM: [cost-model] MIRLocalCSEPass Accept transform=GlobalCSE {{.*}} reason=Profitable

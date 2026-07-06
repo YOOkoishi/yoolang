@@ -60,14 +60,18 @@ Result:
 
 - Cases: 119
 - Failed: 0
-- Total runtime: 46.1305s
-- Geomean speedup: GCC 0.7821686424741846, Clang++ 0.8109606792364373
+- Total runtime: 41.4146s
+- Geomean speedup: GCC 0.936692009660409, Clang++ 0.9719614534957396
 - MIR stage metrics: OK
 - QEMU dynamic instruction count: disabled
-- Cost-model decisions: 5705 total, 559 accepted, 1470 bypassed profitability, 3676 rejected
-- Proof status totals: 5501 proven, 204 refuted
-- MIR final totals: 26305 instructions, 6932 moves, 1789 branches, 2715 jumps, 1496 loads,
-  1218 stores, 210 spills, 264 stack slots
+- Cost-model decisions: 12406 total, 2113 accepted, 2085 bypassed profitability, 8208 rejected
+- Targeted transform/action totals: Inline 616 accepted / 48 rejected; constant-argument
+  specialization 6 accepted / 72 rejected; GlobalCSE 261 accepted; PreRA instruction scheduling
+  519 accepted / 714 rejected; PostRA instruction scheduling 315 bypassed profitability; LICM 627
+  accepted; strength reduction 6 accepted; loop unswitch 714 rejected for code growth.
+- Proof status totals: 8452 proven, 780 refuted, 3174 timeout
+- MIR final totals: 33672 instructions, 7808 moves, 2587 branches, 3621 jumps, 1800 loads,
+  1164 stores, 162 spills, 216 stack slots
 
 The generated reports are `build/perf-ci/perf-report.md` and
 `build/perf-ci/perf-report.json`.
