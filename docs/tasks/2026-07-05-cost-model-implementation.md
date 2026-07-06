@@ -17,6 +17,38 @@ The task must be executable by Codex `/goal` as a sequence of bounded checkpoint
 checkpoint must leave enough context in this file for the next run to continue without
 rescanning the repository.
 
+## Final Product Requirement
+
+The intended outcome is a precise, production-usable cost model for the existing `-O1`
+optimization pipeline, not a diagnostics-only prototype.
+
+Priority order:
+
+1. Integrate the cost model into existing high-impact optimizations first, especially OIR inline
+   and constant-argument specialization, plus current OIR/MIR transforms with real profitability
+   tradeoffs.
+2. Make the model's decisions precise enough to be trusted for important performance work:
+   estimates must account for target costs, code growth, register pressure, live-range growth,
+   cleanup dependency, setup/compile-time cost, and post-RA spill risk where applicable.
+3. Keep normal `-S -O1` quiet, but ensure the optimization path and `--emit-cost-model` use the
+   same decision engine and policy so diagnostics reproduce real decisions.
+4. Leave clean, typed extension points for SMT, partial evaluation, and e-graph work. These future
+   providers should plug into the same CandidateProvider -> ProofGate -> StaticEstimator ->
+   DecisionEngine flow without requiring a redesign.
+5. Do not claim SMT/PE/e-graph are complete until they are truly implemented. Placeholder or
+   prototype providers are acceptable only if the task labels them as scaffolding and they cannot
+   mislead calibration or correctness review.
+
+Review standard:
+
+- A cost-model gate is acceptable only when the legality proof is separate from profitability, the
+  before/after estimate is explainable, and the decision trace is useful for debugging a performance
+  regression.
+- Performance validation must compare timing, MIR stage metrics, and final assembly shape for
+  representative cases. Passing JSON/FileCheck diagnostics alone is not enough.
+- The design must remain contest-compliant: no filename, function-name, variable-name, testcase, or
+  input-data keyed optimization decisions.
+
 ## Non-goals
 
 - Do not add `-O2` or `-O3`; the cost model serves the existing `-O1` competition pipeline.
@@ -207,10 +239,10 @@ Recommended follow-up checkpoints:
 
 | Checkpoint | Status | Deliverable | Main anchors | Required result |
 | --- | --- | --- | --- | --- |
-| C10 | pending | Split cost-model reporting from cost-model policy activation so default `-O1` can use decisions without printing diagnostics | `src/main/main.cpp`, `include/oir/OIRScalarOpt.h`, MIR peephole/list-scheduler context plumbing, `include/pass/CostModel.h` | ordinary `-S -O1` stays quiet but uses the same policy path as `--emit-cost-model`; tests compare accepted/rejected behavior under explicit policies |
-| C11 | pending | Move pass-local inline/specialization/loop thresholds into structured cost estimates or clearly keep them as legality/resource prefilters | `src/pass/oir/OIRInlinePass.cpp`, `src/pass/oir/OIRLoopTransforms.cpp`, `src/pass/oir/OIRCostModel.cpp` | code growth/register pressure decisions are visible in cost-model decisions rather than hidden in pass-local magic numbers |
-| C12 | pending | Replace the SMT adapter with a real bounded proof implementation or downgrade C6 scope in the docs | `include/pass/SMTProof.h`, `src/pass/SMTProof.cpp`, `src/pass/oir/OIRLocalSimplify.cpp` | i32 bitvector proof result is produced by the proof layer; timeout/unknown still reject |
-| C13 | pending | Decide whether e-graph is a real saturation/extraction implementation or a scoped peephole rule; update implementation/docs accordingly | `src/pass/oir/OIRLocalSimplify.cpp`, `include/pass/CostModel.h`, `test/ir/cost_model_egraph.sy` | extraction uses candidate alternatives and budgets, or task status explicitly records this as a future non-goal |
+| C10 | pending | Split cost-model reporting from cost-model policy activation so default `-O1` can use decisions without printing diagnostics | `src/main/main.cpp`, `include/oir/OIRScalarOpt.h`, MIR peephole/list-scheduler context plumbing, `include/pass/CostModel.h` | ordinary `-S -O1` stays quiet but uses the same policy path as `--emit-cost-model`; diagnostics reproduce real optimization decisions |
+| C11 | pending | Make inline and constant-argument specialization the first precise production gates | `src/pass/oir/OIRInlinePass.cpp`, `include/pass/CostModel.h`, `src/pass/oir/OIRCostModel.cpp` | call removal, exposed constants/branches, code growth, register pressure, cleanup dependency, recursive/specialized clone costs, and post-RA risk are represented in structured estimates; pass-local thresholds are reduced to legality/resource prefilters or moved into policy |
+| C12 | pending | Generalize the same precise estimator pattern to current OIR/MIR tradeoff transforms | `src/pass/oir/OIRLoopTransforms.cpp`, `src/pass/oir/OIRLocalSimplify.cpp`, `src/pass/mir/MIRLocalCSEPass.cpp`, `src/pass/mir/MIRLoopInvariantCodeMotionPass.cpp`, `src/pass/mir/MIRListSchedulerPass.cpp` | loop/if/CSE/LICM/scheduler decisions expose concrete risk and gain fields instead of coarse constants; accepted decisions can be connected to MIR metrics |
+| C13 | pending | Define stable extension interfaces for future SMT, PE, and e-graph providers without claiming full implementations | `include/pass/CostModel.h`, `include/pass/SMTProof.h`, `include/pass/oir/OIRCostModel.h`, docs/tests | provider interfaces carry proof metadata, setup cost, cleanup dependency, extraction/proof budgets, and alternative costs; prototype rules are clearly labeled scaffolding |
 | C14 | pending | Extend perf calibration to connect decisions to MIR stage metric deltas and estimated gain totals | `scripts/compare_perf.py`, `src/pass/CostModel.cpp`, `docs/cost-model-calibration.md` | report can identify accepted high-risk decision kinds when post-RA/final metrics regress |
 | C15 | pending | Clean up contest-compliance naming risks and missing MIR small-if claim | `src/pass/oir/OIRInlinePass.cpp`, task docs, optional MIR small-if task | no function-name keyed optimization trigger remains unless justified as ABI/entry semantics |
 
@@ -346,6 +378,7 @@ Next command:
 - 2026-07-05: completed C8 e-graph integration: added bounded OIR expression-slice extraction for a registered i32 rule and proof/budget trace coverage.
 - 2026-07-05: completed C9 finalization: perf reports now aggregate cost-model decisions; calibration notes added; full optimized tests and full performance set pass; status moved to `ready_for_review`.
 - 2026-07-06: code review found the branch is not yet design-complete. Status moved to `needs_revision`; added C10-C15 follow-up checkpoints for default `-O1` activation, pass-local threshold cleanup, real/downgraded SMT and e-graph scope, perf calibration linkage, and contest-compliance cleanup.
+- 2026-07-06: clarified final product requirement: prioritize precise production cost-model gates for inline and existing optimizations, keep diagnostics tied to real `-O1` decisions, and reserve clean extension points for later SMT/PE/e-graph work without overclaiming incomplete providers.
 
 ## Open Questions
 
@@ -395,6 +428,9 @@ Next action:
 - Start C10: split diagnostics/reporting from policy activation so ordinary quiet `-S -O1` can use
   the same cost-model decision path as `--emit-cost-model`, then re-run focused FileCheck/stage/e2e
   and performance smoke before deciding whether to flip default behavior.
+- After C10, do C11 before deeper SMT/PE/e-graph work. The next concrete implementation target is
+  a precise inline/specialization cost model with explainable estimates and measurable calibration
+  against MIR/final assembly behavior.
 
 Read next:
 
