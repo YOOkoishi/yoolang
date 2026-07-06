@@ -18,6 +18,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [Cost Model Rejection Recovery](2026-07-07-cost-model-rejection-recovery.md) | ready_for_review | `task/cost-model-rejection-recovery` | 2026-07-07 |
 | [Cost Model Pass Activation](2026-07-07-cost-model-pass-activation.md) | ready_for_review | `task/cost-model-gating-scope` | 2026-07-07 |
 | [Cost Model Gating Scope](2026-07-07-cost-model-gating-scope.md) | ready_for_review | `task/cost-model-gating-scope` | 2026-07-07 |
 | [Cost Model Implementation](2026-07-05-cost-model-implementation.md) | ready_for_review | `task/cost-model-implementation` | 2026-07-06 |

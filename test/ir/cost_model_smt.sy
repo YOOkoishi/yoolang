@@ -17,13 +17,13 @@ int smt_timeout(int a, int b) {
   int x2 = x1 + 3;
   int x3 = x2 + 4;
   int t = x3 - b;
-  return t + b;
+  return t + a;
 }
 
 int smt_unknown(int a, int b, int c) {
   int q = a / b;
   int t = q - c;
-  return t + c;
+  return t + b;
 }
 
 int main() {
@@ -40,8 +40,10 @@ int main() {
 // TEXT: [cost-model] OIRLocalSimplify Reject transform=AlgebraicSimplify {{.*}} reason=ProofUnknown
 
 // JSON: "transform": "AlgebraicSimplify"
-// JSON: "kind": "SMT"
+// JSON: "kind": "Structural"
 // JSON: "status": "Proven"
+// JSON: "rule_id": "structural.bv32.add_sub_cancel"
+// JSON: "kind": "SMT"
 // JSON: "solver_id": "yoolang-static-bv32-smt"
 // JSON: "obligations": 1
 // JSON: "status": "Refuted"

@@ -60,18 +60,31 @@ Result:
 
 - Cases: 119
 - Failed: 0
-- Total runtime: 41.4146s
-- Geomean speedup: GCC 0.936692009660409, Clang++ 0.9719614534957396
+- Total runtime: 41.7533s
+- Geomean speedup: GCC 0.9702487919411927, Clang++ 1.0135988680507693
 - MIR stage metrics: OK
-- QEMU dynamic instruction count: disabled
-- Cost-model decisions: 12406 total, 2113 accepted, 2085 bypassed profitability, 8208 rejected
-- Targeted transform/action totals: Inline 616 accepted / 48 rejected; constant-argument
-  specialization 6 accepted / 72 rejected; GlobalCSE 261 accepted; PreRA instruction scheduling
-  519 accepted / 714 rejected; PostRA instruction scheduling 315 bypassed profitability; LICM 627
-  accepted; strength reduction 6 accepted; loop unswitch 714 rejected for code growth.
-- Proof status totals: 8452 proven, 780 refuted, 3174 timeout
-- MIR final totals: 33672 instructions, 7808 moves, 2587 branches, 3621 jumps, 1800 loads,
-  1164 stores, 162 spills, 216 stack slots
+- QEMU dynamic instruction count: attempted but failed because the local QEMU plugin API is
+  incompatible (`plugin requires API version 1, but this QEMU supports only a minimum version of
+  2`); use MIR final metrics as fallback evidence in this run.
+- Cost-model decisions: 7882 total, 2527 accepted, 2067 bypassed profitability, 3288 rejected
+- Targeted transform/action totals: Inline 616 accepted / 54 rejected; constant-argument
+  specialization 6 accepted / 72 rejected; if-conversion 162 accepted / 792 bypassed
+  profitability; algebraic simplify 210 accepted / 1740 rejected; GlobalCSE 261 accepted; PreRA
+  instruction scheduling 519 accepted / 708 rejected; PostRA instruction scheduling 297 bypassed
+  profitability; LICM 747 accepted; strength reduction
+  6 accepted; loop unswitch 714 rejected for code growth.
+- Proof status totals: 6142 proven, 780 refuted, 960 timeout
+- MIR final totals: 33126 instructions, 7628 moves, 2437 branches, 3405 jumps, 1782 loads,
+  1170 stores, 168 spills, 222 stack slots
+
+The 2026-07-07 rejection-recovery task changed OIR `short_circuit_bool` if-conversion metadata:
+single-result boolean diamonds no longer claim register/live-range growth. These candidates remain
+profitability-gated; under `Balanced` they need positive score, while `Conservative` still rejects
+the same candidate shape for low confidence. The same task also changed exact add/sub cancellation
+`(x - y) + y` and `y + (x - y)` to use a structural proof before SMT budgeting; the previous model
+incorrectly rejected complex but exact cancellations as `ProofTimeout`. This recovered the
+crypto-equivalent regressions while preserving SMT timeout/unknown handling for non-cancelling or
+unsupported expressions.
 
 The generated reports are `build/perf-ci/perf-report.md` and
 `build/perf-ci/perf-report.json`.

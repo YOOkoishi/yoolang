@@ -120,6 +120,24 @@ bool cost_model_allows_smt_add_sub_cancel(Stats &stats, pass::smt::SMTProofCache
         return true;
     }
 
+    const bool exact_cancel = same_smt_value(sub.rhs(), rhs);
+    if (exact_cancel) {
+        OIRTransformCostEstimate estimate;
+        estimate.kind = pass::cost_model::TransformKind::AlgebraicSimplify;
+        estimate.pass_name = "OIRLocalSimplify";
+        estimate.candidate_id =
+            "structural.algebraic." + std::to_string(++stats.cost_model_candidates);
+        estimate.scope = "instruction";
+        estimate.proof_kind = pass::cost_model::ProofKind::Structural;
+        estimate.proof_status = pass::cost_model::ProofStatus::Proven;
+        estimate.proof_summary = "SSA value identity: bvadd(bvsub(x,y),y) == x";
+        estimate.proof_rule_id = "structural.bv32.add_sub_cancel";
+        estimate.confidence = 0.90;
+        estimate.before_instrs = 5;
+        estimate.after_instrs = 0;
+        return cost_model_allows_transform(stats, estimate);
+    }
+
     pass::smt::SMTObligation obligation;
     obligation.id = "smt.bv32.add_sub_cancel";
     obligation.stage = pass::cost_model::CostIRStage::OIR;
@@ -137,9 +155,6 @@ bool cost_model_allows_smt_add_sub_cancel(Stats &stats, pass::smt::SMTProofCache
         smt_expr_has_unsupported_op(rhs)) {
         proof_status = pass::cost_model::ProofStatus::Unknown;
         proof_summary = "SMT adapter does not model this i32 expression";
-    } else if (same_smt_value(sub.rhs(), rhs)) {
-        proof_status = pass::cost_model::ProofStatus::Proven;
-        proof_summary = "SMT proves bvadd(bvsub(x,y),y) == x";
     }
     obligation.assumptions.push_back(
         "structural-result=" + std::string(pass::cost_model::to_string(proof_status)));
@@ -1112,7 +1127,7 @@ void replace_conditional_branch_with_merge(
 bool convert_short_circuit_bool(oir::Module &module, oir::BasicBlock &block,
                                 std::list<std::unique_ptr<oir::Instruction>>::iterator term_it,
                                 ShortCircuitBoolDiamond &diamond, Stats &stats) {
-    if (!cost_model_allows_if_conversion(stats, "short_circuit_bool", 3, 1)) {
+    if (!cost_model_allows_if_conversion(stats, "short_circuit_bool", 3, 0)) {
         return false;
     }
     auto *branch = static_cast<oir::BranchInst *>(term_it->get());

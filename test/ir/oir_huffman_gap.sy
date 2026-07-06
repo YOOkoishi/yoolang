@@ -69,8 +69,9 @@ int main() {
 // OIR: add i32 %x.arg
 
 // OIR-LABEL: define i32 @short_and_add
-// OIR: br i1
-// OIR: phi
+// OIR-NOT: br i1
+// OIR: and i1
+// OIR-NOT: br i1
 // OIR: zext i1
 // OIR: and i32 %y.arg
 // OIR: add i32 %x.arg
