@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pass/CostModel.h"
+#include "smt/Solver.h"
 
 #include <cstdint>
 #include <string>
@@ -17,6 +18,8 @@ struct SMTObligation {
     std::int64_t estimated_cost_us = 0;
     std::vector<std::string> assumptions;
     std::vector<std::string> guarantees;
+    std::vector<::smt::Expr> assertions;
+    ::smt::SolverOptions options;
 };
 
 class SMTProofCache {

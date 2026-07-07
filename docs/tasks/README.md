@@ -18,6 +18,8 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [Performance Optimization Opportunity Audit](2026-07-08-performance-optimization-audit.md) | ready_for_review | `not used` | 2026-07-08 |
+| [SMT Solver](2026-07-07-smt-solver.md) | ready_for_review | `task/smt-solver` | 2026-07-07 |
 | [Cost Model Rejection Recovery](2026-07-07-cost-model-rejection-recovery.md) | ready_for_review | `task/cost-model-rejection-recovery` | 2026-07-07 |
 | [Cost Model Pass Activation](2026-07-07-cost-model-pass-activation.md) | ready_for_review | `task/cost-model-gating-scope` | 2026-07-07 |
 | [Cost Model Gating Scope](2026-07-07-cost-model-gating-scope.md) | ready_for_review | `task/cost-model-gating-scope` | 2026-07-07 |

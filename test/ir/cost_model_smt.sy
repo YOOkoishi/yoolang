@@ -6,6 +6,13 @@ int smt_proven(int a, int b) {
   return t + b;
 }
 
+int smt_solver_proven(int a, int b) {
+  int y = b + 1;
+  int z = b + 1;
+  int t = a - y;
+  return t + z;
+}
+
 int smt_refuted(int a, int b, int c) {
   int t = a - b;
   return t + c;
@@ -30,8 +37,8 @@ int main() {
   int a = getint();
   int b = getint();
   int c = getint();
-  return smt_proven(a, b) + smt_refuted(a, b, c) + smt_timeout(a, b) +
-         smt_unknown(a, b, c);
+  return smt_proven(a, b) + smt_solver_proven(a, b) +
+         smt_refuted(a, b, c) + smt_timeout(a, b) + smt_unknown(a, b, c);
 }
 
 // TEXT: [cost-model] OIRLocalSimplify Accept transform=AlgebraicSimplify {{.*}} reason=Profitable
@@ -44,7 +51,8 @@ int main() {
 // JSON: "status": "Proven"
 // JSON: "rule_id": "structural.bv32.add_sub_cancel"
 // JSON: "kind": "SMT"
-// JSON: "solver_id": "yoolang-static-bv32-smt"
+// JSON: "status": "Proven"
+// JSON: "solver_id": "yoolang-qfbv-smt"
 // JSON: "obligations": 1
 // JSON: "status": "Refuted"
 // JSON: "status": "Timeout"

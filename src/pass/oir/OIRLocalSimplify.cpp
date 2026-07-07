@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace pass::oir_opt {
@@ -113,15 +114,71 @@ bool same_smt_value(oir::Value *lhs, oir::Value *rhs) {
     return lhs_const.has_value() && rhs_const.has_value() && *lhs_const == *rhs_const;
 }
 
+class OIRSMTExprBuilder {
+  public:
+    std::optional<::smt::Expr> translate(oir::Value *value, int depth = 0) {
+        if (value == nullptr || depth > 16 || !is_i32_type(value->type())) {
+            return std::nullopt;
+        }
+        auto found = values_.find(value);
+        if (found != values_.end()) {
+            return found->second;
+        }
+        if (auto constant = int_constant(value)) {
+            return builder_.bv_const(32, static_cast<std::uint32_t>(*constant));
+        }
+        auto *binary = dynamic_cast<oir::BinaryInst *>(value);
+        if (binary == nullptr) {
+            auto expr = builder_.bv_var(32, "v" + std::to_string(next_symbol_++));
+            values_[value] = expr;
+            return expr;
+        }
+
+        auto lhs = translate(binary->lhs(), depth + 1);
+        auto rhs = translate(binary->rhs(), depth + 1);
+        if (!lhs || !rhs) {
+            return std::nullopt;
+        }
+
+        std::optional<::smt::Expr> expr;
+        switch (binary->op()) {
+        case oir::Instruction::OpID::Add:
+            expr = builder_.bv_add(*lhs, *rhs);
+            break;
+        case oir::Instruction::OpID::Sub:
+            expr = builder_.bv_sub(*lhs, *rhs);
+            break;
+        case oir::Instruction::OpID::And:
+            expr = builder_.bv_and(*lhs, *rhs);
+            break;
+        case oir::Instruction::OpID::Xor:
+            expr = builder_.bv_xor(*lhs, *rhs);
+            break;
+        default:
+            return std::nullopt;
+        }
+        values_[value] = *expr;
+        return expr;
+    }
+
+    ::smt::Expr distinct(const ::smt::Expr &lhs, const ::smt::Expr &rhs) {
+        return builder_.distinct(lhs, rhs);
+    }
+
+  private:
+    ::smt::ExprBuilder builder_;
+    std::unordered_map<oir::Value *, ::smt::Expr> values_;
+    int next_symbol_ = 0;
+};
+
 bool cost_model_allows_smt_add_sub_cancel(Stats &stats, pass::smt::SMTProofCache &smt_cache,
                                           oir::BinaryInst &add, oir::BinaryInst &sub,
                                           oir::Value *rhs) {
-    if (stats.cost_model_report == nullptr) {
-        return true;
-    }
-
     const bool exact_cancel = same_smt_value(sub.rhs(), rhs);
     if (exact_cancel) {
+        if (stats.cost_model_report == nullptr) {
+            return true;
+        }
         OIRTransformCostEstimate estimate;
         estimate.kind = pass::cost_model::TransformKind::AlgebraicSimplify;
         estimate.pass_name = "OIRLocalSimplify";
@@ -141,7 +198,7 @@ bool cost_model_allows_smt_add_sub_cancel(Stats &stats, pass::smt::SMTProofCache
     pass::smt::SMTObligation obligation;
     obligation.id = "smt.bv32.add_sub_cancel";
     obligation.stage = pass::cost_model::CostIRStage::OIR;
-    obligation.formula = "bvadd(bvsub(x,y),z) == x";
+    obligation.formula = "distinct(bvadd(bvsub(x,y),z), x)";
     obligation.timeout_us =
         pass::cost_model::policy_for_kind(stats.cost_model_policy).max_smt_time_us;
     const int complexity = smt_expr_complexity(add.lhs()) + smt_expr_complexity(add.rhs());
@@ -149,18 +206,28 @@ bool cost_model_allows_smt_add_sub_cancel(Stats &stats, pass::smt::SMTProofCache
     obligation.assumptions.push_back("x,y,z are i32 bitvectors");
     obligation.guarantees.push_back("rewrite preserves bv32 value");
 
-    pass::cost_model::ProofStatus proof_status = pass::cost_model::ProofStatus::Refuted;
-    std::string proof_summary = "SMT refuted add/sub cancellation guard";
-    if (smt_expr_has_unsupported_op(sub.lhs()) || smt_expr_has_unsupported_op(sub.rhs()) ||
-        smt_expr_has_unsupported_op(rhs)) {
-        proof_status = pass::cost_model::ProofStatus::Unknown;
-        proof_summary = "SMT adapter does not model this i32 expression";
+    pass::cost_model::ProofStatus fallback_status = pass::cost_model::ProofStatus::Unknown;
+    std::string proof_summary = "add/sub cancellation counterexample query";
+    OIRSMTExprBuilder smt_builder;
+    auto add_expr = smt_builder.translate(&add);
+    auto original_expr = smt_builder.translate(sub.lhs());
+    if (add_expr && original_expr) {
+        auto counterexample = smt_builder.distinct(*add_expr, *original_expr);
+        obligation.formula = ::smt::to_string(counterexample);
+        obligation.assertions.push_back(counterexample);
+        obligation.options.timeout_us = obligation.timeout_us;
+    } else {
+        proof_summary = "SMT solver does not model this i32 expression";
     }
-    obligation.assumptions.push_back(
-        "structural-result=" + std::string(pass::cost_model::to_string(proof_status)));
+    obligation.assumptions.push_back("typed-qfbv=" +
+                                     std::string(obligation.assertions.empty() ? "unsupported"
+                                                                               : "available"));
 
     auto proof =
-        pass::smt::prove_obligation(obligation, proof_status, proof_summary, &smt_cache);
+        pass::smt::prove_obligation(obligation, fallback_status, proof_summary, &smt_cache);
+    if (stats.cost_model_report == nullptr) {
+        return proof.status == pass::cost_model::ProofStatus::Proven;
+    }
 
     OIRTransformCostEstimate estimate;
     estimate.kind = pass::cost_model::TransformKind::AlgebraicSimplify;
@@ -181,7 +248,8 @@ bool cost_model_allows_smt_add_sub_cancel(Stats &stats, pass::smt::SMTProofCache
     estimate.smt_queries = proof.obligations;
     estimate.risk.proof_timeout_risk =
         proof.status == pass::cost_model::ProofStatus::Timeout ? 1 : 0;
-    return cost_model_allows_transform(stats, estimate);
+    const bool cost_model_allowed = cost_model_allows_transform(stats, estimate);
+    return proof.status == pass::cost_model::ProofStatus::Proven && cost_model_allowed;
 }
 
 bool cost_model_allows_egraph_mul_by_two(Stats &stats, oir::BinaryInst &mul,
@@ -444,15 +512,13 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block, St
             if (is_i32_type(inst.type())) {
                 if (auto *lhs_sub = as_binary_op(binary->lhs(), oir::Instruction::OpID::Sub)) {
                     if (cost_model_allows_smt_add_sub_cancel(stats, smt_cache, *binary, *lhs_sub,
-                                                             binary->rhs()) &&
-                        same_smt_value(lhs_sub->rhs(), binary->rhs())) {
+                                                             binary->rhs())) {
                         return lhs_sub->lhs();
                     }
                 }
                 if (auto *rhs_sub = as_binary_op(binary->rhs(), oir::Instruction::OpID::Sub)) {
                     if (cost_model_allows_smt_add_sub_cancel(stats, smt_cache, *binary, *rhs_sub,
-                                                             binary->lhs()) &&
-                        same_smt_value(rhs_sub->rhs(), binary->lhs())) {
+                                                             binary->lhs())) {
                         return rhs_sub->lhs();
                     }
                 }
