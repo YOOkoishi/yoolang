@@ -16,8 +16,18 @@ int unreachable_cleanup() {
   return 9;
 }
 
+int no_nondom_div_replacement(int a, int b, int c) {
+  int x = 0;
+  if (c != 0) {
+    x = a / b;
+  }
+  int y = a / b;
+  return x + y;
+}
+
 int main() {
-  return gvn_cross_block(1, 2, 1) + unreachable_cleanup();
+  return gvn_cross_block(1, 2, 1) + unreachable_cleanup() +
+         no_nondom_div_replacement(12, 3, 1);
 }
 
 // OIR-LABEL: define i32 @gvn_cross_block
@@ -28,3 +38,8 @@ int main() {
 // OIR-LABEL: define i32 @unreachable_cleanup
 // OIR-NOT: ret i32 9
 // OIR: ret i32 7
+
+// OIR-LABEL: define i32 @no_nondom_div_replacement
+// OIR: sdiv i32 %a.arg, %b.arg
+// OIR: sdiv i32 %a.arg, %b.arg
+// OIR: ret i32

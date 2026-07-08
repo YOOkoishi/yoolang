@@ -86,7 +86,7 @@ bool cleanup_after_tail_recursion(oir::Module &module, oir_opt::Stats &stats) {
 
 bool run_call_specialization_window(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
-    constexpr unsigned kMaxRounds = 4;
+    constexpr unsigned kMaxRounds = 12;
     for (unsigned round = 0; round < kMaxRounds; ++round) {
         if (!oir_opt::specialize_constant_argument_calls(module, stats)) {
             break;
@@ -173,8 +173,16 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= promote_global_loads(module, stats);
     changed |= scalar_replacement_of_aggregates(module, stats);
     changed |= promote_memory_to_registers(module, stats);
+    changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
+    changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
+    changed |= run_sccp(module, stats);
+    changed |= simplify_branches(module, stats);
+    changed |= cleanup_cfg(module, stats);
+    changed |= value_range_propagation(module, stats);
+    changed |= global_value_numbering(module, stats);
     changed |= eliminate_dead_loads(module, stats);
     changed |= eliminate_dead_stores(module, stats);
+    changed |= eliminate_dead_code(module, stats);
     changed |= aggressive_dead_code_elimination(module, stats);
     changed |= jump_threading(module, stats);
     changed |= eliminate_dead_arguments(module, stats);

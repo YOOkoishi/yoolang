@@ -29,12 +29,16 @@ constexpr unsigned kMaxSpecializedInlineReturns = 8;
 constexpr unsigned kMaxSpecializationCalleeBlocks = 64;
 constexpr unsigned kMaxSpecializedFunctions = 48;
 constexpr unsigned kMaxSpecializedCallSites = 128;
+constexpr unsigned kMaxRecursiveConstantSpecializationLayers = 10;
+constexpr unsigned kMaxRecursiveSpecializationCalleeBlocks = 64;
+constexpr unsigned kMaxRecursiveSpecializationStaticInstrs = 1600;
 constexpr unsigned kMaxRecursiveInlineDepth = 5;
 constexpr unsigned kMaxRecursiveCalleeBlocks = 16;
 constexpr unsigned kMaxRecursiveCalleeReturns = 8;
 
 using ValueMap = std::unordered_map<oir::Value *, oir::Value *>;
 using BlockMap = std::unordered_map<oir::BasicBlock *, oir::BasicBlock *>;
+using SpecializationMask = std::vector<bool>;
 
 struct CalleeInfo {
     unsigned blocks = 0;
@@ -59,6 +63,7 @@ struct InlineContext {
 };
 
 bool is_constprop_specialization(const oir::Function &function);
+bool mask_selects_argument(const SpecializationMask &mask, std::size_t index);
 
 std::string inline_name(const oir::Function &callee, const oir::Value &value,
                         unsigned inline_index) {
@@ -583,13 +588,14 @@ std::string constant_key(oir::Value *value) {
     return "*";
 }
 
-std::string specialization_key(const oir::Function &callee, const oir::CallInst &call) {
+std::string specialization_key(const oir::Function &callee, const oir::CallInst &call,
+                               const SpecializationMask &mask) {
     std::ostringstream oss;
     oss << static_cast<const void *>(&callee);
     auto args = call.args();
     for (std::size_t i = 0; i < args.size(); ++i) {
         oss << ";";
-        if (is_specializable_constant(args[i])) {
+        if (mask_selects_argument(mask, i)) {
             oss << i << "=" << constant_key(args[i]);
         } else {
             oss << i << "=*";
@@ -617,27 +623,44 @@ bool has_constant_argument(const oir::CallInst &call) {
     return false;
 }
 
-unsigned count_specializable_constants(const oir::CallInst &call) {
+unsigned count_specializable_constants(const SpecializationMask &mask) {
     unsigned count = 0;
-    for (auto *arg : call.args()) {
-        if (is_specializable_constant(arg)) {
+    for (bool selected : mask) {
+        if (selected) {
             ++count;
         }
     }
     return count;
 }
 
+bool mask_selects_argument(const SpecializationMask &mask, std::size_t index) {
+    return index < mask.size() && mask[index];
+}
+
 bool has_live_pointer_argument_after_specialization(const oir::CallInst &call,
-                                                    const oir::Function &callee) {
+                                                    const oir::Function &callee,
+                                                    const SpecializationMask &mask) {
     auto args = call.args();
     if (args.size() != callee.args().size()) {
         return true;
     }
     for (std::size_t i = 0; i < args.size(); ++i) {
-        if (is_specializable_constant(args[i])) {
+        if (mask_selects_argument(mask, i)) {
             continue;
         }
         if (callee.args()[i]->type()->is_pointer()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool argument_feeds_phi(const oir::Function &callee, std::size_t index) {
+    if (index >= callee.args().size()) {
+        return true;
+    }
+    for (auto *user : callee.args()[index]->users()) {
+        if (dynamic_cast<oir::PhiInst *>(user) != nullptr) {
             return true;
         }
     }
@@ -654,30 +677,138 @@ bool specialized_constant_argument_feeds_phi(const oir::CallInst &call,
         if (!is_specializable_constant(args[i])) {
             continue;
         }
-        for (auto *user : callee.args()[i]->users()) {
-            if (dynamic_cast<oir::PhiInst *>(user) != nullptr) {
-                return true;
-            }
+        if (argument_feeds_phi(callee, i)) {
+            return true;
         }
     }
     return false;
 }
 
+bool argument_has_structural_use(const oir::Function &callee, std::size_t index) {
+    if (index >= callee.args().size()) {
+        return false;
+    }
+    for (auto *user : callee.args()[index]->users()) {
+        auto *inst = dynamic_cast<oir::Instruction *>(user);
+        if (inst == nullptr) {
+            continue;
+        }
+        switch (inst->op()) {
+        case oir::Instruction::OpID::Add:
+        case oir::Instruction::OpID::Sub:
+        case oir::Instruction::OpID::Mul:
+        case oir::Instruction::OpID::SDiv:
+        case oir::Instruction::OpID::SRem:
+        case oir::Instruction::OpID::And:
+        case oir::Instruction::OpID::Xor:
+        case oir::Instruction::OpID::ICmp:
+        case oir::Instruction::OpID::FCmp:
+        case oir::Instruction::OpID::Br:
+        case oir::Instruction::OpID::Call:
+            return true;
+        case oir::Instruction::OpID::Ret:
+        case oir::Instruction::OpID::Alloca:
+        case oir::Instruction::OpID::Load:
+        case oir::Instruction::OpID::Store:
+        case oir::Instruction::OpID::MemZero:
+        case oir::Instruction::OpID::Phi:
+        case oir::Instruction::OpID::GetElementPtr:
+        case oir::Instruction::OpID::ZExt:
+        case oir::Instruction::OpID::SIToFP:
+        case oir::Instruction::OpID::FPToSI:
+        case oir::Instruction::OpID::FAdd:
+        case oir::Instruction::OpID::FSub:
+        case oir::Instruction::OpID::FMul:
+        case oir::Instruction::OpID::FDiv:
+            break;
+        }
+    }
+    return false;
+}
+
+bool mask_has_selection(const SpecializationMask &mask) {
+    return std::any_of(mask.begin(), mask.end(), [](bool selected) { return selected; });
+}
+
+SpecializationMask build_specialization_mask(const oir::CallInst &call,
+                                             const oir::Function &callee,
+                                             bool recursive_layer) {
+    auto args = call.args();
+    SpecializationMask mask(args.size(), false);
+    if (args.size() != callee.args().size()) {
+        return mask;
+    }
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (!is_specializable_constant(args[i])) {
+            continue;
+        }
+        if (recursive_layer &&
+            (argument_feeds_phi(callee, i) || !argument_has_structural_use(callee, i))) {
+            continue;
+        }
+        mask[i] = true;
+    }
+    return mask;
+}
+
+bool is_directly_recursive(const oir::Function &function) {
+    return contains_call_to(function, function);
+}
+
+unsigned recursive_specialization_budget(
+    const pass::cost_model::CostModelPolicy &policy) {
+    return std::min<unsigned>(static_cast<unsigned>(policy.max_specializations_per_function),
+                              kMaxRecursiveConstantSpecializationLayers);
+}
+
+bool within_recursive_specialization_growth_budget(
+    const CalleeInfo &info, unsigned existing_for_callee,
+    const pass::cost_model::CostModelPolicy &policy) {
+    const auto projected_layers = existing_for_callee + 1;
+    if (projected_layers > recursive_specialization_budget(policy)) {
+        return false;
+    }
+    if (info.blocks > kMaxRecursiveSpecializationCalleeBlocks || info.returns == 0) {
+        return false;
+    }
+    const auto projected_static_instrs = info.static_instrs * projected_layers;
+    const auto policy_static_cap =
+        static_cast<unsigned>(std::max<std::int64_t>(policy.max_function_code_growth, 1) * 8);
+    return projected_static_instrs <=
+           std::min<unsigned>(kMaxRecursiveSpecializationStaticInstrs, policy_static_cap);
+}
+
 bool is_eligible_for_constant_specialization(const oir::Function &caller, const oir::CallInst &call,
                                              oir::Function *callee,
-                                             const pass::cost_model::CostModelPolicy &policy) {
+                                             const pass::cost_model::CostModelPolicy &policy,
+                                             unsigned existing_for_callee,
+                                             SpecializationMask &mask) {
+    mask.clear();
     if (callee == nullptr || callee == &caller || callee->is_external() ||
         callee->entry_block() == nullptr || is_constprop_specialization(*callee) ||
-        !has_compatible_call_shape(call, *callee) || !has_constant_argument(call) ||
-        specialized_constant_argument_feeds_phi(call, *callee) ||
-        has_recursive_call_graph_dependency(*callee)) {
+        !has_compatible_call_shape(call, *callee) || !has_constant_argument(call)) {
         return false;
     }
 
     auto info = inspect_callee(*callee);
+    if (has_recursive_call_graph_dependency(*callee)) {
+        mask = build_specialization_mask(call, *callee, true);
+        return is_directly_recursive(*callee) &&
+               mask_has_selection(mask) &&
+               within_recursive_specialization_growth_budget(info, existing_for_callee, policy);
+    }
+
+    if (specialized_constant_argument_feeds_phi(call, *callee)) {
+        return false;
+    }
+    mask = build_specialization_mask(call, *callee, false);
+    if (!mask_has_selection(mask)) {
+        return false;
+    }
+
     if ((info.blocks > kMaxCalleeBlocks ||
          info.cost > static_cast<unsigned>(policy.max_inline_callee_cost)) &&
-        has_live_pointer_argument_after_specialization(call, *callee)) {
+        has_live_pointer_argument_after_specialization(call, *callee, mask)) {
         return false;
     }
     return info.blocks <= kMaxSpecializationCalleeBlocks &&
@@ -686,11 +817,12 @@ bool is_eligible_for_constant_specialization(const oir::Function &caller, const 
 }
 
 oir::Function *clone_constant_specialization(oir::Module &module, oir::Function &callee,
-                                             const oir::CallInst &call, unsigned &next_id) {
+                                             const oir::CallInst &call,
+                                             const SpecializationMask &mask, unsigned &next_id) {
     auto args = call.args();
     std::vector<oir::Type *> param_types;
     for (std::size_t i = 0; i < args.size(); ++i) {
-        if (!is_specializable_constant(args[i])) {
+        if (!mask_selects_argument(mask, i)) {
             param_types.push_back(callee.args()[i]->type());
         }
     }
@@ -703,7 +835,7 @@ oir::Function *clone_constant_specialization(oir::Module &module, oir::Function 
     BlockMap blocks;
     std::size_t next_arg = 0;
     for (std::size_t i = 0; i < callee.args().size(); ++i) {
-        if (is_specializable_constant(args[i])) {
+        if (mask_selects_argument(mask, i)) {
             values[callee.args()[i].get()] = args[i];
             continue;
         }
@@ -796,11 +928,12 @@ oir::Function *clone_constant_specialization(oir::Module &module, oir::Function 
     return clone;
 }
 
-void retarget_call_to_specialization(oir::CallInst &call, oir::Function &clone) {
+void retarget_call_to_specialization(oir::CallInst &call, oir::Function &clone,
+                                     const SpecializationMask &mask) {
     auto args = call.args();
     call.set_operand(0, &clone);
     for (std::size_t i = args.size(); i > 0; --i) {
-        if (is_specializable_constant(args[i - 1])) {
+        if (mask_selects_argument(mask, i - 1)) {
             call.remove_arg(i - 1);
         }
     }
@@ -1036,6 +1169,7 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
         oir::Function *callee = nullptr;
         oir::CallInst *call = nullptr;
         std::string key;
+        SpecializationMask mask;
     };
 
     std::vector<Site> sites;
@@ -1051,10 +1185,17 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
                     continue;
                 }
                 auto *callee = dynamic_cast<oir::Function *>(call->callee());
-                if (!is_eligible_for_constant_specialization(*function, *call, callee, policy)) {
+                const unsigned existing_for_callee =
+                    callee == nullptr
+                        ? 0
+                        : existing_specialization_count(module, *callee);
+                SpecializationMask mask;
+                if (!is_eligible_for_constant_specialization(*function, *call, callee, policy,
+                                                             existing_for_callee, mask)) {
                     continue;
                 }
-                sites.push_back({function.get(), callee, call, specialization_key(*callee, *call)});
+                sites.push_back({function.get(), callee, call,
+                                 specialization_key(*callee, *call, mask), std::move(mask)});
                 if (sites.size() >= kMaxSpecializedCallSites) {
                     break;
                 }
@@ -1088,10 +1229,14 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
         const unsigned existing_for_callee =
             existing_specialization_count(module, *site.callee) +
             specializations_by_callee[site.callee];
+        const bool recursive_layer = is_directly_recursive(*site.callee);
+        const unsigned specialization_budget =
+            recursive_layer ? recursive_specialization_budget(policy)
+                            : static_cast<unsigned>(policy.max_specializations_per_function);
         const bool exceeds_policy_specialization_budget =
             stats.cost_model_report != nullptr && needs_new_clone &&
-            existing_for_callee >= policy.max_specializations_per_function;
-        const auto constant_arg_count = count_specializable_constants(*site.call);
+            existing_for_callee >= specialization_budget;
+        const auto constant_arg_count = count_specializable_constants(site.mask);
         const auto info = inspect_callee(*site.callee);
         OIRTransformCostEstimate estimate;
         estimate.kind = pass::cost_model::TransformKind::ConstantArgumentSpecialization;
@@ -1099,8 +1244,11 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
         estimate.candidate_id = "specialize." + std::to_string(++stats.cost_model_candidates);
         estimate.scope = "call";
         estimate.proof_kind = pass::cost_model::ProofKind::PartialEvaluation;
-        estimate.proof_summary = "constant arguments proven at callsite";
-        estimate.confidence = constant_arg_count == 0 ? 0.55 : 0.74;
+        estimate.proof_summary =
+            recursive_layer
+                ? "constant arguments proven at callsite; bounded direct-recursive layer"
+                : "constant arguments proven at callsite";
+        estimate.confidence = constant_arg_count == 0 ? 0.55 : (recursive_layer ? 0.70 : 0.74);
         fill_before_after_from_callee(estimate, info, 1, 0);
         const std::int64_t eliminated_alu =
             std::min<std::int64_t>(estimate.after_int_alu, constant_arg_count * 2);
@@ -1142,6 +1290,10 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
                 "constant arguments proven at callsite; specialization budget exceeded";
             estimate.risk.code_growth = policy.max_function_code_growth + 1;
         }
+        if (recursive_layer && !exceeds_policy_specialization_budget) {
+            estimate.bypass_profitability = true;
+            estimate.bypass_reason = "BoundedRecursiveConstantLayer";
+        }
         if (!cost_model_allows_transform(stats, estimate)) {
             continue;
         }
@@ -1151,11 +1303,12 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
             if (clones.size() >= kMaxSpecializedFunctions) {
                 break;
             }
-            clone = clone_constant_specialization(module, *site.callee, *site.call, next_id);
+            clone = clone_constant_specialization(module, *site.callee, *site.call, site.mask,
+                                                  next_id);
             clones.emplace(site.key, clone);
             ++specializations_by_callee[site.callee];
         }
-        retarget_call_to_specialization(*site.call, *clone);
+        retarget_call_to_specialization(*site.call, *clone, site.mask);
         ++stats.specialized;
         changed = true;
         (void)site.caller;

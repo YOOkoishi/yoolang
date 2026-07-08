@@ -634,6 +634,25 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block, St
             if (is_int_value(binary->rhs(), 1)) {
                 return binary->lhs();
             }
+            if (auto outer_divisor = int_constant(binary->rhs());
+                outer_divisor.has_value() && *outer_divisor > 0) {
+                auto *inner = as_binary_op(binary->lhs(), oir::Instruction::OpID::SDiv);
+                auto inner_divisor = inner == nullptr ? std::nullopt : int_constant(inner->rhs());
+                if (inner_divisor.has_value() && *inner_divisor > 0) {
+                    const auto max_i32 = static_cast<std::int64_t>(
+                        std::numeric_limits<std::int32_t>::max());
+                    if (*inner_divisor <= max_i32 / *outer_divisor) {
+                        const auto combined = *inner_divisor * *outer_divisor;
+                        if (combined == 1) {
+                            return inner->lhs();
+                        }
+                        return insert_binary_before(
+                            block, before, inst.type(), oir::Instruction::OpID::SDiv,
+                            inner->lhs(), make_int_constant(module, inst.type(), combined),
+                            inst.name().empty() ? "sdiv.compose" : inst.name() + ".compose");
+                    }
+                }
+            }
             break;
         case oir::Instruction::OpID::SRem:
             if (is_int_value(binary->rhs(), 1)) {

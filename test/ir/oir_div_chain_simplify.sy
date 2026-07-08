@@ -1,0 +1,24 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int nested_positive_div_chain(int x) {
+  return ((x / 16) / 16) % 16;
+}
+
+int nested_negative_div_chain(int x) {
+  return ((x / -16) / 16) % 16;
+}
+
+int main() {
+  int x = getint();
+  return nested_positive_div_chain(x) + nested_negative_div_chain(x);
+}
+
+// OIR-LABEL: define i32 @nested_positive_div_chain
+// OIR: sdiv i32 %x.arg, 256
+// OIR-NOT: sdiv i32 {{.*}}, 16
+// OIR: srem i32
+
+// OIR-LABEL: define i32 @nested_negative_div_chain
+// OIR: sdiv i32 %x.arg, -16
+// OIR: sdiv i32 {{.*}}, 16
+// OIR: srem i32

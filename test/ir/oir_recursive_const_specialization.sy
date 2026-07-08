@@ -1,0 +1,35 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int layer_accum(int n, int level, int x) {
+  int tweak = n % 2;
+  if (n <= 0) {
+    return x;
+  }
+  if (level <= 0) {
+    return x;
+  }
+  if (level == 3) {
+    return layer_accum(n - 1, level - 1, x + 3 + tweak) + 3;
+  }
+  if (level == 2) {
+    return layer_accum(n - 1, level - 1, x + 2 + tweak) + 2;
+  }
+  return layer_accum(n - 1, level - 1, x + 1 + tweak) + 1;
+}
+
+int passthrough_layer(int n) {
+  return layer_accum(n, 3, 0);
+}
+
+int main() {
+  return passthrough_layer(getint());
+}
+
+// OIR-LABEL: define i32 @passthrough_layer
+// OIR: inl.__yo_constprop.layer_accum.
+// OIR-NOT: icmp eq i32 %level.arg
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @__yo_constprop.layer_accum.
+// OIR-NOT: icmp eq i32 %level.arg
+// OIR: ret i32
