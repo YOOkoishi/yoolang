@@ -238,15 +238,14 @@ void test_proof_adapter_and_cache() {
 
 } // namespace
 
-// int main() {
-//     test_boolean_sat_unsat();
-//     test_bv_add_sub_equivalence();
-//     test_linear_normalizer_rejects_textual_atom_collision();
-//     test_bv_refutation_model();
-//     test_signed_unsigned_distinction();
-//     test_model_for_modular_arithmetic();
-//     test_extract_concat_and_shifts();
-//     test_resource_timeout();
-//     test_proof_adapter_and_cache();
-//     return 0;
-// }
+void run_smt_solver_tests() {
+    test_boolean_sat_unsat();
+    test_bv_add_sub_equivalence();
+    test_linear_normalizer_rejects_textual_atom_collision();
+    test_bv_refutation_model();
+    test_signed_unsigned_distinction();
+    test_model_for_modular_arithmetic();
+    test_extract_concat_and_shifts();
+    test_resource_timeout();
+    test_proof_adapter_and_cache();
+}
