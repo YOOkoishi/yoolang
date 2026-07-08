@@ -6,6 +6,8 @@ namespace pass {
 
 namespace {
 
+bool cleanup_after_tail_recursion(oir::Module &module, oir_opt::Stats &stats);
+
 bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
     changed |= oir_opt::canonicalize_loops(module, stats);
@@ -34,6 +36,12 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::cleanup_cfg(module, stats);
     changed |= oir_opt::unswitch_loops(module, stats);
     changed |= oir_opt::rotate_loops(module, stats);
+    if (oir_opt::unroll_small_constant_loops(module, stats)) {
+        changed = true;
+        if (oir_opt::eliminate_tail_recursion(module, stats)) {
+            changed |= cleanup_after_tail_recursion(module, stats);
+        }
+    }
     changed |= oir_opt::eliminate_overwritten_countdown_loops(module, stats);
     changed |= oir_opt::reduce_gep_strength(module, stats);
     changed |= oir_opt::lower_counted_zero_store_loops_to_memzero(module, stats);
@@ -108,6 +116,8 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= lower_dense_return_chains(module, stats);
     changed |= propagate_global_constants(module, stats);
     changed |= run_call_specialization_window(module, stats);
+    changed |= pre_inline_load_call_cse(module, stats);
+    changed |= eliminate_dead_code(module, stats);
     changed |= inline_functions(module, stats);
     if (changed) {
         changed |= run_sccp(module, stats);
@@ -151,6 +161,12 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= tighten_monotonic_guarded_loop_bounds(module, stats);
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
+    if (unroll_small_constant_loops(module, stats)) {
+        changed = true;
+        if (eliminate_tail_recursion(module, stats)) {
+            changed |= cleanup_after_tail_recursion(module, stats);
+        }
+    }
     changed |= eliminate_overwritten_countdown_loops(module, stats);
     changed |= lower_counted_zero_store_loops_to_memzero(module, stats);
     changed |= propagate_global_constants(module, stats);

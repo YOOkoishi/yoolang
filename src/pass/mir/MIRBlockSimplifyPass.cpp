@@ -7,6 +7,38 @@
 namespace pass::mir_peephole {
 namespace {
 
+bool has_non_implicit_reg_use(const mir::MachineInstr &instr, const mir::Register &reg) {
+    for (const auto &operand : instr.operands()) {
+        if (operand.is_reg() && operand.is_use() && !operand.is_implicit() &&
+            same_reg(operand.reg_value(), reg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_reg_def(const mir::MachineInstr &instr, const mir::Register &reg) {
+    for (const auto &def : instr.defs()) {
+        if (same_reg(def, reg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool reg_redefined_before_next_use(const std::vector<mir::MachineInstr> &instrs,
+                                   std::size_t start, const mir::Register &reg) {
+    for (std::size_t i = start; i < instrs.size(); ++i) {
+        if (has_non_implicit_reg_use(instrs[i], reg)) {
+            return false;
+        }
+        if (has_reg_def(instrs[i], reg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool simplify_block(mir::MachineBasicBlock &block, const mir::MachineBasicBlock *next_block,
                     bool post_ra, Stats &stats) {
     bool changed = false;
@@ -81,6 +113,23 @@ bool simplify_block(mir::MachineBasicBlock &block, const mir::MachineBasicBlock 
                 ops.size() == 2 && next_ops.size() == 2 && same_reg(ops[0], next_ops[1]) &&
                 same_reg(ops[1], next_ops[0])) {
                 instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(i + 1));
+                ++stats.copies;
+                changed = true;
+                continue;
+            }
+
+            if (post_ra && (instr.opcode() == mir::Opcode::AddI ||
+                            instr.opcode() == mir::Opcode::AddIW) &&
+                next.opcode() == mir::Opcode::Move && ops.size() >= 3 && next_ops.size() >= 2 &&
+                ops[0].is_reg() && ops[1].is_reg() && ops[2].kind() == mir::OperandKind::Imm &&
+                next_ops[0].is_reg() && next_ops[1].is_reg() &&
+                same_reg(ops[0], next_ops[1]) &&
+                reg_redefined_before_next_use(instrs, i + 2, ops[0].reg_value())) {
+                instr = mir::MachineInstr(
+                    instr.opcode(),
+                    {mir::MachineOperand::reg_def(next_ops[0].reg_value()), ops[1], ops[2]});
+                instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(i + 1));
+                ++stats.arithmetic;
                 ++stats.copies;
                 changed = true;
                 continue;

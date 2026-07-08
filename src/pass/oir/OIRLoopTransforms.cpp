@@ -48,7 +48,8 @@ bool cost_model_allows_loop_transform(Stats &stats, pass::cost_model::TransformK
                                       std::int64_t before_branches,
                                       std::int64_t after_branches,
                                       std::int64_t code_growth,
-                                      double confidence) {
+                                      double confidence,
+                                      bool exact_first_peel_has_coupled_lsr = false) {
     OIRTransformCostEstimate estimate;
     estimate.kind = kind;
     estimate.pass_name = "OIRLoopTransforms";
@@ -66,6 +67,18 @@ bool cost_model_allows_loop_transform(Stats &stats, pass::cost_model::TransformK
     if (kind == pass::cost_model::TransformKind::LoopRotate) {
         estimate.bypass_profitability = true;
         estimate.bypass_reason = "AlwaysOnCanonicalization";
+    } else if (kind == pass::cost_model::TransformKind::LoopUnswitch) {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "LoopInvariantBranch";
+    } else if (kind == pass::cost_model::TransformKind::LoopUnroll && before_branches > 0 &&
+               after_branches == 0 && code_growth <= 512) {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "ExactSmallTripCount";
+    } else if (kind == pass::cost_model::TransformKind::LoopUnroll &&
+               starts_with(candidate_id, "first-peel.") && before_branches > after_branches &&
+               code_growth <= 128 && exact_first_peel_has_coupled_lsr) {
+        estimate.bypass_profitability = true;
+        estimate.bypass_reason = "ExactFirstIterationPeelWithStackLSR";
     }
     return cost_model_allows_transform(stats, estimate);
 }
@@ -853,6 +866,1383 @@ oir::BranchInst *find_unswitch_branch(const oir::Loop &loop, const oir::ScalarEv
         }
     }
     return nullptr;
+}
+
+struct SingleBlockUnrollMatch {
+    oir::BasicBlock *header = nullptr;
+    oir::BasicBlock *preheader = nullptr;
+    oir::BasicBlock *exit = nullptr;
+    bool backedge_is_true = false;
+    std::int64_t trip_count = 0;
+};
+
+struct MultiBlockUnrollMatch {
+    oir::BasicBlock *header = nullptr;
+    oir::BasicBlock *preheader = nullptr;
+    oir::BasicBlock *latch = nullptr;
+    oir::BasicBlock *exit = nullptr;
+    std::vector<oir::BasicBlock *> blocks;
+    std::int64_t trip_count = 0;
+    bool has_call = false;
+};
+
+struct FinalIterationPeelMatch {
+    MultiBlockUnrollMatch loop;
+    oir::CallInst *call = nullptr;
+    oir::CmpInst *latch_cmp = nullptr;
+    std::size_t latch_bound_operand = 0;
+    std::int64_t peeled_bound = 0;
+};
+
+struct FirstIterationGuardMatch {
+    oir::BranchInst *branch = nullptr;
+    bool residual_takes_true = false;
+};
+
+bool is_unroll_cloneable_instruction(const oir::Instruction &inst) {
+    switch (inst.op()) {
+    case oir::Instruction::OpID::Ret:
+    case oir::Instruction::OpID::Alloca:
+        return false;
+    default:
+        return true;
+    }
+}
+
+std::optional<std::int64_t> latch_update_step(const oir::PhiInst *phi,
+                                              const HeaderPhiIncoming &incoming) {
+    auto *binary = dynamic_cast<oir::BinaryInst *>(incoming.latch);
+    if (binary == nullptr) {
+        return std::nullopt;
+    }
+    if (binary->op() == oir::Instruction::OpID::Add) {
+        if (binary->lhs() == nullptr || binary->rhs() == nullptr) {
+            return std::nullopt;
+        }
+        if (binary->lhs() == phi) {
+            if (auto step = int_constant(binary->rhs())) {
+                return step;
+            }
+        }
+        if (binary->rhs() == phi) {
+            if (auto step = int_constant(binary->lhs())) {
+                return step;
+            }
+        }
+    }
+    if (binary->op() == oir::Instruction::OpID::Sub && binary->lhs() != nullptr) {
+        if (binary->lhs() == phi) {
+            if (auto step = int_constant(binary->rhs())) {
+                return -*step;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+oir::CmpPred swap_unroll_cmp_operands(oir::CmpPred pred) {
+    switch (pred) {
+    case oir::CmpPred::LT:
+        return oir::CmpPred::GT;
+    case oir::CmpPred::LE:
+        return oir::CmpPred::GE;
+    case oir::CmpPred::GT:
+        return oir::CmpPred::LT;
+    case oir::CmpPred::GE:
+        return oir::CmpPred::LE;
+    case oir::CmpPred::EQ:
+    case oir::CmpPred::NE:
+        return pred;
+    }
+    return pred;
+}
+
+std::optional<std::int64_t> continuing_trip_count_for(std::int64_t start, std::int64_t bound,
+                                                       std::int64_t step, oir::CmpPred pred) {
+    if (step == 0) {
+        return std::nullopt;
+    }
+    switch (pred) {
+    case oir::CmpPred::LT: {
+        if (step <= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t distance = bound - start;
+        if (distance <= 0) {
+            return 0;
+        }
+        return (distance + step - 1) / step;
+    }
+    case oir::CmpPred::LE: {
+        if (step <= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t distance = bound - start;
+        if (distance < 0) {
+            return 0;
+        }
+        return distance / step + 1;
+    }
+    case oir::CmpPred::GT: {
+        if (step >= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t step_abs = -step;
+        const std::int64_t distance = start - bound;
+        if (distance <= 0) {
+            return 0;
+        }
+        return (distance + step_abs - 1) / step_abs;
+    }
+    case oir::CmpPred::GE: {
+        if (step >= 0) {
+            return std::nullopt;
+        }
+        const std::int64_t step_abs = -step;
+        const std::int64_t distance = start - bound;
+        if (distance < 0) {
+            return 0;
+        }
+        return distance / step_abs + 1;
+    }
+    case oir::CmpPred::EQ:
+    case oir::CmpPred::NE:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int64_t> constant_latch_trip_count(
+    oir::BasicBlock *header, oir::BasicBlock *preheader, oir::BasicBlock *latch,
+    const oir::BranchInst &branch) {
+    auto *cmp = dynamic_cast<oir::CmpInst *>(branch.cond());
+    if (cmp == nullptr || cmp->op() != oir::Instruction::OpID::ICmp) {
+        return std::nullopt;
+    }
+
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> incoming;
+    if (!collect_header_phi_incoming(*header, preheader, latch, incoming)) {
+        return std::nullopt;
+    }
+
+    auto count_from_latch = [&](oir::Value *candidate, oir::Value *bound,
+                                oir::CmpPred pred) -> std::optional<std::int64_t> {
+        auto limit = int_constant(bound);
+        if (!limit.has_value()) {
+            return std::nullopt;
+        }
+        for (const auto &[phi, values] : incoming) {
+            if (candidate != values.latch) {
+                continue;
+            }
+            auto start = int_constant(values.outside);
+            auto step = latch_update_step(phi, values);
+            if (!start.has_value() || !step.has_value()) {
+                return std::nullopt;
+            }
+            auto first_latch_value = static_cast<std::int32_t>(*start + *step);
+            auto continuing = continuing_trip_count_for(first_latch_value, *limit, *step, pred);
+            if (!continuing.has_value()) {
+                return std::nullopt;
+            }
+            return *continuing + 1;
+        }
+        return std::nullopt;
+    };
+
+    if (auto count = count_from_latch(cmp->lhs(), cmp->rhs(), cmp->pred())) {
+        return count;
+    }
+    return count_from_latch(cmp->rhs(), cmp->lhs(), swap_unroll_cmp_operands(cmp->pred()));
+}
+
+std::optional<bool> evaluate_integer_cmp(std::int64_t lhs, std::int64_t rhs,
+                                         oir::CmpPred pred) {
+    switch (pred) {
+    case oir::CmpPred::EQ:
+        return lhs == rhs;
+    case oir::CmpPred::NE:
+        return lhs != rhs;
+    case oir::CmpPred::LT:
+        return lhs < rhs;
+    case oir::CmpPred::LE:
+        return lhs <= rhs;
+    case oir::CmpPred::GT:
+        return lhs > rhs;
+    case oir::CmpPred::GE:
+        return lhs >= rhs;
+    }
+    return std::nullopt;
+}
+
+bool loop_reachable_from_has_call(oir::BasicBlock *start, const oir::Loop &loop) {
+    std::deque<oir::BasicBlock *> worklist;
+    std::unordered_set<oir::BasicBlock *> seen;
+    worklist.push_back(start);
+    seen.insert(start);
+
+    while (!worklist.empty()) {
+        auto *block = worklist.front();
+        worklist.pop_front();
+        for (const auto &inst : block->instructions()) {
+            if (inst->op() == oir::Instruction::OpID::Call) {
+                return true;
+            }
+        }
+        for (auto *succ : block->successors()) {
+            if (!contains_block(loop, succ)) {
+                continue;
+            }
+            if (seen.insert(succ).second) {
+                worklist.push_back(succ);
+            }
+        }
+    }
+    return false;
+}
+
+std::optional<bool> residual_outcome_for_first_iteration_guard(
+    const oir::CmpInst &cmp, const oir::Loop &loop, const MultiBlockUnrollMatch &match,
+    const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &phi_incoming) {
+    auto try_phi_constant = [&](oir::Value *candidate, oir::Value *constant,
+                                oir::CmpPred pred) -> std::optional<bool> {
+        auto *phi = dynamic_cast<oir::PhiInst *>(candidate);
+        auto guard_constant = int_constant(constant);
+        if (phi == nullptr || phi->parent() != match.header || !guard_constant.has_value()) {
+            return std::nullopt;
+        }
+
+        auto found = phi_incoming.find(phi);
+        if (found == phi_incoming.end()) {
+            return std::nullopt;
+        }
+        auto start = int_constant(found->second.outside);
+        auto step = latch_update_step(phi, found->second);
+        if (!start.has_value() || !step.has_value()) {
+            return std::nullopt;
+        }
+
+        std::optional<bool> first_outcome;
+        std::optional<bool> residual_outcome;
+        for (std::int64_t iteration = 0; iteration < match.trip_count; ++iteration) {
+            const std::int64_t value = *start + *step * iteration;
+            auto outcome = evaluate_integer_cmp(value, *guard_constant, pred);
+            if (!outcome.has_value()) {
+                return std::nullopt;
+            }
+            if (iteration == 0) {
+                first_outcome = *outcome;
+                continue;
+            }
+            if (!residual_outcome.has_value()) {
+                residual_outcome = *outcome;
+                continue;
+            }
+            if (*residual_outcome != *outcome) {
+                return std::nullopt;
+            }
+        }
+        if (!first_outcome.has_value() || !residual_outcome.has_value() ||
+            *first_outcome == *residual_outcome) {
+            return std::nullopt;
+        }
+        (void)loop;
+        return residual_outcome;
+    };
+
+    if (auto outcome = try_phi_constant(cmp.lhs(), cmp.rhs(), cmp.pred())) {
+        return outcome;
+    }
+    return try_phi_constant(cmp.rhs(), cmp.lhs(), swap_unroll_cmp_operands(cmp.pred()));
+}
+
+std::optional<FirstIterationGuardMatch> find_first_iteration_guard(
+    const oir::Loop &loop, const MultiBlockUnrollMatch &match,
+    const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &phi_incoming) {
+    for (auto *block : match.blocks) {
+        if (block == match.latch) {
+            continue;
+        }
+        auto *branch = dynamic_cast<oir::BranchInst *>(block->terminator());
+        if (branch == nullptr || !branch->is_conditional() ||
+            branch->true_bb() == branch->false_bb() ||
+            !contains_block(loop, branch->true_bb()) ||
+            !contains_block(loop, branch->false_bb())) {
+            continue;
+        }
+        if (!loop_reachable_from_has_call(branch->true_bb(), loop) &&
+            !loop_reachable_from_has_call(branch->false_bb(), loop)) {
+            continue;
+        }
+
+        auto *cmp = dynamic_cast<oir::CmpInst *>(branch->cond());
+        if (cmp == nullptr || cmp->op() != oir::Instruction::OpID::ICmp) {
+            continue;
+        }
+        auto residual_outcome =
+            residual_outcome_for_first_iteration_guard(*cmp, loop, match, phi_incoming);
+        if (!residual_outcome.has_value()) {
+            continue;
+        }
+        return FirstIterationGuardMatch{branch, *residual_outcome};
+    }
+    return std::nullopt;
+}
+
+oir::AllocaInst *underlying_alloca(oir::Value *value) {
+    std::unordered_set<oir::Value *> seen;
+    auto *current = value;
+    while (current != nullptr && seen.insert(current).second) {
+        if (auto *alloca = dynamic_cast<oir::AllocaInst *>(current)) {
+            return alloca;
+        }
+        auto *gep = dynamic_cast<oir::GetElementPtrInst *>(current);
+        if (gep == nullptr) {
+            return nullptr;
+        }
+        current = gep->base_ptr();
+    }
+    return nullptr;
+}
+
+bool stack_object_is_non_escaping_impl(oir::Value *value, std::unordered_set<oir::Value *> &seen) {
+    if (value == nullptr || !seen.insert(value).second) {
+        return true;
+    }
+    for (auto *user : value->users()) {
+        auto *inst = dynamic_cast<oir::Instruction *>(user);
+        if (inst == nullptr) {
+            return false;
+        }
+        if (auto *gep = dynamic_cast<oir::GetElementPtrInst *>(inst)) {
+            if (gep->base_ptr() != value || !stack_object_is_non_escaping_impl(gep, seen)) {
+                return false;
+            }
+            continue;
+        }
+        if (dynamic_cast<oir::PhiInst *>(inst) != nullptr) {
+            if (!stack_object_is_non_escaping_impl(inst, seen)) {
+                return false;
+            }
+            continue;
+        }
+        if (auto *load = dynamic_cast<oir::LoadInst *>(inst)) {
+            if (load->ptr() == value) {
+                continue;
+            }
+            return false;
+        }
+        if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
+            if (store->ptr() == value && store->value() != value) {
+                continue;
+            }
+            return false;
+        }
+        if (auto *memzero = dynamic_cast<oir::MemZeroInst *>(inst)) {
+            if (memzero->ptr() == value) {
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool stack_object_is_non_escaping(oir::AllocaInst *alloca) {
+    std::unordered_set<oir::Value *> seen;
+    return stack_object_is_non_escaping_impl(alloca, seen);
+}
+
+oir::CallInst *first_call_before_terminator(oir::BasicBlock *block) {
+    if (block == nullptr) {
+        return nullptr;
+    }
+    for (const auto &inst : block->instructions()) {
+        if (inst->is_terminator()) {
+            return nullptr;
+        }
+        if (auto *call = dynamic_cast<oir::CallInst *>(inst.get())) {
+            return call;
+        }
+    }
+    return nullptr;
+}
+
+std::optional<std::int64_t> affine_header_phi_offset(
+    oir::Value *value, const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &phi_incoming,
+    oir::PhiInst *&matched_phi) {
+    if (auto *phi = dynamic_cast<oir::PhiInst *>(value)) {
+        if (phi_incoming.find(phi) == phi_incoming.end()) {
+            return std::nullopt;
+        }
+        matched_phi = phi;
+        return 0;
+    }
+    auto *binary = dynamic_cast<oir::BinaryInst *>(value);
+    if (binary == nullptr) {
+        return std::nullopt;
+    }
+    if (binary->op() == oir::Instruction::OpID::Add) {
+        if (auto rhs = int_constant(binary->rhs())) {
+            if (auto lhs = affine_header_phi_offset(binary->lhs(), phi_incoming, matched_phi)) {
+                return *lhs + *rhs;
+            }
+        }
+        if (auto lhs = int_constant(binary->lhs())) {
+            if (auto rhs = affine_header_phi_offset(binary->rhs(), phi_incoming, matched_phi)) {
+                return *lhs + *rhs;
+            }
+        }
+    }
+    if (binary->op() == oir::Instruction::OpID::Sub) {
+        if (auto rhs = int_constant(binary->rhs())) {
+            if (auto lhs = affine_header_phi_offset(binary->lhs(), phi_incoming, matched_phi)) {
+                return *lhs - *rhs;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool first_peel_has_coupled_stack_lsr_shape(
+    const MultiBlockUnrollMatch &match,
+    const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &phi_incoming,
+    const FirstIterationGuardMatch &guard) {
+    auto *call = first_call_before_terminator(match.latch);
+    if (call == nullptr) {
+        return false;
+    }
+
+    std::vector<oir::BasicBlock *> path;
+    auto *block = guard.residual_takes_true ? guard.branch->true_bb() : guard.branch->false_bb();
+    std::unordered_set<oir::BasicBlock *> seen_path;
+    while (block != nullptr && seen_path.insert(block).second) {
+        if (std::find(match.blocks.begin(), match.blocks.end(), block) == match.blocks.end()) {
+            return false;
+        }
+        path.push_back(block);
+        if (block == match.latch) {
+            break;
+        }
+        if (block->successors().size() != 1) {
+            return false;
+        }
+        for (const auto &inst : block->instructions()) {
+            if (inst->op() == oir::Instruction::OpID::Call) {
+                return false;
+            }
+        }
+        block = block->successors().front();
+    }
+    if (path.empty() || path.back() != match.latch) {
+        return false;
+    }
+
+    struct GroupKey {
+        oir::AllocaInst *alloca = nullptr;
+        oir::PhiInst *phi = nullptr;
+    };
+    std::vector<GroupKey> groups;
+    std::unordered_map<oir::AllocaInst *, bool> alloca_non_escape;
+
+    for (auto *path_block : path) {
+        for (const auto &inst : path_block->instructions()) {
+            if (inst.get() == call) {
+                break;
+            }
+            if (inst->op() == oir::Instruction::OpID::Call) {
+                return false;
+            }
+            auto *gep = dynamic_cast<oir::GetElementPtrInst *>(inst.get());
+            if (gep == nullptr) {
+                continue;
+            }
+            auto *alloca = underlying_alloca(gep->base_ptr());
+            if (alloca == nullptr) {
+                continue;
+            }
+            auto [escape_it, inserted] = alloca_non_escape.emplace(alloca, false);
+            if (inserted) {
+                escape_it->second = stack_object_is_non_escaping(alloca);
+            }
+            if (!escape_it->second) {
+                continue;
+            }
+            auto indices = gep->indices();
+            oir::PhiInst *matched_phi = nullptr;
+            unsigned affine_indices = 0;
+            for (auto *index : indices) {
+                oir::PhiInst *candidate_phi = nullptr;
+                if (affine_header_phi_offset(index, phi_incoming, candidate_phi).has_value()) {
+                    matched_phi = candidate_phi;
+                    ++affine_indices;
+                }
+            }
+            if (matched_phi == nullptr || affine_indices != 1) {
+                continue;
+            }
+            bool seen_group = false;
+            for (const auto &group : groups) {
+                if (group.alloca == alloca && group.phi == matched_phi) {
+                    seen_group = true;
+                    break;
+                }
+            }
+            if (!seen_group) {
+                groups.push_back({alloca, matched_phi});
+            }
+        }
+    }
+
+    return groups.size() >= 2 && groups.size() <= 4;
+}
+
+std::optional<SingleBlockUnrollMatch> match_single_block_unroll_loop(
+    const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+    if (loop.header == nullptr || loop.blocks.size() != 1 || loop.blocks.front() != loop.header) {
+        return std::nullopt;
+    }
+
+    auto *header = mutable_block(loop.header);
+    auto *branch = dynamic_cast<oir::BranchInst *>(header->terminator());
+    if (branch == nullptr || !branch->is_conditional()) {
+        return std::nullopt;
+    }
+
+    bool backedge_is_true = false;
+    oir::BasicBlock *exit = nullptr;
+    if (branch->true_bb() == header && branch->false_bb() != header) {
+        backedge_is_true = true;
+        exit = branch->false_bb();
+    } else if (branch->false_bb() == header && branch->true_bb() != header) {
+        backedge_is_true = false;
+        exit = branch->true_bb();
+    } else {
+        return std::nullopt;
+    }
+    if (exit == nullptr || contains_block(loop, exit)) {
+        return std::nullopt;
+    }
+
+    auto *preheader = find_preheader(loop);
+    if (preheader == nullptr || !preheader->has_terminator()) {
+        return std::nullopt;
+    }
+    if (std::count(header->predecessors().begin(), header->predecessors().end(), preheader) != 1 ||
+        std::count(header->predecessors().begin(), header->predecessors().end(), header) != 1) {
+        return std::nullopt;
+    }
+
+    auto trip_count = constant_latch_trip_count(header, preheader, header, *branch);
+    if (!trip_count.has_value()) {
+        trip_count = scev.constant_trip_count(loop);
+    }
+    constexpr std::int64_t kMaxUnrollTripCount = 16;
+    if (!trip_count.has_value() || *trip_count <= 1 || *trip_count > kMaxUnrollTripCount) {
+        return std::nullopt;
+    }
+
+    for (const auto &inst : header->instructions()) {
+        if (inst->op() == oir::Instruction::OpID::Phi) {
+            continue;
+        }
+        if (inst->is_terminator()) {
+            break;
+        }
+        if (!is_unroll_cloneable_instruction(*inst)) {
+            return std::nullopt;
+        }
+        if (inst->op() == oir::Instruction::OpID::Call) {
+            return std::nullopt;
+        }
+    }
+
+    return SingleBlockUnrollMatch{header, preheader, exit, backedge_is_true, *trip_count};
+}
+
+bool loop_body_is_acyclic_except_latch(const oir::Loop &loop, oir::BasicBlock *latch) {
+    enum class VisitState { Visiting, Done };
+    std::unordered_map<const oir::BasicBlock *, VisitState> state;
+
+    auto dfs = [&](const oir::BasicBlock *block, const auto &self) -> bool {
+        auto found = state.find(block);
+        if (found != state.end()) {
+            return found->second == VisitState::Done;
+        }
+        state[block] = VisitState::Visiting;
+        for (auto *succ : block->successors()) {
+            if (!contains_block(loop, succ)) {
+                continue;
+            }
+            if (block == latch && succ == loop.header) {
+                continue;
+            }
+            if (!self(succ, self)) {
+                return false;
+            }
+        }
+        state[block] = VisitState::Done;
+        return true;
+    };
+
+    return dfs(loop.header, dfs);
+}
+
+std::optional<MultiBlockUnrollMatch> match_multi_block_unroll_loop(
+    const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+    if (loop.header == nullptr || loop.blocks.size() <= 1) {
+        return std::nullopt;
+    }
+
+    auto *header = mutable_block(loop.header);
+    auto *preheader = find_preheader(loop);
+    auto *latch = mutable_block(single_latch(loop));
+    if (preheader == nullptr || latch == nullptr || !preheader->has_terminator() ||
+        !latch->has_terminator()) {
+        return std::nullopt;
+    }
+    if (preheader->name().find(".unr") != std::string::npos) {
+        return std::nullopt;
+    }
+
+    auto *preheader_branch = dynamic_cast<oir::BranchInst *>(preheader->terminator());
+    auto *latch_branch = dynamic_cast<oir::BranchInst *>(latch->terminator());
+    if (preheader_branch == nullptr || preheader_branch->is_conditional() ||
+        preheader_branch->target_bb() != header || latch_branch == nullptr ||
+        !latch_branch->is_conditional()) {
+        return std::nullopt;
+    }
+
+    oir::BasicBlock *exit = nullptr;
+    if (latch_branch->true_bb() == header && !contains_block(loop, latch_branch->false_bb())) {
+        exit = latch_branch->false_bb();
+    } else if (latch_branch->false_bb() == header &&
+               !contains_block(loop, latch_branch->true_bb())) {
+        exit = latch_branch->true_bb();
+    } else {
+        return std::nullopt;
+    }
+    if (exit == nullptr) {
+        return std::nullopt;
+    }
+
+    for (auto *block : loop.blocks) {
+        if (block == loop.header) {
+            continue;
+        }
+        for (auto *pred : block->predecessors()) {
+            if (!contains_block(loop, pred)) {
+                return std::nullopt;
+            }
+        }
+    }
+    for (auto *block : loop.blocks) {
+        for (auto *succ : block->successors()) {
+            if (contains_block(loop, succ)) {
+                continue;
+            }
+            if (block != latch || succ != exit) {
+                return std::nullopt;
+            }
+        }
+    }
+    if (!loop_body_is_acyclic_except_latch(loop, latch)) {
+        return std::nullopt;
+    }
+
+    auto trip_count = constant_latch_trip_count(header, preheader, latch, *latch_branch);
+    if (!trip_count.has_value()) {
+        trip_count = scev.constant_trip_count(loop);
+    }
+    constexpr std::int64_t kMaxUnrollTripCount = 16;
+    if (!trip_count.has_value() || *trip_count <= 1 || *trip_count > kMaxUnrollTripCount) {
+        return std::nullopt;
+    }
+
+    auto blocks = function_ordered_loop_blocks(*header->parent(), loop);
+    bool has_call = false;
+    for (auto *block : blocks) {
+        for (const auto &inst : block->instructions()) {
+            if (block == header && inst->op() == oir::Instruction::OpID::Phi) {
+                continue;
+            }
+            if (!is_unroll_cloneable_instruction(*inst)) {
+                return std::nullopt;
+            }
+            if (inst->op() == oir::Instruction::OpID::Call) {
+                has_call = true;
+            }
+        }
+    }
+
+    return MultiBlockUnrollMatch{header, preheader, latch, exit, std::move(blocks), *trip_count,
+                                 has_call};
+}
+
+bool collect_single_block_phi_incoming(
+    oir::BasicBlock *header, oir::BasicBlock *preheader,
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &incoming) {
+    return collect_header_phi_incoming(*header, preheader, header, incoming);
+}
+
+void rewrite_exit_phi_incoming(oir::BasicBlock *exit, oir::BasicBlock *old_pred,
+                               oir::BasicBlock *new_pred, const ValueMap &final_map) {
+    for (auto &inst : exit->instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
+            if (phi->incoming()[i].second != old_pred) {
+                continue;
+            }
+            phi->set_operand(i * 2, map_value(phi->incoming()[i].first, final_map));
+            phi->set_operand(i * 2 + 1, new_pred);
+        }
+    }
+}
+
+void fix_cloned_operands(const std::vector<oir::BasicBlock *> &clones, const ValueMap &map);
+void force_branch_direction(oir::BranchInst &branch, bool take_true);
+
+bool unroll_single_block_loop(oir::Function &function, const oir::Loop &loop,
+                              const oir::ScalarEvolution &scev, Stats &stats) {
+    auto match = match_single_block_unroll_loop(loop, scev);
+    if (!match.has_value()) {
+        return false;
+    }
+
+    std::vector<oir::BasicBlock *> blocks = {match->header};
+    if (!direct_loop_value_uses_are_repairable(blocks, loop)) {
+        return false;
+    }
+    auto direct_exit_values = loop_values_used_on_exit_edge(match->exit, loop);
+
+    const auto body_instrs = static_cast<std::int64_t>(loop_instruction_count(blocks));
+    const auto cloned_instrs = body_instrs * match->trip_count;
+    constexpr std::int64_t kMaxClonedInstructions = 512;
+    if (cloned_instrs > kMaxClonedInstructions) {
+        return false;
+    }
+    if (!cost_model_allows_loop_transform(
+            stats, pass::cost_model::TransformKind::LoopUnroll,
+            "unroll." + std::to_string(stats.loop_unroll + 1), body_instrs * match->trip_count,
+            cloned_instrs, match->trip_count, 0, cloned_instrs - body_instrs, 0.78)) {
+        return false;
+    }
+
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> phi_incoming;
+    if (!collect_single_block_phi_incoming(match->header, match->preheader, phi_incoming)) {
+        return false;
+    }
+
+    auto *module = function.parent();
+    std::vector<oir::BasicBlock *> unrolled_blocks;
+    unrolled_blocks.reserve(static_cast<std::size_t>(match->trip_count));
+    ValueMap iteration_map;
+    for (const auto &[phi, incoming] : phi_incoming) {
+        iteration_map[phi] = incoming.outside;
+    }
+
+    ValueMap final_map;
+    for (std::int64_t iteration = 0; iteration < match->trip_count; ++iteration) {
+        auto *clone_block = function.create_block(match->header->name() + ".unr");
+        unrolled_blocks.push_back(clone_block);
+        ValueMap body_map = iteration_map;
+
+        for (const auto &inst : match->header->instructions()) {
+            if (inst->op() == oir::Instruction::OpID::Phi) {
+                continue;
+            }
+            if (inst->is_terminator()) {
+                break;
+            }
+            auto clone = clone_instruction(*inst, body_map, clone_block, ".unr");
+            if (clone == nullptr) {
+                return false;
+            }
+            auto *raw = clone.get();
+            clone_block->append_instruction(std::move(clone));
+            body_map[inst.get()] = raw;
+        }
+
+        final_map = body_map;
+        ValueMap next_iteration_map;
+        for (const auto &[phi, incoming] : phi_incoming) {
+            next_iteration_map[phi] = map_value(incoming.latch, body_map);
+        }
+        iteration_map = std::move(next_iteration_map);
+    }
+
+    replace_terminator_with_br(match->preheader, unrolled_blocks.front());
+    oir::cfg::remove_edge_no_phi_update(match->preheader, match->header);
+
+    for (std::size_t i = 0; i < unrolled_blocks.size(); ++i) {
+        auto *target = i + 1 < unrolled_blocks.size() ? unrolled_blocks[i + 1] : match->exit;
+        oir::cfg::append_unconditional_branch(*module, unrolled_blocks[i], target);
+    }
+
+    rewrite_exit_phi_incoming(match->exit, match->header, unrolled_blocks.back(), final_map);
+    for (auto *value : direct_exit_values) {
+        auto *mapped = map_value(value, final_map);
+        if (mapped != value) {
+            replace_non_phi_uses_in_block(match->exit, value, mapped);
+            replace_phi_uses_on_successor_edges(match->exit, value, mapped);
+        }
+    }
+    oir::cfg::remove_edge_no_phi_update(match->header, match->exit);
+    oir::cfg::remove_edge_no_phi_update(match->header, match->header);
+    function.erase_block(match->header);
+
+    ++stats.loop_unroll;
+    ++stats.cfg;
+    return true;
+}
+
+struct UnrolledIteration {
+    oir::BasicBlock *header = nullptr;
+    oir::BasicBlock *latch = nullptr;
+    std::vector<oir::BasicBlock *> blocks;
+    ValueMap value_map;
+};
+
+std::optional<UnrolledIteration> clone_unroll_iteration(
+    oir::Function &function, const MultiBlockUnrollMatch &match,
+    const ValueMap &iteration_map, std::int64_t iteration) {
+    BlockMap block_map;
+    ValueMap value_map = iteration_map;
+    UnrolledIteration out;
+    out.blocks.reserve(match.blocks.size());
+
+    for (auto *block : match.blocks) {
+        auto *clone = function.create_block(block->name() + ".unr" + std::to_string(iteration));
+        block_map[block] = clone;
+        value_map[block] = clone;
+        out.blocks.push_back(clone);
+        if (block == match.header) {
+            out.header = clone;
+        }
+        if (block == match.latch) {
+            out.latch = clone;
+        }
+    }
+
+    for (auto *block : match.blocks) {
+        auto *clone_block = block_map.at(block);
+        for (const auto &inst : block->instructions()) {
+            if (block == match.header && inst->op() == oir::Instruction::OpID::Phi) {
+                continue;
+            }
+            auto clone = clone_instruction(*inst, value_map, clone_block, ".unr");
+            if (clone == nullptr) {
+                return std::nullopt;
+            }
+            auto *raw = clone.get();
+            clone_block->append_instruction(std::move(clone));
+            value_map[inst.get()] = raw;
+        }
+    }
+
+    fix_cloned_operands(out.blocks, value_map);
+    for (auto *block : match.blocks) {
+        if (block == match.latch) {
+            continue;
+        }
+        auto *clone = block_map.at(block);
+        for (auto *succ : block->successors()) {
+            auto found = block_map.find(succ);
+            if (found != block_map.end()) {
+                oir::cfg::add_edge(clone, found->second);
+            }
+        }
+    }
+
+    out.value_map = std::move(value_map);
+    return out;
+}
+
+std::optional<UnrolledIteration> clone_first_peel_iteration(
+    oir::Function &function, const MultiBlockUnrollMatch &match,
+    const ValueMap &iteration_map) {
+    BlockMap block_map;
+    ValueMap value_map = iteration_map;
+    UnrolledIteration out;
+    out.blocks.reserve(match.blocks.size());
+
+    for (auto *block : match.blocks) {
+        auto *clone = function.create_block(block->name() + ".peel.first");
+        block_map[block] = clone;
+        value_map[block] = clone;
+        out.blocks.push_back(clone);
+        if (block == match.header) {
+            out.header = clone;
+        }
+        if (block == match.latch) {
+            out.latch = clone;
+        }
+    }
+
+    for (auto *block : match.blocks) {
+        auto *clone_block = block_map.at(block);
+        for (const auto &inst : block->instructions()) {
+            if (block == match.header && inst->op() == oir::Instruction::OpID::Phi) {
+                continue;
+            }
+            auto clone = clone_instruction(*inst, value_map, clone_block, ".peel.first");
+            if (clone == nullptr) {
+                return std::nullopt;
+            }
+            auto *raw = clone.get();
+            clone_block->append_instruction(std::move(clone));
+            value_map[inst.get()] = raw;
+        }
+    }
+
+    fix_cloned_operands(out.blocks, value_map);
+    for (auto *block : match.blocks) {
+        if (block == match.latch) {
+            continue;
+        }
+        auto *clone = block_map.at(block);
+        for (auto *succ : block->successors()) {
+            auto found = block_map.find(succ);
+            if (found != block_map.end()) {
+                oir::cfg::add_edge(clone, found->second);
+            }
+        }
+    }
+
+    out.value_map = std::move(value_map);
+    return out;
+}
+
+bool rewrite_header_phi_initial_values_after_first_peel(
+    oir::BasicBlock *header, oir::BasicBlock *preheader, oir::BasicBlock *peeled_latch,
+    const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &phi_incoming,
+    const ValueMap &peeled_value_map) {
+    for (auto &inst : header->instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        auto found = phi_incoming.find(phi);
+        if (found == phi_incoming.end()) {
+            return false;
+        }
+        bool updated = false;
+        for (std::size_t i = 0; i < phi->incoming().size(); ++i) {
+            if (phi->incoming()[i].second != preheader) {
+                continue;
+            }
+            phi->set_operand(i * 2, map_value(found->second.latch, peeled_value_map));
+            phi->set_operand(i * 2 + 1, peeled_latch);
+            updated = true;
+            break;
+        }
+        if (!updated) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void remove_original_loop_cfg_edges(const std::vector<oir::BasicBlock *> &blocks) {
+    for (auto *block : blocks) {
+        auto successors = block->successors();
+        for (auto *succ : successors) {
+            oir::cfg::remove_edge_no_phi_update(block, succ);
+        }
+    }
+}
+
+bool unroll_multi_block_loop(oir::Function &function, const oir::Loop &loop,
+                             const oir::ScalarEvolution &scev, Stats &stats) {
+    auto match = match_multi_block_unroll_loop(loop, scev);
+    if (!match.has_value()) {
+        return false;
+    }
+    if (match->has_call) {
+        return false;
+    }
+
+    if (!direct_loop_value_uses_are_repairable(match->blocks, loop)) {
+        return false;
+    }
+    auto direct_exit_values = loop_values_used_on_exit_edge(match->exit, loop);
+
+    const auto body_instrs = static_cast<std::int64_t>(loop_instruction_count(match->blocks));
+    const auto cloned_instrs = body_instrs * match->trip_count;
+    constexpr std::int64_t kMaxClonedInstructions = 512;
+    if (cloned_instrs > kMaxClonedInstructions) {
+        return false;
+    }
+    if (!cost_model_allows_loop_transform(
+            stats, pass::cost_model::TransformKind::LoopUnroll,
+            "unroll." + std::to_string(stats.loop_unroll + 1), body_instrs * match->trip_count,
+            cloned_instrs, match->trip_count, 0, cloned_instrs - body_instrs, 0.74)) {
+        return false;
+    }
+
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> phi_incoming;
+    if (!collect_header_phi_incoming(*match->header, match->preheader, match->latch,
+                                     phi_incoming)) {
+        return false;
+    }
+
+    ValueMap iteration_map;
+    for (const auto &[phi, incoming] : phi_incoming) {
+        iteration_map[phi] = incoming.outside;
+    }
+
+    std::vector<UnrolledIteration> iterations;
+    iterations.reserve(static_cast<std::size_t>(match->trip_count));
+    ValueMap final_map;
+    for (std::int64_t iteration = 0; iteration < match->trip_count; ++iteration) {
+        auto cloned = clone_unroll_iteration(function, *match, iteration_map, iteration);
+        if (!cloned.has_value()) {
+            return false;
+        }
+        final_map = cloned->value_map;
+
+        ValueMap next_iteration_map;
+        for (const auto &[phi, incoming] : phi_incoming) {
+            next_iteration_map[phi] = map_value(incoming.latch, cloned->value_map);
+        }
+        iteration_map = std::move(next_iteration_map);
+        iterations.push_back(std::move(*cloned));
+    }
+
+    replace_terminator_with_br(match->preheader, iterations.front().header);
+    oir::cfg::remove_edge_no_phi_update(match->preheader, match->header);
+    for (std::size_t i = 0; i < iterations.size(); ++i) {
+        auto *target = i + 1 < iterations.size() ? iterations[i + 1].header : match->exit;
+        replace_terminator_with_br(iterations[i].latch, target);
+    }
+
+    rewrite_exit_phi_incoming(match->exit, match->latch, iterations.back().latch, final_map);
+    for (auto *value : direct_exit_values) {
+        auto *mapped = map_value(value, final_map);
+        if (mapped != value) {
+            replace_non_phi_uses_in_block(match->exit, value, mapped);
+            replace_phi_uses_on_successor_edges(match->exit, value, mapped);
+        }
+    }
+
+    remove_original_loop_cfg_edges(match->blocks);
+    for (auto *block : match->blocks) {
+        function.erase_block(block);
+    }
+
+    ++stats.loop_unroll;
+    ++stats.cfg;
+    return true;
+}
+
+bool peel_first_iteration_loop(oir::Function &function, const oir::Loop &loop,
+                               const oir::ScalarEvolution &scev, Stats &stats) {
+    auto match = match_multi_block_unroll_loop(loop, scev);
+    if (!match.has_value() || !match->has_call || match->trip_count <= 1 ||
+        match->trip_count > 16) {
+        return false;
+    }
+    if (match->preheader->name().find(".peel.first") != std::string::npos ||
+        match->header->name().find(".peel.first") != std::string::npos) {
+        return false;
+    }
+    if (!direct_loop_value_uses_are_repairable(match->blocks, loop)) {
+        return false;
+    }
+
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> phi_incoming;
+    if (!collect_header_phi_incoming(*match->header, match->preheader, match->latch,
+                                     phi_incoming)) {
+        return false;
+    }
+    auto guard = find_first_iteration_guard(loop, *match, phi_incoming);
+    if (!guard.has_value()) {
+        return false;
+    }
+    const bool has_coupled_lsr =
+        first_peel_has_coupled_stack_lsr_shape(*match, phi_incoming, *guard);
+
+    const auto body_instrs = static_cast<std::int64_t>(loop_instruction_count(match->blocks));
+    constexpr std::int64_t kMaxPeeledInstructions = 128;
+    if (body_instrs > kMaxPeeledInstructions) {
+        return false;
+    }
+    if (!cost_model_allows_loop_transform(
+            stats, pass::cost_model::TransformKind::LoopUnroll,
+            "first-peel." + std::to_string(stats.loop_unroll + 1),
+            body_instrs * match->trip_count, body_instrs * match->trip_count + body_instrs,
+            match->trip_count, match->trip_count - 1, body_instrs, 0.76,
+            has_coupled_lsr)) {
+        return false;
+    }
+
+    ValueMap first_iteration_map;
+    for (const auto &[phi, incoming] : phi_incoming) {
+        first_iteration_map[phi] = incoming.outside;
+    }
+
+    auto peeled = clone_first_peel_iteration(function, *match, first_iteration_map);
+    if (!peeled.has_value() || peeled->header == nullptr || peeled->latch == nullptr) {
+        return false;
+    }
+
+    replace_terminator_with_br(match->preheader, peeled->header);
+    oir::cfg::remove_edge_no_phi_update(match->preheader, match->header);
+    replace_terminator_with_br(peeled->latch, match->header);
+    if (!rewrite_header_phi_initial_values_after_first_peel(
+            match->header, match->preheader, peeled->latch, phi_incoming, peeled->value_map)) {
+        return false;
+    }
+    force_branch_direction(*guard->branch, guard->residual_takes_true);
+
+    ++stats.loop_unroll;
+    ++stats.cfg;
+    return true;
+}
+
+bool is_final_peel_post_call_instruction(const oir::Instruction &inst) {
+    switch (inst.op()) {
+    case oir::Instruction::OpID::Add:
+    case oir::Instruction::OpID::Sub:
+    case oir::Instruction::OpID::GetElementPtr:
+    case oir::Instruction::OpID::ICmp:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool exit_block_is_void_return_only(const oir::BasicBlock &block) {
+    auto *ret = dynamic_cast<oir::ReturnInst *>(block.terminator());
+    if (ret == nullptr || ret->has_value()) {
+        return false;
+    }
+    for (const auto &inst : block.instructions()) {
+        if (inst.get() == ret) {
+            return true;
+        }
+        if (dynamic_cast<oir::PhiInst *>(inst.get()) == nullptr) {
+            return false;
+        }
+    }
+    return false;
+}
+
+std::optional<FinalIterationPeelMatch> match_final_iteration_peel_loop(
+    oir::Function &function, const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+    if (function.return_type() == nullptr || !function.return_type()->is_void()) {
+        return std::nullopt;
+    }
+    auto base = match_multi_block_unroll_loop(loop, scev);
+    if (!base.has_value() || !base->has_call || base->trip_count <= 1 ||
+        base->trip_count > 16 || !exit_block_is_void_return_only(*base->exit) ||
+        !loop_values_used_on_exit_edge(base->exit, loop).empty()) {
+        return std::nullopt;
+    }
+
+    auto *latch_branch = dynamic_cast<oir::BranchInst *>(base->latch->terminator());
+    auto *latch_cmp = latch_branch == nullptr ? nullptr
+                                              : dynamic_cast<oir::CmpInst *>(latch_branch->cond());
+    if (latch_branch == nullptr || latch_cmp == nullptr || latch_cmp->op() != oir::Instruction::OpID::ICmp ||
+        latch_branch->true_bb() != base->header || latch_branch->false_bb() != base->exit) {
+        return std::nullopt;
+    }
+
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> phi_incoming;
+    if (!collect_header_phi_incoming(*base->header, base->preheader, base->latch, phi_incoming)) {
+        return std::nullopt;
+    }
+
+    std::size_t bound_operand = 0;
+    std::int64_t peeled_bound = 0;
+    bool found_bound = false;
+    auto try_match_bound = [&](oir::Value *candidate, oir::Value *bound,
+                               oir::CmpPred pred, std::size_t operand_index) {
+        if (found_bound || (pred != oir::CmpPred::LT && pred != oir::CmpPred::LE)) {
+            return;
+        }
+        auto limit = int_constant(bound);
+        if (!limit.has_value()) {
+            return;
+        }
+        for (const auto &[phi, incoming] : phi_incoming) {
+            if (candidate != incoming.latch) {
+                continue;
+            }
+            auto step = latch_update_step(phi, incoming);
+            if (!step.has_value() || *step != 1) {
+                continue;
+            }
+            bound_operand = operand_index;
+            peeled_bound = *limit - 1;
+            found_bound = true;
+            return;
+        }
+    };
+    try_match_bound(latch_cmp->lhs(), latch_cmp->rhs(), latch_cmp->pred(), 1);
+    try_match_bound(latch_cmp->rhs(), latch_cmp->lhs(),
+                    swap_unroll_cmp_operands(latch_cmp->pred()), 0);
+    if (!found_bound) {
+        return std::nullopt;
+    }
+
+    oir::CallInst *call = nullptr;
+    for (auto *block : base->blocks) {
+        bool after_call = false;
+        for (const auto &inst : block->instructions()) {
+            if (inst->is_terminator()) {
+                break;
+            }
+            auto *candidate_call = dynamic_cast<oir::CallInst *>(inst.get());
+            if (candidate_call != nullptr) {
+                if (call != nullptr || block != base->latch || candidate_call->use_count() != 0) {
+                    return std::nullopt;
+                }
+                call = candidate_call;
+                after_call = true;
+                continue;
+            }
+            if (after_call && !is_final_peel_post_call_instruction(*inst)) {
+                return std::nullopt;
+            }
+        }
+    }
+    if (call == nullptr) {
+        return std::nullopt;
+    }
+    if (dynamic_cast<oir::Function *>(call->callee()) != &function) {
+        return std::nullopt;
+    }
+
+    return FinalIterationPeelMatch{std::move(*base), call, latch_cmp, bound_operand,
+                                   peeled_bound};
+}
+
+std::optional<UnrolledIteration> clone_final_peel_iteration(
+    oir::Function &function, const MultiBlockUnrollMatch &match, const ValueMap &iteration_map) {
+    BlockMap block_map;
+    ValueMap value_map = iteration_map;
+    UnrolledIteration out;
+    out.blocks.reserve(match.blocks.size());
+
+    for (auto *block : match.blocks) {
+        auto *clone = function.create_block(block->name() + ".peel");
+        block_map[block] = clone;
+        value_map[block] = clone;
+        out.blocks.push_back(clone);
+        if (block == match.header) {
+            out.header = clone;
+        }
+        if (block == match.latch) {
+            out.latch = clone;
+        }
+    }
+
+    for (auto *block : match.blocks) {
+        auto *clone_block = block_map.at(block);
+        for (const auto &inst : block->instructions()) {
+            if (block == match.header && inst->op() == oir::Instruction::OpID::Phi) {
+                continue;
+            }
+            if (block == match.latch && inst->is_terminator()) {
+                break;
+            }
+            auto clone = clone_instruction(*inst, value_map, clone_block, ".peel");
+            if (clone == nullptr) {
+                return std::nullopt;
+            }
+            auto *raw = clone.get();
+            clone_block->append_instruction(std::move(clone));
+            value_map[inst.get()] = raw;
+            if (block == match.latch && inst->op() == oir::Instruction::OpID::Call) {
+                break;
+            }
+        }
+    }
+
+    fix_cloned_operands(out.blocks, value_map);
+    for (auto *block : match.blocks) {
+        auto *clone = block_map.at(block);
+        if (block == match.latch) {
+            continue;
+        }
+        for (auto *succ : block->successors()) {
+            auto found = block_map.find(succ);
+            if (found != block_map.end()) {
+                oir::cfg::add_edge(clone, found->second);
+            }
+        }
+    }
+
+    out.value_map = std::move(value_map);
+    return out;
+}
+
+bool peel_final_iteration_loop(oir::Function &function, const oir::Loop &loop,
+                               const oir::ScalarEvolution &scev, Stats &stats) {
+    constexpr bool kEnableFinalIterationPeel = false;
+    if (!kEnableFinalIterationPeel) {
+        (void)function;
+        (void)loop;
+        (void)scev;
+        (void)stats;
+        return false;
+    }
+
+    auto match = match_final_iteration_peel_loop(function, loop, scev);
+    if (!match.has_value()) {
+        return false;
+    }
+
+    const auto body_instrs = static_cast<std::int64_t>(loop_instruction_count(match->loop.blocks));
+    constexpr std::int64_t kMaxPeeledInstructions = 128;
+    if (body_instrs > kMaxPeeledInstructions) {
+        return false;
+    }
+    if (!cost_model_allows_loop_transform(
+            stats, pass::cost_model::TransformKind::LoopUnroll,
+            "final-peel." + std::to_string(stats.loop_unroll + 1),
+            body_instrs * match->loop.trip_count, body_instrs * match->loop.trip_count + body_instrs,
+            match->loop.trip_count, match->loop.trip_count - 1, body_instrs, 0.72)) {
+        return false;
+    }
+
+    std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> phi_incoming;
+    if (!collect_header_phi_incoming(*match->loop.header, match->loop.preheader,
+                                     match->loop.latch, phi_incoming)) {
+        return false;
+    }
+    ValueMap final_iteration_map;
+    for (const auto &[phi, incoming] : phi_incoming) {
+        final_iteration_map[phi] = incoming.latch;
+    }
+
+    auto peeled = clone_final_peel_iteration(function, match->loop, final_iteration_map);
+    if (!peeled.has_value() || peeled->header == nullptr || peeled->latch == nullptr) {
+        return false;
+    }
+
+    match->latch_cmp->set_operand(
+        match->latch_bound_operand,
+        make_int_constant(*function.parent(), match->latch_cmp->operand(match->latch_bound_operand)->type(),
+                          match->peeled_bound));
+
+    auto *latch_branch = static_cast<oir::BranchInst *>(match->loop.latch->terminator());
+    if (!oir::cfg::replace_branch_target(*latch_branch, match->loop.exit, peeled->header)) {
+        return false;
+    }
+    oir::cfg::remove_edge_no_phi_update(match->loop.latch, match->loop.exit);
+    oir::cfg::add_edge(match->loop.latch, peeled->header);
+    oir::cfg::append_unconditional_branch(*function.parent(), peeled->latch, match->loop.exit);
+    oir::cfg::replace_phi_incoming_block(match->loop.exit, match->loop.latch, peeled->latch);
+
+    ++stats.loop_unroll;
+    ++stats.cfg;
+    return true;
 }
 
 bool is_safely_speculatable_for_unswitch(const oir::Instruction &inst) {
@@ -1833,6 +3223,48 @@ bool unswitch_loops_in_function(oir::Function &function, Stats &stats) {
     return changed;
 }
 
+bool unroll_small_constant_loops_in_function(oir::Function &function, Stats &stats) {
+    bool changed = false;
+    constexpr unsigned kMaxUnrollsPerFunction = 16;
+    for (unsigned iteration = 0; iteration < kMaxUnrollsPerFunction; ++iteration) {
+        oir::DominatorTree dom_tree(function);
+        oir::LoopInfo loop_info(function, dom_tree);
+        oir::ScalarEvolution scev(function, loop_info);
+        auto loops = loop_info.loops();
+        std::sort(loops.begin(), loops.end(), [](const oir::Loop &lhs, const oir::Loop &rhs) {
+            return lhs.blocks.size() < rhs.blocks.size();
+        });
+
+        bool unrolled = false;
+        for (const auto &loop : loops) {
+            if (unroll_single_block_loop(function, loop, scev, stats)) {
+                changed = true;
+                unrolled = true;
+                break;
+            }
+            if (unroll_multi_block_loop(function, loop, scev, stats)) {
+                changed = true;
+                unrolled = true;
+                break;
+            }
+            if (peel_first_iteration_loop(function, loop, scev, stats)) {
+                changed = true;
+                unrolled = true;
+                break;
+            }
+            if (peel_final_iteration_loop(function, loop, scev, stats)) {
+                changed = true;
+                unrolled = true;
+                break;
+            }
+        }
+        if (!unrolled) {
+            break;
+        }
+    }
+    return changed;
+}
+
 bool tighten_guarded_loop_bounds_in_function(oir::Function &function, Stats &stats) {
     bool changed = false;
     constexpr unsigned kMaxTightensPerFunction = 32;
@@ -1883,6 +3315,17 @@ bool unswitch_loops(oir::Module &module, Stats &stats) {
             continue;
         }
         changed |= unswitch_loops_in_function(*function, stats);
+    }
+    return changed;
+}
+
+bool unroll_small_constant_loops(oir::Module &module, Stats &stats) {
+    bool changed = false;
+    for (auto &function : module.functions()) {
+        if (function->is_external() || function->entry_block() == nullptr) {
+            continue;
+        }
+        changed |= unroll_small_constant_loops_in_function(*function, stats);
     }
     return changed;
 }

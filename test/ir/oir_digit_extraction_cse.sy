@@ -1,0 +1,45 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+const int BASE = 16;
+
+int digit(int num, int pos) {
+  int i = 0;
+  while (i < pos) {
+    num = num / BASE;
+    i = i + 1;
+  }
+  return num % BASE;
+}
+
+int repeated_same_digit(int x, int pos) {
+  int a = digit(x, pos);
+  int b = digit(x, pos);
+  return a + b;
+}
+
+int repeated_loaded_digit(int arr[], int idx) {
+  int bucket[16] = {};
+  int first = digit(arr[idx], idx);
+  bucket[first] = first + 1;
+  int second = digit(arr[idx], idx);
+  return bucket[second];
+}
+
+int main() {
+  int data[4] = {12345, 23456, 34567, 45678};
+  return repeated_same_digit(data[0], 2) + repeated_loaded_digit(data, 2);
+}
+
+// OIR-LABEL: define i32 @repeated_same_digit
+// OIR: sdiv i32
+// OIR: srem i32
+// OIR-NOT: sdiv i32
+// OIR-NOT: srem i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @repeated_loaded_digit
+// OIR: sdiv i32
+// OIR: srem i32
+// OIR-NOT: sdiv i32
+// OIR-NOT: srem i32
+// OIR: ret i32

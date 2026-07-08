@@ -57,6 +57,63 @@ int call_escape(int x) {
   return a[0];
 }
 
+int guarded_zero_init(int n, int idx) {
+  int a[4] = {};
+  if (n <= 0) {
+    return 7;
+  }
+  a[idx] = n;
+  return a[0] + a[idx];
+}
+
+int double_guard_zero_init(int n, int m, int idx) {
+  int a[4] = {};
+  if (n <= 0) {
+    return 11;
+  }
+  if (m <= 0) {
+    return 13;
+  }
+  a[idx] = n + m;
+  return a[idx] + a[0];
+}
+
+int full_overwrite_zero_init(int x, int idx) {
+  int a[4] = {};
+  a[0] = x;
+  a[1] = x + 1;
+  a[2] = x + 2;
+  a[3] = x + 3;
+  return a[idx];
+}
+
+int partial_overwrite_keeps_zero(int x, int idx) {
+  int a[4] = {};
+  a[0] = x;
+  return a[idx];
+}
+
+int branch_overwrite_keeps_zero(int c, int x, int idx) {
+  int a[4] = {};
+  if (c != 0) {
+    a[0] = x;
+    a[1] = x + 1;
+    a[2] = x + 2;
+    a[3] = x + 3;
+  }
+  return a[idx];
+}
+
+int call_escape_keeps_zero(int x) {
+  int a[4] = {};
+  a[0] = x;
+  getarray(a);
+  a[1] = x + 1;
+  a[2] = x + 2;
+  a[3] = x + 3;
+  return a[0];
+}
+
 float float_sroa(float x) {
   float a[2];
   a[0] = x;
@@ -74,7 +131,10 @@ int nested_sroa(int x) {
 int main() {
   return sroa_const_indices(4) + zero_init_sroa() + overwrite_same(1, 2) +
          noalias_forward(3, 4) + cross_block_forward(8) + dynamic_skip(1, 5) +
-         branch_noalias_forward(9, 1) + call_escape(6) + nested_sroa(7);
+         branch_noalias_forward(9, 1) + call_escape(6) + guarded_zero_init(3, 1) +
+         double_guard_zero_init(3, 4, 1) + full_overwrite_zero_init(5, 2) +
+         partial_overwrite_keeps_zero(6, 1) + branch_overwrite_keeps_zero(1, 7, 2) +
+         call_escape_keeps_zero(8) + nested_sroa(7);
 }
 
 // OIR-LABEL: define i32 @sroa_const_indices
@@ -120,6 +180,47 @@ int main() {
 // OIR: alloca [2 x i32]
 // OIR: call i32 @getarray
 // OIR: load i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @guarded_zero_init
+// OIR: br i1
+// OIR: ret i32 7
+// OIR-NOT: store [4 x i32] zero
+// OIR: store [4 x i32] zero
+
+// OIR-LABEL: define i32 @double_guard_zero_init
+// OIR: ret i32 11
+// OIR-NOT: store [4 x i32] zero
+// OIR: ret i32 13
+// OIR-NOT: store [4 x i32] zero
+// OIR: store [4 x i32] zero
+
+// OIR-LABEL: define i32 @full_overwrite_zero_init
+// OIR-NOT: store [4 x i32] zero
+// OIR: store i32 %x.arg
+// OIR: store i32
+// OIR: store i32
+// OIR: store i32
+// OIR: load i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @partial_overwrite_keeps_zero
+// OIR: store [4 x i32] zero
+// OIR: store i32 %x.arg
+// OIR: load i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @branch_overwrite_keeps_zero
+// OIR: store [4 x i32] zero
+// OIR: br i1
+// OIR: store i32 %x.arg
+// OIR: load i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @call_escape_keeps_zero
+// OIR: store [4 x i32] zero
+// OIR: store i32 %x.arg
+// OIR: call i32 @getarray
 // OIR: ret i32
 
 // OIR-LABEL: define float @float_sroa

@@ -20,6 +20,47 @@ int dynamic_stride_lsr(int n, int a[], int rows) {
   return 0;
 }
 
+void call_pressure_lsr(int n, int a[]) {
+  int i = 0;
+  while (i < n) {
+    int value = a[i];
+    putint(value);
+    a[i] = value + 1;
+    i = i + 1;
+  }
+}
+
+int stack_call_latch_lsr(int n) {
+  int buf[32];
+  int mirror[32];
+  buf[0] = 1;
+  int i = 1;
+  int acc = 0;
+  while (i < n) {
+    int prev = buf[i - 1];
+    mirror[i] = prev;
+    buf[i] = prev + 1;
+    acc = acc + prev;
+    putint(acc);
+    i = i + 1;
+  }
+  return acc + mirror[i - 1];
+}
+
+int stack_call_latch_dynamic_offset(int n, int base) {
+  int buf[64];
+  buf[base] = base;
+  int i = 1;
+  int acc = 0;
+  while (i < n) {
+    int value = buf[i + base];
+    acc = acc + value;
+    putint(acc);
+    i = i + 1;
+  }
+  return acc;
+}
+
 // OIR-LABEL: define i32 @dynamic_stride_lsr
 // OIR-NOT: mul i32 %j.loop
 // OIR: %a.addr.ptr = phi
@@ -31,3 +72,20 @@ int dynamic_stride_lsr(int n, int a[], int rows) {
 // OIR-NOT: mul i32 %j.loop
 // OIR: %a.addr.next = gep i32* %a.addr.ptr, i32 1
 // OIR-NEXT: %elem.addr.next = gep i32* %elem.addr.ptr, i32 %v0
+
+// OIR-LABEL: define void @call_pressure_lsr
+// OIR-NOT: .ptr = phi
+// OIR: call void @putint
+// OIR-NOT: .ptr = phi
+
+// OIR-LABEL: define i32 @stack_call_latch_lsr
+// OIR: {{.*}}.stack.ptr = phi
+// OIR: {{.*}}.stack.ptr = phi
+// OIR: load i32, i32* %{{.*}}.stack.ptr
+// OIR: call void @putint
+// OIR: {{.*}}.stack.next = gep
+
+// OIR-LABEL: define i32 @stack_call_latch_dynamic_offset
+// OIR-NOT: .stack.ptr
+// OIR: call void @putint
+// OIR-NOT: .stack.ptr

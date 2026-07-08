@@ -195,6 +195,12 @@ bool has_disjoint_constant_index(const std::vector<const Value *> &lhs,
     return false;
 }
 
+bool is_argument_or_distinct_object(const Value *value) {
+    return dynamic_cast<const Argument *>(value) != nullptr ||
+           dynamic_cast<const AllocaInst *>(value) != nullptr ||
+           dynamic_cast<const GlobalVariable *>(value) != nullptr;
+}
+
 } // namespace
 
 UseAnalysis::UseAnalysis(Function &function) {
@@ -844,7 +850,24 @@ SCEVExpr ScalarEvolution::try_add_rec(
 }
 
 std::optional<std::int64_t> ScalarEvolution::constant_expr_value(const SCEVExpr &expr) const {
-    return expr.constant_value();
+    if (auto constant = expr.constant_value()) {
+        return constant;
+    }
+    if (expr.kind() == SCEVKind::Add && expr.lhs() != nullptr && expr.rhs() != nullptr) {
+        auto lhs = constant_expr_value(*expr.lhs());
+        auto rhs = constant_expr_value(*expr.rhs());
+        if (lhs.has_value() && rhs.has_value()) {
+            return static_cast<std::int32_t>(*lhs + *rhs);
+        }
+    }
+    if (expr.kind() == SCEVKind::Mul && expr.lhs() != nullptr && expr.rhs() != nullptr) {
+        auto lhs = constant_expr_value(*expr.lhs());
+        auto rhs = constant_expr_value(*expr.rhs());
+        if (lhs.has_value() && rhs.has_value()) {
+            return static_cast<std::int32_t>(*lhs * *rhs);
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<std::int64_t> ScalarEvolution::constant_trip_count(const Loop &loop) const {
@@ -860,19 +883,49 @@ std::optional<std::int64_t> ScalarEvolution::constant_trip_count(const Loop &loo
     auto lhs = expression_for(cmp->lhs(), &loop);
     auto rhs = expression_for(cmp->rhs(), &loop);
 
+    struct LinearAddRec {
+        std::int64_t start = 0;
+        std::int64_t step = 0;
+    };
+
+    auto linear_add_rec = [&](const SCEVExpr &expr,
+                              const auto &self) -> std::optional<LinearAddRec> {
+        if (expr.kind() == SCEVKind::AddRec && expr.lhs() != nullptr &&
+            expr.rhs() != nullptr) {
+            auto start = constant_expr_value(*expr.lhs());
+            auto step = constant_expr_value(*expr.rhs());
+            if (start.has_value() && step.has_value()) {
+                return LinearAddRec{*start, *step};
+            }
+            return std::nullopt;
+        }
+
+        if (expr.kind() != SCEVKind::Add || expr.lhs() == nullptr || expr.rhs() == nullptr) {
+            return std::nullopt;
+        }
+        if (auto lhs_rec = self(*expr.lhs(), self)) {
+            if (auto rhs_constant = constant_expr_value(*expr.rhs())) {
+                lhs_rec->start = static_cast<std::int32_t>(lhs_rec->start + *rhs_constant);
+                return lhs_rec;
+            }
+        }
+        if (auto rhs_rec = self(*expr.rhs(), self)) {
+            if (auto lhs_constant = constant_expr_value(*expr.lhs())) {
+                rhs_rec->start = static_cast<std::int32_t>(rhs_rec->start + *lhs_constant);
+                return rhs_rec;
+            }
+        }
+        return std::nullopt;
+    };
+
     auto count_from = [&](const SCEVExpr &add_rec, const SCEVExpr &bound,
                           CmpPred pred) -> std::optional<std::int64_t> {
-        if (add_rec.kind() != SCEVKind::AddRec || add_rec.lhs() == nullptr ||
-            add_rec.rhs() == nullptr) {
-            return std::nullopt;
-        }
-        auto start = constant_expr_value(*add_rec.lhs());
-        auto step = constant_expr_value(*add_rec.rhs());
+        auto rec = linear_add_rec(add_rec, linear_add_rec);
         auto limit = constant_expr_value(bound);
-        if (!start.has_value() || !step.has_value() || !limit.has_value()) {
+        if (!rec.has_value() || !limit.has_value()) {
             return std::nullopt;
         }
-        return trip_count_for(*start, *limit, *step, pred);
+        return trip_count_for(rec->start, *limit, rec->step, pred);
     };
 
     if (auto count = count_from(lhs, rhs, cmp->pred())) {
@@ -920,6 +973,16 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
     auto path_b = collect_pointer_path(b);
     auto *root_a = loc_a.base != nullptr ? loc_a.base : underlying_object(path_a.root);
     auto *root_b = loc_b.base != nullptr ? loc_b.base : underlying_object(path_b.root);
+
+    const bool a_is_stack_object = dynamic_cast<const AllocaInst *>(root_a) != nullptr;
+    const bool b_is_stack_object = dynamic_cast<const AllocaInst *>(root_b) != nullptr;
+    const auto *known_root_a = root_a != nullptr ? root_a : path_a.root;
+    const auto *known_root_b = root_b != nullptr ? root_b : path_b.root;
+    if (root_a != root_b &&
+        ((a_is_stack_object && is_argument_or_distinct_object(known_root_b)) ||
+         (b_is_stack_object && is_argument_or_distinct_object(known_root_a)))) {
+        return AliasResult::NoAlias;
+    }
 
     if (path_a.root != nullptr && path_a.root == path_b.root) {
         if (same_index_path(path_a.indices, path_b.indices)) {

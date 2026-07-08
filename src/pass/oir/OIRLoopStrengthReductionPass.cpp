@@ -38,6 +38,15 @@ struct GEPCandidate {
     int index_offset_value_sign = 1;
 };
 
+struct GEPCandidateGroup {
+    oir::AllocaInst *alloca = nullptr;
+    oir::PhiInst *induction_phi = nullptr;
+    oir::Value *base_ptr = nullptr;
+    std::size_t index_pos = 0;
+    std::int64_t pointer_step = 0;
+    std::vector<GEPCandidate> candidates;
+};
+
 bool contains_block(const oir::Loop &loop, const oir::BasicBlock *block) {
     return std::find(loop.blocks.begin(), loop.blocks.end(), block) != loop.blocks.end();
 }
@@ -70,6 +79,71 @@ oir::BasicBlock *single_latch(const oir::Loop &loop) {
 bool value_defined_in_loop(oir::Value *value, const oir::Loop &loop) {
     auto *inst = dynamic_cast<oir::Instruction *>(value);
     return inst != nullptr && contains_block(loop, inst->parent());
+}
+
+oir::AllocaInst *underlying_alloca(oir::Value *value) {
+    std::unordered_set<oir::Value *> seen;
+    auto *current = value;
+    while (current != nullptr && seen.insert(current).second) {
+        if (auto *alloca = dynamic_cast<oir::AllocaInst *>(current)) {
+            return alloca;
+        }
+        auto *gep = dynamic_cast<oir::GetElementPtrInst *>(current);
+        if (gep == nullptr) {
+            return nullptr;
+        }
+        current = gep->base_ptr();
+    }
+    return nullptr;
+}
+
+bool stack_object_is_non_escaping_impl(oir::Value *value, std::unordered_set<oir::Value *> &seen) {
+    if (value == nullptr || !seen.insert(value).second) {
+        return true;
+    }
+    for (auto *user : value->users()) {
+        auto *inst = dynamic_cast<oir::Instruction *>(user);
+        if (inst == nullptr) {
+            return false;
+        }
+        if (auto *gep = dynamic_cast<oir::GetElementPtrInst *>(inst)) {
+            if (gep->base_ptr() != value || !stack_object_is_non_escaping_impl(gep, seen)) {
+                return false;
+            }
+            continue;
+        }
+        if (dynamic_cast<oir::PhiInst *>(inst) != nullptr) {
+            if (!stack_object_is_non_escaping_impl(inst, seen)) {
+                return false;
+            }
+            continue;
+        }
+        if (auto *load = dynamic_cast<oir::LoadInst *>(inst)) {
+            if (load->ptr() == value) {
+                continue;
+            }
+            return false;
+        }
+        if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
+            if (store->ptr() == value && store->value() != value) {
+                continue;
+            }
+            return false;
+        }
+        if (auto *memzero = dynamic_cast<oir::MemZeroInst *>(inst)) {
+            if (memzero->ptr() == value) {
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool stack_object_is_non_escaping(oir::AllocaInst *alloca) {
+    std::unordered_set<oir::Value *> seen;
+    return stack_object_is_non_escaping_impl(alloca, seen);
 }
 
 std::optional<std::int64_t> constant_int(oir::Value *value) {
@@ -410,6 +484,140 @@ collect_candidates(const oir::Loop &loop, const std::vector<InductionInfo> &indu
     return candidates;
 }
 
+bool latch_has_call_before_terminator(const oir::BasicBlock &latch) {
+    for (const auto &inst : latch.instructions()) {
+        if (inst->is_terminator()) {
+            return false;
+        }
+        if (inst->op() == oir::Instruction::OpID::Call) {
+            return true;
+        }
+    }
+    return false;
+}
+
+oir::CallInst *first_call_before_terminator(oir::BasicBlock *block) {
+    for (const auto &inst : block->instructions()) {
+        if (inst->is_terminator()) {
+            return nullptr;
+        }
+        if (auto *call = dynamic_cast<oir::CallInst *>(inst.get())) {
+            return call;
+        }
+    }
+    return nullptr;
+}
+
+bool instruction_precedes_in_block(const oir::Instruction *candidate,
+                                   const oir::Instruction *limit) {
+    if (candidate == nullptr || limit == nullptr || candidate->parent() != limit->parent()) {
+        return false;
+    }
+    for (const auto &inst : candidate->parent()->instructions()) {
+        if (inst.get() == limit) {
+            return false;
+        }
+        if (inst.get() == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool gep_loop_uses_precede_call(const GEPCandidate &candidate, const oir::Loop &loop,
+                                const oir::CallInst *call) {
+    if (!instruction_precedes_in_block(candidate.gep, call)) {
+        return false;
+    }
+    for (auto *user : candidate.gep->users()) {
+        auto *inst = dynamic_cast<oir::Instruction *>(user);
+        if (inst == nullptr || !contains_block(loop, inst->parent())) {
+            return false;
+        }
+        if (!instruction_precedes_in_block(inst, call)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool candidate_is_stack_call_lsr_safe(const GEPCandidate &candidate, const oir::Loop &loop,
+                                      const oir::CallInst *call,
+                                      std::unordered_map<oir::AllocaInst *, bool> &escape_cache,
+                                      oir::AllocaInst *&alloca) {
+    alloca = underlying_alloca(candidate.gep->base_ptr());
+    if (alloca == nullptr) {
+        return false;
+    }
+    auto [escape_it, inserted] = escape_cache.emplace(alloca, false);
+    if (inserted) {
+        escape_it->second = stack_object_is_non_escaping(alloca);
+    }
+    if (!escape_it->second) {
+        return false;
+    }
+    if (candidate.pointer_step_value != nullptr || candidate.index_scale_value != nullptr ||
+        candidate.index_offset_value != nullptr || candidate.index_scale != 1) {
+        return false;
+    }
+    constexpr std::int64_t kMaxStackPointerStep = 8;
+    if (candidate.pointer_step < -kMaxStackPointerStep ||
+        candidate.pointer_step > kMaxStackPointerStep) {
+        return false;
+    }
+    return gep_loop_uses_precede_call(candidate, loop, call);
+}
+
+std::vector<GEPCandidateGroup>
+group_stack_call_lsr_candidates(const oir::Loop &loop, oir::BasicBlock *latch,
+                                const std::vector<GEPCandidate> &candidates) {
+    std::vector<GEPCandidateGroup> groups;
+    auto *call = first_call_before_terminator(latch);
+    if (call == nullptr) {
+        return groups;
+    }
+
+    std::unordered_map<oir::AllocaInst *, bool> escape_cache;
+    for (const auto &candidate : candidates) {
+        oir::AllocaInst *alloca = nullptr;
+        if (!candidate_is_stack_call_lsr_safe(candidate, loop, call, escape_cache, alloca)) {
+            continue;
+        }
+
+        auto found = std::find_if(groups.begin(), groups.end(), [&](const GEPCandidateGroup &g) {
+            return g.alloca == alloca && g.induction_phi == candidate.induction.phi &&
+                   g.base_ptr == candidate.gep->base_ptr() && g.index_pos == candidate.index_pos &&
+                   g.pointer_step == candidate.pointer_step;
+        });
+        if (found == groups.end()) {
+            groups.push_back(
+                GEPCandidateGroup{alloca, candidate.induction.phi, candidate.gep->base_ptr(),
+                                  candidate.index_pos, candidate.pointer_step, {candidate}});
+        } else {
+            found->candidates.push_back(candidate);
+        }
+    }
+
+    constexpr std::size_t kMaxStackCallPointerPhis = 4;
+    if (groups.size() > kMaxStackCallPointerPhis) {
+        groups.clear();
+    }
+    return groups;
+}
+
+oir::Instruction *insert_before_instruction(oir::BasicBlock *block, oir::Instruction *before,
+                                            std::unique_ptr<oir::Instruction> inst) {
+    auto *raw = inst.get();
+    raw->set_parent(block);
+    for (auto it = block->instructions().begin(); it != block->instructions().end(); ++it) {
+        if (it->get() == before) {
+            block->instructions().insert(it, std::move(inst));
+            return raw;
+        }
+    }
+    return block->insert_before_terminator(std::move(inst));
+}
+
 std::string lsr_name(const oir::GetElementPtrInst &gep, const char *suffix) {
     const std::string base = gep.name().empty() ? "gep" : gep.name();
     return base + suffix;
@@ -515,6 +723,69 @@ bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preh
     return apply_replacements(module, replacements) != 0;
 }
 
+bool apply_stack_call_lsr(oir::Module &module, oir::BasicBlock *preheader,
+                          oir::BasicBlock *latch,
+                          const std::vector<GEPCandidateGroup> &groups, Stats &stats) {
+    if (groups.empty()) {
+        return false;
+    }
+
+    ReplacementMap replacements;
+    auto *header = latch;
+    for (const auto &group : groups) {
+        if (group.candidates.empty()) {
+            continue;
+        }
+
+        auto base_candidate = group.candidates.front();
+        for (const auto &candidate : group.candidates) {
+            if (candidate.index_offset < base_candidate.index_offset) {
+                base_candidate = candidate;
+            }
+        }
+
+        auto start_indices = base_candidate.gep->indices();
+        start_indices[base_candidate.index_pos] =
+            materialize_start_index(module, preheader, base_candidate);
+        auto *start_ptr = static_cast<oir::GetElementPtrInst *>(
+            preheader->insert_before_terminator(std::make_unique<oir::GetElementPtrInst>(
+                base_candidate.gep->type(), base_candidate.gep->base_ptr(), start_indices,
+                preheader, lsr_name(*base_candidate.gep, ".start"))));
+
+        auto *phi =
+            insert_pointer_phi(header, base_candidate.gep->type(),
+                               lsr_name(*base_candidate.gep, ".stack.ptr"));
+        phi->add_incoming(start_ptr, preheader);
+
+        auto *step = materialize_pointer_step(module, preheader, base_candidate);
+        auto *next = static_cast<oir::GetElementPtrInst *>(
+            latch->insert_before_terminator(std::make_unique<oir::GetElementPtrInst>(
+                base_candidate.gep->type(), phi, std::vector<oir::Value *>{step}, latch,
+                lsr_name(*base_candidate.gep, ".stack.next"))));
+        phi->add_incoming(next, latch);
+
+        for (const auto &candidate : group.candidates) {
+            const auto offset_delta = candidate.index_offset - base_candidate.index_offset;
+            if (offset_delta == 0) {
+                replacements[candidate.gep] = phi;
+                continue;
+            }
+            auto *offset_ptr = insert_before_instruction(
+                candidate.gep->parent(), candidate.gep,
+                std::make_unique<oir::GetElementPtrInst>(
+                    candidate.gep->type(), phi,
+                    std::vector<oir::Value *>{
+                        make_int_constant(module, module.types().int32_ty(), offset_delta)},
+                    candidate.gep->parent(), lsr_name(*candidate.gep, ".stack.off")));
+            replacements[candidate.gep] = offset_ptr;
+        }
+
+        ++stats.lsr;
+    }
+
+    return apply_replacements(module, replacements) != 0;
+}
+
 bool run_on_loop(oir::Module &module, const oir::Loop &loop, Stats &stats) {
     auto *preheader = find_preheader(loop);
     auto *latch = single_latch(loop);
@@ -528,6 +799,13 @@ bool run_on_loop(oir::Module &module, const oir::Loop &loop, Stats &stats) {
     }
 
     auto candidates = collect_candidates(loop, inductions);
+    if (latch_has_call_before_terminator(*latch)) {
+        if (mutable_block(loop.header) != latch) {
+            return false;
+        }
+        auto groups = group_stack_call_lsr_candidates(loop, latch, candidates);
+        return apply_stack_call_lsr(module, preheader, latch, groups, stats);
+    }
     return apply_lsr(module, loop, preheader, latch, candidates, stats);
 }
 

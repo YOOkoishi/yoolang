@@ -1,6 +1,7 @@
 // RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
 // RUN: %compiler --emit-cost-model --cost-model-filter=LoopRotate -O1 %s | FileCheck %s --check-prefix=COST-ROTATE
 // RUN: %compiler --emit-cost-model --cost-model-filter=LoopUnswitch -O1 %s | FileCheck %s --check-prefix=COST-UNSWITCH
+// RUN: %compiler --emit-cost-model --cost-model-filter=LoopUnroll -O1 %s | FileCheck %s --check-prefix=COST-UNROLL
 
 int rotated_sum(int n) {
   int i = 0;
@@ -26,8 +27,146 @@ int unswitch_sum(int n, int flag) {
   return sum;
 }
 
+int unroll_sum4(int x) {
+  int i = 0;
+  int sum = x;
+  while (i < 4) {
+    sum = sum + i;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int unroll_multiblock_if4(int x) {
+  int i = 0;
+  int sum = 0;
+  while (i < 4) {
+    if (x > i) {
+      sum = sum + x;
+    }
+    sum = sum + i;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int no_unroll_side_exit(int n) {
+  int i = 0;
+  int sum = 0;
+  while (i < 4) {
+    putint(i);
+    if (i == n) {
+      return sum;
+    }
+    sum = sum + i;
+    i = i + 1;
+  }
+  return sum;
+}
+
+void final_peel_tail_loop(int depth, int data[]) {
+  if (depth <= 0) {
+    return;
+  }
+  if (data[0] == depth) {
+    data[0] = data[0] + depth;
+    data[1] = data[1] + depth;
+    data[2] = data[2] + depth;
+    data[3] = data[3] + depth;
+    data[0] = data[0] + data[1];
+    data[1] = data[1] + data[2];
+    data[2] = data[2] + data[3];
+    data[3] = data[3] + data[0];
+  }
+  int i = 0;
+  while (i < 4) {
+    if (i > 0) {
+      data[i] = data[i - 1] + 1;
+    }
+    final_peel_tail_loop(depth - 1, data);
+    i = i + 1;
+  }
+}
+
+void no_full_unroll_call_loop(int data[]) {
+  int i = 0;
+  while (i < 4) {
+    if (i > 0) {
+      data[i] = data[i - 1] + 1;
+      putint(data[i]);
+    }
+    putint(i);
+    i = i + 1;
+  }
+}
+
+void no_first_peel_side_exit(int n, int data[]) {
+  int i = 0;
+  while (i < 4) {
+    if (i == n) {
+      return;
+    }
+    if (i > 0) {
+      data[i] = data[i - 1] + 1;
+    }
+    putint(i);
+    i = i + 1;
+  }
+}
+
+void no_first_peel_unknown_trip(int n, int data[]) {
+  int i = 0;
+  while (i < n) {
+    if (i > 0) {
+      data[i] = data[i - 1] + 1;
+    }
+    putint(i);
+    i = i + 1;
+  }
+}
+
+int no_first_peel_exit_value(int n, int data[]) {
+  int i = 0;
+  int last = 0;
+  while (i < 4) {
+    if (i > 0) {
+      last = data[i - 1];
+    }
+    putint(i);
+    if (data[i] == n) {
+      break;
+    }
+    last = last + i;
+    i = i + 1;
+  }
+  return last;
+}
+
+void no_first_peel_nested_control(int n, int data[]) {
+  int i = 0;
+  while (i < 4) {
+    int j = 0;
+    while (j < n) {
+      putint(j);
+      j = j + 1;
+    }
+    if (i > 0) {
+      data[i] = data[i - 1] + 1;
+    }
+    putint(i);
+    i = i + 1;
+  }
+}
+
 int main() {
-  return rotated_sum(5) + unswitch_sum(4, 1);
+  int data[4];
+  final_peel_tail_loop(2, data);
+  no_full_unroll_call_loop(data);
+  no_first_peel_side_exit(3, data);
+  no_first_peel_unknown_trip(4, data);
+  no_first_peel_nested_control(2, data);
+  return rotated_sum(5) + unswitch_sum(4, 1) + unroll_sum4(7) +
+         unroll_multiblock_if4(3) + no_first_peel_exit_value(9, data);
 }
 
 // OIR-LABEL: define i32 @rotated_sum
@@ -37,13 +176,57 @@ int main() {
 
 // OIR-LABEL: define i32 @unswitch_sum
 // OIR: br i1
-// OIR-NOT: usw.
-// OIR: %sum.phi = phi
+// OIR: usw.
+// OIR: %sum.loop = phi
+
+// OIR-LABEL: define i32 @unroll_sum4
+// OIR: .unr
+// OIR-NOT: %i.loop = phi
+
+// OIR-LABEL: define i32 @unroll_multiblock_if4
+// OIR: .unr
+// OIR-NOT: %i.loop = phi
+
+// OIR-LABEL: define i32 @no_unroll_side_exit
+// OIR-NOT: .unr
+// OIR: call void @putint
+// OIR: br i1
+
+// OIR-LABEL: define void @final_peel_tail_loop
+// OIR-NOT: .peel
+
+// OIR-LABEL: define void @no_full_unroll_call_loop
+// OIR-NOT: .peel.first
+// OIR: %i.loop = phi [0, %entry.0]
+// OIR: icmp gt i32 %i.loop, 0
+// OIR: call void @putint(i32 %i.loop)
+// OIR-NOT: .unr
+
+// OIR-LABEL: define void @no_first_peel_side_exit
+// OIR-NOT: .peel.first
+// OIR: ret void
+
+// OIR-LABEL: define void @no_first_peel_unknown_trip
+// OIR-NOT: .peel.first
+// OIR: ret void
+
+// OIR-LABEL: define i32 @no_first_peel_exit_value
+// OIR-NOT: .peel.first
+// OIR: ret i32
+
+// OIR-LABEL: define void @no_first_peel_nested_control
+// OIR-NOT: .peel.first
+// OIR: ret void
 
 // COST-ROTATE: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopRotate
 // COST-ROTATE: [cost-model] OIRLoopTransforms BypassProfitability transform=LoopRotate
 // COST-ROTATE: reason=AlwaysOnCanonicalization
 
 // COST-UNSWITCH: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopUnswitch
-// COST-UNSWITCH: [cost-model] OIRLoopTransforms Reject transform=LoopUnswitch
-// COST-UNSWITCH: reason=CodeGrowthTooHigh
+// COST-UNSWITCH: [cost-model] OIRLoopTransforms BypassProfitability transform=LoopUnswitch
+// COST-UNSWITCH: reason=LoopInvariantBranch
+
+// COST-UNROLL: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopUnroll
+// COST-UNROLL: [cost-model] OIRLoopTransforms BypassProfitability transform=LoopUnroll
+// COST-UNROLL: reason=ExactSmallTripCount
+// COST-UNROLL-NOT: ExactFirstIterationPeel

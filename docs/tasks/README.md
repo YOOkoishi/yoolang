@@ -18,6 +18,8 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [Radix General Optimizations](2026-07-08-radix-general-opts.md) | blocked | `task/oir-digit-extraction-cse` | 2026-07-08 |
+| [OIR Digit Extraction CSE](2026-07-08-oir-digit-extraction-cse.md) | ready_for_review | `task/oir-digit-extraction-cse` | 2026-07-08 |
 | [Performance Optimization Opportunity Audit](2026-07-08-performance-optimization-audit.md) | ready_for_review | `not used` | 2026-07-08 |
 | [SMT Solver](2026-07-07-smt-solver.md) | ready_for_review | `task/smt-solver` | 2026-07-07 |
 | [Cost Model Rejection Recovery](2026-07-07-cost-model-rejection-recovery.md) | ready_for_review | `task/cost-model-rejection-recovery` | 2026-07-07 |

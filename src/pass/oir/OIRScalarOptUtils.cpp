@@ -9,7 +9,7 @@ namespace pass::oir_opt {
 bool Stats::changed() const {
     return folded != 0 || sccp != 0 || branches != 0 || dce != 0 || cfg != 0 || gvn != 0 ||
            mem2reg != 0 || licm != 0 || loop_rotate != 0 || loop_unswitch != 0 ||
-           inlined != 0 || globals != 0 || tail_recursion != 0 || lsr != 0 ||
+           loop_unroll != 0 || inlined != 0 || globals != 0 || tail_recursion != 0 || lsr != 0 ||
            loop_canonicalize != 0 || sroa != 0 || dse != 0 || dle != 0 || adce != 0 ||
            jump_threading != 0 || dae != 0 || memzero != 0 ||
            loop_bound_tighten != 0 || specialized != 0;
@@ -20,6 +20,7 @@ std::string Stats::message() const {
     oss << "folded=" << folded << " sccp=" << sccp << " branches=" << branches << " dce=" << dce
         << " cfg=" << cfg << " gvn=" << gvn << " mem2reg=" << mem2reg << " licm=" << licm
         << " rotate=" << loop_rotate << " unswitch=" << loop_unswitch
+        << " unroll=" << loop_unroll
         << " inlined=" << inlined << " globals=" << globals
         << " tailrec=" << tail_recursion << " lsr=" << lsr
         << " loopcanon=" << loop_canonicalize << " sroa=" << sroa << " dse=" << dse

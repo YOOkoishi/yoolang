@@ -84,6 +84,7 @@ void AsmPrinter::print_global(const Global &global) {
 
 void AsmPrinter::print_function(const MachineFunction &function) {
     current_function_ = &function;
+    compute_stack_addr_facts(function);
     out_ << "\t.align 1\n";
     out_ << "\t.globl " << symbol_name(function.name()) << "\n";
     out_ << "\t.type " << symbol_name(function.name()) << ", @function\n";
@@ -103,6 +104,7 @@ void AsmPrinter::print_function(const MachineFunction &function) {
 
     for (const auto &block : function.blocks()) {
         out_ << label_for(function.name(), block->name()) << ":\n";
+        known_stack_addr_offsets_ = stack_addr_block_in_[block.get()];
         for (const auto &instr : block->instructions()) {
             print_instr(function, instr);
         }
@@ -112,6 +114,113 @@ void AsmPrinter::print_function(const MachineFunction &function) {
     out_ << "\t.size " << symbol_name(function.name()) << ", .-" << symbol_name(function.name())
          << "\n";
     current_function_ = nullptr;
+    stack_addr_block_in_.clear();
+    known_stack_addr_offsets_.clear();
+}
+
+void AsmPrinter::update_stack_addr_facts(
+    const MachineFunction &function, const MachineInstr &instr,
+    std::unordered_map<std::string, std::int64_t> &facts) const {
+    if (instr.opcode() == Opcode::Call) {
+        facts.clear();
+        return;
+    }
+
+    if (instr.opcode() == Opcode::MemZero) {
+        invalidate_memzero_stack_addr_facts(instr, facts);
+        return;
+    }
+
+    if (instr.opcode() != Opcode::LoadStackAddr) {
+        for (const auto &reg : instr.defs()) {
+            if (reg.is_physical()) {
+                facts.erase(reg.name);
+            }
+        }
+        return;
+    }
+
+    const auto &ops = instr.operands();
+    if (ops.size() >= 2) {
+        facts[ops[0].string_value()] = function.stack_slot(ops[1].slot_id())->offset;
+    }
+}
+
+void AsmPrinter::invalidate_memzero_stack_addr_facts(
+    const MachineInstr &instr, std::unordered_map<std::string, std::int64_t> &facts) const {
+    const auto &ops = instr.operands();
+    if (ops.size() < 3) {
+        return;
+    }
+
+    const auto &byte_value = ops[1];
+    const auto &byte_count = ops[2];
+    if (byte_count.kind() == OperandKind::Imm &&
+        byte_count.int_value() >= kMemZeroMemsetThresholdBytes) {
+        facts.clear();
+        return;
+    }
+
+    if (byte_value.kind() == OperandKind::Imm && byte_value.int_value() != 0) {
+        facts.erase("t3");
+    }
+    facts.erase("t4");
+    facts.erase("t5");
+}
+
+void AsmPrinter::compute_stack_addr_facts(const MachineFunction &function) {
+    stack_addr_block_in_.clear();
+    std::unordered_map<const MachineBasicBlock *,
+                       std::unordered_map<std::string, std::int64_t>>
+        block_out;
+
+    for (const auto &block : function.blocks()) {
+        stack_addr_block_in_[block.get()] = {};
+        block_out[block.get()] = {};
+    }
+
+    auto intersect_facts =
+        [](const std::unordered_map<std::string, std::int64_t> &lhs,
+           const std::unordered_map<std::string, std::int64_t> &rhs) {
+            std::unordered_map<std::string, std::int64_t> out;
+            for (const auto &[reg, offset] : lhs) {
+                auto found = rhs.find(reg);
+                if (found != rhs.end() && found->second == offset) {
+                    out[reg] = offset;
+                }
+            }
+            return out;
+        };
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto &block_ptr : function.blocks()) {
+            auto *block = block_ptr.get();
+            std::unordered_map<std::string, std::int64_t> in;
+            const auto &preds = block->predecessors();
+            if (!preds.empty()) {
+                in = block_out[preds.front()];
+                for (std::size_t i = 1; i < preds.size(); ++i) {
+                    in = intersect_facts(in, block_out[preds[i]]);
+                }
+            }
+
+            if (stack_addr_block_in_[block] != in) {
+                stack_addr_block_in_[block] = in;
+                changed = true;
+            }
+
+            auto out = in;
+            for (const auto &instr : block->instructions()) {
+                update_stack_addr_facts(function, instr, out);
+            }
+            if (block_out[block] != out) {
+                block_out[block] = std::move(out);
+                changed = true;
+            }
+        }
+    }
 }
 
 void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr &instr) {
@@ -346,6 +455,7 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
         out_ << "\tcall " << symbol_name(ops[0].string_value()) << "\n";
         break;
     }
+    update_stack_addr_facts(function, instr, known_stack_addr_offsets_);
 }
 
 void AsmPrinter::print_epilogue(const MachineFunction &function) {
@@ -460,12 +570,49 @@ void AsmPrinter::emit_memzero(const MachineOperand &addr, const MachineOperand &
         if (size == 0) {
             return;
         }
+        const auto known_stack_addr = known_stack_addr_offsets_.find(addr.string_value());
+        const bool prefer_wide_zero_stores =
+            known_stack_addr != known_stack_addr_offsets_.end() && known_stack_addr->second % 8 == 0;
+        if (emit_inline_memzero_stores(addr.string_value(), byte_value, size,
+                                       prefer_wide_zero_stores)) {
+            return;
+        }
         if (byte_count.int_value() >= kMemZeroMemsetThresholdBytes) {
             emit_memset_call(addr.string_value(), byte_value, size);
             return;
         }
     }
     emit_memzero_loop(addr.string_value(), byte_value, byte_count);
+}
+
+bool AsmPrinter::emit_inline_memzero_stores(const std::string &addr_reg,
+                                            const MachineOperand &byte_value,
+                                            std::uint64_t size,
+                                            bool prefer_wide_zero_stores) {
+    constexpr std::uint64_t kMaxInlineStoreBytes = 64;
+    if (size > kMaxInlineStoreBytes || size % 4 != 0) {
+        return false;
+    }
+    if (byte_value.kind() != OperandKind::Imm) {
+        return false;
+    }
+
+    const bool stores_zero = byte_value.int_value() == 0;
+    if (stores_zero && prefer_wide_zero_stores && size % 8 == 0) {
+        for (std::uint64_t offset = 0; offset < size; offset += 8) {
+            out_ << "\tsd zero, " << offset << "(" << addr_reg << ")\n";
+        }
+        return true;
+    }
+
+    const std::string value_reg = stores_zero ? "zero" : (addr_reg == "t3" ? "t4" : "t3");
+    if (!stores_zero) {
+        out_ << "\tli " << value_reg << ", " << repeated_byte_word(byte_value.int_value()) << "\n";
+    }
+    for (std::uint64_t offset = 0; offset < size; offset += 4) {
+        out_ << "\tsw " << value_reg << ", " << offset << "(" << addr_reg << ")\n";
+    }
+    return true;
 }
 
 void AsmPrinter::emit_memset_call(const std::string &addr_reg, const MachineOperand &byte_value,

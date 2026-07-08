@@ -43,6 +43,10 @@ int nonnegative_divrem(int x) {
   return x / 8 + x % 16;
 }
 
+int signed_rem_pow2(int x) {
+  return x % 16;
+}
+
 int parity_branch(int x) {
   if (x % 2 == 0) {
     return 3;
@@ -70,10 +74,47 @@ int phi_shuffle(int n) {
   return a + b;
 }
 
+int stack_zero64() {
+  int data[16] = {};
+  putarray(16, data);
+  return data[0];
+}
+
+int stack_zero_after_nonzero_fill(int x) {
+  int first[16];
+  int second[16] = {};
+  int i = 0;
+  while (i < 16) {
+    first[i] = -1;
+    i = i + 1;
+  }
+  return second[x % 16] + first[x % 16];
+}
+
+int stack_zero_after_large_memset(int x) {
+  int large[80] = {};
+  putarray(80, large);
+  int small[16] = {};
+  return small[x % 16];
+}
+
+int stack_zero_merge_disagreement(int flag, int x) {
+  int first[16] = {};
+  int second[16] = {};
+  if (flag != 0) {
+    putarray(16, first);
+  } else {
+    putarray(16, second);
+  }
+  return first[x % 16] + second[x % 16];
+}
+
 int main() {
   return cmp_lt(1, 2) + cmp_eq(3, 3) + nonnegative_divrem(32) +
          cmp_ge_const(1235) + cmp_ne_zero(9) +
-         parity_branch(9) + address_offset_fold(7) + phi_shuffle(4);
+         signed_rem_pow2(-31) + parity_branch(9) + address_offset_fold(7) +
+         phi_shuffle(4) + stack_zero64() + stack_zero_after_nonzero_fill(5) +
+         stack_zero_after_large_memset(3) + stack_zero_merge_disagreement(1, 7);
 }
 
 // MIR-O1-LABEL: func @cmp_lt
@@ -104,6 +145,14 @@ int main() {
 // MIR-O1: ANDI {{.*}}, 15
 // MIR-O1: SRAIW {{.*}}, 3
 
+// MIR-O1-LABEL: func @signed_rem_pow2
+// MIR-O1: SRAIW {{.*}}, 31
+// MIR-O1: SRLIW {{.*}}, 28
+// MIR-O1: ADDW
+// MIR-O1: ANDI {{.*}}, 15
+// MIR-O1: SUBW
+// MIR-O1-NOT: SLLIW
+
 // MIR-O1-LABEL: func @parity_branch
 // MIR-O1-NOT: SRAIW
 // MIR-O1: ANDI {{.*}}, 1
@@ -129,6 +178,22 @@ int main() {
 // MIR-O1-NOT: J %while.end.3
 // MIR-O1: while.end.3:
 
+// MIR-O1-LABEL: func @stack_zero64
+// MIR-O1: MEMZERO {{.*}}, 0, 64
+
+// MIR-O1-LABEL: func @stack_zero_after_nonzero_fill
+// MIR-O1: MEMZERO {{.*}}, 255, 64
+// MIR-O1: MEMZERO {{.*}}, 0, 64
+
+// MIR-O1-LABEL: func @stack_zero_after_large_memset
+// MIR-O1: MEMZERO {{.*}}, 0, 320
+// MIR-O1: CALL putarray
+// MIR-O1: MEMZERO {{.*}}, 0, 64
+
+// MIR-O1-LABEL: func @stack_zero_merge_disagreement
+// MIR-O1: MEMZERO {{.*}}, 0, 64
+// MIR-O1: MEMZERO {{.*}}, 0, 64
+
 // ASM-LABEL: cmp_lt:
 // ASM: bge
 // ASM-LABEL: cmp_eq:
@@ -147,6 +212,13 @@ int main() {
 // ASM-LABEL: nonnegative_divrem:
 // ASM: srliw {{.*}}, 3
 // ASM: andi {{.*}}, 15
+// ASM-LABEL: signed_rem_pow2:
+// ASM: sraiw {{.*}}, 31
+// ASM: srliw {{.*}}, 28
+// ASM: addw
+// ASM: andi {{.*}}, 15
+// ASM: subw
+// ASM-NOT: slliw
 // ASM-LABEL: parity_branch:
 // ASM-NOT: sraiw
 // ASM: andi {{.*}}, 1
@@ -169,3 +241,18 @@ int main() {
 // ASM: .Lphi_shuffle_edge.while.body.2.to.while.end.3:
 // ASM-NOT: j .Lphi_shuffle_while.end.3
 // ASM: .Lphi_shuffle_while.end.3:
+// ASM-LABEL: stack_zero64:
+// ASM: sd zero
+// ASM-NOT: sw zero
+// ASM-LABEL: stack_zero_after_nonzero_fill:
+// ASM: li t3, -1
+// ASM-NOT: sd zero, 0(t3)
+// ASM: sd zero
+// ASM-LABEL: stack_zero_after_large_memset:
+// ASM: call memset
+// ASM: call putarray
+// ASM-NOT: sd zero, 0(a0)
+// ASM: sd zero
+// ASM-LABEL: stack_zero_merge_disagreement:
+// ASM-NOT: sd zero, 0(t3)
+// ASM: call putarray

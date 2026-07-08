@@ -270,7 +270,7 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
                   ScopedValueTable &table, ReplacementMap &replacements,
                   const oir::OIRAliasAnalysis &alias_analysis,
                   const oir::FunctionModRefAnalysis &modref,
-                  const oir::MemorySSA &memory_ssa) {
+                  const oir::MemorySSA &memory_ssa, bool loads_and_calls_only) {
     auto mark = table.mark();
     for (auto &inst_ptr : const_cast<oir::BasicBlock *>(block)->instructions()) {
         auto *inst = inst_ptr.get();
@@ -316,7 +316,8 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
             continue;
         }
 
-        if (!is_gvn_candidate(*inst) || inst->type() == nullptr || inst->type()->is_void()) {
+        if (loads_and_calls_only || !is_gvn_candidate(*inst) || inst->type() == nullptr ||
+            inst->type()->is_void()) {
             continue;
         }
 
@@ -334,12 +335,14 @@ void number_block(const oir::DominatorTree &dom_tree, const oir::BasicBlock *blo
     }
 
     for (auto *child : dom_tree.children(block)) {
-        number_block(dom_tree, child, table, replacements, alias_analysis, modref, memory_ssa);
+        number_block(dom_tree, child, table, replacements, alias_analysis, modref, memory_ssa,
+                     loads_and_calls_only);
     }
     table.pop_to(mark);
 }
 
-bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats) {
+bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats,
+                     bool loads_and_calls_only) {
     if (function.is_external() || function.entry_block() == nullptr) {
         return false;
     }
@@ -404,7 +407,7 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
                     continue;
                 }
 
-                if (!is_gvn_candidate(*inst) || inst->type() == nullptr ||
+                if (loads_and_calls_only || !is_gvn_candidate(*inst) || inst->type() == nullptr ||
                     inst->type()->is_void()) {
                     continue;
                 }
@@ -435,7 +438,7 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
     oir::FunctionModRefAnalysis modref(module);
     oir::MemorySSA memory_ssa(function, alias_analysis, modref);
     number_block(dom_tree, function.entry_block(), table, replacements, alias_analysis, modref,
-                 memory_ssa);
+                 memory_ssa, loads_and_calls_only);
     if (apply_replacements(module, replacements) == 0) {
         return false;
     }
@@ -448,7 +451,15 @@ bool run_on_function(oir::Module &module, oir::Function &function, Stats &stats)
 bool global_value_numbering(oir::Module &module, Stats &stats) {
     bool changed = false;
     for (auto &function : module.functions()) {
-        changed |= run_on_function(module, *function, stats);
+        changed |= run_on_function(module, *function, stats, false);
+    }
+    return changed;
+}
+
+bool pre_inline_load_call_cse(oir::Module &module, Stats &stats) {
+    bool changed = false;
+    for (auto &function : module.functions()) {
+        changed |= run_on_function(module, *function, stats, true);
     }
     return changed;
 }

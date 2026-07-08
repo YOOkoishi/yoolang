@@ -1268,15 +1268,36 @@ class VRegLowerer final {
         if (is_power_of_two(magnitude)) {
             auto shift = log2_u64(magnitude);
             if (shift > 0 && shift < 31) {
-                auto quotient = create_vreg(mir::ValueType::I32);
-                emit_signed_div_pow2(quotient, value, shift, false);
-                auto product = create_vreg(mir::ValueType::I32);
-                emit(mir::Opcode::SllIW,
-                     {mir::MachineOperand::reg_def(product),
-                      mir::MachineOperand::reg_use(quotient), mir::MachineOperand::imm(shift)});
+                auto bias = create_vreg(mir::ValueType::I32);
+                emit(mir::Opcode::SraIW,
+                     {mir::MachineOperand::reg_def(bias), mir::MachineOperand::reg_use(value),
+                      mir::MachineOperand::imm(31)});
+                emit(mir::Opcode::SrliW,
+                     {mir::MachineOperand::reg_def(bias), mir::MachineOperand::reg_use(bias),
+                      mir::MachineOperand::imm(32 - shift)});
+
+                auto adjusted = create_vreg(mir::ValueType::I32);
+                emit(mir::Opcode::AddW,
+                     {mir::MachineOperand::reg_def(adjusted), mir::MachineOperand::reg_use(value),
+                      mir::MachineOperand::reg_use(bias)});
+                auto masked = create_vreg(mir::ValueType::I32);
+                const auto mask = static_cast<std::int64_t>(magnitude - 1);
+                if (fits_simm12(mask)) {
+                    emit(mir::Opcode::AndI,
+                         {mir::MachineOperand::reg_def(masked),
+                          mir::MachineOperand::reg_use(adjusted), mir::MachineOperand::imm(mask)});
+                } else {
+                    auto mask_reg = create_vreg(mir::ValueType::I32);
+                    emit(mir::Opcode::LoadImm,
+                         {mir::MachineOperand::reg_def(mask_reg), mir::MachineOperand::imm(mask)});
+                    emit(mir::Opcode::And,
+                         {mir::MachineOperand::reg_def(masked),
+                          mir::MachineOperand::reg_use(adjusted),
+                          mir::MachineOperand::reg_use(mask_reg)});
+                }
                 emit(mir::Opcode::SubW,
-                     {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(value),
-                      mir::MachineOperand::reg_use(product)});
+                     {mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(masked),
+                      mir::MachineOperand::reg_use(bias)});
                 return true;
             }
         }

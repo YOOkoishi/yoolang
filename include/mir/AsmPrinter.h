@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mir {
@@ -19,6 +20,12 @@ class AsmPrinter final {
     void print_global_sections(const Module &module);
     void print_global(const Global &global);
     void print_function(const MachineFunction &function);
+    void compute_stack_addr_facts(const MachineFunction &function);
+    void update_stack_addr_facts(
+        const MachineFunction &function, const MachineInstr &instr,
+        std::unordered_map<std::string, std::int64_t> &facts) const;
+    void invalidate_memzero_stack_addr_facts(
+        const MachineInstr &instr, std::unordered_map<std::string, std::int64_t> &facts) const;
     void print_instr(const MachineFunction &function, const MachineInstr &instr);
     void print_epilogue(const MachineFunction &function);
 
@@ -37,6 +44,9 @@ class AsmPrinter final {
     void emit_adjust_sp(std::int64_t amount);
     void emit_memzero(const MachineOperand &addr, const MachineOperand &byte_value,
                       const MachineOperand &byte_count);
+    bool emit_inline_memzero_stores(const std::string &addr_reg,
+                                    const MachineOperand &byte_value,
+                                    std::uint64_t size, bool prefer_wide_zero_stores);
     void emit_memzero_loop(const std::string &addr_reg, const MachineOperand &byte_value,
                            const MachineOperand &byte_count);
     void emit_memset_call(const std::string &addr_reg, const MachineOperand &byte_value,
@@ -59,6 +69,10 @@ class AsmPrinter final {
 
     std::ostream &out_;
     const MachineFunction *current_function_ = nullptr;
+    std::unordered_map<const MachineBasicBlock *,
+                       std::unordered_map<std::string, std::int64_t>>
+        stack_addr_block_in_;
+    std::unordered_map<std::string, std::int64_t> known_stack_addr_offsets_;
     unsigned unique_label_id_ = 0;
 };
 
