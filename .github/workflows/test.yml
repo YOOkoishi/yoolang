@@ -309,7 +309,7 @@ jobs:
             --baseline-commit-author "$baseline_commit_author" || true
 
       - name: Configure GitHub Pages
-        if: always() && github.ref_name == github.event.repository.default_branch
+        if: always()
         continue-on-error: true
         id: configure_pages
         uses: actions/configure-pages@v5
@@ -709,7 +709,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload instruction report to Pages
-        if: always() && github.ref_name == github.event.repository.default_branch
+        if: always()
         id: upload_instruction_pages
         continue-on-error: true
         uses: actions/upload-pages-artifact@v3
@@ -717,7 +717,7 @@ jobs:
           path: public
 
       - name: Deploy instruction report to Pages
-        if: always() && github.ref_name == github.event.repository.default_branch
+        if: always()
         id: deploy_instruction_pages
         continue-on-error: true
         uses: actions/deploy-pages@v4
