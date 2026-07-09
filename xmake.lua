@@ -15,7 +15,7 @@ target("compiler")
     set_languages("c++17")
     add_includedirs("include")
     add_files(srcs)
-    add_files("src/main/main.cpp")
+    add_files("src/main/**.cpp")
 
 target("smt_solver_tests")
     set_kind("static")
