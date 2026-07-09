@@ -1,0 +1,62 @@
+int unroll_a[16][16];
+int unroll_b[16][16];
+int unroll_c[16][16];
+
+void pointer_unroll_kernel(int n, int a[][16], int b[][16], int c[][16]) {
+  int i, j, k;
+  i = 0;
+  j = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      c[i][j] = 0;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  i = 0;
+  j = 0;
+  k = 0;
+  while (k < n) {
+    i = 0;
+    while (i < n) {
+      if (a[i][k] == 1) {
+        i = i + 1;
+        continue;
+      }
+      j = 0;
+      while (j < n) {
+        c[i][j] = c[i][j] * a[i][k] + b[k][j];
+        j = j + 1;
+      }
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+}
+
+int main() {
+  int i = 0;
+  int j = 0;
+  while (i < 10) {
+    j = 0;
+    while (j < 10) {
+      unroll_b[i][j] = i * 10 + j;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  int n = 0;
+  int answer = 0;
+  pointer_unroll_kernel(-1, unroll_a, unroll_b, unroll_c);
+  while (n <= 9) {
+    pointer_unroll_kernel(n, unroll_a, unroll_b, unroll_c);
+    if (n > 0) {
+      answer = answer + unroll_c[n - 1][n - 1];
+    }
+    n = n + 1;
+  }
+  return answer;
+}

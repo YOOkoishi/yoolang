@@ -155,8 +155,9 @@ void AsmPrinter::invalidate_memzero_stack_addr_facts(
 
     const auto &byte_value = ops[1];
     const auto &byte_count = ops[2];
-    if (byte_count.kind() == OperandKind::Imm &&
-        byte_count.int_value() >= kMemZeroMemsetThresholdBytes) {
+    if (byte_count.kind() == OperandKind::Reg ||
+        (byte_count.kind() == OperandKind::Imm &&
+         byte_count.int_value() >= kMemZeroMemsetThresholdBytes)) {
         facts.clear();
         return;
     }
@@ -581,6 +582,28 @@ void AsmPrinter::emit_memzero(const MachineOperand &addr, const MachineOperand &
             emit_memset_call(addr.string_value(), byte_value, size);
             return;
         }
+    } else if (byte_count.kind() == OperandKind::Reg) {
+        const std::string done =
+            ".Lmemzero_dynamic_done_" + std::to_string(unique_label_id_++);
+        const std::string &addr_reg = addr.string_value();
+        const std::string &count_reg = byte_count.string_value();
+        std::string count_scratch = "t6";
+        if (addr_reg == count_scratch || count_reg == count_scratch) {
+            count_scratch = "t5";
+        }
+        if (addr_reg == count_scratch || count_reg == count_scratch) {
+            count_scratch = "t4";
+        }
+        out_ << "\tbge zero, " << byte_count.string_value() << ", " << done << "\n";
+        out_ << "\tmv " << count_scratch << ", " << count_reg << "\n";
+        if (addr_reg != "a0") {
+            out_ << "\tmv a0, " << addr_reg << "\n";
+        }
+        out_ << "\tli a1, " << byte_value.int_value() << "\n";
+        out_ << "\tmv a2, " << count_scratch << "\n";
+        out_ << "\tcall memset\n";
+        out_ << done << ":\n";
+        return;
     }
     emit_memzero_loop(addr.string_value(), byte_value, byte_count);
 }

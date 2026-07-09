@@ -370,6 +370,7 @@ class Lowerer final {
         emit(mir::Opcode::MemZero,
              {mir::MachineOperand::reg("t0"), mir::MachineOperand::imm(byte_value->value()),
               mir::MachineOperand::reg("t1")});
+        current_function_->note_call();
     }
 
     void lower_gep(const oir::GetElementPtrInst &inst) {

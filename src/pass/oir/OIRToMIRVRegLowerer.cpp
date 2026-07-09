@@ -921,6 +921,7 @@ class VRegLowerer final {
         emit(mir::Opcode::MemZero,
              {mir::MachineOperand::reg_use(addr), mir::MachineOperand::imm(byte_value->value()),
               mir::MachineOperand::reg_use(byte_count)});
+        current_function_->note_call();
     }
 
     void lower_gep(const oir::GetElementPtrInst &inst) {

@@ -21,11 +21,50 @@ int small_constant_dot(int a[], int b[]) {
   return acc;
 }
 
+void pretested_pointer_exit(int n, int a[][16], int b[][16], int c[][16]) {
+  int i, j, k;
+  i = 0;
+  j = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      c[i][j] = 0;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  i = 0;
+  j = 0;
+  k = 0;
+  while (k < n) {
+    i = 0;
+    while (i < n) {
+      if (a[i][k] == 1) {
+        i = i + 1;
+        continue;
+      }
+      j = 0;
+      while (j < n) {
+        c[i][j] = c[i][j] * a[i][k] + b[k][j];
+        j = j + 1;
+      }
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+}
+
+int matrix_a[16][16];
+int matrix_b[16][16];
+int matrix_c[16][16];
+
 int main() {
   int a[8];
   int b[8];
   a[0] = 1;
   b[0] = 2;
+  pretested_pointer_exit(1, matrix_a, matrix_b, matrix_c);
   return pointer_exit_dot(1, a, b) + small_constant_dot(a, b);
 }
 
@@ -37,6 +76,11 @@ int main() {
 // MIR-LABEL: func @small_constant_dot
 // MIR-NOT: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
 // MIR: BLT %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
+// MIR-LABEL: func @pretested_pointer_exit
+// MIR: ANDI %v{{[0-9]+}}:gpr, %v0:gpr, 3
+// MIR: J %{{.*}}unroll4.dispatch
+// MIR: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %{{.*}}while.body
+// MIR: BNEZ %v{{[0-9]+}}:gpr, %{{.*}}unroll4.peel
 
 // ASM-LABEL: pointer_exit_dot:
 // ASM-NOT: slt
@@ -46,3 +90,11 @@ int main() {
 // ASM-LABEL: small_constant_dot:
 // ASM-NOT: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lsmall_constant_dot_edge
 // ASM: blt
+// ASM-LABEL: pretested_pointer_exit:
+// ASM: andi {{[a-z0-9]+}}, {{[a-z0-9]+}}, 3
+// ASM: .Lpretested_pointer_exit_{{.*}}unroll4.dispatch:
+// ASM: beqz {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}while.body
+// ASM: .Lpretested_pointer_exit_{{.*}}unroll4.peel:
+// ASM: bnez {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}unroll4.peel
+// ASM: .Lpretested_pointer_exit_{{.*}}unroll4.peel.done:
+// ASM: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}while.body

@@ -30,6 +30,20 @@ struct PointerMatch {
     std::int64_t stride = 0;
 };
 
+struct PretestedLoopControl {
+    mir::MachineBasicBlock *body = nullptr;
+    mir::MachineBasicBlock *exit = nullptr;
+    mir::Register current_iv;
+    mir::MachineOperand bound;
+};
+
+struct DirectPointerStep {
+    std::size_t step_index = 0;
+    std::size_t copy_index = 0;
+    mir::Register current;
+    mir::Register next;
+};
+
 using PositiveFactSet = std::set<VRegId>;
 
 struct PositiveBoundInfo {
@@ -94,6 +108,15 @@ bool is_move_to_reg(const mir::MachineInstr &instr, const mir::Register &dst) {
 bool instr_defines_reg(const mir::MachineInstr &instr, const mir::Register &reg) {
     for (const auto &def : instr.defs()) {
         if (same_reg(def, reg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool instr_uses_reg(const mir::MachineInstr &instr, const mir::Register &reg) {
+    for (const auto &use : instr.uses()) {
+        if (same_reg(use, reg)) {
             return true;
         }
     }
@@ -395,21 +418,6 @@ std::optional<CopyMatch> find_copy_to(mir::MachineBasicBlock &block, const mir::
     return std::nullopt;
 }
 
-std::optional<CopyMatch> find_copy_from(const mir::MachineBasicBlock &block,
-                                        const mir::Register &src) {
-    const auto &instrs = block.instructions();
-    for (std::size_t i = 0; i < instrs.size(); ++i) {
-        const auto &instr = instrs[i];
-        const auto &ops = instr.operands();
-        if (instr.opcode() != mir::Opcode::Move || ops.size() < 2 || !ops[0].is_reg() ||
-            !ops[1].is_reg() || !same_reg(ops[1].reg_value(), src)) {
-            continue;
-        }
-        return CopyMatch{i, ops[0]};
-    }
-    return std::nullopt;
-}
-
 std::optional<StepMatch> match_unit_iv_step(const mir::MachineBasicBlock &header,
                                             const mir::Register &next_iv) {
     const auto &instrs = header.instructions();
@@ -445,27 +453,70 @@ std::optional<PointerMatch> find_pointer_progression(
             continue;
         }
 
-        auto next_ptr = raw_next_ptr;
-        if (auto next_copy = find_copy_from(header, raw_next_ptr)) {
-            if (!next_copy->src.is_reg() ||
-                next_copy->src.reg_value().value_type != mir::ValueType::Ptr) {
-                continue;
-            }
-            next_ptr = next_copy->src.reg_value();
-        }
-
         auto preheader_copy = find_copy_to(preheader, current_ptr);
         auto backedge_copy = find_copy_to(backedge, current_ptr);
         if (!preheader_copy || !backedge_copy || !preheader_copy->src.is_reg() ||
-            !backedge_copy->src.is_reg() ||
-            !same_reg(backedge_copy->src.reg_value(), next_ptr)) {
+            !backedge_copy->src.is_reg()) {
             continue;
         }
 
-        return PointerMatch{preheader_copy->index, backedge_copy->index, preheader_copy->src,
-                            current_ptr, next_ptr, ops[2].int_value()};
+        auto next_ptr = backedge_copy->src.reg_value();
+        if (!same_reg(next_ptr, raw_next_ptr)) {
+            auto intermediate_copy = find_copy_to(header, next_ptr);
+            if (!intermediate_copy || !intermediate_copy->src.is_reg() ||
+                !same_reg(intermediate_copy->src.reg_value(), raw_next_ptr)) {
+                continue;
+            }
+        }
+
+        return PointerMatch{
+            preheader_copy->index, backedge_copy->index, preheader_copy->src, current_ptr, next_ptr,
+            ops[2].int_value()};
     }
     return std::nullopt;
+}
+
+std::vector<DirectPointerStep>
+collect_direct_pointer_steps(mir::MachineBasicBlock &block,
+                             const std::map<VRegId, RegCounts> &counts) {
+    std::vector<DirectPointerStep> out;
+    const auto &instrs = block.instructions();
+    for (std::size_t i = 0; i < instrs.size(); ++i) {
+        const auto &instr = instrs[i];
+        const auto &ops = instr.operands();
+        if (instr.opcode() != mir::Opcode::AddI || ops.size() < 3 || !ops[0].is_reg() ||
+            !ops[1].is_reg() || ops[2].kind() != mir::OperandKind::Imm) {
+            continue;
+        }
+
+        const auto next = ops[0].reg_value();
+        const auto current = ops[1].reg_value();
+        if (next.value_type != mir::ValueType::Ptr || current.value_type != mir::ValueType::Ptr ||
+            !next.is_virtual() || !current.is_virtual() || def_count(counts, next) != 1 ||
+            use_count(counts, next) != 1 || def_count(counts, current) != 2) {
+            continue;
+        }
+
+        auto copy = find_copy_to(block, current);
+        if (!copy || copy->index <= i || !copy->src.is_reg() ||
+            !same_reg(copy->src.reg_value(), next)) {
+            continue;
+        }
+
+        bool changes_old_pointer_semantics = false;
+        for (std::size_t scan = i + 1; scan < copy->index; ++scan) {
+            if (instr_uses_reg(instrs[scan], current) ||
+                instr_defines_reg(instrs[scan], current)) {
+                changes_old_pointer_semantics = true;
+                break;
+            }
+        }
+        if (changes_old_pointer_semantics) {
+            continue;
+        }
+        out.push_back(DirectPointerStep{i, copy->index, current, next});
+    }
+    return out;
 }
 
 unsigned memory_access_count(const mir::MachineBasicBlock &block) {
@@ -509,6 +560,45 @@ std::optional<std::size_t> continue_branch_index(const mir::MachineBasicBlock &b
         return instrs.size() - 2;
     }
     return std::nullopt;
+}
+
+std::optional<PretestedLoopControl> match_pretested_loop_control(mir::MachineFunction &function,
+                                                                 mir::MachineBasicBlock &header) {
+    const auto &instrs = header.instructions();
+    if (instrs.empty() || instrs.size() > 2) {
+        return std::nullopt;
+    }
+
+    const auto &branch = instrs.front();
+    const auto &ops = branch.operands();
+    if ((branch.opcode() != mir::Opcode::BranchLT && branch.opcode() != mir::Opcode::BranchGE) ||
+        ops.size() < 3 || !ops[0].is_reg() || !ops[1].is_reg() ||
+        ops[0].reg_value().value_type != mir::ValueType::I32 ||
+        ops[1].reg_value().value_type != mir::ValueType::I32 ||
+        ops[2].kind() != mir::OperandKind::Block) {
+        return std::nullopt;
+    }
+
+    auto *true_target = function.get_block(ops[2].string_value());
+    mir::MachineBasicBlock *false_target = nullptr;
+    if (instrs.size() == 2) {
+        const auto &jump = instrs.back();
+        if (jump.opcode() != mir::Opcode::Jump || jump.operands().empty() ||
+            jump.operands()[0].kind() != mir::OperandKind::Block) {
+            return std::nullopt;
+        }
+        false_target = function.get_block(jump.operands()[0].string_value());
+    } else {
+        false_target = next_block(function, header);
+    }
+
+    auto *body = branch.opcode() == mir::Opcode::BranchLT ? true_target : false_target;
+    auto *exit = branch.opcode() == mir::Opcode::BranchLT ? false_target : true_target;
+    if (body == nullptr || exit == nullptr || body == &header || exit == &header || body == exit) {
+        return std::nullopt;
+    }
+
+    return PretestedLoopControl{body, exit, ops[0].reg_value(), ops[1]};
 }
 
 mir::MachineBasicBlock *unique_preheader(mir::MachineBasicBlock &header,
@@ -556,6 +646,116 @@ void erase_indices(std::vector<mir::MachineInstr> &instrs, std::vector<std::size
             instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(index));
         }
     }
+}
+
+bool is_factor_four_unroll_core(const std::vector<mir::MachineInstr> &core) {
+    constexpr std::size_t kMaxUnrolledCoreInstructions = 12;
+    if (core.empty() || core.size() > kMaxUnrolledCoreInstructions) {
+        return false;
+    }
+    for (const auto &instr : core) {
+        if (instr.opcode() == mir::Opcode::Call || instr.opcode() == mir::Opcode::MemZero ||
+            instr.opcode() == mir::Opcode::Jump || is_conditional_branch(instr.opcode()) ||
+            instr.opcode() == mir::Opcode::StoreOutgoingArg ||
+            instr.opcode() == mir::Opcode::LoadIncomingArg) {
+            return false;
+        }
+        for (const auto &reg : instr.defs()) {
+            if (reg.is_physical()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool unroll_rewritten_pointer_loop_by_four(
+    mir::MachineFunction &function, mir::MachineBasicBlock &preheader,
+    mir::MachineBasicBlock &header, mir::MachineBasicBlock &body, mir::MachineBasicBlock &exit,
+    const mir::Register &current_iv, const mir::MachineOperand &bound, const mir::Register &pointer,
+    const mir::Register &end_pointer, Stats &stats) {
+    const auto &original_body_instrs = body.instructions();
+    std::optional<std::size_t> branch_index;
+    if (!original_body_instrs.empty() &&
+        original_body_instrs.back().opcode() == mir::Opcode::BranchNe) {
+        branch_index = original_body_instrs.size() - 1;
+    } else if (original_body_instrs.size() >= 2 &&
+               original_body_instrs[original_body_instrs.size() - 2].opcode() ==
+                   mir::Opcode::BranchNe &&
+               original_body_instrs.back().opcode() == mir::Opcode::Jump) {
+        branch_index = original_body_instrs.size() - 2;
+    }
+    if (!branch_index) {
+        return false;
+    }
+
+    std::vector<mir::MachineInstr> core(original_body_instrs.begin(),
+                                        original_body_instrs.begin() +
+                                            static_cast<std::ptrdiff_t>(*branch_index));
+    if (!is_factor_four_unroll_core(core)) {
+        return false;
+    }
+
+    const std::string dispatch_name = header.name() + ".unroll4.dispatch";
+    const std::string peel_name = header.name() + ".unroll4.peel";
+    const std::string peel_done_name = header.name() + ".unroll4.peel.done";
+    if (function.get_block(dispatch_name) != nullptr || function.get_block(peel_name) != nullptr ||
+        function.get_block(peel_done_name) != nullptr) {
+        return false;
+    }
+
+    auto remainder = function.regs().create_virtual(mir::RegisterClass::GPR, mir::ValueType::I32);
+    auto &preheader_instrs = preheader.instructions();
+    const auto remainder_index = terminator_index(preheader).value_or(preheader_instrs.size());
+    preheader_instrs.insert(
+        preheader_instrs.begin() + static_cast<std::ptrdiff_t>(remainder_index),
+        mir::MachineInstr(mir::Opcode::AndI, {mir::MachineOperand::reg_def(remainder), bound,
+                                              mir::MachineOperand::imm(3)}));
+
+    auto *dispatch = function.create_block(dispatch_name);
+    auto *peel = function.create_block(peel_name);
+    auto *peel_done = function.create_block(peel_done_name);
+
+    auto &header_instrs = header.instructions();
+    header_instrs.clear();
+    header.add_instr(mir::Opcode::BranchGE, {mir::MachineOperand::reg_use(current_iv), bound,
+                                             mir::MachineOperand::block(exit.name())});
+    header.add_instr(mir::Opcode::Jump, {mir::MachineOperand::block(dispatch->name())});
+
+    dispatch->add_instr(mir::Opcode::BranchNonZero, {mir::MachineOperand::reg_use(remainder),
+                                                     mir::MachineOperand::block(peel->name())});
+    dispatch->add_instr(mir::Opcode::Jump, {mir::MachineOperand::block(body.name())});
+
+    for (const auto &instr : core) {
+        peel->add_instr(instr);
+    }
+    peel->add_instr(mir::Opcode::AddIW,
+                    {mir::MachineOperand::reg_def(remainder),
+                     mir::MachineOperand::reg_use(remainder), mir::MachineOperand::imm(-1)});
+    peel->add_instr(mir::Opcode::BranchNonZero, {mir::MachineOperand::reg_use(remainder),
+                                                 mir::MachineOperand::block(peel->name())});
+    peel->add_instr(mir::Opcode::Jump, {mir::MachineOperand::block(peel_done->name())});
+
+    peel_done->add_instr(mir::Opcode::BranchNe, {mir::MachineOperand::reg_use(pointer),
+                                                 mir::MachineOperand::reg_use(end_pointer),
+                                                 mir::MachineOperand::block(body.name())});
+    peel_done->add_instr(mir::Opcode::Jump, {mir::MachineOperand::block(exit.name())});
+
+    auto &body_instrs = body.instructions();
+    body_instrs.clear();
+    for (unsigned lane = 0; lane < 4; ++lane) {
+        for (const auto &instr : core) {
+            body.add_instr(instr);
+        }
+    }
+    body.add_instr(mir::Opcode::BranchNe, {mir::MachineOperand::reg_use(pointer),
+                                           mir::MachineOperand::reg_use(end_pointer),
+                                           mir::MachineOperand::block(body.name())});
+    body.add_instr(mir::Opcode::Jump, {mir::MachineOperand::block(exit.name())});
+
+    ++stats.arithmetic;
+    ++stats.branches;
+    return true;
 }
 
 bool try_rewrite_loop(mir::MachineFunction &function, mir::MachineBasicBlock &header,
@@ -660,6 +860,103 @@ bool try_rewrite_loop(mir::MachineFunction &function, mir::MachineBasicBlock &he
     return true;
 }
 
+bool try_rewrite_pretested_loop(mir::MachineFunction &function, mir::MachineBasicBlock &header,
+                                const std::map<VRegId, RegCounts> &counts,
+                                const PositiveBoundInfo &positive_bounds, Stats &stats) {
+    auto control = match_pretested_loop_control(function, header);
+    if (!control || memory_access_count(*control->body) < 2 ||
+        !flows_unconditionally_to(function, *control->body, header) ||
+        control->body->predecessors().size() != 1 ||
+        control->body->predecessors().front() != &header) {
+        return false;
+    }
+
+    auto *preheader = unique_preheader(header, *control->body);
+    if (preheader == nullptr || !flows_unconditionally_to(function, *preheader, header)) {
+        return false;
+    }
+
+    const auto &bound = control->bound.reg_value();
+    if (!bound.is_virtual() || def_count(counts, bound) != 1 || block_defines_reg(header, bound) ||
+        block_defines_reg(*control->body, bound) || use_count(counts, control->current_iv) != 2) {
+        return false;
+    }
+
+    auto preheader_iv = find_copy_to(*preheader, control->current_iv);
+    auto backedge_iv = find_copy_to(*control->body, control->current_iv);
+    if (!preheader_iv || !backedge_iv || !is_zero_reg(preheader_iv->src) ||
+        !backedge_iv->src.is_reg()) {
+        return false;
+    }
+
+    const auto next_iv = backedge_iv->src.reg_value();
+    auto iv_step = match_unit_iv_step(*control->body, next_iv);
+    if (!iv_step || !same_reg(iv_step->current, control->current_iv) ||
+        def_count(counts, next_iv) != 1 || use_count(counts, next_iv) != 1) {
+        return false;
+    }
+
+    auto pointer = find_pointer_progression(*preheader, *control->body, *control->body);
+    if (!pointer || !pointer->start.is_reg() ||
+        is_small_positive_constant(positive_bounds, bound) ||
+        loop_carried_gpr_count(*control->body) > kMaxLoopCarriedGprs) {
+        return false;
+    }
+
+    auto backedge_terminator = terminator_index(*control->body);
+    if (!backedge_terminator || *backedge_terminator + 1 != control->body->instructions().size() ||
+        !is_jump_to(control->body->instructions()[*backedge_terminator], header)) {
+        return false;
+    }
+    for (std::size_t index = 0; index < *backedge_terminator; ++index) {
+        const auto opcode = control->body->instructions()[index].opcode();
+        if (opcode == mir::Opcode::Jump || is_conditional_branch(opcode)) {
+            return false;
+        }
+    }
+
+    auto end_ptr = function.regs().create_virtual(mir::RegisterClass::GPR, mir::ValueType::Ptr);
+    auto setup =
+        materialize_end_pointer(function, pointer->start, control->bound, pointer->stride, end_ptr);
+    auto &preheader_instrs = preheader->instructions();
+    const auto setup_index = terminator_index(*preheader).value_or(preheader_instrs.size());
+    preheader_instrs.insert(preheader_instrs.begin() + static_cast<std::ptrdiff_t>(setup_index),
+                            setup.begin(), setup.end());
+
+    auto &body_instrs = control->body->instructions();
+    auto direct_pointer_steps = collect_direct_pointer_steps(*control->body, counts);
+    auto branch_ptr = pointer->next;
+    std::vector<std::size_t> dead_body_indices{iv_step->index, backedge_iv->index};
+    for (const auto &step : direct_pointer_steps) {
+        auto operands = body_instrs[step.step_index].operands();
+        operands[0] = mir::MachineOperand::reg_def(step.current);
+        body_instrs[step.step_index] = mir::MachineInstr(mir::Opcode::AddI, std::move(operands));
+        dead_body_indices.push_back(step.copy_index);
+        if (same_reg(branch_ptr, step.next)) {
+            branch_ptr = step.current;
+        }
+    }
+
+    body_instrs[*backedge_terminator] = mir::MachineInstr(
+        mir::Opcode::BranchNe,
+        {mir::MachineOperand::reg_use(branch_ptr), mir::MachineOperand::reg_use(end_ptr),
+         mir::MachineOperand::block(control->body->name())});
+    body_instrs.insert(
+        body_instrs.begin() + static_cast<std::ptrdiff_t>(*backedge_terminator + 1),
+        mir::MachineInstr(mir::Opcode::Jump, {mir::MachineOperand::block(control->exit->name())}));
+
+    erase_indices(body_instrs, std::move(dead_body_indices));
+
+    unroll_rewritten_pointer_loop_by_four(function, *preheader, header, *control->body,
+                                          *control->exit, control->current_iv, control->bound,
+                                          branch_ptr, end_ptr, stats);
+
+    ++stats.branches;
+    ++stats.arithmetic;
+    ++stats.dead;
+    return true;
+}
+
 } // namespace
 
 bool optimize_pointer_loop_exits(mir::MachineFunction &function, bool post_ra, Stats &stats) {
@@ -671,8 +968,11 @@ bool optimize_pointer_loop_exits(mir::MachineFunction &function, bool post_ra, S
     auto counts = count_vregs(function);
     auto positive_bounds = compute_positive_bound_info(function, counts);
     bool changed = false;
-    for (auto &block : function.blocks()) {
-        if (try_rewrite_loop(function, *block, counts, positive_bounds, stats)) {
+    const std::size_t initial_block_count = function.blocks().size();
+    for (std::size_t index = 0; index < initial_block_count; ++index) {
+        auto *block = function.blocks()[index].get();
+        if (try_rewrite_loop(function, *block, counts, positive_bounds, stats) ||
+            try_rewrite_pretested_loop(function, *block, counts, positive_bounds, stats)) {
             changed = true;
             function.rebuild_cfg();
             counts = count_vregs(function);

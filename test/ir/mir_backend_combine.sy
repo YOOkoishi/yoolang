@@ -54,6 +54,14 @@ int parity_branch(int x) {
   return 5;
 }
 
+void low32_muladd_store(int x, int y, int z, int out[]) {
+  out[0] = x * y + z;
+}
+
+int signed_muladd_return(int x, int y, int z) {
+  return x * y + z;
+}
+
 int address_offset_fold(int x) {
   int data[8];
   data[3] = x;
@@ -110,11 +118,14 @@ int stack_zero_merge_disagreement(int flag, int x) {
 }
 
 int main() {
+  int low32[1];
+  low32_muladd_store(7, 9, 5, low32);
   return cmp_lt(1, 2) + cmp_eq(3, 3) + nonnegative_divrem(32) +
          cmp_ge_const(1235) + cmp_ne_zero(9) +
          signed_rem_pow2(-31) + parity_branch(9) + address_offset_fold(7) +
          phi_shuffle(4) + stack_zero64() + stack_zero_after_nonzero_fill(5) +
-         stack_zero_after_large_memset(3) + stack_zero_merge_disagreement(1, 7);
+         stack_zero_after_large_memset(3) + stack_zero_merge_disagreement(1, 7) +
+         low32[0] + signed_muladd_return(7, 9, 5);
 }
 
 // MIR-O1-LABEL: func @cmp_lt
@@ -159,6 +170,14 @@ int main() {
 // MIR-O1-NOT: SRAIW
 // MIR-O1: B{{EQ|NE}} {{.*}}, zero
 // MIR-O1-NOT: SRAIW
+
+// MIR-O1-LABEL: func @low32_muladd_store
+// MIR-O1: MUL {{.*}}
+// MIR-O1: ADD {{.*}}
+// MIR-O1: STORE_MEM {{.*}}, i32
+// MIR-O1-LABEL: func @signed_muladd_return
+// MIR-O1: MULW {{.*}}
+// MIR-O1: ADDW {{.*}}
 
 // MIR-O1-LABEL: func @address_offset_fold
 // MIR-O1: STORE_MEM_OFF {{.*}}, 12, i32
@@ -225,6 +244,13 @@ int main() {
 // ASM-NOT: sraiw
 // ASM: b{{eq|ne}} {{.*}}, zero
 // ASM-NOT: sraiw
+// ASM-LABEL: low32_muladd_store:
+// ASM: mul {{.*}}
+// ASM: add {{.*}}
+// ASM: sw {{.*}}
+// ASM-LABEL: signed_muladd_return:
+// ASM: mulw {{.*}}
+// ASM: addw {{.*}}
 // ASM-LABEL: address_offset_fold:
 // ASM: sw {{.*}}, 12(
 // ASM: lw {{.*}}, 12(

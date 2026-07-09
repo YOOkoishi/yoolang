@@ -25,6 +25,35 @@ bool combine_bit_idioms(mir::MachineFunction &function, Stats &stats) {
                 changed = true;
             };
 
+            if ((instr.opcode() == mir::Opcode::StoreMem ||
+                 instr.opcode() == mir::Opcode::StoreMemOffset) &&
+                ops.size() >= 3 && ops[1].is_reg() && ops.back().kind() == mir::OperandKind::Type &&
+                ops.back().type_value() == mir::ValueType::I32 &&
+                single_use_vreg(counts, ops[1].reg_value())) {
+                auto add_index = find_def_before(instrs, i, ops[1].reg_value());
+                if (add_index && instrs[*add_index].opcode() == mir::Opcode::AddW) {
+                    auto add_ops = instrs[*add_index].operands();
+                    for (std::size_t operand_index : {std::size_t{1}, std::size_t{2}}) {
+                        if (add_ops.size() <= operand_index || !add_ops[operand_index].is_reg() ||
+                            !single_use_vreg(counts, add_ops[operand_index].reg_value())) {
+                            continue;
+                        }
+                        auto mul_index =
+                            find_def_before(instrs, *add_index, add_ops[operand_index].reg_value());
+                        if (!mul_index || instrs[*mul_index].opcode() != mir::Opcode::MulW) {
+                            continue;
+                        }
+                        instrs[*mul_index] =
+                            mir::MachineInstr(mir::Opcode::Mul, instrs[*mul_index].operands());
+                        instrs[*add_index] =
+                            mir::MachineInstr(mir::Opcode::Add, std::move(add_ops));
+                        ++stats.bit_idioms;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+
             if (is_move(instr.opcode()) && ops.size() >= 2 && same_reg(ops[0], ops[1])) {
                 instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(i));
                 --i;
