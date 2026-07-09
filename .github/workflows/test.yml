@@ -177,6 +177,30 @@ jobs:
           mkdir -p build/github-actions
           python3 scripts/compare_perf.py 2>&1 | tee build/github-actions/perf-tests.log
 
+      - name: Generate flamegraphs
+        id: flamegraphs
+        if: always()
+        continue-on-error: true
+        env:
+          QEMU_RISCV64: /home/cjj/.local/yoolang-ci/qemu-plugin/bin/qemu-riscv64
+          FLAMEGRAPH_SAMPLE_FREQUENCY: "997"
+          FLAMEGRAPH_TIMEOUT_SEC: "60"
+        run: |
+          set -o pipefail
+          mkdir -p build/github-actions build/perf-ci/flamegraphs
+          if [ ! -f build/perf-ci/perf-report.json ]; then
+            echo "Perf report missing; skip flamegraph generation." | tee build/github-actions/flamegraphs.log
+            exit 0
+          fi
+          python3 scripts/generate_qemu_flamegraphs.py \
+            --perf-report build/perf-ci/perf-report.json \
+            --out-dir build/perf-ci/flamegraphs \
+            --qemu "${QEMU_RISCV64}" \
+            --sample-frequency "${FLAMEGRAPH_SAMPLE_FREQUENCY}" \
+            --timeout-sec "${FLAMEGRAPH_TIMEOUT_SEC}" \
+            --mode all \
+            2>&1 | tee build/github-actions/flamegraphs.log
+
       - name: Run static instruction diff (GCC/Clang vs yoolang)
         id: static_diff
         if: always()
@@ -356,6 +380,7 @@ jobs:
             insn_html="public/instruction-report/index.html"
             perf_runs="public/perf-report/runs"
             insn_runs="public/instruction-report/runs"
+            perf_flamegraphs="public/perf-report/flamegraphs"
             is_main_flag="--is-main-branch"
           else
             branch_dir="public/branches/${safe_branch}"
@@ -363,7 +388,14 @@ jobs:
             insn_html="${branch_dir}/instruction-report/index.html"
             perf_runs="${branch_dir}/perf-report/runs"
             insn_runs="${branch_dir}/instruction-report/runs"
+            perf_flamegraphs="${branch_dir}/perf-report/flamegraphs"
             is_main_flag=""
+          fi
+
+          rm -rf "$perf_flamegraphs"
+          if [ -d build/perf-ci/flamegraphs ]; then
+            mkdir -p "$(dirname "$perf_flamegraphs")"
+            cp -a build/perf-ci/flamegraphs "$perf_flamegraphs"
           fi
 
           python3 scripts/generate_instruction_report.py \
@@ -375,6 +407,7 @@ jobs:
           python3 scripts/generate_perf_report.py \
             --perf-report build/perf-ci/perf-report.json \
             --delta-report build/perf-ci/perf-delta.json \
+            --flamegraph-index build/perf-ci/flamegraphs/index.json \
             --out-json ci-result/perf_compare.json \
             --out-html "$perf_html" \
             --pages-base-url "${PAGES_BASE_URL:-}"
@@ -386,6 +419,10 @@ jobs:
           cp "$perf_html" "$perf_runs/$run_id/index.html"
           cp ci-result/perf_compare.json "$perf_runs/$run_id/perf_compare.json"
           cp build/perf-ci/perf-report.json "$perf_runs/$run_id/perf-report.json"
+          if [ -d "$perf_flamegraphs" ]; then
+            rm -rf "$perf_runs/$run_id/flamegraphs"
+            cp -a "$perf_flamegraphs" "$perf_runs/$run_id/flamegraphs"
+          fi
 
           python3 scripts/update_report_history.py \
             --public-dir public \
@@ -684,12 +721,14 @@ jobs:
           path: |
             build/github-actions/functional-tests.log
             build/github-actions/perf-tests.log
+            build/github-actions/flamegraphs.log
             build/github-actions/static-diff.log
             build/perf-ci/perf-report.md
             build/perf-ci/perf-report.json
             build/perf-ci/perf-delta.md
             build/perf-ci/perf-delta.json
             build/perf-ci/instruction-count-compare.json
+            build/perf-ci/flamegraphs
             build/gcc-clang-diff/summary.json
             build/gcc-clang-diff/summary.txt
             ci-result/instruction_count_compare.json
@@ -700,6 +739,7 @@ jobs:
             public/instruction-report/runs
             public/perf-report/index.html
             public/perf-report/perf_compare.json
+            public/perf-report/flamegraphs
             public/perf-report/history.html
             public/perf-report/runs
             public/index.html

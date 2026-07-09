@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate static Yoolang performance report.")
     parser.add_argument("--perf-report", required=True, type=Path)
     parser.add_argument("--delta-report", type=Path)
+    parser.add_argument("--flamegraph-index", type=Path)
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--out-html", required=True, type=Path)
     parser.add_argument("--pages-base-url", default="")
@@ -119,8 +120,26 @@ def rows_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
-def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, str], report_index_url: str = "") -> dict[str, Any]:
+def flamegraphs_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("case"), str):
+            result[row["case"]] = row
+    return result
+
+
+def build_payload(
+    perf: dict[str, Any],
+    delta: dict[str, Any],
+    flamegraphs: dict[str, Any],
+    meta: dict[str, str],
+    report_index_url: str = "",
+) -> dict[str, Any]:
     delta_rows = rows_by_case(delta)
+    flamegraph_rows = flamegraphs_by_case(flamegraphs)
     rows: list[dict[str, Any]] = []
     for row in perf.get("rows", []):
         if not isinstance(row, dict):
@@ -130,6 +149,7 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
         clang = parse_seconds(row.get("clang"))
         yoolang = parse_seconds(row.get("compiler", row.get("yoolang")))
         delta_row = delta_rows.get(case, {})
+        flamegraph_row = flamegraph_rows.get(case, {})
         status = str(row.get("status", "UNKNOWN"))
         detail = str(row.get("detail", "")).strip()
         rows.append(
@@ -147,6 +167,14 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
                 "baseline_status": str(delta_row.get("status", "")),
                 "status": status,
                 "reason": detail,
+                "flamegraph_status": str(flamegraph_row.get("status", "N/A")),
+                "flamegraph_url": f"./flamegraphs/{flamegraph_row.get('url', '')}"
+                if flamegraph_row.get("url")
+                else "",
+                "flamegraph_samples": flamegraph_row.get("samples")
+                if isinstance(flamegraph_row.get("samples"), int)
+                else None,
+                "flamegraph_detail": str(flamegraph_row.get("detail", "")),
             }
         )
 
@@ -489,7 +517,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       border: 1px solid var(--line);
       border-radius: 8px;
     }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 1230px; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 1330px; }}
     th, td {{
       padding: 10px 12px;
       border-bottom: 1px solid var(--line);
@@ -522,6 +550,18 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
     .ok {{ color: var(--good); font-weight: 600; }}
     .fail {{ color: var(--bad); font-weight: 600; }}
     .reason {{ color: var(--muted); max-width: 360px; }}
+    .flamegraph-link {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--control);
+      text-decoration: none;
+      white-space: nowrap;
+    }}
+    .flamegraph-detail {{ color: var(--muted); font-size: 12px; margin-top: 4px; max-width: 220px; }}
     .empty {{ padding: 24px; color: var(--muted); }}
 {REPORT_THEME_CSS}
     @media (max-width: 760px) {{
@@ -600,6 +640,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
             <th data-key="yoolang_vs_clang_speedup">Yoolang vs Clang++ <span class="sort"></span></th>
             <th data-key="baseline_sec">Baseline 时间 <span class="sort"></span></th>
             <th data-key="delta_pct">相对 baseline <span class="sort"></span></th>
+            <th data-key="flamegraph_status">火焰图 <span class="sort"></span></th>
             <th data-key="status">状态 <span class="sort"></span></th>
             <th data-key="reason">失败原因 <span class="sort"></span></th>
           </tr>
@@ -633,6 +674,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
     const fmtSec = (value) => isNumber(value) ? `${{value.toFixed(4)}}s` : 'N/A';
     const fmtPct = (value) => isNumber(value) ? `${{value > 0 ? '+' : ''}}${{value.toFixed(2)}}%` : 'N/A';
     const fmtSpeedup = (value) => isNumber(value) ? `${{value.toFixed(2)}}x` : 'N/A';
+    const fmtSamples = (value) => Number.isInteger(value) ? value.toLocaleString() : 'N/A';
     const winsGcc = (row) => isNumber(row.yoolang_sec) && isNumber(row.gcc_sec) && row.yoolang_sec < row.gcc_sec;
     const winsClang = (row) => isNumber(row.yoolang_sec) && isNumber(row.clang_sec) && row.yoolang_sec < row.clang_sec;
     const losesGcc = (row) => isNumber(row.yoolang_sec) && isNumber(row.gcc_sec) && row.yoolang_sec > row.gcc_sec;
@@ -981,6 +1023,15 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       return `<div class="top-card">${{heading}}<ol class="mini-list">${{rows.map((item) => `<li>${{itemRenderer(item)}}</li>`).join('')}}</ol></div>`;
     }}
 
+    function renderFlamegraph(row) {{
+      const status = String(row.flamegraph_status || 'N/A');
+      const detail = row.flamegraph_detail ? `<div class="flamegraph-detail">${{escapeHtml(row.flamegraph_detail)}}</div>` : '';
+      if (row.flamegraph_url && (status === 'OK' || status === 'EMPTY' || status === 'FAILED')) {{
+        return `<a class="flamegraph-link" href="${{escapeHtml(row.flamegraph_url)}}">打开</a><div class="flamegraph-detail">${{escapeHtml(status)}} / ${{fmtSamples(row.flamegraph_samples)}} samples</div>`;
+      }}
+      return `<span class="muted">${{escapeHtml(status)}}</span>${{detail}}`;
+    }}
+
     function filteredRows() {{
       const query = document.getElementById('search').value.trim().toLowerCase();
       const filter = document.getElementById('filter').value;
@@ -1051,6 +1102,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
           <td class="num ${{compareTimeClass(row.yoolang_sec, row.clang_sec)}}">${{fmtSpeedup(row.yoolang_vs_clang_speedup)}}</td>
           <td class="num">${{row.baseline_sec != null ? fmtSec(row.baseline_sec) : (row.baseline_status !== 'OK' && row.baseline_status !== 'MISSING' ? row.baseline_status : 'N/A')}}</td>
           <td class="num ${{baselineClass(row.delta_pct)}}">${{fmtPct(row.delta_pct)}}</td>
+          <td>${{renderFlamegraph(row)}}</td>
           <td class="${{row.status === 'OK' ? 'ok' : 'fail'}}">${{escapeHtml(row.status || '')}}</td>
           <td class="reason">${{escapeHtml(row.reason || '')}}</td>
         </tr>
@@ -1133,8 +1185,9 @@ def main() -> int:
     args = parse_args()
     perf = read_json(args.perf_report)
     delta = read_json(args.delta_report)
+    flamegraphs = read_json(args.flamegraph_index)
     report_index_url = args.report_index_url or default_report_index_url(args.out_html, args.pages_base_url)
-    payload = build_payload(perf, delta, report_meta(args), report_index_url)
+    payload = build_payload(perf, delta, flamegraphs, report_meta(args), report_index_url)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     json_text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
     args.out_json.write_text(json_text)
