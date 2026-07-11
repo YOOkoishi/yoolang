@@ -95,17 +95,24 @@ int main() {
 // ASM: call memset
 
 // ASM-LABEL: dynamic_clear:
+// ASM: addi sp, sp, -512
+// ASM-NOT: sd ra
+// ASM-NOT: call memset
+// ASM: .Lmemzero_
 // ASM: bge zero,
-// ASM: li a1, 0
-// ASM: call memset
-// ASM: .Lmemzero_dynamic_done_
+// ASM-NOT: call memset
 
 // ASM-LABEL: static_fill_minus_one:
 // ASM: li a1, 255
 // ASM: call memset
 
 // ASM-LABEL: dynamic_fill_minus_one:
+// ASM: addi sp, sp, -512
+// ASM-NOT: sd ra
+// ASM-NOT: call memset
+// ASM: li t3, -1
+// ASM: .Lmemzero_
 // ASM: bge zero,
-// ASM: li a1, 255
-// ASM: call memset
-// ASM: .Lmemzero_dynamic_done_
+// ASM-NOT: call memset
+
+// ASM-LABEL: static_fill_nonbyte:

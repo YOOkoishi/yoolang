@@ -165,27 +165,11 @@ bool phys_in_set(const std::set<std::string> &set, const mir::Register &reg) {
     return reg.is_physical() && set.find(reg.name) != set.end();
 }
 
-const mir::MachineOperand *memzero_byte_count_operand(const mir::MachineInstr &instr) {
-    if (instr.opcode() != mir::Opcode::MemZero) {
-        return nullptr;
-    }
-    const auto &ops = instr.operands();
-    return ops.size() >= 3 ? &ops[2] : nullptr;
-}
-
-bool memzero_uses_memset(const mir::MachineInstr &instr) {
-    const auto *byte_count = memzero_byte_count_operand(instr);
-    return byte_count != nullptr &&
-           (byte_count->kind() == mir::OperandKind::Reg ||
-            (byte_count->kind() == mir::OperandKind::Imm &&
-             byte_count->int_value() >= mir::kMemZeroMemsetThresholdBytes));
-}
-
 std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineInstr &instr,
                                                            mir::RegisterClass reg_class) {
     std::vector<mir::Register> out;
     if (instr.opcode() == mir::Opcode::MemZero && reg_class == mir::RegisterClass::GPR) {
-        if (memzero_uses_memset(instr)) {
+        if (mir::memzero_uses_memset(instr)) {
             return caller_saved(reg_class);
         }
         const auto &ops = instr.operands();
@@ -195,9 +179,10 @@ std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineIns
         }
         out.push_back(mir::Register::physical("t4", reg_class));
         out.push_back(mir::Register::physical("t5", reg_class));
+        out.push_back(mir::Register::physical("t6", reg_class));
     }
     if (instr.opcode() == mir::Opcode::MemZero && reg_class == mir::RegisterClass::FPR32) {
-        if (memzero_uses_memset(instr)) {
+        if (mir::memzero_uses_memset(instr)) {
             return caller_saved(reg_class);
         }
     }
@@ -218,7 +203,7 @@ bool is_call_like_instr(const mir::MachineInstr &instr) {
     if (instr.opcode() == mir::Opcode::Call) {
         return true;
     }
-    return memzero_uses_memset(instr);
+    return mir::memzero_uses_memset(instr);
 }
 
 VRegSet live_across_call(const mir::MachineInstr &instr, const VRegSet &live_after,

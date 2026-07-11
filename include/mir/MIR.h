@@ -121,6 +121,11 @@ struct TargetInfo {
 
 inline constexpr std::int64_t kMemZeroMemsetThresholdBytes = 256;
 
+// Dynamic byte counts deliberately stay on the inline-loop path.
+inline constexpr bool memzero_constant_uses_memset(std::int64_t byte_count) {
+    return byte_count >= kMemZeroMemsetThresholdBytes;
+}
+
 struct TypeInfo {
     ValueType value_type = ValueType::Void;
     std::string ir;
@@ -221,6 +226,11 @@ class MachineOperand final {
     bool is_dead_ = false;
 };
 
+inline bool memzero_uses_memset(const MachineOperand &byte_count) {
+    return byte_count.kind() == OperandKind::Imm &&
+           memzero_constant_uses_memset(byte_count.int_value());
+}
+
 class MachineInstr final {
   public:
     MachineInstr() = default;
@@ -236,6 +246,11 @@ class MachineInstr final {
     Opcode opcode_ = Opcode::Comment;
     std::vector<MachineOperand> operands_;
 };
+
+inline bool memzero_uses_memset(const MachineInstr &instr) {
+    const auto &ops = instr.operands();
+    return instr.opcode() == Opcode::MemZero && ops.size() >= 3 && memzero_uses_memset(ops[2]);
+}
 
 class MachineBasicBlock final {
   public:

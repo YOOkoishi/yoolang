@@ -155,9 +155,7 @@ void AsmPrinter::invalidate_memzero_stack_addr_facts(
 
     const auto &byte_value = ops[1];
     const auto &byte_count = ops[2];
-    if (byte_count.kind() == OperandKind::Reg ||
-        (byte_count.kind() == OperandKind::Imm &&
-         byte_count.int_value() >= kMemZeroMemsetThresholdBytes)) {
+    if (memzero_uses_memset(byte_count)) {
         facts.clear();
         return;
     }
@@ -167,6 +165,7 @@ void AsmPrinter::invalidate_memzero_stack_addr_facts(
     }
     facts.erase("t4");
     facts.erase("t5");
+    facts.erase("t6");
 }
 
 void AsmPrinter::compute_stack_addr_facts(const MachineFunction &function) {
@@ -578,32 +577,10 @@ void AsmPrinter::emit_memzero(const MachineOperand &addr, const MachineOperand &
                                        prefer_wide_zero_stores)) {
             return;
         }
-        if (byte_count.int_value() >= kMemZeroMemsetThresholdBytes) {
+        if (memzero_uses_memset(byte_count)) {
             emit_memset_call(addr.string_value(), byte_value, size);
             return;
         }
-    } else if (byte_count.kind() == OperandKind::Reg) {
-        const std::string done =
-            ".Lmemzero_dynamic_done_" + std::to_string(unique_label_id_++);
-        const std::string &addr_reg = addr.string_value();
-        const std::string &count_reg = byte_count.string_value();
-        std::string count_scratch = "t6";
-        if (addr_reg == count_scratch || count_reg == count_scratch) {
-            count_scratch = "t5";
-        }
-        if (addr_reg == count_scratch || count_reg == count_scratch) {
-            count_scratch = "t4";
-        }
-        out_ << "\tbge zero, " << byte_count.string_value() << ", " << done << "\n";
-        out_ << "\tmv " << count_scratch << ", " << count_reg << "\n";
-        if (addr_reg != "a0") {
-            out_ << "\tmv a0, " << addr_reg << "\n";
-        }
-        out_ << "\tli a1, " << byte_value.int_value() << "\n";
-        out_ << "\tmv a2, " << count_scratch << "\n";
-        out_ << "\tcall memset\n";
-        out_ << done << ":\n";
-        return;
     }
     emit_memzero_loop(addr.string_value(), byte_value, byte_count);
 }
@@ -658,11 +635,31 @@ void AsmPrinter::emit_memzero_loop(const std::string &addr_reg,
     std::string done = loop + "_done";
     const std::string cursor = addr_reg == "t5" ? "t4" : "t5";
     const std::string counter = cursor == "t5" ? "t4" : "t5";
-    out_ << "\tmv " << cursor << ", " << addr_reg << "\n";
     if (byte_count.kind() == OperandKind::Imm) {
+        out_ << "\tmv " << cursor << ", " << addr_reg << "\n";
         out_ << "\tli " << counter << ", " << byte_count.int_value() << "\n";
     } else {
-        out_ << "\tmv " << counter << ", " << byte_count.string_value() << "\n";
+        const auto &count_reg = byte_count.string_value();
+        if (count_reg == cursor && addr_reg == counter) {
+            // Spill rewriting may assign the two inputs to t4/t5. Preserve the
+            // parallel-copy semantics when the requested scratch assignment is a swap.
+            out_ << "\tmv t6, " << addr_reg << "\n";
+            out_ << "\tmv " << counter << ", " << count_reg << "\n";
+            out_ << "\tmv " << cursor << ", t6\n";
+        } else if (count_reg == cursor) {
+            // Save the count before installing the cursor over its source register.
+            out_ << "\tmv " << counter << ", " << count_reg << "\n";
+            if (addr_reg != cursor) {
+                out_ << "\tmv " << cursor << ", " << addr_reg << "\n";
+            }
+        } else {
+            if (addr_reg != cursor) {
+                out_ << "\tmv " << cursor << ", " << addr_reg << "\n";
+            }
+            if (count_reg != counter) {
+                out_ << "\tmv " << counter << ", " << count_reg << "\n";
+            }
+        }
     }
     const bool stores_zero = byte_value.kind() == OperandKind::Imm && byte_value.int_value() == 0;
     if (!stores_zero) {

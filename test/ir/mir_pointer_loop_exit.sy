@@ -1,5 +1,12 @@
 // RUN: %compiler --emit-mir-stage=pre-ra -O1 %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler --emit-mir-stage=pre-ra --cost-model-policy=conservative -O1 %s | FileCheck %s --check-prefix=MIR-CONSERVATIVE
+// RUN: %compiler --emit-mir-stage=pre-ra --cost-model-policy=balanced -O1 %s | FileCheck %s --check-prefix=MIR-BALANCED
 // RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
+// RUN: %compiler --emit-cost-model --cost-model-filter=LoopUnroll -O1 %s | FileCheck %s --check-prefix=COST-DEFAULT
+// RUN: %compiler --emit-cost-model --cost-model-filter=LoopUnroll --cost-model-policy=conservative -O1 %s | FileCheck %s --check-prefix=COST-CONSERVATIVE
+// RUN: %compiler --emit-cost-model --cost-model-filter=LoopUnroll --cost-model-policy=balanced -O1 %s | FileCheck %s --check-prefix=COST-BALANCED
+// RUN: %compiler --emit-cost-model --cost-model-filter=LoopUnroll --cost-model-policy=aggressive -O1 %s | FileCheck %s --check-prefix=COST-AGGRESSIVE
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=LoopUnroll -O1 %s | FileCheck %s --check-prefix=COST-JSON
 
 int pointer_exit_dot(int n, int a[], int b[]) {
   int acc = 0;
@@ -55,6 +62,36 @@ void pretested_pointer_exit(int n, int a[][16], int b[][16], int c[][16]) {
   }
 }
 
+void guarded_large_pointer_unroll(int n, int a[][64], int b[][64], int c[][64]) {
+  if (n < 32) {
+    return;
+  }
+
+  int i = 0;
+  int j = 0;
+  int k = 0;
+  while (k < n) {
+    i = 0;
+    while (i < n) {
+      if (a[i][k] == 1) {
+        i = i + 1;
+        continue;
+      }
+      j = 0;
+      while (j < n) {
+        c[i][j] = c[i][j] * a[i][k] + b[k][j];
+        j = j + 1;
+      }
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+  // Keep observable tail work so balanced policy can prefer the proven lower-bound candidate
+  // without first failing the module-growth gate.
+  c[0][0] = c[0][0] + a[0][0] + b[0][0];
+  c[0][1] = c[0][1] + a[0][1] + b[0][1];
+}
+
 int matrix_a[16][16];
 int matrix_b[16][16];
 int matrix_c[16][16];
@@ -73,14 +110,38 @@ int main() {
 // MIR: SLLIW %v{{[0-9]+}}:gpr, %v0:gpr, 2
 // MIR: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
 // MIR-NOT: BLT %v{{[0-9]+}}:gpr, %v0:gpr, %edge.{{.*}}
+// The existing OIR exact-trip unroller removes the five-trip loop before MIR.
 // MIR-LABEL: func @small_constant_dot
 // MIR-NOT: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
-// MIR: BLT %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
+// MIR-NOT: BLT
+// MIR: LOAD_MEM_OFF
+// MIR-NOT: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
+// MIR-NOT: BLT
 // MIR-LABEL: func @pretested_pointer_exit
 // MIR: ANDI %v{{[0-9]+}}:gpr, %v0:gpr, 3
 // MIR: J %{{.*}}unroll4.dispatch
-// MIR: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %{{.*}}while.body
 // MIR: BNEZ %v{{[0-9]+}}:gpr, %{{.*}}unroll4.peel
+// MIR-LABEL: func @guarded_large_pointer_unroll
+// MIR: J %{{.*}}unroll4.dispatch
+// MIR: BNEZ %v{{[0-9]+}}:gpr, %{{.*}}unroll4.peel
+
+// MIR-CONSERVATIVE-LABEL: func @pretested_pointer_exit
+// MIR-CONSERVATIVE-NOT: unroll4
+// MIR-CONSERVATIVE: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %{{.*}}while.body
+// MIR-CONSERVATIVE-NOT: unroll4
+// MIR-CONSERVATIVE-LABEL: func @guarded_large_pointer_unroll
+// MIR-CONSERVATIVE-NOT: unroll4
+// MIR-CONSERVATIVE: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %{{.*}}while.body
+// MIR-CONSERVATIVE-NOT: unroll4
+// MIR-CONSERVATIVE-LABEL: func @main
+
+// MIR-BALANCED-LABEL: func @pretested_pointer_exit
+// MIR-BALANCED-NOT: unroll4
+// MIR-BALANCED: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %{{.*}}while.body
+// MIR-BALANCED-NOT: unroll4
+// MIR-BALANCED-LABEL: func @guarded_large_pointer_unroll
+// MIR-BALANCED: J %{{.*}}unroll4.dispatch
+// MIR-BALANCED: BNEZ %v{{[0-9]+}}:gpr, %{{.*}}unroll4.peel
 
 // ASM-LABEL: pointer_exit_dot:
 // ASM-NOT: slt
@@ -89,12 +150,41 @@ int main() {
 // ASM-NOT: blt
 // ASM-LABEL: small_constant_dot:
 // ASM-NOT: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lsmall_constant_dot_edge
-// ASM: blt
+// ASM-NOT: blt
+// ASM: lw
+// ASM-NOT: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lsmall_constant_dot_edge
+// ASM-NOT: blt
 // ASM-LABEL: pretested_pointer_exit:
 // ASM: andi {{[a-z0-9]+}}, {{[a-z0-9]+}}, 3
 // ASM: .Lpretested_pointer_exit_{{.*}}unroll4.dispatch:
-// ASM: beqz {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}while.body
 // ASM: .Lpretested_pointer_exit_{{.*}}unroll4.peel:
 // ASM: bnez {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}unroll4.peel
-// ASM: .Lpretested_pointer_exit_{{.*}}unroll4.peel.done:
-// ASM: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}while.body
+// ASM-LABEL: guarded_large_pointer_unroll:
+// ASM: .Lguarded_large_pointer_unroll_{{.*}}unroll4.dispatch:
+// ASM: .Lguarded_large_pointer_unroll_{{.*}}unroll4.peel:
+// ASM: bnez {{[a-z0-9]+}}, .Lguarded_large_pointer_unroll_{{.*}}unroll4.peel
+
+// COST-DEFAULT: [cost-model] target=rv64gc/lp64d policy=aggressive filter=LoopUnroll
+// COST-DEFAULT: [cost-model] MIRPointerLoopExitPass Accept transform=LoopUnroll scope=pretested_pointer_exit:{{[^ ]+}} {{.*}} reason=Profitable
+// COST-DEFAULT: [cost-model] MIRPointerLoopExitPass Accept transform=LoopUnroll scope=guarded_large_pointer_unroll:{{[^ ]+}} {{.*}} reason=Profitable
+
+// COST-CONSERVATIVE: [cost-model] target=rv64gc/lp64d policy=conservative filter=LoopUnroll
+// COST-CONSERVATIVE: [cost-model] MIRPointerLoopExitPass Reject transform=LoopUnroll scope=pretested_pointer_exit:{{[^ ]+}}
+// COST-CONSERVATIVE: [cost-model] MIRPointerLoopExitPass Reject transform=LoopUnroll scope=guarded_large_pointer_unroll:{{[^ ]+}}
+
+// COST-BALANCED: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopUnroll
+// COST-BALANCED: [cost-model] MIRPointerLoopExitPass Reject transform=LoopUnroll scope=pretested_pointer_exit:{{[^ ]+}}
+// COST-BALANCED: [cost-model] MIRPointerLoopExitPass Accept transform=LoopUnroll scope=guarded_large_pointer_unroll:{{[^ ]+}}
+
+// COST-AGGRESSIVE: [cost-model] target=rv64gc/lp64d policy=aggressive filter=LoopUnroll
+// COST-AGGRESSIVE: [cost-model] MIRPointerLoopExitPass Accept transform=LoopUnroll scope=pretested_pointer_exit:{{[^ ]+}}
+// COST-AGGRESSIVE: [cost-model] MIRPointerLoopExitPass Accept transform=LoopUnroll scope=guarded_large_pointer_unroll:{{[^ ]+}}
+
+// COST-JSON: "pass": "MIRPointerLoopExitPass"
+// COST-JSON: "candidate_id": "pointer-unroll4.{{[^"]+}}"
+// COST-JSON: "scope": "pretested_pointer_exit:{{[^"]+}}"
+// COST-JSON: "action": "Accept"
+// COST-JSON: "pass": "MIRPointerLoopExitPass"
+// COST-JSON: "candidate_id": "pointer-unroll4.{{[^"]+}}"
+// COST-JSON: "scope": "guarded_large_pointer_unroll:{{[^"]+}}"
+// COST-JSON: "action": "Accept"

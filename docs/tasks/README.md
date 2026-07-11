@@ -18,6 +18,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [MIR Performance Review Fixes](2026-07-11-mir-performance-review-fixes.md) | ready_for_review | `ipsccp` | 2026-07-11 |
 | [OIR Scalar Precision Pipeline](2026-07-10-oir-scalar-precision-pipeline.md) | ready_for_review | `master` | 2026-07-10 |
 | [Sort Hard Gate Cleanup](2026-07-08-sort-hard-gate-cleanup.md) | blocked | `task/oir-digit-extraction-cse` | 2026-07-08 |
 | [Radix General Optimizations](2026-07-08-radix-general-opts.md) | blocked | `task/oir-digit-extraction-cse` | 2026-07-08 |

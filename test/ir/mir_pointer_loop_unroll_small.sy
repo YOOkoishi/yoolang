@@ -1,0 +1,55 @@
+// RUN: %compiler --emit-mir-stage=pre-ra -O1 %s | FileCheck %s --check-prefix=MIR
+// RUN: %compiler --emit-cost-model --cost-model-filter=LoopUnroll --cost-model-policy=aggressive -O1 %s | FileCheck %s --check-prefix=COST
+
+int small_a[16][16];
+int small_b[16][16];
+int small_c[16][16];
+
+void pretested_small(int n, int a[][16], int b[][16], int c[][16]) {
+  int i = 0;
+  int j = 0;
+  int k = 0;
+  while (k < n) {
+    i = 0;
+    while (i < n) {
+      if (a[i][k] == 1) {
+        i = i + 1;
+        continue;
+      }
+      j = 0;
+      while (j < n) {
+        c[i][j] = c[i][j] * a[i][k] + b[k][j];
+        j = j + 1;
+      }
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+}
+
+int main() {
+  int n = getint();
+  int reps = getint();
+  small_a[0][0] = 2;
+  small_b[0][0] = 1;
+  small_c[0][0] = 1;
+  while (reps > 0) {
+    pretested_small(n, small_a, small_b, small_c);
+    reps = reps - 1;
+  }
+  putint(small_c[0][0]);
+  return 0;
+}
+
+// MIR-LABEL: func @pretested_small
+// MIR-NOT: unroll4
+// MIR: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %{{.*}}while.body
+// MIR-NOT: unroll4
+// MIR-LABEL: func @main
+// MIR-NOT: unroll4
+// MIR: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %{{.*}}while.body
+// MIR-NOT: unroll4
+
+// COST: [cost-model] target=rv64gc/lp64d policy=aggressive filter=LoopUnroll
+// COST: [cost-model] MIRPointerLoopExitPass Reject transform=LoopUnroll scope=pretested_small:{{[^ ]+}} {{.*}} reason=CodeGrowthTooHigh
+// COST: [cost-model] MIRPointerLoopExitPass Reject transform=LoopUnroll scope=main:{{[^ ]+}} {{.*}} reason=CodeGrowthTooHigh

@@ -27,6 +27,8 @@ struct Stats {
     unsigned licm = 0;
     unsigned dead = 0;
 
+    std::int64_t module_static_instrs = 0;
+
     pass::cost_model::CostModelReport *cost_model_report = nullptr;
     pass::cost_model::CostModelPolicyKind cost_model_policy =
         pass::cost_model::CostModelPolicyKind::Balanced;

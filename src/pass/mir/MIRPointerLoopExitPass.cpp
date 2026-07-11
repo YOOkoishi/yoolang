@@ -1,8 +1,10 @@
+#include "pass/mir/MIRCostModel.h"
 #include "pass/mir/MIRPeepholeCommon.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -49,6 +51,7 @@ using PositiveFactSet = std::set<VRegId>;
 struct PositiveBoundInfo {
     std::map<VRegId, std::int64_t> constants;
     std::map<VRegId, std::set<mir::MachineBasicBlock *>> positive_edge_targets;
+    std::map<VRegId, std::map<mir::MachineBasicBlock *, std::int64_t>> lower_bound_edge_targets;
 };
 
 constexpr std::int64_t kSmallConstantTripCount = 8;
@@ -212,6 +215,39 @@ mir::MachineBasicBlock *branch_target(mir::MachineFunction &function,
     return function.get_block(ops[target].string_value());
 }
 
+struct ConditionalBranchEdges {
+    const mir::MachineInstr *branch = nullptr;
+    mir::MachineBasicBlock *true_target = nullptr;
+    mir::MachineBasicBlock *false_target = nullptr;
+};
+
+std::optional<ConditionalBranchEdges> conditional_branch_edges(mir::MachineFunction &function,
+                                                               mir::MachineBasicBlock &block) {
+    const auto &instrs = block.instructions();
+    if (instrs.empty()) {
+        return std::nullopt;
+    }
+
+    ConditionalBranchEdges edges;
+    const auto &last = instrs.back();
+    if (is_conditional_branch(last.opcode())) {
+        edges.branch = &last;
+        edges.false_target = next_block(function, block);
+    } else if (instrs.size() >= 2 && is_conditional_branch(instrs[instrs.size() - 2].opcode())) {
+        edges.branch = &instrs[instrs.size() - 2];
+        if (last.opcode() == mir::Opcode::Jump && !last.operands().empty() &&
+            last.operands()[0].kind() == mir::OperandKind::Block) {
+            edges.false_target = function.get_block(last.operands()[0].string_value());
+        } else {
+            edges.false_target = next_block(function, block);
+        }
+    } else {
+        return std::nullopt;
+    }
+    edges.true_target = branch_target(function, *edges.branch);
+    return edges;
+}
+
 void add_positive_fact(PositiveFactSet &facts, const mir::Register &reg) {
     if (reg.is_virtual() && reg.value_type == mir::ValueType::I32) {
         facts.insert(reg.id);
@@ -274,52 +310,79 @@ void add_branch_positive_facts(PositiveFactSet &facts, const mir::MachineInstr &
     }
 }
 
+std::optional<std::int64_t>
+constant_operand_value(const mir::MachineOperand &operand,
+                       const std::map<VRegId, std::int64_t> &constants) {
+    if (!operand.is_reg()) {
+        return std::nullopt;
+    }
+    const auto &reg = operand.reg_value();
+    if (!reg.is_virtual()) {
+        return is_zero_reg(reg) ? std::optional<std::int64_t>(0) : std::nullopt;
+    }
+    auto found = constants.find(reg.id);
+    return found == constants.end() ? std::nullopt : std::optional<std::int64_t>(found->second);
+}
+
+std::optional<std::pair<VRegId, std::int64_t>>
+make_lower_bound_fact(const mir::MachineOperand &operand, std::int64_t lower_bound) {
+    if (!operand.is_reg() || !operand.reg_value().is_virtual() ||
+        operand.reg_value().value_type != mir::ValueType::I32) {
+        return std::nullopt;
+    }
+    return std::pair<VRegId, std::int64_t>{operand.reg_value().id, lower_bound};
+}
+
+std::optional<std::pair<VRegId, std::int64_t>>
+branch_lower_bound_fact(const mir::MachineInstr &branch, bool true_edge,
+                        const std::map<VRegId, std::int64_t> &constants) {
+    const auto &ops = branch.operands();
+    if (ops.size() < 2) {
+        return std::nullopt;
+    }
+
+    const auto lhs_constant = constant_operand_value(ops[0], constants);
+    const auto rhs_constant = constant_operand_value(ops[1], constants);
+    if (branch.opcode() == mir::Opcode::BranchLT) {
+        if (true_edge && lhs_constant && *lhs_constant < std::numeric_limits<std::int32_t>::max()) {
+            return make_lower_bound_fact(ops[1], *lhs_constant + 1);
+        }
+        if (!true_edge && rhs_constant) {
+            return make_lower_bound_fact(ops[0], *rhs_constant);
+        }
+    } else if (branch.opcode() == mir::Opcode::BranchGE) {
+        if (true_edge && rhs_constant) {
+            return make_lower_bound_fact(ops[0], *rhs_constant);
+        }
+        if (!true_edge && lhs_constant &&
+            *lhs_constant < std::numeric_limits<std::int32_t>::max()) {
+            return make_lower_bound_fact(ops[1], *lhs_constant + 1);
+        }
+    }
+    return std::nullopt;
+}
+
 void add_edge_positive_facts(mir::MachineFunction &function, mir::MachineBasicBlock &block,
                              mir::MachineBasicBlock &succ, PositiveFactSet &facts,
                              const std::map<VRegId, mir::Register> &positive_slt_defs) {
-    const auto &instrs = block.instructions();
-    if (instrs.empty()) {
+    const auto edges = conditional_branch_edges(function, block);
+    if (!edges) {
         return;
     }
-
-    const mir::MachineInstr *branch = nullptr;
-    mir::MachineBasicBlock *true_target = nullptr;
-    mir::MachineBasicBlock *false_target = nullptr;
-    const auto &last = instrs.back();
-
-    if (is_conditional_branch(last.opcode())) {
-        branch = &last;
-        true_target = branch_target(function, last);
-        false_target = next_block(function, block);
-    } else if (last.opcode() == mir::Opcode::Jump && instrs.size() >= 2 &&
-               is_conditional_branch(instrs[instrs.size() - 2].opcode())) {
-        branch = &instrs[instrs.size() - 2];
-        true_target = branch_target(function, *branch);
-        if (!last.operands().empty() && last.operands()[0].kind() == mir::OperandKind::Block) {
-            false_target = function.get_block(last.operands()[0].string_value());
-        }
-    } else if (instrs.size() >= 2 && is_conditional_branch(instrs[instrs.size() - 2].opcode())) {
-        branch = &instrs[instrs.size() - 2];
-        true_target = branch_target(function, *branch);
-        false_target = next_block(function, block);
+    if (edges->true_target == &succ) {
+        add_branch_positive_facts(facts, *edges->branch, true, positive_slt_defs);
     }
-
-    if (branch == nullptr) {
-        return;
-    }
-    if (true_target == &succ) {
-        add_branch_positive_facts(facts, *branch, true, positive_slt_defs);
-    }
-    if (false_target == &succ) {
-        add_branch_positive_facts(facts, *branch, false, positive_slt_defs);
+    if (edges->false_target == &succ) {
+        add_branch_positive_facts(facts, *edges->branch, false, positive_slt_defs);
     }
 }
 
-PositiveBoundInfo compute_positive_bound_info(
-    mir::MachineFunction &function, const std::map<VRegId, RegCounts> &counts) {
+PositiveBoundInfo compute_positive_bound_info(mir::MachineFunction &function,
+                                              const std::map<VRegId, RegCounts> &counts) {
     PositiveBoundInfo info;
     info.constants = collect_i32_constants(function, counts);
     const auto positive_slt_defs = collect_positive_slt_defs(function, counts);
+    auto *entry = function.blocks().empty() ? nullptr : function.blocks().front().get();
 
     for (auto &block_ptr : function.blocks()) {
         auto *block = block_ptr.get();
@@ -328,6 +391,23 @@ PositiveBoundInfo compute_positive_bound_info(
             add_edge_positive_facts(function, *block, *succ, direct_facts, positive_slt_defs);
             for (auto fact : direct_facts) {
                 info.positive_edge_targets[fact].insert(succ);
+            }
+
+            if (succ == entry || succ->predecessors().size() != 1) {
+                continue;
+            }
+            const auto edges = conditional_branch_edges(function, *block);
+            if (!edges) {
+                continue;
+            }
+            const bool true_edge = edges->true_target == succ;
+            const bool false_edge = edges->false_target == succ;
+            if (true_edge == false_edge) {
+                continue;
+            }
+            auto fact = branch_lower_bound_fact(*edges->branch, true_edge, info.constants);
+            if (fact) {
+                info.lower_bound_edge_targets[fact->first][succ] = fact->second;
             }
         }
     }
@@ -389,6 +469,31 @@ bool bound_known_positive_at(const PositiveBoundInfo &info, const mir::MachineBa
         }
     }
     return false;
+}
+
+std::optional<std::int64_t> bound_lower_bound_at(const PositiveBoundInfo &info,
+                                                 const mir::MachineBasicBlock &block,
+                                                 const mir::Register &bound,
+                                                 mir::MachineFunction &function) {
+    if (!bound.is_virtual()) {
+        return std::nullopt;
+    }
+    auto constant = info.constants.find(bound.id);
+    if (constant != info.constants.end()) {
+        return constant->second;
+    }
+    auto facts = info.lower_bound_edge_targets.find(bound.id);
+    if (facts == info.lower_bound_edge_targets.end()) {
+        return std::nullopt;
+    }
+
+    std::optional<std::int64_t> lower_bound;
+    for (const auto &[target, value] : facts->second) {
+        if (dominates_by_reachability(function, *target, block)) {
+            lower_bound = lower_bound ? std::max(*lower_bound, value) : value;
+        }
+    }
+    return lower_bound;
 }
 
 unsigned loop_carried_gpr_count(const mir::MachineBasicBlock &backedge) {
@@ -669,11 +774,94 @@ bool is_factor_four_unroll_core(const std::vector<mir::MachineInstr> &core) {
     return true;
 }
 
+bool cost_model_allows_factor_four_unroll(const mir::MachineFunction &function,
+                                          const mir::MachineBasicBlock &header,
+                                          const std::vector<mir::MachineInstr> &core,
+                                          std::optional<std::int64_t> trip_lower_bound,
+                                          bool exact_trip_count, Stats &stats) {
+    const bool has_useful_trip_bound =
+        exact_trip_count || (trip_lower_bound && *trip_lower_bound > 1);
+    constexpr std::int64_t kUnknownTripEstimate = 32;
+    const auto estimated_trip_count =
+        has_useful_trip_bound
+            ? std::max<std::int64_t>(trip_lower_bound.value_or(1), 1)
+            : kUnknownTripEstimate;
+    const auto remainder = estimated_trip_count % 4;
+    const auto unrolled_iterations = estimated_trip_count / 4;
+
+    const auto before_control_instrs = estimated_trip_count + 1;
+    const auto before_control_cycles = estimated_trip_count * 2 + 1;
+    std::int64_t after_control_instrs = 2;
+    std::int64_t after_control_cycles = 3;
+    if (remainder != 0) {
+        after_control_instrs += remainder * 2 + 2;
+        after_control_cycles += remainder * 3 + 3;
+        if (unrolled_iterations == 0) {
+            ++after_control_instrs;
+            ++after_control_cycles;
+        }
+    } else {
+        ++after_control_instrs;
+        ++after_control_cycles;
+    }
+    if (unrolled_iterations != 0) {
+        after_control_instrs += unrolled_iterations + 1;
+        after_control_cycles += unrolled_iterations * 2 + 1;
+    }
+
+    const auto core_instrs = estimated_trip_count * static_cast<std::int64_t>(core.size());
+    const auto pre_ra_static_growth = static_cast<std::int64_t>(core.size()) * 4 + 8;
+    constexpr std::int64_t kLiveRangeGrowth = 2;
+    constexpr std::int64_t kRegisterPressureGrowth = 2;
+    // Project the PreRA expansion through register allocation.  Each extra
+    // callee-saved register needs a save/restore pair, while each extended live
+    // range reserves one copy/spill instruction.  This keeps the code-growth
+    // gate honest about the final code that exposed the original regression.
+    constexpr std::int64_t kEstimatedPostRAGrowth =
+        2 * kRegisterPressureGrowth + kLiveRangeGrowth;
+    const auto estimated_static_growth = pre_ra_static_growth + kEstimatedPostRAGrowth;
+    std::int64_t function_instrs = 0;
+    for (const auto &block : function.blocks()) {
+        function_instrs += static_cast<std::int64_t>(block->instructions().size());
+    }
+
+    pass::mir_cost_model::MIRTransformCostEstimate estimate;
+    estimate.kind = pass::cost_model::TransformKind::LoopUnroll;
+    estimate.stage = pass::cost_model::CostIRStage::PreRAMIR;
+    estimate.pass_name = "MIRPointerLoopExitPass";
+    estimate.candidate_id = "pointer-unroll4." + function.name() + "." + header.name();
+    estimate.scope = function.name() + ":" + header.name();
+    estimate.proof_summary = exact_trip_count
+                                 ? "exact trip-count dynamic estimate and factor-four structural "
+                                   "checks"
+                             : has_useful_trip_bound
+                                 ? "dominating minimum-trip dynamic estimate and factor-four "
+                                   "structural checks"
+                                 : "low-confidence 32-trip heuristic; runtime trip count unknown";
+    estimate.confidence = exact_trip_count ? 0.85 : has_useful_trip_bound ? 0.72 : 0.50;
+    estimate.before_instrs =
+        stats.module_static_instrs > 0 ? stats.module_static_instrs : function_instrs;
+    estimate.after_instrs = estimate.before_instrs + estimated_static_growth;
+    estimate.before_dynamic_instrs = core_instrs + before_control_instrs;
+    estimate.after_dynamic_instrs = core_instrs + after_control_instrs;
+    estimate.before_cycles = core_instrs + before_control_cycles;
+    estimate.after_cycles = core_instrs + after_control_cycles;
+    estimate.before_branches = estimated_trip_count;
+    estimate.after_branches = remainder + unrolled_iterations + (remainder != 0 ? 2 : 1);
+    estimate.risk.code_growth = estimated_static_growth;
+    estimate.risk.live_range_growth = kLiveRangeGrowth;
+    estimate.risk.register_pressure_growth = kRegisterPressureGrowth;
+    estimate.risk.cleanup_dependency = 1;
+    return pass::mir_cost_model::allows_transform(stats.cost_model_report, stats.cost_model_policy,
+                                                  stats.cost_model_filter, estimate);
+}
+
 bool unroll_rewritten_pointer_loop_by_four(
     mir::MachineFunction &function, mir::MachineBasicBlock &preheader,
     mir::MachineBasicBlock &header, mir::MachineBasicBlock &body, mir::MachineBasicBlock &exit,
     const mir::Register &current_iv, const mir::MachineOperand &bound, const mir::Register &pointer,
-    const mir::Register &end_pointer, Stats &stats) {
+    const mir::Register &end_pointer, std::optional<std::int64_t> trip_lower_bound,
+    bool exact_trip_count, Stats &stats) {
     const auto &original_body_instrs = body.instructions();
     std::optional<std::size_t> branch_index;
     if (!original_body_instrs.empty() &&
@@ -701,6 +889,10 @@ bool unroll_rewritten_pointer_loop_by_four(
     const std::string peel_done_name = header.name() + ".unroll4.peel.done";
     if (function.get_block(dispatch_name) != nullptr || function.get_block(peel_name) != nullptr ||
         function.get_block(peel_done_name) != nullptr) {
+        return false;
+    }
+    if (!cost_model_allows_factor_four_unroll(function, header, core, trip_lower_bound,
+                                               exact_trip_count, stats)) {
         return false;
     }
 
@@ -947,9 +1139,13 @@ bool try_rewrite_pretested_loop(mir::MachineFunction &function, mir::MachineBasi
 
     erase_indices(body_instrs, std::move(dead_body_indices));
 
-    unroll_rewritten_pointer_loop_by_four(function, *preheader, header, *control->body,
-                                          *control->exit, control->current_iv, control->bound,
-                                          branch_ptr, end_ptr, stats);
+    const auto trip_lower_bound =
+        bound_lower_bound_at(positive_bounds, *preheader, bound, function);
+    const bool exact_trip_count =
+        positive_bounds.constants.find(bound.id) != positive_bounds.constants.end();
+    unroll_rewritten_pointer_loop_by_four(
+        function, *preheader, header, *control->body, *control->exit, control->current_iv,
+        control->bound, branch_ptr, end_ptr, trip_lower_bound, exact_trip_count, stats);
 
     ++stats.branches;
     ++stats.arithmetic;

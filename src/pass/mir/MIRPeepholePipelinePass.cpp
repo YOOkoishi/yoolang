@@ -69,6 +69,15 @@ PassResult MIRPeepholePipelinePass::run(PassContext &context) {
         total.cost_model_policy = cost_model_report->policy;
         total.cost_model_filter = cost_model_report->filter;
     }
+    for (const auto &function : module->functions()) {
+        if (function->is_external()) {
+            continue;
+        }
+        for (const auto &block : function->blocks()) {
+            total.module_static_instrs +=
+                static_cast<std::int64_t>(block->instructions().size());
+        }
+    }
     bool changed = false;
     for (auto &function : module->functions()) {
         if (function->is_external()) {

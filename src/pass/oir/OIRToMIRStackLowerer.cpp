@@ -328,7 +328,7 @@ class Lowerer final {
                  {mir::MachineOperand::reg("t0"),
                   mir::MachineOperand::imm(0),
                   mir::MachineOperand::imm(static_cast<std::int64_t>(stored.size))});
-            if (static_cast<std::int64_t>(stored.size) >= mir::kMemZeroMemsetThresholdBytes) {
+            if (mir::memzero_constant_uses_memset(static_cast<std::int64_t>(stored.size))) {
                 current_function_->note_call();
             }
             return;
@@ -360,7 +360,7 @@ class Lowerer final {
             emit(mir::Opcode::MemZero,
                  {mir::MachineOperand::reg("t0"), mir::MachineOperand::imm(byte_value->value()),
                   mir::MachineOperand::imm(constant->value())});
-            if (constant->value() >= mir::kMemZeroMemsetThresholdBytes) {
+            if (mir::memzero_constant_uses_memset(constant->value())) {
                 current_function_->note_call();
             }
             return;
@@ -370,7 +370,6 @@ class Lowerer final {
         emit(mir::Opcode::MemZero,
              {mir::MachineOperand::reg("t0"), mir::MachineOperand::imm(byte_value->value()),
               mir::MachineOperand::reg("t1")});
-        current_function_->note_call();
     }
 
     void lower_gep(const oir::GetElementPtrInst &inst) {
