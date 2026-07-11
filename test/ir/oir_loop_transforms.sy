@@ -218,15 +218,15 @@ int main() {
 // OIR-NOT: .peel.first
 // OIR: ret void
 
-// COST-ROTATE: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopRotate
+// COST-ROTATE: [cost-model] target=rv64gc/lp64d policy=aggressive filter=LoopRotate
 // COST-ROTATE: [cost-model] OIRLoopTransforms BypassProfitability transform=LoopRotate
 // COST-ROTATE: reason=AlwaysOnCanonicalization
 
-// COST-UNSWITCH: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopUnswitch
+// COST-UNSWITCH: [cost-model] target=rv64gc/lp64d policy=aggressive filter=LoopUnswitch
 // COST-UNSWITCH: [cost-model] OIRLoopTransforms BypassProfitability transform=LoopUnswitch
 // COST-UNSWITCH: reason=LoopInvariantBranch
 
-// COST-UNROLL: [cost-model] target=rv64gc/lp64d policy=balanced filter=LoopUnroll
+// COST-UNROLL: [cost-model] target=rv64gc/lp64d policy=aggressive filter=LoopUnroll
 // COST-UNROLL: [cost-model] OIRLoopTransforms BypassProfitability transform=LoopUnroll
 // COST-UNROLL: reason=ExactSmallTripCount
 // COST-UNROLL-NOT: ExactFirstIterationPeel

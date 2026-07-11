@@ -113,7 +113,7 @@ int main() {
 // OIR: br i1
 // OIR: store i32 1
 
-// COST-IFC: [cost-model] target=rv64gc/lp64d policy=balanced filter=IfConversion
+// COST-IFC: [cost-model] target=rv64gc/lp64d policy=aggressive filter=IfConversion
 // COST-IFC: [cost-model] summary stage=OIR label=oir
 // COST-IFC: [cost-model] OIRLocalSimplify BypassProfitability transform=IfConversion
 // COST-IFC: reason=AlwaysOnLowRiskIfConversion

@@ -18,6 +18,7 @@ SOURCE = r"""
 #include "oir/OIR.h"
 #include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
+#include "oir/OIRScalarOpt.h"
 
 #include <exception>
 #include <iostream>
@@ -292,6 +293,60 @@ void test_memory_ssa_uses_phi_at_cfg_join() {
     REQUIRE(memory_ssa.clobbering_access(*load_g) == phi);
 }
 
+void test_verifier_checks_call_signatures() {
+    {
+        oir::Module module("call_arg_count");
+        auto *callee = module.create_function(
+            "callee", module.types().func_ty(module.types().int32_ty(),
+                                               {module.types().int32_ty()}), true);
+        auto *caller = create_function(module, "caller", module.types().int32_ty());
+        auto *entry = caller->create_block("entry");
+        oir::IRBuilder builder(&module);
+        builder.set_insert_point(entry);
+        auto *call = builder.create_call(callee, module.types().int32_ty(), {}, "bad.count");
+        builder.create_ret(call);
+        require_verify_fails(module, "callee expects 1");
+    }
+    {
+        oir::Module module("call_arg_type");
+        auto *callee = module.create_function(
+            "callee", module.types().func_ty(module.types().int32_ty(),
+                                               {module.types().int32_ty()}), true);
+        auto *caller = create_function(module, "caller", module.types().int32_ty());
+        auto *entry = caller->create_block("entry");
+        oir::IRBuilder builder(&module);
+        builder.set_insert_point(entry);
+        auto *call = builder.create_call(callee, module.types().int32_ty(), {builder.f32(1.0F)},
+                                         "bad.type");
+        builder.create_ret(call);
+        require_verify_fails(module, "argument 0 type mismatch");
+    }
+    {
+        oir::Module module("call_result_type");
+        auto *callee = module.create_function(
+            "callee", module.types().func_ty(module.types().int32_ty(), {}), true);
+        auto *caller = create_function(module, "caller", module.types().float_ty());
+        auto *entry = caller->create_block("entry");
+        oir::IRBuilder builder(&module);
+        builder.set_insert_point(entry);
+        auto *call = builder.create_call(callee, module.types().float_ty(), {}, "bad.result");
+        builder.create_ret(call);
+        require_verify_fails(module, "result type mismatch");
+    }
+}
+
+void test_float_constant_identity_preserves_signed_zero() {
+    oir::Module module("float_constant_identity");
+    auto *positive_zero = module.create_f32(0.0F);
+    auto *another_positive_zero = module.create_f32(0.0F);
+    auto *negative_zero = module.create_f32(-0.0F);
+    auto *generic_zero = module.create_zero(module.types().float_ty());
+
+    REQUIRE(pass::oir_opt::same_constant_value(positive_zero, another_positive_zero));
+    REQUIRE(pass::oir_opt::same_constant_value(positive_zero, generic_zero));
+    REQUIRE(!pass::oir_opt::same_constant_value(positive_zero, negative_zero));
+}
+
 } // namespace
 
 int main() {
@@ -306,6 +361,9 @@ int main() {
          test_verifier_catches_stale_constant_use_list},
         {"memory_ssa_skips_noalias_defs", test_memory_ssa_skips_noalias_defs},
         {"memory_ssa_uses_phi_at_cfg_join", test_memory_ssa_uses_phi_at_cfg_join},
+        {"verifier_checks_call_signatures", test_verifier_checks_call_signatures},
+        {"float_constant_identity_preserves_signed_zero",
+         test_float_constant_identity_preserves_signed_zero},
     };
 
     for (const auto &[name, test] : tests) {
@@ -356,6 +414,7 @@ def main() -> int:
             str(ROOT / "src/oir/OIR.cpp"),
             str(ROOT / "src/oir/OIRAnalysis.cpp"),
             str(ROOT / "src/oir/OIRCFGUtils.cpp"),
+            str(ROOT / "src/pass/oir/OIRScalarOptUtils.cpp"),
             "-o",
             str(binary),
         ]

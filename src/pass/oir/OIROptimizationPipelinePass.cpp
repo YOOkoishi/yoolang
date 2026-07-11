@@ -8,6 +8,19 @@ namespace {
 
 bool cleanup_after_tail_recursion(oir::Module &module, oir_opt::Stats &stats);
 
+bool cleanup_after_interprocedural_change(oir::Module &module, oir_opt::Stats &stats) {
+    bool changed = false;
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+    changed |= oir_opt::run_sccp(module, stats);
+    changed |= oir_opt::simplify_branches(module, stats);
+    changed |= oir_opt::cleanup_cfg(module, stats);
+    changed |= oir_opt::global_value_numbering(module, stats);
+    changed |= oir_opt::eliminate_dead_code(module, stats);
+    changed |= oir_opt::eliminate_dead_arguments(module, stats);
+    return changed;
+}
+
 bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
     changed |= oir_opt::canonicalize_loops(module, stats);
@@ -19,7 +32,10 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::promote_memory_to_registers(module, stats);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+    changed |= oir_opt::reassociate_integer_expressions(module, stats);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
     changed |= oir_opt::run_sccp(module, stats);
+    changed |= oir_opt::eliminate_redundant_constraints(module, stats);
     changed |= oir_opt::simplify_branches(module, stats);
     changed |= oir_opt::if_convert_conditional_adds(module, stats);
     changed |= oir_opt::cleanup_cfg(module, stats);
@@ -46,14 +62,17 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::reduce_gep_strength(module, stats);
     changed |= oir_opt::lower_counted_zero_store_loops_to_memzero(module, stats);
     changed |= oir_opt::global_value_numbering(module, stats);
-    changed |= oir_opt::eliminate_dead_loads(module, stats);
-    changed |= oir_opt::eliminate_dead_stores(module, stats);
     changed |= oir_opt::run_sccp(module, stats);
+    changed |= oir_opt::eliminate_dead_bits(module, stats);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
     changed |= oir_opt::simplify_branches(module, stats);
     changed |= oir_opt::if_convert_conditional_adds(module, stats);
     changed |= oir_opt::cleanup_cfg(module, stats);
     changed |= oir_opt::aggressive_dead_code_elimination(module, stats);
     changed |= oir_opt::jump_threading(module, stats);
+    changed |= oir_opt::combine_memory_intrinsics(module, stats);
+    changed |= oir_opt::eliminate_dead_stores(module, stats);
+    changed |= oir_opt::eliminate_dead_loads(module, stats);
     return changed;
 }
 
@@ -112,6 +131,10 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= promote_memory_to_registers(module, stats);
     changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
     changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
+    if (propagate_interprocedural_constants(module, stats)) {
+        changed = true;
+        changed |= cleanup_after_interprocedural_change(module, stats);
+    }
     changed |= eliminate_tail_recursion(module, stats);
     changed |= lower_dense_return_chains(module, stats);
     changed |= propagate_global_constants(module, stats);
@@ -145,6 +168,17 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
         }
     }
 
+    if (promote_fixed_load_arguments(module, stats)) {
+        changed = true;
+        changed |= scalar_replacement_of_aggregates(module, stats);
+        changed |= promote_memory_to_registers(module, stats);
+        changed |= cleanup_after_interprocedural_change(module, stats);
+    }
+    if (propagate_interprocedural_constants(module, stats)) {
+        changed = true;
+        changed |= cleanup_after_interprocedural_change(module, stats);
+    }
+
     constexpr unsigned kMaxIterations = 8;
     for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
         if (!run_aggressive_iteration(module, stats)) {
@@ -175,15 +209,22 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= promote_memory_to_registers(module, stats);
     changed |= local_simplify(module, stats, SimplifyMode::ConstantFold);
     changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
+    changed |= reassociate_integer_expressions(module, stats);
+    changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
     changed |= run_sccp(module, stats);
+    changed |= eliminate_redundant_constraints(module, stats);
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
     changed |= value_range_propagation(module, stats);
     changed |= global_value_numbering(module, stats);
-    changed |= eliminate_dead_loads(module, stats);
-    changed |= eliminate_dead_stores(module, stats);
-    changed |= eliminate_dead_code(module, stats);
+    changed |= run_sccp(module, stats);
+    changed |= eliminate_dead_bits(module, stats);
+    changed |= local_simplify(module, stats, SimplifyMode::Algebraic);
     changed |= aggressive_dead_code_elimination(module, stats);
+    changed |= combine_memory_intrinsics(module, stats);
+    changed |= eliminate_dead_stores(module, stats);
+    changed |= eliminate_dead_loads(module, stats);
+    changed |= eliminate_dead_code(module, stats);
     changed |= jump_threading(module, stats);
     changed |= eliminate_dead_arguments(module, stats);
     changed |= propagate_global_constants(module, stats);

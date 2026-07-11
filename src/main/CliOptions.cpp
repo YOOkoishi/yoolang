@@ -36,7 +36,7 @@ void print_help(const char *program, std::ostream &out) {
         << "  --cost-model-filter=<pass-or-transform>\n"
         << "                   Restrict cost-model decision diagnostics to a pass or transform name\n"
         << "  --cost-model-policy=conservative|balanced|aggressive\n"
-        << "                   Select the cost-model profitability policy (default: balanced)\n"
+        << "                   Select the cost-model profitability policy (default: aggressive)\n"
         << "  --emit-poly      Dump YIR polyhedral SCoP/model/dependence artifacts\n";
 }
 

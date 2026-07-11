@@ -26,7 +26,7 @@ struct CliOptions {
     std::string emit_mir_stage;
     std::string cost_model_filter;
     pass::cost_model::CostModelPolicyKind cost_model_policy =
-        pass::cost_model::CostModelPolicyKind::Balanced;
+        pass::cost_model::CostModelPolicyKind::Aggressive;
 };
 
 bool parse_command_line(int argc, char **argv, CliOptions &options, std::string &error);

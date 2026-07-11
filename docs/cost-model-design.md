@@ -713,7 +713,8 @@ target_weighted_runtime_cost
 
 ## 10. 策略定义
 
-建议有三套策略，但 `-O1` 默认使用 `Balanced`。
+建议有三套策略，`-O1` 默认使用 `Aggressive`；仍可通过命令行显式选择
+`Balanced` 或 `Conservative`。
 
 ```cpp
 enum class CostModelPolicyKind {
@@ -797,7 +798,7 @@ JSON 结构：
 ```json
 {
   "target": "rv64gc/lp64d",
-  "policy": "balanced",
+  "policy": "aggressive",
   "functions": [
     {
       "name": "main",

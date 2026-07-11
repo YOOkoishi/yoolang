@@ -38,6 +38,12 @@ struct Stats {
     unsigned memzero = 0;
     unsigned loop_bound_tighten = 0;
     unsigned specialized = 0;
+    unsigned ipsccp = 0;
+    unsigned arg_promotion = 0;
+    unsigned reassociated = 0;
+    unsigned constraints = 0;
+    unsigned bdce = 0;
+    unsigned memcpyopt = 0;
     unsigned cost_model_candidates = 0;
 
     pass::cost_model::CostModelReport *cost_model_report = nullptr;
@@ -77,6 +83,12 @@ bool lower_dense_return_chains(oir::Module &module, Stats &stats);
 bool simplify_branches(oir::Module &module, Stats &stats);
 bool if_convert_conditional_adds(oir::Module &module, Stats &stats);
 bool run_sccp(oir::Module &module, Stats &stats);
+bool propagate_interprocedural_constants(oir::Module &module, Stats &stats);
+bool promote_fixed_load_arguments(oir::Module &module, Stats &stats);
+bool reassociate_integer_expressions(oir::Module &module, Stats &stats);
+bool eliminate_redundant_constraints(oir::Module &module, Stats &stats);
+bool eliminate_dead_bits(oir::Module &module, Stats &stats);
+bool combine_memory_intrinsics(oir::Module &module, Stats &stats);
 bool eliminate_dead_code(oir::Module &module, Stats &stats);
 bool cleanup_cfg(oir::Module &module, Stats &stats);
 bool scalar_replacement_of_aggregates(oir::Module &module, Stats &stats);

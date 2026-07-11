@@ -15,7 +15,7 @@ int main() {
 }
 
 // JSON: "target": "rv64gc/lp64d"
-// JSON: "policy": "balanced"
+// JSON: "policy": "aggressive"
 // JSON: "summaries":
 // JSON: "stage": "OIR"
 // JSON: "stage": "FinalMIR"

@@ -1,0 +1,180 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int data[4] = {3, 5, 7, 9};
+int zeros[4];
+
+int same_constant_mode(int mode, int x) {
+  if (mode == 7) {
+    x = x / 3 + 1;
+    x = x / 5 + 2;
+    x = x / 7 + 3;
+    x = x / 9 + 4;
+    x = x / 11 + 5;
+    x = x / 13 + 6;
+    x = x / 15 + 7;
+    x = x / 17 + 8;
+    x = x / 19 + 9;
+    x = x / 21 + 10;
+    x = x / 23 + 11;
+    x = x / 25 + 12;
+    return x;
+  }
+  return -1;
+}
+
+int fixed_fields(int a[], int x) {
+  int first = a[0];
+  int second = a[1];
+  x = x / 3 + first;
+  x = x / 5 + second;
+  x = x / 7 + first;
+  x = x / 9 + second;
+  x = x / 11 + first;
+  x = x / 13 + second;
+  x = x / 15 + first;
+  x = x / 17 + second;
+  x = x / 19 + first;
+  x = x / 21 + second;
+  x = x / 23 + first;
+  x = x / 25 + second;
+  return x;
+}
+
+int conditional_field(int a[], int flag) {
+  if (flag != 0) {
+    return a[0];
+  }
+  return 0;
+}
+
+int reassociated(int x, int y) {
+  return (x + 3) + (y + 4);
+}
+
+int constrained(int x, int y, int z) {
+  if (x < y) {
+    if (y <= z) {
+      if (x < z) {
+        return 1;
+      }
+      return 2;
+    }
+  }
+  return 0;
+}
+
+int constraint_join(int x, int y, int flag) {
+  if (flag != 0) {
+    if (x < y) {
+      putint(2);
+    }
+  }
+  if (x < y) {
+    return 1;
+  }
+  return 0;
+}
+
+int demanded_low_bits(int x) {
+  if (x >= 0) {
+    return ((x % 256) + 16) % 16;
+  }
+  return 0;
+}
+
+int fully_demanded_bits(int x) {
+  if (x >= 0) {
+    return x % 256;
+  }
+  return 0;
+}
+
+float preserve_float_order(float x, float y, float z) {
+  return (x + y) + z;
+}
+
+void combine_zero_stores() {
+  zeros[0] = 0;
+  zeros[1] = 0;
+}
+
+void keep_zero_stores_split() {
+  zeros[2] = 0;
+  putint(1);
+  zeros[3] = 0;
+}
+
+int main() {
+  int x = getint();
+  int y = getint();
+  int z = getint();
+  combine_zero_stores();
+  keep_zero_stores_split();
+  return same_constant_mode(7, x) + same_constant_mode(7, y) +
+         fixed_fields(data, x) + conditional_field(data, x) + reassociated(x, y) +
+         constrained(x, y, z) + constraint_join(x, y, z) + demanded_low_bits(x) +
+         fully_demanded_bits(x);
+}
+
+// OIR-LABEL: define i32 @same_constant_mode(i32 %x.arg)
+// OIR-NOT: %mode.arg
+// OIR-NOT: icmp eq
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @fixed_fields(i32 %x.arg, i32 %a.arg.promoted.0, i32 %a.arg.promoted.1)
+// OIR-NOT: i32*
+// OIR-NOT: load
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @conditional_field(i32* %a.arg, i32 %flag.arg)
+// OIR: br i1
+// OIR: load i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @reassociated
+// OIR: add i32 %x.arg, %y.arg
+// OIR: add i32 %{{.*}}, 7
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @constrained
+// OIR: icmp lt i32 %x.arg, %y.arg
+// OIR: icmp le i32 %y.arg, %z.arg
+// OIR-NOT: icmp lt i32 %x.arg, %z.arg
+// OIR-NOT: ret i32 2
+// OIR: ret i32 1
+
+// OIR-LABEL: define i32 @constraint_join
+// OIR: icmp lt i32 %x.arg, %y.arg
+// OIR: icmp lt i32 %x.arg, %y.arg
+// OIR: call void @putint
+
+// OIR-LABEL: define i32 @demanded_low_bits
+// OIR: and i32 %x.arg, 15
+// OIR-NOT: 255
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @fully_demanded_bits
+// OIR: and i32 %x.arg, 255
+// OIR: ret i32
+
+// OIR-LABEL: define float @preserve_float_order
+// OIR: fadd float %x.arg, %y.arg
+// OIR: fadd float %{{.*}}, %z.arg
+// OIR: ret float
+
+// OIR-LABEL: define void @combine_zero_stores
+// OIR: memzero i32* %{{.*}}, i32 8
+// OIR-NOT: store i32 0
+// OIR: ret void
+
+// OIR-LABEL: define void @keep_zero_stores_split
+// OIR: store i32 0
+// OIR: call void @putint
+// OIR: store i32 0
+// OIR-NOT: memzero
+// OIR: ret void
+
+// OIR-LABEL: define i32 @main
+// OIR: %argprom.load.0 = load i32
+// OIR: %argprom.load.1 = load i32
+// OIR: call i32 @fixed_fields(i32 %{{.*}}, i32 %argprom.load.0, i32 %argprom.load.1)

@@ -1882,6 +1882,40 @@ VerifyResult Verifier::verify_module(const Module &module) {
                     }
                     break;
                 }
+                case Instruction::OpID::Call: {
+                    const auto *call = dynamic_cast<const CallInst *>(inst);
+                    if (call == nullptr) {
+                        return fail("call instruction type mismatch in " + block_ref(block));
+                    }
+                    const auto *callee_type =
+                        dynamic_cast<const FunctionType *>(call->callee()->type());
+                    if (callee_type == nullptr) {
+                        return fail("call " + inst_ref(call) + " callee " +
+                                    value_ref(call->callee()) + " does not have function type");
+                    }
+                    if (call->type() != callee_type->return_type()) {
+                        return fail("call " + inst_ref(call) + " result type mismatch: expected " +
+                                    type_key(callee_type->return_type()) + ", got " +
+                                    type_key(call->type()));
+                    }
+
+                    const auto args = call->args();
+                    const auto &param_types = callee_type->param_types();
+                    if (args.size() != param_types.size()) {
+                        return fail(
+                            "call " + inst_ref(call) + " has " + std::to_string(args.size()) +
+                            " arguments, but callee expects " + std::to_string(param_types.size()));
+                    }
+                    for (std::size_t i = 0; i < args.size(); ++i) {
+                        if (args[i]->type() != param_types[i]) {
+                            return fail("call " + inst_ref(call) + " argument " +
+                                        std::to_string(i) + " type mismatch: expected " +
+                                        type_key(param_types[i]) + ", got " +
+                                        type_key(args[i]->type()));
+                        }
+                    }
+                    break;
+                }
                 case Instruction::OpID::Add:
                 case Instruction::OpID::Sub:
                 case Instruction::OpID::Mul:

@@ -1,5 +1,7 @@
 #include "oir/OIRScalarOpt.h"
 
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <unordered_set>
@@ -11,22 +13,23 @@ bool Stats::changed() const {
            mem2reg != 0 || licm != 0 || loop_rotate != 0 || loop_unswitch != 0 ||
            loop_unroll != 0 || inlined != 0 || globals != 0 || tail_recursion != 0 || lsr != 0 ||
            loop_canonicalize != 0 || sroa != 0 || dse != 0 || dle != 0 || adce != 0 ||
-           jump_threading != 0 || dae != 0 || memzero != 0 ||
-           loop_bound_tighten != 0 || specialized != 0;
+           jump_threading != 0 || dae != 0 || memzero != 0 || loop_bound_tighten != 0 ||
+           specialized != 0 || ipsccp != 0 || arg_promotion != 0 || reassociated != 0 ||
+           constraints != 0 || bdce != 0 || memcpyopt != 0;
 }
 
 std::string Stats::message() const {
     std::ostringstream oss;
     oss << "folded=" << folded << " sccp=" << sccp << " branches=" << branches << " dce=" << dce
         << " cfg=" << cfg << " gvn=" << gvn << " mem2reg=" << mem2reg << " licm=" << licm
-        << " rotate=" << loop_rotate << " unswitch=" << loop_unswitch
-        << " unroll=" << loop_unroll
-        << " inlined=" << inlined << " globals=" << globals
-        << " tailrec=" << tail_recursion << " lsr=" << lsr
-        << " loopcanon=" << loop_canonicalize << " sroa=" << sroa << " dse=" << dse
-        << " dle=" << dle << " adce=" << adce << " jumpthread=" << jump_threading
-        << " dae=" << dae << " memzero=" << memzero
-        << " looptighten=" << loop_bound_tighten << " specialized=" << specialized;
+        << " rotate=" << loop_rotate << " unswitch=" << loop_unswitch << " unroll=" << loop_unroll
+        << " inlined=" << inlined << " globals=" << globals << " tailrec=" << tail_recursion
+        << " lsr=" << lsr << " loopcanon=" << loop_canonicalize << " sroa=" << sroa
+        << " dse=" << dse << " dle=" << dle << " adce=" << adce << " jumpthread=" << jump_threading
+        << " dae=" << dae << " memzero=" << memzero << " looptighten=" << loop_bound_tighten
+        << " specialized=" << specialized << " ipsccp=" << ipsccp << " argprom=" << arg_promotion
+        << " reassociate=" << reassociated << " constraints=" << constraints << " bdce=" << bdce
+        << " memcpyopt=" << memcpyopt;
     return oss.str();
 }
 
@@ -97,7 +100,15 @@ bool same_constant_value(oir::Value *lhs, oir::Value *rhs) {
     auto lhs_float = float_constant(lhs);
     auto rhs_float = float_constant(rhs);
     if (lhs_float.has_value() && rhs_float.has_value()) {
-        return *lhs_float == *rhs_float;
+        // Floating constants are interchangeable only when their object representations
+        // match.  In particular, +0.0 and -0.0 compare equal in C++ but are observably
+        // different to floating division and copysign-like operations in OIR.
+        static_assert(sizeof(float) == sizeof(std::uint32_t));
+        std::uint32_t lhs_bits = 0;
+        std::uint32_t rhs_bits = 0;
+        std::memcpy(&lhs_bits, &*lhs_float, sizeof(lhs_bits));
+        std::memcpy(&rhs_bits, &*rhs_float, sizeof(rhs_bits));
+        return lhs_bits == rhs_bits;
     }
     return dynamic_cast<oir::ConstantZero *>(lhs) != nullptr &&
            dynamic_cast<oir::ConstantZero *>(rhs) != nullptr;
