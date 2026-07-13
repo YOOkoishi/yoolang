@@ -3,6 +3,10 @@
 #include "oir/OIRCFGUtils.h"
 #include "oir/OIRScalarOpt.h"
 
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
 namespace pass::oir_opt {
 namespace {
 
@@ -27,6 +31,126 @@ bool can_thread_to(oir::BasicBlock *from, oir::BasicBlock *old_succ, oir::BasicB
         }
     }
     return true;
+}
+
+oir::Value *incoming_value_from(oir::PhiInst &phi, oir::BasicBlock *pred) {
+    for (const auto &[value, incoming_block] : phi.incoming()) {
+        if (incoming_block == pred) {
+            return value;
+        }
+    }
+    return nullptr;
+}
+
+oir::Value *translate_value_through_phi(oir::Value *value, oir::BasicBlock *through,
+                                        oir::BasicBlock *pred) {
+    std::unordered_set<oir::Value *> seen;
+    while (auto *phi = dynamic_cast<oir::PhiInst *>(value)) {
+        if (phi->parent() != through) {
+            break;
+        }
+        if (!seen.insert(phi).second) {
+            return nullptr;
+        }
+        value = incoming_value_from(*phi, pred);
+        if (value == nullptr) {
+            return nullptr;
+        }
+    }
+
+    auto *inst = dynamic_cast<oir::Instruction *>(value);
+    return inst != nullptr && inst->parent() == through ? nullptr : value;
+}
+
+bool has_only_phis_and_branch(oir::BasicBlock &block, oir::BranchInst &branch) {
+    for (const auto &inst : block.instructions()) {
+        if (inst.get() == &branch) {
+            continue;
+        }
+        if (dynamic_cast<oir::PhiInst *>(inst.get()) == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool merge_phi_uses_are_threadable(oir::BasicBlock &merge, oir::BasicBlock *taken) {
+    for (const auto &inst : merge.instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        for (const auto &use : phi->uses()) {
+            auto *user_inst = dynamic_cast<oir::Instruction *>(use.user);
+            if (user_inst != nullptr && user_inst->parent() == &merge) {
+                continue;
+            }
+
+            auto *target_phi = dynamic_cast<oir::PhiInst *>(use.user);
+            const std::size_t incoming_index = use.operand_index / 2;
+            if (target_phi == nullptr || target_phi->parent() != taken ||
+                use.operand_index % 2 != 0 || incoming_index >= target_phi->incoming().size() ||
+                target_phi->incoming()[incoming_index].second != &merge) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool thread_constant_phi_predecessor(oir::BasicBlock &merge, oir::BranchInst &branch,
+                                     Stats &stats) {
+    auto *condition_phi = dynamic_cast<oir::PhiInst *>(branch.cond());
+    auto *condition_type =
+        condition_phi == nullptr ? nullptr
+                                 : dynamic_cast<oir::IntegerType *>(condition_phi->type());
+    if (condition_phi == nullptr || condition_phi->parent() != &merge ||
+        condition_type == nullptr || condition_type->bit_width() != 1 ||
+        !has_only_phis_and_branch(merge, branch)) {
+        return false;
+    }
+
+    const auto condition_incomings = condition_phi->incoming();
+    for (const auto &[condition_value, pred] : condition_incomings) {
+        const auto constant = int_constant(condition_value);
+        if (!constant || (*constant != 0 && *constant != 1) || pred == nullptr ||
+            pred == &merge) {
+            continue;
+        }
+
+        auto *taken = *constant != 0 ? branch.true_bb() : branch.false_bb();
+        if (!can_thread_to(pred, &merge, taken) ||
+            !merge_phi_uses_are_threadable(merge, taken)) {
+            continue;
+        }
+
+        std::vector<std::pair<oir::PhiInst *, oir::Value *>> target_incomings;
+        bool can_translate = true;
+        for (auto &inst : taken->instructions()) {
+            auto *target_phi = dynamic_cast<oir::PhiInst *>(inst.get());
+            if (target_phi == nullptr) {
+                break;
+            }
+            auto *merge_value = incoming_value_from(*target_phi, &merge);
+            auto *translated = translate_value_through_phi(merge_value, &merge, pred);
+            if (translated == nullptr) {
+                can_translate = false;
+                break;
+            }
+            target_incomings.emplace_back(target_phi, translated);
+        }
+        if (!can_translate || !oir::cfg::replace_successor(pred, &merge, taken)) {
+            continue;
+        }
+        for (const auto &[target_phi, value] : target_incomings) {
+            target_phi->add_incoming(value, pred);
+        }
+
+        ++stats.jump_threading;
+        ++stats.cfg;
+        return true;
+    }
+    return false;
 }
 
 bool thread_block(oir::BasicBlock *pred, oir::BasicBlock *succ, bool pred_edge_is_true,
@@ -71,6 +195,9 @@ bool jump_thread_function(oir::Function &function, Stats &stats) {
         auto *br = dynamic_cast<oir::BranchInst *>(block->terminator());
         if (br == nullptr || !br->is_conditional()) {
             continue;
+        }
+        if (thread_constant_phi_predecessor(*block, *br, stats)) {
+            return true;
         }
         if (thread_block(block.get(), br->true_bb(), true, stats) ||
             thread_block(block.get(), br->false_bb(), false, stats)) {

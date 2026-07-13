@@ -1004,6 +1004,17 @@ bool match_short_circuit_bool_diamond(oir::BasicBlock &block, oir::BranchInst &b
     return match_bool_arm(block, branch.false_bb(), branch.true_bb(), false, out);
 }
 
+bool only_controls_merge_branch(const ShortCircuitBoolDiamond &diamond) {
+    const auto &uses = diamond.phi->uses();
+    if (uses.size() != 1) {
+        return false;
+    }
+
+    auto *branch = dynamic_cast<oir::BranchInst *>(uses.front().user);
+    return branch != nullptr && branch->is_conditional() && branch->cond() == diamond.phi &&
+           branch->parent() == diamond.merge && diamond.merge->terminator() == branch;
+}
+
 oir::BasicBlock *empty_select_arm_target(oir::BasicBlock &pred, oir::BasicBlock *arm) {
     if (arm == nullptr || arm == &pred || arm->predecessors().size() != 1 ||
         arm->predecessors().front() != &pred || arm->instructions().size() != 1) {
@@ -1212,6 +1223,11 @@ void replace_conditional_branch_with_merge(
 bool convert_short_circuit_bool(oir::Module &module, oir::BasicBlock &block,
                                 std::list<std::unique_ptr<oir::Instruction>>::iterator term_it,
                                 ShortCircuitBoolDiamond &diamond, Stats &stats) {
+    // Keep short-circuit control flow when the merged boolean only decides the next branch.
+    // Materializing the value would add boolean operations without removing its sole consumer.
+    if (only_controls_merge_branch(diamond)) {
+        return false;
+    }
     if (!cost_model_allows_if_conversion(stats, "short_circuit_bool", 3, 0)) {
         return false;
     }

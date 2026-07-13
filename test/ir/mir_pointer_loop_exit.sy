@@ -74,8 +74,11 @@ int main() {
 // MIR: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
 // MIR-NOT: BLT %v{{[0-9]+}}:gpr, %v0:gpr, %edge.{{.*}}
 // MIR-LABEL: func @small_constant_dot
-// MIR-NOT: BNE %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
-// MIR: BLT %v{{[0-9]+}}:gpr, %v{{[0-9]+}}:gpr, %edge.{{.*}}
+// MIR-NOT: BNE
+// MIR-NOT: BLT
+// MIR-COUNT-5: MULW %v{{[0-9]+}}:gpr
+// MIR-NOT: BNE
+// MIR-NOT: BLT
 // MIR-LABEL: func @pretested_pointer_exit
 // MIR: ANDI %v{{[0-9]+}}:gpr, %v0:gpr, 3
 // MIR: J %{{.*}}unroll4.dispatch
@@ -88,8 +91,11 @@ int main() {
 // ASM: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lpointer_exit_dot_edge
 // ASM-NOT: blt
 // ASM-LABEL: small_constant_dot:
-// ASM-NOT: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lsmall_constant_dot_edge
-// ASM: blt
+// ASM-NOT: bne
+// ASM-NOT: blt
+// ASM-COUNT-5: mulw
+// ASM-NOT: bne
+// ASM-NOT: blt
 // ASM-LABEL: pretested_pointer_exit:
 // ASM: andi {{[a-z0-9]+}}, {{[a-z0-9]+}}, 3
 // ASM: .Lpretested_pointer_exit_{{.*}}unroll4.dispatch:

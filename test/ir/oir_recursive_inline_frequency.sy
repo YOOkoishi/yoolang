@@ -1,0 +1,49 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=INLINE
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int select_score(int left, int right) {
+    if (left > right) {
+        return left + 1;
+    }
+    return right + 1;
+}
+
+int branch_score(int depth) {
+    if (depth <= 0) {
+        return 0;
+    }
+
+    int left = branch_score(depth - 1);
+    int right = branch_score(depth - 2);
+    return select_score(left, right);
+}
+
+int main() {
+    return branch_score(getint());
+}
+
+// The two residual non-tail calls are expanded breadth-first.  With a 50% static
+// recursive-edge estimate, depths 0, 1 and 2 remain above GCC's 10% cutoff.
+// A single argument keeps depth 3 below the pressure limit, so this specifically
+// exercises the frequency cutoff rather than the independent pressure gate.
+// The ordinary helper must be inlined before the recursive template is captured.
+// INLINE: OIRInlinePass Accept transform=Inline scope=call
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE-NOT: scope=direct-recursive-depth-3
+
+// Fourteen accepted inlines replace two calls with sixteen residual leaf calls;
+// the seventeenth occurrence is main's entry call.
+// OIR-COUNT-17: call i32 @branch_score

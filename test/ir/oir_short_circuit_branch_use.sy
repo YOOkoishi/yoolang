@@ -1,0 +1,46 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int keep_short_circuit_branch(int a, int b) {
+  if (a == 0 || b == 0) {
+    return getint();
+  }
+  return a + b;
+}
+
+int materialize_short_circuit_value(int a, int b) {
+  int flag = 0;
+  if (a != 0 && b != 0) {
+    flag = 1;
+  }
+  return flag + a;
+}
+
+int main() {
+  int a = getint();
+  int b = getint();
+  return keep_short_circuit_branch(a, b) + materialize_short_circuit_value(a, b);
+}
+
+// A boolean used only by the following conditional branch should remain two
+// short-circuiting branches instead of becoming an eager AND/NOT expression.
+// OIR-LABEL: define i32 @keep_short_circuit_branch
+// OIR-NOT: phi i1
+// OIR-NOT: and i1
+// OIR: icmp eq i32
+// OIR-NEXT: br i1
+// OIR-NOT: phi i1
+// OIR-NOT: and i1
+// OIR: icmp eq i32
+// OIR-NEXT: br i1
+// OIR-NOT: phi i1
+// OIR-NOT: and i1
+// OIR: call i32 @getint
+// OIR-NOT: phi i1
+// OIR-NOT: and i1
+
+// Once the short-circuit result is a value, if-conversion remains profitable.
+// OIR-LABEL: define i32 @materialize_short_circuit_value
+// OIR-NOT: phi i1
+// OIR: and i1
+// OIR-NOT: br i1
+// OIR: zext i1

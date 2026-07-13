@@ -1,0 +1,28 @@
+int costs[10];
+int gains[10];
+
+int search_value(int count, int budget) {
+  if (count == 0 || budget == 0) {
+    return 0;
+  }
+  if (costs[count - 1] > budget) {
+    return search_value(count - 1, budget);
+  }
+
+  int without = search_value(count - 1, budget);
+  int with = gains[count - 1] +
+             search_value(count - 1, budget - costs[count - 1]);
+  if (with > without) {
+    return with;
+  }
+  return without;
+}
+
+int main() {
+  int count = getint();
+  int budget = getint();
+  getarray(costs);
+  getarray(gains);
+  putint(search_value(count, budget));
+  return 0;
+}

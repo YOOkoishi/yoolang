@@ -32,9 +32,14 @@ constexpr unsigned kMaxSpecializedCallSites = 128;
 constexpr unsigned kMaxRecursiveConstantSpecializationLayers = 10;
 constexpr unsigned kMaxRecursiveSpecializationCalleeBlocks = 64;
 constexpr unsigned kMaxRecursiveSpecializationStaticInstrs = 1600;
-constexpr unsigned kMaxRecursiveInlineDepth = 5;
+constexpr unsigned kMaxRecursiveInlineDepth = 8;
 constexpr unsigned kMaxRecursiveCalleeBlocks = 16;
 constexpr unsigned kMaxRecursiveCalleeReturns = 8;
+constexpr unsigned kRecursiveInlineEdgeProbabilityBasisPoints = 5000;
+constexpr unsigned kMinRecursiveInlineProbabilityBasisPoints = 1000;
+// OIR counts control/phi instructions separately from GCC's inline size units;
+// 512 OIR instructions is the corresponding bounded-growth envelope.
+constexpr unsigned kMaxRecursiveInlineGrowth = 512;
 
 using ValueMap = std::unordered_map<oir::Value *, oir::Value *>;
 using BlockMap = std::unordered_map<oir::BasicBlock *, oir::BasicBlock *>;
@@ -60,6 +65,9 @@ struct CalleeInfo {
 
 struct InlineContext {
     std::unordered_map<oir::Function *, std::unique_ptr<oir::Function>> recursive_templates;
+    std::unordered_map<const oir::CallInst *, unsigned> recursive_call_depths;
+    std::unordered_map<const oir::Function *, unsigned> recursive_growth;
+    std::unordered_set<const oir::Function *> defer_recursive_expansion;
 };
 
 bool is_constprop_specialization(const oir::Function &function);
@@ -251,15 +259,40 @@ std::string recursive_inline_prefix(const oir::Function &function, unsigned dept
     return out;
 }
 
-unsigned recursive_inline_depth(const oir::Function &function, const oir::BasicBlock &block) {
-    const std::string marker = recursive_inline_marker(function);
-    unsigned depth = 0;
-    std::size_t pos = block.name().find(marker);
-    while (pos != std::string::npos) {
-        ++depth;
-        pos = block.name().find(marker, pos + marker.size());
+unsigned recursive_inline_depth(const InlineContext &context, const oir::CallInst &call) {
+    auto found = context.recursive_call_depths.find(&call);
+    return found == context.recursive_call_depths.end() ? 0 : found->second;
+}
+
+unsigned recursive_inline_probability(unsigned depth) {
+    // GCC's default recursive-inline profile decays each call edge by roughly one
+    // half even when sibling recursive calls execute sequentially.  Fanout is
+    // bounded separately by the cumulative growth and pressure budgets.
+    const unsigned edge_probability = kRecursiveInlineEdgeProbabilityBasisPoints;
+    unsigned probability = edge_probability;
+    for (unsigned level = 0; level < depth && probability != 0; ++level) {
+        probability = probability * edge_probability / 10000;
     }
-    return depth;
+    return probability;
+}
+
+unsigned recursive_inline_growth_budget(const pass::cost_model::CostModelPolicy &policy) {
+    const auto policy_growth = static_cast<unsigned>(
+        std::max<std::int64_t>(1, policy.max_function_code_growth));
+    const auto inline_scaled = static_cast<unsigned>(
+        std::max<std::int64_t>(1, policy.max_inline_callee_cost) * 6);
+    return std::min(kMaxRecursiveInlineGrowth, std::max(policy_growth, inline_scaled));
+}
+
+unsigned cloned_instruction_growth(const CalleeInfo &info) {
+    return info.static_instrs + info.branches + info.phis + (info.returns > 1 ? 1 : 0);
+}
+
+unsigned recursive_pressure_growth(const oir::CallInst &call, const CalleeInfo &info,
+                                   unsigned depth) {
+    const auto per_level = std::min<std::size_t>(call.args().size(), 4) +
+                           (info.calls > 0 ? info.calls - 1 : 0);
+    return static_cast<unsigned>(per_level * depth);
 }
 
 void append_reachable_blocks(oir::BasicBlock *block, std::unordered_set<oir::BasicBlock *> &seen,
@@ -338,22 +371,29 @@ bool is_eligible_non_recursive_call(const oir::Function &caller, const oir::Call
     return info.blocks <= kMaxCalleeBlocks && within_inline_resource_limit(info, policy);
 }
 
-bool is_eligible_recursive_call(const oir::Function &caller, const oir::BasicBlock &block,
-                                const oir::CallInst &call,
+bool is_eligible_recursive_call(const oir::Function &caller, const oir::CallInst &call,
                                 const oir::Function &callee_template,
-                                const pass::cost_model::CostModelPolicy &policy) {
+                                const pass::cost_model::CostModelPolicy &policy,
+                                unsigned depth, unsigned current_growth) {
     if (call.callee() != &caller || caller.is_external() || caller.entry_block() == nullptr ||
         !has_compatible_call_shape(call, callee_template) ||
         !has_scalar_recursive_signature(caller) ||
         !has_supported_recursive_body(callee_template, caller) ||
-        recursive_inline_depth(caller, block) >= kMaxRecursiveInlineDepth) {
+        depth >= kMaxRecursiveInlineDepth) {
         return false;
     }
 
     auto info = inspect_callee(callee_template);
-    return info.blocks <= kMaxRecursiveCalleeBlocks &&
+    return recursive_inline_probability(depth) >=
+               kMinRecursiveInlineProbabilityBasisPoints &&
+           info.blocks <= kMaxRecursiveCalleeBlocks &&
            info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost * 2) &&
-           info.returns != 0 && info.returns <= kMaxRecursiveCalleeReturns;
+           info.returns != 0 && info.returns <= kMaxRecursiveCalleeReturns &&
+           recursive_pressure_growth(call, info, depth) <=
+               static_cast<unsigned>(std::max<std::int64_t>(
+                   0, policy.max_register_pressure_growth)) &&
+           current_growth + cloned_instruction_growth(info) <=
+               recursive_inline_growth_budget(policy);
 }
 
 oir::Value *map_value(oir::Value *value, const ValueMap &values, const BlockMap &blocks) {
@@ -1078,10 +1118,18 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     auto *callee = dynamic_cast<oir::Function *>(call->callee());
     bool self_recursive = callee == &caller;
     oir::Function *clone_source = callee;
+    unsigned self_recursive_depth = 0;
     const auto policy = pass::cost_model::policy_for_kind(stats.cost_model_policy);
     if (self_recursive) {
+        if (stats.recursively_inlined_functions.find(&caller) !=
+            stats.recursively_inlined_functions.end()) {
+            return false;
+        }
         clone_source = &recursive_template_for(context, caller);
-        if (!is_eligible_recursive_call(caller, *block, *call, *clone_source, policy)) {
+        self_recursive_depth = recursive_inline_depth(context, *call);
+        if (!is_eligible_recursive_call(caller, *call, *clone_source, policy,
+                                        self_recursive_depth,
+                                        context.recursive_growth[&caller])) {
             return false;
         }
     } else if (!is_eligible_non_recursive_call(caller, *call, callee, policy)) {
@@ -1093,7 +1141,10 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     estimate.kind = pass::cost_model::TransformKind::Inline;
     estimate.pass_name = "OIRInlinePass";
     estimate.candidate_id = "inline." + std::to_string(inline_index);
-    estimate.scope = "call";
+    estimate.scope = self_recursive
+                         ? "direct-recursive-depth-" +
+                               std::to_string(self_recursive_depth)
+                         : "call";
     estimate.proof_kind = pass::cost_model::ProofKind::Structural;
     estimate.proof_summary = "existing inline legality checks";
     estimate.confidence = self_recursive ? 0.60 : 0.65;
@@ -1104,6 +1155,10 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     estimate.after_live_values += static_cast<std::int64_t>(call->args().size());
     estimate.after_max_live_values +=
         static_cast<std::int64_t>(std::min<std::size_t>(call->args().size(), 4));
+    if (self_recursive) {
+        estimate.after_max_live_values +=
+            recursive_pressure_growth(*call, info, self_recursive_depth);
+    }
     estimate.risk.code_growth = std::max<std::int64_t>(1, info.static_instrs);
     estimate.risk.register_pressure_growth =
         static_cast<std::int64_t>((info.loads + info.stores + call->args().size()) / 6);
@@ -1123,7 +1178,7 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
 
     const std::string block_prefix =
         self_recursive
-            ? recursive_inline_prefix(caller, recursive_inline_depth(caller, *block) + 1)
+            ? recursive_inline_prefix(caller, self_recursive_depth + 1)
             : "inl." + callee->name() + ".";
     for (const auto &callee_block : clone_source->blocks()) {
         blocks[callee_block.get()] = caller.create_block(block_prefix + callee_block->name());
@@ -1134,6 +1189,19 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     split_call_block(block, call_it, continuation);
     clone_callee_into_caller(module, caller, *clone_source, *call, continuation, values, blocks,
                              returns, inline_index);
+    if (self_recursive) {
+        for (const auto &[source_block, cloned_block] : blocks) {
+            (void)source_block;
+            for (const auto &inst : cloned_block->instructions()) {
+                auto *cloned_call = dynamic_cast<oir::CallInst *>(inst.get());
+                if (cloned_call != nullptr && cloned_call->callee() == &caller) {
+                    context.recursive_call_depths[cloned_call] = self_recursive_depth + 1;
+                }
+            }
+        }
+        context.recursive_growth[&caller] += cloned_instruction_growth(info);
+        context.recursive_call_depths.erase(call);
+    }
     oir::cfg::append_unconditional_branch(module, block, blocks.at(clone_source->entry_block()));
 
     if (!call->type()->is_void()) {
@@ -1148,16 +1216,63 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
 
 bool inline_one_call(oir::Module &module, InlineContext &context, oir::Function &function,
                      unsigned inline_index, Stats &stats) {
+    struct RecursiveSite {
+        unsigned depth = 0;
+        oir::BasicBlock *block = nullptr;
+        oir::CallInst *call = nullptr;
+    };
+
+    // Inline ordinary helpers first.  Recursive templates must be captured only after
+    // helper calls have had a chance to disappear, otherwise an obsolete template can
+    // make an otherwise supported recursive body look permanently ineligible.
     for (auto &block : function.blocks()) {
         for (auto it = block->instructions().begin(); it != block->instructions().end(); ++it) {
-            if ((*it)->op() != oir::Instruction::OpID::Call) {
+            auto *call = dynamic_cast<oir::CallInst *>(it->get());
+            if (call == nullptr || call->callee() == &function) {
                 continue;
             }
             if (inline_call(module, context, function, block.get(), it, inline_index, stats)) {
+                // Let cleanup and tail-recursion elimination see the helper-free body
+                // before deciding whether recursive expansion is still profitable.
+                context.defer_recursive_expansion.insert(&function);
                 return true;
             }
         }
     }
+
+    if (context.defer_recursive_expansion.find(&function) !=
+        context.defer_recursive_expansion.end()) {
+        return false;
+    }
+
+    std::vector<RecursiveSite> recursive_sites;
+    for (auto &block : function.blocks()) {
+        for (auto &inst : block->instructions()) {
+            auto *call = dynamic_cast<oir::CallInst *>(inst.get());
+            if (call == nullptr || call->callee() != &function) {
+                continue;
+            }
+            recursive_sites.push_back(
+                {recursive_inline_depth(context, *call), block.get(), call});
+        }
+    }
+    std::stable_sort(recursive_sites.begin(), recursive_sites.end(),
+                     [](const RecursiveSite &lhs, const RecursiveSite &rhs) {
+                         return lhs.depth < rhs.depth;
+                     });
+    for (const auto &site : recursive_sites) {
+        auto &instructions = site.block->instructions();
+        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
+            if (it->get() != site.call) {
+                continue;
+            }
+            if (inline_call(module, context, function, site.block, it, inline_index, stats)) {
+                return true;
+            }
+            break;
+        }
+    }
+
     return false;
 }
 
@@ -1339,6 +1454,12 @@ bool inline_functions(oir::Module &module, Stats &stats) {
         }
         if (!round_changed || inline_index >= kMaxInlineSites) {
             break;
+        }
+    }
+
+    for (const auto &[function, growth] : context.recursive_growth) {
+        if (growth != 0) {
+            stats.recursively_inlined_functions.insert(function);
         }
     }
 
