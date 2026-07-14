@@ -177,7 +177,7 @@ jobs:
           mkdir -p build/github-actions
           python3 scripts/compare_perf.py 2>&1 | tee build/github-actions/perf-tests.log
 
-      - name: Generate flamegraphs
+      - name: Generate guest TB heatmaps
         id: flamegraphs
         if: always()
         continue-on-error: true
@@ -189,7 +189,7 @@ jobs:
           set -o pipefail
           mkdir -p build/github-actions build/perf-ci/flamegraphs
           if [ ! -f build/perf-ci/perf-report.json ]; then
-            echo "Perf report missing; skip flamegraph generation." | tee build/github-actions/flamegraphs.log
+            echo "Perf report missing; skip guest TB heatmap generation." | tee build/github-actions/flamegraphs.log
             exit 0
           fi
           python3 scripts/generate_qemu_flamegraphs.py \

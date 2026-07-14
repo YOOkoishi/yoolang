@@ -155,7 +155,7 @@ class FlamegraphResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate QEMU/perf flamegraphs for yoolang perf cases.")
+    parser = argparse.ArgumentParser(description="Generate QEMU guest basic-block heatmaps for yoolang perf cases.")
     parser.add_argument("--perf-report", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--qemu", default=DEFAULT_QEMU)
@@ -163,6 +163,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-sec", type=int, default=DEFAULT_TIMEOUT_SEC)
     parser.add_argument("--mode", choices=("all", "list"), default=os.environ.get("FLAMEGRAPH_MODE", "all"))
     parser.add_argument("--cases", default=os.environ.get("FLAMEGRAPH_CASES", ""))
+    parser.add_argument(
+        "--source",
+        choices=("tb", "perf"),
+        default=os.environ.get("FLAMEGRAPH_SOURCE", "tb"),
+        help="profile source: QEMU guest translation-block heatmap (tb) or host perf call graph (perf)",
+    )
     return parser.parse_args()
 
 
@@ -190,6 +196,11 @@ def case_exe(case: str) -> Path:
 def case_input(case: str) -> Path | None:
     candidate = (WORKSPACE / case).with_suffix(".in")
     return candidate if candidate.exists() else None
+
+
+def case_asm(case: str) -> Path:
+    src = WORKSPACE / case
+    return WORKSPACE / "build" / "perf-ci" / src.parent.relative_to(WORKSPACE) / src.stem / f"{src.stem}.compiler.s"
 
 
 def case_slug(case: str) -> str:
@@ -330,6 +341,21 @@ def symbol_for(addr: int, addrs: list[int], names: list[str]) -> str:
     return names[index]
 
 
+def compiler_function_symbols(case: str) -> set[str]:
+    asm = case_asm(case)
+    if not asm.exists():
+        return set()
+    symbols: set[str] = set()
+    for line in asm.read_text(errors="replace").splitlines():
+        text = line.strip()
+        if not text.endswith(":") or text.startswith("."):
+            continue
+        name = text[:-1]
+        if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_.$]*", name):
+            symbols.add(name)
+    return symbols
+
+
 def run_tb_profile(case: str, exe: Path, out_dir: Path, qemu: str, timeout_sec: int) -> tuple[bool, str, dict[tuple[str, ...], int]]:
     input_file = case_input(case)
     stdin_data = input_file.read_bytes() if input_file is not None else None
@@ -367,6 +393,7 @@ def run_tb_profile(case: str, exe: Path, out_dir: Path, qemu: str, timeout_sec: 
         return False, shorten(stderr or stdout or f"QEMU TB profile exited {result.returncode}"), {}
 
     addrs, names = symbol_table(exe)
+    compiler_symbols = compiler_function_symbols(case)
     folded: dict[tuple[str, ...], int] = {}
     for match in TB_PROFILE_RE.finditer(stdout + "\n" + stderr):
         addr = int(match.group(1), 16)
@@ -374,12 +401,17 @@ def run_tb_profile(case: str, exe: Path, out_dir: Path, qemu: str, timeout_sec: 
         count = int(match.group(3))
         weight = max(1, n_insns) * count
         symbol = symbol_for(addr, addrs, names)
+        if compiler_symbols and symbol not in compiler_symbols:
+            continue
         frame = f"tb@0x{addr:x}"
         stack = ("qemu-tb-profile", symbol, frame)
         folded[stack] = folded.get(stack, 0) + weight
     if not folded:
-        return False, "QEMU TB profile produced no block samples", {}
-    return True, "QEMU TB profile fallback", folded
+        return False, "QEMU TB profile produced no compiler block samples", {}
+    detail = "QEMU guest TB heatmap"
+    if compiler_symbols:
+        detail += " (compiler functions only)"
+    return True, detail, folded
 
 
 def clean_symbol(symbol: str, dso: str | None) -> str:
@@ -447,6 +479,15 @@ def build_tree(folded: dict[tuple[str, ...], int]) -> dict[str, Any]:
     return root
 
 
+def tree_payload(node: dict[str, Any]) -> dict[str, Any]:
+    children = sorted(node["children"].values(), key=lambda item: item["value"], reverse=True)
+    return {
+        "name": node["name"],
+        "value": node["value"],
+        "children": [tree_payload(child) for child in children],
+    }
+
+
 def flatten_tree(node: dict[str, Any], depth: int, x: float, scale: float, rects: list[dict[str, Any]]) -> None:
     current_x = x
     for child in sorted(node["children"].values(), key=lambda item: item["value"], reverse=True):
@@ -465,7 +506,7 @@ def write_svg(folded: dict[tuple[str, ...], int], path: Path, title: str) -> int
     if samples <= 0:
         path.write_text(
             '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="120">'
-            '<text x="20" y="55" font-family="sans-serif" font-size="16">No perf samples captured.</text>'
+            '<text x="20" y="55" font-family="sans-serif" font-size="16">No guest basic-block samples captured.</text>'
             "</svg>\n"
         )
         return 0
@@ -479,7 +520,7 @@ def write_svg(folded: dict[tuple[str, ...], int], path: Path, title: str) -> int
         "<style>text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}"
         ".frame:hover{stroke:#111;stroke-width:1.2}</style>",
         f'<text x="{pad_x}" y="24" font-family="sans-serif" font-size="18">{html.escape(title)}</text>',
-        f'<text x="{pad_x}" y="42" font-family="sans-serif" font-size="12">{samples} samples</text>',
+        f'<text x="{pad_x}" y="42" font-family="sans-serif" font-size="12">weight {samples}</text>',
     ]
     for rect in rects:
         if rect["width"] < 0.4:
@@ -490,7 +531,7 @@ def write_svg(folded: dict[tuple[str, ...], int], path: Path, title: str) -> int
         label = rect["name"]
         pct = (rect["value"] / samples) * 100.0
         parts.append(
-            f'<g class="frame"><title>{html.escape(label)} ({rect["value"]} samples, {pct:.2f}%)</title>'
+            f'<g class="frame"><title>{html.escape(label)} (weight {rect["value"]}, {pct:.2f}%)</title>'
             f'<rect x="{x:.3f}" y="{y}" width="{w:.3f}" height="{frame_h - 1}" fill="{color_for(label)}" rx="2" ry="2"/>'
         )
         if w > 42:
@@ -503,36 +544,313 @@ def write_svg(folded: dict[tuple[str, ...], int], path: Path, title: str) -> int
     return samples
 
 
-def write_html(svg_name: str, folded_name: str, path: Path, case: str, samples: int) -> None:
-    path.write_text(
-        f"""<!doctype html>
+def write_html(
+    svg_name: str,
+    folded_name: str,
+    path: Path,
+    case: str,
+    samples: int,
+    folded: dict[tuple[str, ...], int],
+) -> None:
+    payload = json.dumps(tree_payload(build_tree(folded)), ensure_ascii=True, separators=(",", ":"))
+    page = """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Yoolang Flamegraph - {html.escape(case)}</title>
+  <title>Yoolang Guest TB Heatmap - __CASE_TITLE__</title>
   <style>
-    body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #2e3440; color: #eceff4; }}
-    header {{ padding: 18px 24px; background: #3b4252; border-bottom: 1px solid #4c566a; }}
-    h1 {{ margin: 0 0 6px; font-size: 22px; letter-spacing: 0; }}
-    .meta {{ color: #d8dee9; font-size: 14px; }}
-    .links {{ margin-top: 10px; display: flex; gap: 10px; flex-wrap: wrap; }}
-    a {{ color: #88c0d0; }}
-    main {{ overflow: auto; padding: 14px; }}
-    .canvas {{ display: inline-block; background: #eceff4; border: 1px solid #4c566a; }}
+    :root {
+      color-scheme: dark;
+      --bg: #252a35;
+      --panel: #323946;
+      --line: #526072;
+      --text: #eef2f7;
+      --muted: #c9d2de;
+      --accent: #8fd0dd;
+      --hot: #ffdf6e;
+      --canvas: #f1f4f8;
+      --ink: #151922;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 16px 24px 14px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 21px;
+      letter-spacing: 0;
+      overflow-wrap: anywhere;
+    }
+    .meta, .status { color: var(--muted); font-size: 14px; }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    button, input {
+      height: 32px;
+      border: 1px solid var(--line);
+      background: #242b36;
+      color: var(--text);
+      border-radius: 6px;
+      font: inherit;
+      font-size: 14px;
+    }
+    button {
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    input {
+      width: min(360px, 100%);
+      padding: 0 10px;
+    }
+    a { color: var(--accent); }
+    .links { display: flex; gap: 12px; flex-wrap: wrap; }
+    main { overflow: auto; padding: 14px; }
+    .canvas {
+      display: inline-block;
+      min-width: 100%;
+      background: var(--canvas);
+      border: 1px solid var(--line);
+      color: var(--ink);
+    }
+    svg { display: block; }
+    .frame rect {
+      cursor: pointer;
+      stroke: rgba(255, 255, 255, 0.45);
+      stroke-width: 0.5;
+    }
+    .frame:hover rect {
+      stroke: #111;
+      stroke-width: 1.4;
+    }
+    .frame.is-match rect {
+      stroke: var(--hot);
+      stroke-width: 2;
+    }
+    .label {
+      pointer-events: none;
+      fill: #12161f;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .title-text {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      fill: #12161f;
+    }
+    #tooltip {
+      position: fixed;
+      display: none;
+      max-width: min(620px, calc(100vw - 24px));
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid #111827;
+      background: rgba(17, 24, 39, 0.96);
+      color: #f9fafb;
+      font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      z-index: 10;
+      overflow-wrap: anywhere;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>{html.escape(case)}</h1>
-    <div class="meta">QEMU/perf flamegraph, yoolang .compiler.riscv, samples: {samples}</div>
-    <div class="links"><a href="{html.escape(svg_name)}">打开 SVG</a><a href="{html.escape(folded_name)}">下载 folded stacks</a></div>
+    <h1>__CASE_HEADING__</h1>
+    <div class="meta">QEMU guest basic-block heatmap, yoolang .compiler.riscv, weight: __SAMPLES__</div>
+    <div class="toolbar">
+      <button id="reset" type="button">Reset zoom</button>
+      <input id="search" type="search" placeholder="Search function or tb address">
+      <span class="links"><a href="__SVG_NAME__">打开 SVG</a><a href="__FOLDED_NAME__">下载 folded stacks</a></span>
+    </div>
+    <div id="status" class="status">Hover a block to inspect it. Click a block to zoom.</div>
   </header>
-  <main><div class="canvas"><img src="{html.escape(svg_name)}" alt="flamegraph for {html.escape(case)}"></div></main>
+  <main><div class="canvas"><svg id="heatmap" role="img" aria-label="guest basic-block heatmap for __CASE_ATTR__"></svg></div></main>
+  <div id="tooltip"></div>
+  <script>
+    const root = __TREE_JSON__;
+    const svg = document.getElementById("heatmap");
+    const status = document.getElementById("status");
+    const tooltip = document.getElementById("tooltip");
+    const search = document.getElementById("search");
+    const reset = document.getElementById("reset");
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const WIDTH = 1400;
+    const PAD_X = 10;
+    const TOP = 50;
+    const FRAME_H = 18;
+    let current = root;
+
+    function colorFor(name) {
+      let value = 0;
+      for (const ch of name) value = (value * 131 + ch.charCodeAt(0)) >>> 0;
+      const hue = 20 + (value % 38);
+      const sat = 58 + (value % 18);
+      const light = 54 + (value % 12);
+      return `hsl(${hue}, ${sat}%, ${light}%)`;
+    }
+
+    function pct(value, base) {
+      if (!base) return "0.00";
+      return ((value / base) * 100).toFixed(2);
+    }
+
+    function layout(node, depth, x, scale, out) {
+      let currentX = x;
+      for (const child of node.children || []) {
+        const width = child.value * scale;
+        out.push({ node: child, depth, x: currentX, width });
+        layout(child, depth + 1, currentX, scale, out);
+        currentX += width;
+      }
+    }
+
+    function textWidthLimit(width) {
+      return Math.max(1, Math.floor((width - 8) / 7));
+    }
+
+    function describe(node, base) {
+      return `${node.name} | weight ${node.value} | ${pct(node.value, base)}% of view | ${pct(node.value, root.value)}% total`;
+    }
+
+    function setTooltip(event, text) {
+      tooltip.textContent = text;
+      tooltip.style.display = "block";
+      const margin = 12;
+      const x = Math.min(event.clientX + margin, window.innerWidth - tooltip.offsetWidth - margin);
+      const y = Math.min(event.clientY + margin, window.innerHeight - tooltip.offsetHeight - margin);
+      tooltip.style.left = `${Math.max(margin, x)}px`;
+      tooltip.style.top = `${Math.max(margin, y)}px`;
+    }
+
+    function clearTooltip() {
+      tooltip.style.display = "none";
+    }
+
+    function render() {
+      const rects = [];
+      const scale = (WIDTH - 2 * PAD_X) / Math.max(1, current.value);
+      layout(current, 0, PAD_X, scale, rects);
+      const maxDepth = rects.reduce((acc, item) => Math.max(acc, item.depth), 0);
+      const height = TOP + (maxDepth + 2) * FRAME_H + 20;
+      const query = search.value.trim().toLowerCase();
+      svg.setAttribute("width", String(WIDTH));
+      svg.setAttribute("height", String(height));
+      svg.setAttribute("viewBox", `0 0 ${WIDTH} ${height}`);
+      svg.replaceChildren();
+
+      const title = document.createElementNS(SVG_NS, "text");
+      title.setAttribute("x", PAD_X);
+      title.setAttribute("y", "24");
+      title.setAttribute("class", "title-text");
+      title.setAttribute("font-size", "18");
+      title.textContent = current === root ? "__CASE_JS__" : `Zoom: ${current.name}`;
+      svg.appendChild(title);
+
+      const meta = document.createElementNS(SVG_NS, "text");
+      meta.setAttribute("x", PAD_X);
+      meta.setAttribute("y", "42");
+      meta.setAttribute("class", "title-text");
+      meta.setAttribute("font-size", "12");
+      meta.textContent = `view weight ${current.value}, total weight ${root.value}`;
+      svg.appendChild(meta);
+
+      for (const item of rects) {
+        if (item.width < 0.35) continue;
+        const { node, depth, x, width } = item;
+        const y = TOP + depth * FRAME_H;
+        const group = document.createElementNS(SVG_NS, "g");
+        group.setAttribute("class", "frame" + (query && node.name.toLowerCase().includes(query) ? " is-match" : ""));
+        group.setAttribute("tabindex", "0");
+        group.setAttribute("role", "button");
+        group.setAttribute("aria-label", describe(node, current.value));
+
+        const titleNode = document.createElementNS(SVG_NS, "title");
+        titleNode.textContent = describe(node, current.value);
+        group.appendChild(titleNode);
+
+        const rect = document.createElementNS(SVG_NS, "rect");
+        rect.setAttribute("x", x.toFixed(3));
+        rect.setAttribute("y", String(y));
+        rect.setAttribute("width", Math.max(width, 0.35).toFixed(3));
+        rect.setAttribute("height", String(FRAME_H - 1));
+        rect.setAttribute("fill", colorFor(node.name));
+        rect.setAttribute("rx", "2");
+        rect.setAttribute("ry", "2");
+        group.appendChild(rect);
+
+        if (width > 42) {
+          const label = document.createElementNS(SVG_NS, "text");
+          const maxChars = textWidthLimit(width);
+          label.setAttribute("x", (x + 4).toFixed(3));
+          label.setAttribute("y", String(y + 13));
+          label.setAttribute("class", "label");
+          label.textContent = node.name.length <= maxChars ? node.name : `${node.name.slice(0, Math.max(1, maxChars - 1))}~`;
+          group.appendChild(label);
+        }
+
+        group.addEventListener("mousemove", event => {
+          const text = describe(node, current.value);
+          status.textContent = text;
+          setTooltip(event, text);
+        });
+        group.addEventListener("mouseleave", clearTooltip);
+        group.addEventListener("click", event => {
+          event.stopPropagation();
+          if ((node.children || []).length > 0) {
+            current = node;
+            clearTooltip();
+            render();
+          }
+        });
+        group.addEventListener("keydown", event => {
+          if ((event.key === "Enter" || event.key === " ") && (node.children || []).length > 0) {
+            event.preventDefault();
+            current = node;
+            render();
+          }
+        });
+        svg.appendChild(group);
+      }
+    }
+
+    reset.addEventListener("click", () => {
+      current = root;
+      status.textContent = "Hover a block to inspect it. Click a block to zoom.";
+      render();
+    });
+    search.addEventListener("input", render);
+    svg.addEventListener("mouseleave", clearTooltip);
+    render();
+  </script>
 </body>
 </html>
 """
-    )
+    page = page.replace("__CASE_TITLE__", html.escape(case))
+    page = page.replace("__CASE_HEADING__", html.escape(case))
+    page = page.replace("__CASE_ATTR__", html.escape(case, quote=True))
+    page = page.replace("__CASE_JS__", json.dumps(case, ensure_ascii=True)[1:-1])
+    page = page.replace("__SAMPLES__", str(samples))
+    page = page.replace("__SVG_NAME__", html.escape(svg_name, quote=True))
+    page = page.replace("__FOLDED_NAME__", html.escape(folded_name, quote=True))
+    page = page.replace("__TREE_JSON__", payload)
+    path.write_text(page)
 
 
 def write_case_artifacts(
@@ -546,8 +864,8 @@ def write_case_artifacts(
     svg_path = out_dir / "flamegraph.svg"
     html_path = out_dir / "index.html"
     samples = write_folded(folded, folded_path)
-    write_svg(folded, svg_path, f"Yoolang QEMU flamegraph: {case}")
-    write_html(svg_path.name, folded_path.name, html_path, case, samples)
+    write_svg(folded, svg_path, f"Yoolang guest TB heatmap: {case}")
+    write_html(svg_path.name, folded_path.name, html_path, case, samples, folded)
     status = "OK" if samples > 0 else "EMPTY"
     return FlamegraphResult(
         case=case,
@@ -561,13 +879,19 @@ def write_case_artifacts(
     )
 
 
-def generate_case(case: str, out_root: Path, qemu: str, sample_frequency: int, timeout_sec: int) -> FlamegraphResult:
+def generate_case(case: str, out_root: Path, qemu: str, sample_frequency: int, timeout_sec: int, source: str) -> FlamegraphResult:
     slug = case_slug(case)
     out_dir = out_root / slug
     out_dir.mkdir(parents=True, exist_ok=True)
     exe = case_exe(case)
     if not exe.exists():
         return FlamegraphResult(case=case, status="MISSING", detail=f"compiler executable not found: {exe}")
+
+    if source == "tb":
+        ok, detail, folded = run_tb_profile(case, exe, out_dir, qemu, timeout_sec)
+        if ok:
+            return write_case_artifacts(case, out_root, out_dir, folded, detail)
+        return FlamegraphResult(case=case, status="FAILED", detail=detail, url=f"{slug}/")
 
     ok, detail, perf_data = run_perf(case, exe, out_dir, qemu, sample_frequency, timeout_sec)
     if not ok:
@@ -588,12 +912,14 @@ def generate_case(case: str, out_root: Path, qemu: str, sample_frequency: int, t
 
 
 def write_index(results: list[FlamegraphResult], out_dir: Path, meta: dict[str, Any]) -> None:
+    result_rows = [result.__dict__ for result in results]
     payload = {
         "status": "OK" if all(result.status in {"OK", "EMPTY", "MISSING", "FAILED"} for result in results) else "UNKNOWN",
         "generated_cases": len(results),
         "ok_cases": sum(1 for result in results if result.status == "OK"),
         "meta": meta,
-        "rows": [result.__dict__ for result in results],
+        "cases": result_rows,
+        "rows": result_rows,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "index.json").write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
@@ -606,10 +932,10 @@ def write_index(results: list[FlamegraphResult], out_dir: Path, meta: dict[str, 
     (out_dir / "index.html").write_text(
         f"""<!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Yoolang Flamegraphs</title>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Yoolang Guest TB Heatmaps</title>
 <style>body{{font-family:ui-sans-serif,system-ui,sans-serif;margin:24px;background:#2e3440;color:#eceff4}}a{{color:#88c0d0}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #4c566a;padding:8px;text-align:left}}code{{color:#ebcb8b}}</style></head>
-<body><h1>Yoolang Flamegraphs</h1><p><code>{html.escape(str(meta.get("source_report", "")))}</code></p>
-<table><thead><tr><th>Case</th><th>Status</th><th>Samples</th><th>Flamegraph</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table></body></html>
+<body><h1>Yoolang Guest TB Heatmaps</h1><p><code>{html.escape(str(meta.get("source_report", "")))}</code></p>
+<table><thead><tr><th>Case</th><th>Status</th><th>Weight</th><th>Heatmap</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table></body></html>
 """
     )
 
@@ -623,13 +949,13 @@ def main() -> int:
     cases = selected_cases(rows, args.mode, args.cases)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not check_tool("perf"):
+    if args.source == "perf" and not check_tool("perf"):
         results = [FlamegraphResult(case=case, status="SKIPPED", detail="perf not found") for case in cases]
     elif not check_tool(args.qemu):
         results = [FlamegraphResult(case=case, status="SKIPPED", detail=f"qemu not found: {args.qemu}") for case in cases]
     else:
         results = [
-            generate_case(case, args.out_dir, args.qemu, args.sample_frequency, args.timeout_sec)
+            generate_case(case, args.out_dir, args.qemu, args.sample_frequency, args.timeout_sec, args.source)
             for case in cases
         ]
 
@@ -642,10 +968,11 @@ def main() -> int:
             "sample_frequency": args.sample_frequency,
             "timeout_sec": args.timeout_sec,
             "mode": args.mode,
+            "source": args.source,
         },
     )
     ok = sum(1 for result in results if result.status == "OK")
-    print(f"Generated QEMU flamegraphs: {ok}/{len(results)} OK, index: {args.out_dir / 'index.json'}")
+    print(f"Generated QEMU guest TB heatmaps: {ok}/{len(results)} OK, index: {args.out_dir / 'index.json'}")
     return 0
 
 

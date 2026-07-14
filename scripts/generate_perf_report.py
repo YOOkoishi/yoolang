@@ -121,7 +121,7 @@ def rows_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def flamegraphs_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    rows = payload.get("rows", [])
+    rows = payload.get("cases", payload.get("rows", []))
     if not isinstance(rows, list):
         return {}
     result: dict[str, dict[str, Any]] = {}
@@ -640,7 +640,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
             <th data-key="yoolang_vs_clang_speedup">Yoolang vs Clang++ <span class="sort"></span></th>
             <th data-key="baseline_sec">Baseline 时间 <span class="sort"></span></th>
             <th data-key="delta_pct">相对 baseline <span class="sort"></span></th>
-            <th data-key="flamegraph_status">火焰图 <span class="sort"></span></th>
+            <th data-key="flamegraph_status">热点图 <span class="sort"></span></th>
             <th data-key="status">状态 <span class="sort"></span></th>
             <th data-key="reason">失败原因 <span class="sort"></span></th>
           </tr>
@@ -1027,7 +1027,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       const status = String(row.flamegraph_status || 'N/A');
       const detail = row.flamegraph_detail ? `<div class="flamegraph-detail">${{escapeHtml(row.flamegraph_detail)}}</div>` : '';
       if (row.flamegraph_url && (status === 'OK' || status === 'EMPTY' || status === 'FAILED')) {{
-        return `<a class="flamegraph-link" href="${{escapeHtml(row.flamegraph_url)}}">打开</a><div class="flamegraph-detail">${{escapeHtml(status)}} / ${{fmtSamples(row.flamegraph_samples)}} samples</div>`;
+        return `<a class="flamegraph-link" href="${{escapeHtml(row.flamegraph_url)}}">打开</a><div class="flamegraph-detail">${{escapeHtml(status)}} / weight ${{fmtSamples(row.flamegraph_samples)}}</div>`;
       }}
       return `<span class="muted">${{escapeHtml(status)}}</span>${{detail}}`;
     }}
