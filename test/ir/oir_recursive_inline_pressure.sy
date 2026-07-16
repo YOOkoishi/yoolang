@@ -1,0 +1,35 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=INLINE
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int pressure_tree(int depth, int budget, int bias, int step) {
+    if (depth == 0 || budget == 0) {
+        return bias;
+    }
+    if (depth > budget) {
+        return pressure_tree(depth - 1, budget, bias, step);
+    }
+
+    int left = pressure_tree(depth - 1, budget, bias + step, step);
+    int right = pressure_tree(depth - 1, budget - 1, bias, step);
+    if (left > right) {
+        return left;
+    }
+    return right;
+}
+
+int main() {
+    return pressure_tree(getint(), getint(), getint(), getint());
+}
+
+// Four scalar arguments plus binary recursive fanout exhaust the balanced
+// register-pressure allowance after two complete breadth levels.
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE-NOT: scope=direct-recursive-depth-2
+
+// Eight residual leaf calls plus main's entry call remain.
+// OIR-COUNT-9: call i32 @pressure_tree

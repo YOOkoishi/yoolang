@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace pass::oir_opt {
 
@@ -39,6 +40,11 @@ struct Stats {
     unsigned loop_bound_tighten = 0;
     unsigned specialized = 0;
     unsigned cost_model_candidates = 0;
+
+    // Recursive inlining is deliberately a single, bounded phase per function.  The
+    // aggressive pipeline may revisit ordinary inlining after cleanup, but restarting
+    // recursive expansion from depth zero would defeat its growth/frequency budget.
+    std::unordered_set<const oir::Function *> recursively_inlined_functions;
 
     pass::cost_model::CostModelReport *cost_model_report = nullptr;
     pass::cost_model::CostModelPolicyKind cost_model_policy =
