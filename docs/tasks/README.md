@@ -18,6 +18,8 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [Context-Sensitive Callsite Inlining And Transactional Residual Partial Evaluation](2026-07-17-context-inline-residual-pe.md) | scoped | `task/context-inline-residual-pe` (planned) | 2026-07-17 |
+| [OIR Guarded Small-Loop Unroll And Address Recurrence Optimization](2026-07-17-oir-guarded-small-loop-unroll.md) | scoped | `task/oir-guarded-small-loop-unroll` (planned) | 2026-07-17 |
 | [Sort Hard Gate Cleanup](2026-07-08-sort-hard-gate-cleanup.md) | blocked | `task/oir-digit-extraction-cse` | 2026-07-08 |
 | [Radix General Optimizations](2026-07-08-radix-general-opts.md) | blocked | `task/oir-digit-extraction-cse` | 2026-07-08 |
 | [OIR Digit Extraction CSE](2026-07-08-oir-digit-extraction-cse.md) | ready_for_review | `task/oir-digit-extraction-cse` | 2026-07-08 |

@@ -8,3 +8,4 @@
 - [mir-design.md](mir-design.md): RISC-V MIR 设计说明。
 - [polyhedral.md](polyhedral.md): polyhedral pipeline 设计说明。
 - [cost-model-design.md](cost-model-design.md): 面向 OIR/MIR、SMT、partial evaluation 和 e-graph 的 cost model 设计说明。
+- [egraph-design.md](egraph-design.md): OIR 局部 equality saturation、proof、cost-model extraction 和分阶段落地设计。
