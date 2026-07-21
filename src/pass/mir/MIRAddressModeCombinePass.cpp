@@ -26,7 +26,8 @@ bool combine_address_modes(mir::MachineFunction &function, Stats &stats) {
                 continue;
             }
 
-            mir::Register addi_result = addr.reg_value();
+            const mir::Register address_result = addr.reg_value();
+            mir::Register addi_result = address_result;
             auto producer_index = find_def_before(instrs, i, addr.reg_value());
             if (!producer_index) {
                 continue;
@@ -64,7 +65,7 @@ bool combine_address_modes(mir::MachineFunction &function, Stats &stats) {
             }
 
             std::vector<std::size_t> erase_indices;
-            const bool erase_copy = copy_index && use_count(counts, addr.reg_value()) == 1;
+            const bool erase_copy = copy_index && use_count(counts, address_result) == 1;
             if (erase_copy) {
                 erase_indices.push_back(*copy_index);
             }

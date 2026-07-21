@@ -1,0 +1,65 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int observed_total;
+
+int effectful_value(int value, int select) {
+  observed_total = observed_total + value;
+  if (select == 0) {
+    return value * value;
+  }
+  return value + 1;
+}
+
+int pure_value(int value, int select) {
+  if (select == 0) {
+    return value * value;
+  }
+  return value - 1;
+}
+
+int trapping_value(int value, int divisor, int select) {
+  int quotient = value / divisor;
+  if (select == 0) {
+    return quotient;
+  }
+  return value;
+}
+
+int uncertain_read(int data[], int select) {
+  int loaded = data[0];
+  if (select == 0) {
+    return loaded;
+  }
+  return 0;
+}
+
+int discard_results(int value) {
+  effectful_value(value, 0);
+  pure_value(value, 0);
+  return observed_total;
+}
+
+int discard_sensitive_results(int value, int divisor, int data[]) {
+  trapping_value(value, divisor, 0);
+  uncertain_read(data, 0);
+  return value;
+}
+
+int main() {
+  int data[1] = {7};
+  return discard_results(getint()) +
+         discard_sensitive_results(getint(), getint(), data);
+}
+
+// OIR-LABEL: define i32 @discard_results
+// OIR-NOT: call i32 @effectful_value
+// OIR-NOT: call i32 @pure_value
+// OIR-NOT: mul i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @discard_sensitive_results
+// OIR-NOT: call i32 @trapping_value
+// OIR-NOT: call i32 @uncertain_read
+// OIR: sdiv i32
+// OIR: load i32
+// OIR: ret i32

@@ -1,0 +1,24 @@
+// RUN: python3 %S/../../scripts/context_inline_metamorphic_test.py --compiler %compiler --lhs %s --rhs %s --rhs-permute | FileCheck %s
+// CHECK: "accepted_structural_fingerprints"
+// CHECK: "consumed_budget_totals"
+// CHECK: "reject_reasons"
+
+int cfg_sink;
+
+int cfg_leaf(int value, int mode) {
+  cfg_sink = cfg_sink + value;
+  int mixed = value * 3 + 1;
+  if (mode == 0) return mixed + 7;
+  return mixed - 9;
+}
+
+int cfg_caller(int value, int flag) {
+  int selected;
+  if (flag == 0) selected = value + 1;
+  else selected = value - 1;
+  int first = cfg_leaf(selected, 0);
+  int second = cfg_leaf(selected, 0);
+  return first + second;
+}
+
+int main() { return cfg_caller(getint(), getint()); }

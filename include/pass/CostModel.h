@@ -95,6 +95,9 @@ enum class RejectReason {
     MemoryPressureTooHigh,
     CompileTimeTooHigh,
     CleanupTooSpeculative,
+    CleanupBudgetExhausted,
+    CumulativeBudgetExhausted,
+    CommitPreflightFailed,
     TargetUnsupported,
 };
 
@@ -241,6 +244,7 @@ struct TransformCandidate {
 
     bool bypass_profitability = false;
     std::string bypass_reason;
+    RejectReason forced_reject_reason = RejectReason::None;
 
     std::vector<std::string> required_cleanup_passes;
     std::vector<std::string> reason_hints;

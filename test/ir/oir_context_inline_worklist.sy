@@ -1,0 +1,116 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=COST
+
+int leaf_choice(int value, int choose) {
+  if (choose == 0) {
+    return value + 3;
+  }
+  return value - 5;
+}
+
+int second_wrapper(int value) {
+  return leaf_choice(value, 1) + 2;
+}
+
+int first_wrapper(int value) {
+  return leaf_choice(value, 0) + 4;
+}
+
+int ordinary_tie_leaf(int value) {
+  return value * 3 + 1;
+}
+
+int ordinary_tie_left(int value) {
+  return ordinary_tie_leaf(value);
+}
+
+int ordinary_tie_right(int renamed) {
+  return ordinary_tie_leaf(renamed);
+}
+
+int arity_shape_one(int value) {
+  return value * 5;
+}
+
+int arity_shape_two(int value, int unused) {
+  return value * 5;
+}
+
+int arity_tie_left(int value) {
+  return arity_shape_one(value);
+}
+
+int arity_tie_right(int renamed) {
+  return arity_shape_two(renamed, renamed);
+}
+
+int wide_leaf(int a0, int a1, int a2, int a3, int a4, int a5,
+              int a6, int a7, int a8, int a9, int a10, int a11,
+              int a12, int a13, int a14, int a15, int a16) {
+  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 +
+         a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16;
+}
+
+int wide_wrapper(int value) {
+  return wide_leaf(value, value, value, value, value, value,
+                   value, value, value, value, value, value,
+                   value, value, value, value, value);
+}
+
+int cycle_first(int value) {
+  if (value == 0) {
+    return 1;
+  }
+  return cycle_second(value - 1);
+}
+
+int cycle_second(int value) {
+  if (value == 0) {
+    return 2;
+  }
+  return cycle_third(value - 1);
+}
+
+int cycle_third(int value) {
+  if (value == 0) {
+    return 3;
+  }
+  return cycle_first(value - 1);
+}
+
+int main() {
+  int value = getint();
+  return first_wrapper(value) + second_wrapper(value) + cycle_first(value) +
+         ordinary_tie_left(value) + ordinary_tie_right(value) +
+         arity_tie_left(value) + arity_tie_right(value) + wide_wrapper(value);
+}
+
+// OIR-LABEL: define i32 @second_wrapper
+// OIR-NOT: call i32 @leaf_choice
+// OIR: ret i32
+// OIR-LABEL: define i32 @first_wrapper
+// OIR-NOT: call i32 @leaf_choice
+// OIR: ret i32
+// OIR-LABEL: define i32 @ordinary_tie_left
+// OIR-NOT: call i32 @ordinary_tie_leaf
+// OIR: ret i32
+// OIR-LABEL: define i32 @ordinary_tie_right
+// OIR-NOT: call i32 @ordinary_tie_leaf
+// OIR: ret i32
+// OIR-LABEL: define i32 @arity_tie_left
+// OIR-NOT: call i32 @arity_shape_one
+// OIR: ret i32
+// OIR-LABEL: define i32 @arity_tie_right
+// OIR-NOT: call i32 @arity_shape_two
+// OIR: ret i32
+// OIR-LABEL: define i32 @wide_wrapper
+// OIR: call i32 @wide_leaf
+// OIR: ret i32
+// OIR-LABEL: define i32 @cycle_first
+// OIR: call i32 @cycle_second
+// OIR-LABEL: define i32 @cycle_second
+// OIR: call i32 @cycle_third
+// OIR-LABEL: define i32 @cycle_third
+// OIR: call i32 @cycle_first
+// COST: OIRInlinePass Accept transform=Inline
+// COST: structural-tie-batch

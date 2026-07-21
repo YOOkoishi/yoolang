@@ -24,6 +24,18 @@ std::optional<std::int64_t> constant_int_value(const Value *value) {
     return std::nullopt;
 }
 
+bool is_proven_nontrapping_divrem(const Instruction &inst) {
+    if (inst.op() != Instruction::OpID::SDiv &&
+        inst.op() != Instruction::OpID::SRem) {
+        return false;
+    }
+    const auto *binary = dynamic_cast<const BinaryInst *>(&inst);
+    const auto divisor =
+        binary == nullptr ? std::optional<std::int64_t>{}
+                          : constant_int_value(binary->rhs());
+    return divisor && *divisor != 0 && *divisor != -1;
+}
+
 bool same_index_value(const Value *lhs, const Value *rhs) {
     if (lhs == rhs) {
         return true;
@@ -1147,7 +1159,11 @@ bool OIRAliasAnalysis::has_side_effect(const Instruction &inst) const {
     case Instruction::OpID::Store:
     case Instruction::OpID::MemZero:
     case Instruction::OpID::Call:
+    case Instruction::OpID::Load:
         return true;
+    case Instruction::OpID::SDiv:
+    case Instruction::OpID::SRem:
+        return !is_proven_nontrapping_divrem(inst);
     case Instruction::OpID::Ret:
     case Instruction::OpID::Br:
         // Treat terminators as side-effecting from a DCE perspective: removing them changes CFG.
@@ -1388,6 +1404,22 @@ FunctionMemorySummary FunctionModRefAnalysis::scan_function(const Function &func
         for (const auto &inst : block->instructions()) {
             if (auto *load = dynamic_cast<const LoadInst *>(inst.get())) {
                 add_pointer_effect(out, load->ptr(), alias_analysis, false);
+                auto location = alias_analysis.memory_location(load->ptr());
+                if (location.base == nullptr ||
+                    dynamic_cast<const Argument *>(location.base) != nullptr) {
+                    // A read through an escaped/argument pointer can fault even when
+                    // its value is dead.  Preserve callers that contain such a read.
+                    out.has_side_effect = true;
+                }
+                continue;
+            }
+
+            if (inst->op() == Instruction::OpID::SDiv ||
+                inst->op() == Instruction::OpID::SRem) {
+                // A dynamic/zero divisor, or the conservative signed-minimum/-1
+                // case, can trap.  Constant nonzero/non--1 divisors are proven
+                // safe and do not make an otherwise pure call observable.
+                out.has_side_effect |= !is_proven_nontrapping_divrem(*inst);
                 continue;
             }
 

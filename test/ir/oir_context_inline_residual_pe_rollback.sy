@@ -1,0 +1,86 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=COST
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: env YOOLANG_TEST_FORCE_OIR_CLEANUP_VERIFY_FAILURE=1 %compiler --emit-cost-model -O1 %s | FileCheck %s --check-prefix=VERIFY-ROLLBACK-COST
+// RUN: env YOOLANG_TEST_FORCE_OIR_CLEANUP_VERIFY_FAILURE=1 %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=VERIFY-ROLLBACK-OIR
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=unsupported %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %S/oir_context_inline_positional_tie.sy | FileCheck %s --check-prefix=UNSUPPORTED
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=cleanup-budget %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %S/oir_context_inline_positional_tie.sy | FileCheck %s --check-prefix=CLEANUP
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=verify %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %S/oir_context_inline_positional_tie.sy | FileCheck %s --check-prefix=VERIFY-FAIL
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=typed-import %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %S/oir_context_inline_positional_tie.sy | FileCheck %s --check-prefix=TYPED-IMPORT
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=commit-preflight %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %S/oir_context_inline_positional_tie.sy | FileCheck %s --check-prefix=PREFLIGHT
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=commit-after-first %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %S/oir_context_inline_positional_tie.sy | FileCheck %s --check-prefix=AFTER-FIRST
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=cost-reject %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %S/oir_context_inline_positional_tie.sy | FileCheck %s --check-prefix=COST-REJECT
+
+int unchanged_shape(int value, int offset) {
+  return value + offset;
+}
+
+int removable_branch(int value, int select) {
+  if (select == 4) {
+    return value + 29;
+  }
+  return value - 31;
+}
+
+int rollback_control(int value) {
+  int first = unchanged_shape(value, 7);
+  int second = removable_branch(value, 4);
+  return first + second;
+}
+
+int main() {
+  return rollback_control(getint());
+}
+
+// COST-DAG: OIRInlinePass Reject transform=ConstantArgumentSpecialization {{.*}} reason=ProofUnknown
+// COST-DAG: OIRInlinePass Accept transform=ConstantArgumentSpecialization scope=direct-residual
+// OIR-NOT: define i32 @__yo_constprop
+// OIR-LABEL: define i32 @rollback_control
+// OIR-NOT: call i32 @removable_branch
+// OIR: ret i32
+
+// VERIFY-ROLLBACK-COST-DAG: OIRInlinePass Reject transform=Inline scope=constant-residual-affected-cleanup {{.*}} reason=CommitPreflightFailed
+// VERIFY-ROLLBACK-COST-DAG: OIRInlinePass Reject transform=Inline scope=ordinary-inline-affected-cleanup {{.*}} reason=CommitPreflightFailed
+// VERIFY-ROLLBACK-OIR-NOT: define i32 @__yo_constprop
+// VERIFY-ROLLBACK-OIR-LABEL: define i32 @rollback_control
+// VERIFY-ROLLBACK-OIR: call i32 @unchanged_shape
+// VERIFY-ROLLBACK-OIR: call i32 @removable_branch
+// VERIFY-ROLLBACK-OIR: ret i32
+
+// UNSUPPORTED: "candidate_id": "specialize.1"
+// UNSUPPORTED: "action": "Reject"
+// UNSUPPORTED: "summary": "{{.*}}unsupported detached instruction; live snapshot including function table unchanged"
+// UNSUPPORTED: "candidate_id": "specialize.2"
+// UNSUPPORTED: "action": "Accept"
+// CLEANUP: "candidate_id": "specialize.1"
+// CLEANUP: "action": "Reject"
+// CLEANUP: "summary": "{{.*}}detached cleanup budget exhausted; live snapshot including function table unchanged"
+// CLEANUP: "candidate_id": "specialize.2"
+// CLEANUP: "action": "Accept"
+// VERIFY-FAIL: "candidate_id": "specialize.1"
+// VERIFY-FAIL: "action": "Reject"
+// VERIFY-FAIL: "summary": "{{.*}}detached verifier failure; live snapshot including function table unchanged"
+// VERIFY-FAIL: "candidate_id": "specialize.2"
+// VERIFY-FAIL: "action": "Accept"
+// TYPED-IMPORT: "candidate_id": "specialize.1"
+// TYPED-IMPORT: "action": "Reject"
+// TYPED-IMPORT: "summary": "{{.*}}missing detached TypeContext import mapping; live snapshot including function table unchanged"
+// TYPED-IMPORT: "candidate_id": "specialize.2"
+// TYPED-IMPORT: "action": "Accept"
+// PREFLIGHT: "candidate_id": "specialize.1"
+// PREFLIGHT: "action": "Reject"
+// PREFLIGHT: "reject_reason": "CommitPreflightFailed"
+// PREFLIGHT: "summary": "direct residual commit verification failed; live snapshot including function table restored"
+// PREFLIGHT: "candidate_id": "specialize.2"
+// PREFLIGHT: "action": "Accept"
+// AFTER-FIRST: "candidate_id": "specialize.3"
+// AFTER-FIRST: "action": "Reject"
+// AFTER-FIRST: "reject_reason": "CommitPreflightFailed"
+// AFTER-FIRST: "summary": "residual tie batch commit failed; all live snapshots including function table restored"
+// AFTER-FIRST: "candidate_id": "specialize.5"
+// AFTER-FIRST: "action": "Accept"
+// COST-REJECT: "candidate_id": "specialize.1"
+// COST-REJECT: "action": "Reject"
+// COST-REJECT: "reject_reason": "CodeGrowthTooHigh"
+// COST-REJECT: "summary": "{{.*}}test failpoint cost rejection; live snapshot including function table unchanged"
+// COST-REJECT: "candidate_id": "specialize.2"
+// COST-REJECT: "action": "Accept"

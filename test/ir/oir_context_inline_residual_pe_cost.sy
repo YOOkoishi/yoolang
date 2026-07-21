@@ -1,0 +1,25 @@
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=COST
+
+int measured_choice(int value, int select) {
+  if (select == 2) {
+    return value + 13;
+  }
+  return value - 17;
+}
+
+int measured_caller(int value) {
+  return measured_choice(value, 2);
+}
+
+int main() {
+  return measured_caller(getint());
+}
+
+// COST: "transform": "ConstantArgumentSpecialization"
+// COST: "scope": "direct-residual"
+// COST: "kind": "PartialEvaluation"
+// COST: "summary": "verified detached residual with direct inline preflight"
+// COST: "calls": 1
+// COST: "calls": 0
+// COST: "smt_queries": 0
+// COST-NOT: "reject_reason": "CodeGrowthTooHigh"

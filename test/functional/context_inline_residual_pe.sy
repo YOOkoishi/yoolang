@@ -1,0 +1,73 @@
+int visible_sum;
+
+int choose_value(int value, int select) {
+  if (select == 2) {
+    return value + 19;
+  }
+  return value - 23;
+}
+
+int update_and_return(int value, int select) {
+  visible_sum = visible_sum + value;
+  if (select == 0) {
+    return value * value;
+  }
+  return value + 1;
+}
+
+int signed_half(int value, int select) {
+  if (select == 0) {
+    return value / 2;
+  }
+  return value % 2;
+}
+
+int two_gate_value(int first, int second, int value) {
+  if (first == 0) {
+    value = value + 4;
+  }
+  if (second == 1) {
+    value = value + 8;
+  }
+  return value;
+}
+
+int ordered_pair(int first, int second, int value) {
+  return first * 10 + second + value;
+}
+
+int ordered_pair_left(int value) {
+  return ordered_pair(2, 3, value);
+}
+
+int ordered_pair_right(int value) {
+  return ordered_pair(3, 2, value);
+}
+
+int dependent_same_block(int value) {
+  int first = choose_value(value, 2);
+  int second = choose_value(first, 2);
+  return second;
+}
+
+int main() {
+  visible_sum = 0;
+  putint(choose_value(10, 2));
+  putch(32);
+  update_and_return(5, 0);
+  putint(visible_sum);
+  putch(32);
+  putint(signed_half(-1, 0));
+  putch(32);
+  putint(signed_half(-5, 1));
+  putch(32);
+  putint(two_gate_value(0, 1, 3));
+  putch(32);
+  putint(ordered_pair_left(5));
+  putch(32);
+  putint(ordered_pair_right(5));
+  putch(32);
+  putint(dependent_same_block(1));
+  putch(10);
+  return 0;
+}

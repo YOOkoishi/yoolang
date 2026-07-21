@@ -11,28 +11,20 @@
 namespace pass::oir_opt {
 namespace {
 
-bool is_live_root(const oir::Instruction &inst, const oir::FunctionModRefAnalysis &modref) {
-    if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
-        return modref.call_has_side_effect(*call);
-    }
-
-    switch (inst.op()) {
-    case oir::Instruction::OpID::Ret:
-    case oir::Instruction::OpID::Br:
-    case oir::Instruction::OpID::Store:
-    case oir::Instruction::OpID::MemZero:
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool is_removable_instruction(const oir::Instruction &inst,
                               const oir::FunctionModRefAnalysis &modref) {
     if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
         return !modref.call_has_side_effect(*call);
     }
     return is_pure_instruction(inst);
+}
+
+bool is_live_root(const oir::Instruction &inst, const oir::FunctionModRefAnalysis &modref) {
+    // Every instruction that ADCE promises not to erase must seed liveness.
+    // In particular, potentially trapping divisions/remainders and retained
+    // loads still need their operand definitions even when their result is
+    // otherwise unused.
+    return !is_removable_instruction(inst, modref);
 }
 
 bool run_adce_on_function(oir::Function &function, const oir::FunctionModRefAnalysis &modref,

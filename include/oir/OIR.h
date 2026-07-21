@@ -155,6 +155,7 @@ class Value {
     std::vector<User *> users() const;
     std::size_t use_count() const;
     bool has_uses() const;
+    void reserve_additional_uses(std::size_t additional);
     void replace_all_uses_with(Value *new_value);
 
     virtual std::string print() const = 0;
@@ -229,6 +230,14 @@ class User : public Value {
 class BasicBlock;
 class Function;
 class Module;
+
+using FunctionID = std::uint64_t;
+inline constexpr FunctionID kInvalidFunctionID = 0;
+
+enum class FunctionOrigin {
+    Original,
+    ResidualSpecialization,
+};
 
 class Instruction : public User {
   public:
@@ -365,6 +374,7 @@ class CallInst final : public Instruction {
     Value *callee() const;
     std::vector<Value *> args() const;
     void remove_arg(std::size_t arg_index);
+    void reset_callee_and_args(Value *callee, const std::vector<Value *> &args);
     std::string print() const override;
 };
 
@@ -411,6 +421,7 @@ class Argument final : public Value {
 
     Function *parent() const;
     std::size_t index() const;
+    void set_parent(Function *parent);
     void set_index(std::size_t index);
     std::string print() const override;
 
@@ -439,6 +450,7 @@ class BasicBlock final : public Value {
     const std::list<std::unique_ptr<Instruction>> &instructions() const;
 
     Function *parent() const;
+    void set_parent(Function *parent);
     std::string print() const override;
 
   private:
@@ -450,7 +462,10 @@ class BasicBlock final : public Value {
 
 class Function final : public Value {
   public:
-    Function(FunctionType *type, const std::string &name, Module *parent, bool is_external = false);
+    Function(FunctionType *type, const std::string &name, Module *parent, bool is_external = false,
+             FunctionID function_id = kInvalidFunctionID,
+             FunctionOrigin origin = FunctionOrigin::Original,
+             FunctionID root_function_id = kInvalidFunctionID);
     ~Function() override;
 
     FunctionType *function_type() const;
@@ -459,6 +474,9 @@ class Function final : public Value {
     bool is_external() const;
     void set_external(bool is_external);
     void set_function_type(FunctionType *type);
+    FunctionID function_id() const;
+    FunctionID root_function_id() const;
+    FunctionOrigin origin() const;
 
     Argument *add_argument(Type *type, const std::string &name);
     void keep_arguments(const std::vector<bool> &keep);
@@ -470,15 +488,35 @@ class Function final : public Value {
     const std::vector<std::unique_ptr<Argument>> &args() const;
     std::list<std::unique_ptr<BasicBlock>> &blocks();
     const std::list<std::unique_ptr<BasicBlock>> &blocks() const;
+    std::size_t block_allocator_state() const;
+    void set_block_allocator_state(std::size_t state);
+    void swap_body(Function &other) noexcept;
 
     std::string print() const override;
 
   private:
     Module *parent_;
     bool is_external_;
+    FunctionID function_id_;
+    FunctionID root_function_id_;
+    FunctionOrigin origin_;
     std::size_t next_block_id_;
     std::vector<std::unique_ptr<Argument>> args_;
     std::list<std::unique_ptr<BasicBlock>> blocks_;
+};
+
+struct ModuleFunctionSet {
+    std::vector<std::unique_ptr<Function>> functions;
+    std::unordered_map<std::string, Function *> function_table;
+
+    ModuleFunctionSet() = default;
+    ModuleFunctionSet(const ModuleFunctionSet &) = delete;
+    ModuleFunctionSet &operator=(const ModuleFunctionSet &) = delete;
+    ModuleFunctionSet(ModuleFunctionSet &&other) noexcept;
+    ModuleFunctionSet &operator=(ModuleFunctionSet &&other) noexcept;
+    ~ModuleFunctionSet();
+
+    void drop_all_references() noexcept;
 };
 
 class GlobalVariable final : public Value {
@@ -503,14 +541,23 @@ class GlobalVariable final : public Value {
 class Module final {
   public:
     explicit Module(const std::string &name);
+    ~Module();
 
     const std::string &name() const;
     TypeContext &types();
     const TypeContext &types() const;
 
-    Function *create_function(const std::string &name, FunctionType *type,
-                              bool is_external = false);
+    Function *create_function(
+        const std::string &name, FunctionType *type, bool is_external = false,
+        FunctionOrigin origin = FunctionOrigin::Original,
+        FunctionID root_function_id = kInvalidFunctionID);
     Function *get_function(const std::string &name) const;
+    const std::unordered_map<std::string, Function *> &function_table_mappings() const;
+    bool erase_function(Function *function);
+    void prepare_function_set(ModuleFunctionSet &set) const;
+    void exchange_function_set(ModuleFunctionSet &set) noexcept;
+    FunctionID function_allocator_state() const;
+    void set_function_allocator_state(FunctionID state);
 
     GlobalVariable *create_global(const std::string &name, Type *value_type, bool is_const,
                                   Value *init_value = nullptr);
@@ -521,6 +568,8 @@ class Module final {
     ConstantFloat *create_f32(float value);
     ConstantZero *create_zero(Type *type);
     UndefValue *create_undef(Type *type);
+    void adopt_constants(std::vector<std::unique_ptr<Value>> &constants);
+    bool discard_constants_from(std::size_t first);
 
     std::vector<std::unique_ptr<GlobalVariable>> &globals();
     const std::vector<std::unique_ptr<GlobalVariable>> &globals() const;
@@ -539,6 +588,7 @@ class Module final {
     std::vector<std::unique_ptr<Function>> functions_;
     std::unordered_map<std::string, Function *> function_table_;
     std::unordered_map<std::string, GlobalVariable *> global_table_;
+    FunctionID next_function_id_;
 };
 
 class IRBuilder final {

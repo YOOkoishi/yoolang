@@ -13,6 +13,17 @@
 
 namespace pass::oir_opt {
 
+struct CallPressureVector {
+    std::uint64_t live_pointers = 0;
+    std::uint64_t alias_uncertainty = 0;
+    std::uint64_t loads = 0;
+    std::uint64_t stores = 0;
+    std::uint64_t max_live_values = 0;
+    std::uint64_t memory_pressure = 0;
+    std::uint64_t register_pressure = 0;
+    std::uint64_t spill_proxy = 0;
+};
+
 struct Stats {
     unsigned folded = 0;
     unsigned sccp = 0;
@@ -40,6 +51,15 @@ struct Stats {
     unsigned loop_bound_tighten = 0;
     unsigned specialized = 0;
     unsigned cost_model_candidates = 0;
+    bool call_cleanup_budget_exhausted = false;
+    bool call_growth_budget_initialized = false;
+    std::uint64_t cumulative_call_growth = 0;
+    std::uint64_t call_module_growth_budget = 0;
+    std::uint64_t call_root_growth_budget = 0;
+    std::unordered_map<oir::FunctionID, std::uint64_t> call_root_growth;
+    std::unordered_map<oir::FunctionID, unsigned> call_root_specializations;
+    CallPressureVector cumulative_call_pressure;
+    CallPressureVector call_pressure_budget;
 
     // Recursive inlining is deliberately a single, bounded phase per function.  The
     // aggressive pipeline may revisit ordinary inlining after cleanup, but restarting

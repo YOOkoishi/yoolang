@@ -18,8 +18,10 @@ int main() {
 // TEXT: [cost-model] OIRInlinePass Reject transform=ConstantArgumentSpecialization {{.*}} reason=CodeGrowthTooHigh
 
 // JSON: "transform": "ConstantArgumentSpecialization"
+// JSON: "scope": "direct-residual"
 // JSON: "kind": "PartialEvaluation"
-// JSON: "summary": "constant arguments proven at callsite"
-// JSON: "cleanup_dependency": 1
+// JSON: "summary": "verified detached residual with direct inline preflight"
+// JSON: "calls": 0
+// JSON: "cleanup_dependency": 0
 // JSON: "reject_reason": "CodeGrowthTooHigh"
-// JSON: "summary": "constant arguments proven at callsite; specialization budget exceeded"
+// JSON: "summary": "verified detached residual with direct inline preflight; specialization budget exceeded"

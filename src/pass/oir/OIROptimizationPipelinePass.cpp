@@ -60,7 +60,8 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
 bool cleanup_after_call_specialization(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
     changed |= oir_opt::propagate_global_constants(module, stats);
-    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
+    changed |=
+        oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
     changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
     changed |= oir_opt::run_sccp(module, stats);
     changed |= oir_opt::simplify_branches(module, stats);
@@ -86,12 +87,18 @@ bool cleanup_after_tail_recursion(oir::Module &module, oir_opt::Stats &stats) {
 
 bool run_call_specialization_window(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
-    constexpr unsigned kMaxRounds = 12;
+    constexpr unsigned kMaxRounds = 128;
     for (unsigned round = 0; round < kMaxRounds; ++round) {
+        if (stats.call_cleanup_budget_exhausted) {
+            break;
+        }
         if (!oir_opt::specialize_constant_argument_calls(module, stats)) {
             break;
         }
         changed = true;
+        if (stats.call_cleanup_budget_exhausted) {
+            break;
+        }
         changed |= cleanup_after_call_specialization(module, stats);
     }
     return changed;

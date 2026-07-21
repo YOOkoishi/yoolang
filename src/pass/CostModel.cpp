@@ -1,6 +1,7 @@
 #include "pass/CostModel.h"
 
 #include <algorithm>
+#include <limits>
 #include <ostream>
 #include <string>
 
@@ -89,6 +90,32 @@ void print_risk_vector_json(const RiskVector &risk, std::ostream &out, const cha
 
 std::string reason_for_reject(RejectReason reason) {
     return std::string(to_string(reason));
+}
+
+std::int64_t saturating_nonnegative_add(std::int64_t lhs, std::int64_t rhs) {
+    lhs = std::max<std::int64_t>(0, lhs);
+    rhs = std::max<std::int64_t>(0, rhs);
+    const auto limit = std::numeric_limits<std::int64_t>::max();
+    return rhs > limit - lhs ? limit : lhs + rhs;
+}
+
+std::int64_t saturating_nonnegative_multiply(std::int64_t lhs, std::int64_t rhs) {
+    lhs = std::max<std::int64_t>(0, lhs);
+    rhs = std::max<std::int64_t>(0, rhs);
+    const auto limit = std::numeric_limits<std::int64_t>::max();
+    return lhs != 0 && rhs > limit / lhs ? limit : lhs * rhs;
+}
+
+std::int64_t saturating_signed_subtract(std::int64_t lhs, std::int64_t rhs) {
+    const auto minimum = std::numeric_limits<std::int64_t>::min();
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    if (rhs > 0 && lhs < minimum + rhs) {
+        return minimum;
+    }
+    if (rhs < 0 && lhs > maximum + rhs) {
+        return maximum;
+    }
+    return lhs - rhs;
 }
 
 } // namespace
@@ -243,6 +270,12 @@ std::string_view to_string(RejectReason reason) {
         return "CompileTimeTooHigh";
     case RejectReason::CleanupTooSpeculative:
         return "CleanupTooSpeculative";
+    case RejectReason::CleanupBudgetExhausted:
+        return "CleanupBudgetExhausted";
+    case RejectReason::CumulativeBudgetExhausted:
+        return "CumulativeBudgetExhausted";
+    case RejectReason::CommitPreflightFailed:
+        return "CommitPreflightFailed";
     case RejectReason::TargetUnsupported:
         return "TargetUnsupported";
     }
@@ -326,7 +359,7 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
 
 CostVector subtract_cost(const CostVector &lhs, const CostVector &rhs) {
     CostVector out;
-#define COST_DIFF(name) out.name = lhs.name - rhs.name
+#define COST_DIFF(name) out.name = saturating_signed_subtract(lhs.name, rhs.name)
     COST_DIFF(static_instrs);
     COST_DIFF(dynamic_instrs);
     COST_DIFF(code_bytes);
@@ -365,40 +398,52 @@ std::int64_t weighted_cost(const CostVector &cost, const TargetCostProfile &targ
     }
 
     std::int64_t total = 0;
-    total += cost.int_alu * target.alu_i32;
-    total += cost.int_mul * target.mul_i32;
-    total += cost.int_div_rem * target.div_i32;
-    total += cost.fp_alu * target.fp_add;
-    total += cost.fp_div * target.fp_div;
-    total += cost.loads * target.load;
-    total += cost.stores * target.store;
-    total += cost.branches * target.branch;
-    total += cost.unpredictable_branches * target.unpredictable_branch;
-    total += cost.jumps;
-    total += cost.calls * target.call;
-    total += cost.moves;
-    total += cost.phis;
-    total += cost.pointer_arith * target.alu_i64;
-    total += cost.estimated_spills * (target.spill_load + target.spill_store);
-    total += cost.code_bytes * target.code_byte;
-    total += cost.compile_time_units;
-    total += cost.proof_time_units;
-    total += cost.smt_queries * 3;
-    total += cost.egraph_nodes / 8;
+    const auto add_weighted = [&](std::int64_t value, std::int64_t weight) {
+        total = saturating_nonnegative_add(
+            total, saturating_nonnegative_multiply(value, weight));
+    };
+    add_weighted(cost.int_alu, target.alu_i32);
+    add_weighted(cost.int_mul, target.mul_i32);
+    add_weighted(cost.int_div_rem, target.div_i32);
+    add_weighted(cost.fp_alu, target.fp_add);
+    add_weighted(cost.fp_div, target.fp_div);
+    add_weighted(cost.loads, target.load);
+    add_weighted(cost.stores, target.store);
+    add_weighted(cost.branches, target.branch);
+    add_weighted(cost.unpredictable_branches, target.unpredictable_branch);
+    add_weighted(cost.jumps, 1);
+    add_weighted(cost.calls, target.call);
+    add_weighted(cost.moves, 1);
+    add_weighted(cost.phis, 1);
+    add_weighted(cost.pointer_arith, target.alu_i64);
+    add_weighted(cost.estimated_spills,
+                 saturating_nonnegative_add(target.spill_load, target.spill_store));
+    add_weighted(cost.code_bytes, target.code_byte);
+    add_weighted(cost.compile_time_units, 1);
+    add_weighted(cost.proof_time_units, 1);
+    add_weighted(cost.smt_queries, 3);
+    add_weighted(cost.egraph_nodes / 8, 1);
     return total;
 }
 
 std::int64_t weighted_risk(const RiskVector &risk, const CostModelPolicy &policy) {
     std::int64_t total = 0;
-    total += std::max<std::int64_t>(0, risk.code_growth - policy.small_code_growth_allowance);
-    total += risk.live_range_growth * 2;
-    total += risk.register_pressure_growth * 6;
-    total += risk.memory_pressure_growth * 4;
-    total += risk.branch_predictability_loss * 4;
-    total += risk.locality_loss * 3;
-    total += risk.compile_time_growth;
-    total += risk.proof_timeout_risk * 8;
-    total += risk.cleanup_dependency * 5;
+    const auto add_weighted = [&](std::int64_t value, std::int64_t weight) {
+        total = saturating_nonnegative_add(
+            total, saturating_nonnegative_multiply(value, weight));
+    };
+    add_weighted(risk.code_growth <= policy.small_code_growth_allowance
+                     ? 0
+                     : risk.code_growth - policy.small_code_growth_allowance,
+                 1);
+    add_weighted(risk.live_range_growth, 2);
+    add_weighted(risk.register_pressure_growth, 6);
+    add_weighted(risk.memory_pressure_growth, 4);
+    add_weighted(risk.branch_predictability_loss, 4);
+    add_weighted(risk.locality_loss, 3);
+    add_weighted(risk.compile_time_growth, 1);
+    add_weighted(risk.proof_timeout_risk, 8);
+    add_weighted(risk.cleanup_dependency, 5);
     return total;
 }
 
@@ -416,12 +461,13 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
     decision.scope = candidate.scope;
     decision.confidence = candidate.frequency.confidence;
 
-    decision.estimated_gain =
-        weighted_cost(candidate.before, target) - weighted_cost(candidate.after, target);
+    decision.estimated_gain = saturating_signed_subtract(
+        weighted_cost(candidate.before, target), weighted_cost(candidate.after, target));
     decision.setup_cost = weighted_cost(candidate.setup, target);
     decision.risk_penalty = weighted_risk(candidate.risk, policy);
-    decision.final_score =
-        decision.estimated_gain - decision.setup_cost - decision.risk_penalty;
+    decision.final_score = saturating_signed_subtract(
+        saturating_signed_subtract(decision.estimated_gain, decision.setup_cost),
+        decision.risk_penalty);
 
     if (candidate.proof.status == ProofStatus::Proven) {
         decision.legal = true;
@@ -438,6 +484,12 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
         return decision;
     }
 
+    if (candidate.forced_reject_reason != RejectReason::None) {
+        decision.reject_reason = candidate.forced_reject_reason;
+        decision.reason = reason_for_reject(decision.reject_reason);
+        return decision;
+    }
+
     if (candidate.bypass_profitability) {
         decision.action = DecisionAction::BypassProfitability;
         decision.reject_reason = RejectReason::None;
@@ -448,12 +500,15 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
     }
 
     const bool small_inline_growth =
-        candidate.kind == TransformKind::Inline &&
+        (candidate.kind == TransformKind::Inline ||
+         candidate.kind == TransformKind::PartialEvaluation ||
+         candidate.kind == TransformKind::ConstantArgumentSpecialization) &&
         candidate.risk.code_growth <= policy.small_code_growth_allowance;
     const bool exceeds_growth_percent =
         !small_inline_growth && candidate.before.static_instrs > 0 &&
-        candidate.risk.code_growth * 100 >
-            candidate.before.static_instrs * policy.max_module_code_growth_percent;
+        static_cast<__int128>(candidate.risk.code_growth) * 100 >
+            static_cast<__int128>(candidate.before.static_instrs) *
+                policy.max_module_code_growth_percent;
 
     if (candidate.risk.code_growth > policy.max_function_code_growth || exceeds_growth_percent) {
         decision.reject_reason = RejectReason::CodeGrowthTooHigh;

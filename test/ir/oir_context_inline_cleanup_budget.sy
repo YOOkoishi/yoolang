@@ -1,0 +1,30 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int cleanup_leaf(int value, int flag) {
+  if (flag == 0) {
+    return value + 7;
+  }
+  return value - 11;
+}
+
+int cleanup_middle(int value) {
+  return cleanup_leaf(value, 0) + 5;
+}
+
+int cleanup_outer(int value) {
+  return cleanup_middle(value) + 9;
+}
+
+int main() {
+  return cleanup_outer(getint());
+}
+
+// OIR-LABEL: define i32 @cleanup_middle
+// OIR-NOT: call i32 @cleanup_leaf
+// OIR-NOT: br i1
+// OIR: ret i32
+// OIR-LABEL: define i32 @cleanup_outer
+// OIR-NOT: call i32 @cleanup_middle
+// OIR-NOT: call i32 @cleanup_leaf
+// OIR: ret i32
+

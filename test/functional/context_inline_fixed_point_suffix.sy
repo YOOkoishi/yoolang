@@ -1,0 +1,131 @@
+int visible_total;
+
+int stabilize_div_31() {
+  int remaining = 31;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int stabilize_div_32() {
+  int remaining = 32;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int stabilize_div_33() {
+  int remaining = 33;
+  int state = -2147483647 - 1;
+  while (remaining > 0) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int stabilize_rem_47() {
+  int remaining = 47;
+  int state = -5;
+  while (remaining != 0) {
+    state = state % 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_demanded_liveout_73() {
+  int remaining = 73;
+  int state = 123;
+  int observed = 0;
+  while (remaining != 0) {
+    state = state / 2;
+    observed = observed + 1;
+    remaining = remaining - 1;
+  }
+  return state + observed;
+}
+
+int keep_side_effect_73() {
+  int remaining = 73;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / 2;
+    visible_total = visible_total + 1;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_dynamic_divisor_73(int divisor) {
+  int remaining = 73;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / divisor;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_boolean_cast_toggle_3() {
+  int remaining = 3;
+  int state = 1;
+  while (remaining != 0) {
+    state = state == 0;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_single_value_guard_31() {
+  int remaining = 31;
+  int state = 1;
+  while (remaining == 1) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_reversed_single_value_guard_31() {
+  int remaining = 31;
+  int state = 1;
+  while (1 == remaining) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int main() {
+  visible_total = 0;
+  putint(stabilize_div_31());
+  putch(32);
+  putint(stabilize_div_32());
+  putch(32);
+  putint(stabilize_div_33());
+  putch(32);
+  putint(stabilize_rem_47());
+  putch(32);
+  putint(keep_demanded_liveout_73());
+  putch(32);
+  putint(keep_side_effect_73());
+  putch(32);
+  putint(keep_dynamic_divisor_73(2));
+  putch(32);
+  putint(keep_boolean_cast_toggle_3());
+  putch(32);
+  putint(keep_single_value_guard_31());
+  putch(32);
+  putint(keep_reversed_single_value_guard_31());
+  putch(32);
+  putint(visible_total);
+  putch(10);
+  return 0;
+}

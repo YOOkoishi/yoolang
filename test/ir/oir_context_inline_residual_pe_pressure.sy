@@ -1,0 +1,47 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int guarded_pointer(int data[], int count, int select) {
+  int total = 0;
+  int index = 0;
+  while (index < count) {
+    int value = data[index];
+    if (select == 1) { value = value + 1; }
+    if (select == 2) { value = value + 2; }
+    if (select == 3) { value = value + 3; }
+    if (select == 4) { value = value + 4; }
+    if (select == 5) { value = value + 5; }
+    if (select == 6) { value = value + 6; }
+    if (select == 7) { value = value + 7; }
+    if (select == 8) { value = value + 8; }
+    if (select == 9) { value = value + 9; }
+    if (select == 10) { value = value + 10; }
+    if (select == 11) { value = value + 11; }
+    if (select == 12) { value = value + 12; }
+    if (select == 13) { value = value + 13; }
+    if (select == 14) { value = value + 14; }
+    if (select == 15) { value = value + 15; }
+    if (select == 16) { value = value + 16; }
+    if (select == 17) { value = value + 17; }
+    if (select == 18) { value = value + 18; }
+    if (select == 19) { value = value + 19; }
+    if (select == 20) { value = value + 20; }
+    total = total + value;
+    index = index + 1;
+  }
+  return total;
+}
+
+int pressure_caller(int data[], int count) {
+  return guarded_pointer(data, count, 7);
+}
+
+int main() {
+  int data[16];
+  int count = getarray(data);
+  return pressure_caller(data, count);
+}
+
+// OIR-NOT: define i32 @__yo_constprop
+// OIR-LABEL: define i32 @pressure_caller
+// OIR: call i32 @guarded_pointer
+// OIR: ret i32

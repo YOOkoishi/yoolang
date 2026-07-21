@@ -1,0 +1,29 @@
+// RUN: python3 %S/../../scripts/context_inline_metamorphic_test.py --compiler %compiler --lhs %s --rhs %S/oir_context_inline_metamorphic_definition_b.sy | FileCheck %s
+// CHECK: "accepted_structural_fingerprints"
+// CHECK: "consumed_budget_totals"
+// CHECK: "reject_reasons"
+
+int metamorphic_sink;
+
+int metamorphic_leaf(int value, int mode) {
+  metamorphic_sink = metamorphic_sink + value;
+  int mixed = value * 3 + 1;
+  mixed = mixed * 5 + 2;
+  mixed = mixed * 7 + 4;
+  if (mode == 0) return mixed + 3;
+  return mixed - 5;
+}
+
+int metamorphic_caller(int value) {
+  int result = value;
+  int index = 0;
+  while (index < 4) {
+    int first = metamorphic_leaf(result, 0);
+    int second = metamorphic_leaf(result, 0);
+    result = first + second;
+    index = index + 1;
+  }
+  return result;
+}
+
+int main() { return metamorphic_caller(getint()); }

@@ -1,0 +1,28 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=COST
+
+int select_offset(int value, int selector) {
+  if (selector == 1) {
+    return value + 7;
+  }
+  if (selector == 2) {
+    return value - 9;
+  }
+  return value * selector;
+}
+
+int apply_offsets(int value) {
+  return select_offset(value, 1) + select_offset(value, 2);
+}
+
+int main() {
+  return apply_offsets(getint());
+}
+
+// OIR-LABEL: define i32 @select_offset
+// OIR-LABEL: define i32 @apply_offsets
+// OIR: ret i32
+
+// COST: "transform": "ConstantArgumentSpecialization"
+// COST: "kind": "PartialEvaluation"
+// COST: "summary": "verified detached residual with direct inline preflight"

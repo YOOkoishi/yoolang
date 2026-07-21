@@ -1,0 +1,52 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int two_gate(int first, int second, int value) {
+  if (first == 0) {
+    value = value + 4;
+  }
+  if (second == 1) {
+    value = value + 8;
+  }
+  return value;
+}
+
+int selected_zero(int value) {
+  return two_gate(0, 1, value);
+}
+
+int unknown_first(int value, int first) {
+  return two_gate(first, 1, value);
+}
+
+int external_shadow_body(int select) {
+  int value = getint();
+  if (select == 0) {
+    return value + 6;
+  }
+  return value - 9;
+}
+
+int external_shadow_caller() {
+  return external_shadow_body(0);
+}
+
+int main() {
+  int value = getint();
+  int first = getint();
+  return selected_zero(value) + unknown_first(value, first) + external_shadow_caller();
+}
+
+// OIR-NOT: define i32 @__scratch
+// OIR-NOT: define i32 @__yo_constprop
+// OIR-LABEL: define i32 @selected_zero
+// OIR-NOT: icmp
+// OIR-NOT: call i32 @two_gate
+// OIR: ret i32
+// OIR-LABEL: define i32 @unknown_first
+// OIR: icmp eq i32 %first.arg, 0
+// OIR-NOT: call i32 @two_gate
+// OIR: ret i32
+// OIR-LABEL: define i32 @external_shadow_caller
+// OIR-NOT: call i32 @external_shadow_body
+// OIR: call i32 @getint
+// OIR: ret i32

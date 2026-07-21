@@ -5,7 +5,7 @@ Created: 2026-07-17
 Last update: 2026-07-17
 Owner: Codex implementation subagent
 Branch: `task/oir-guarded-small-loop-unroll` (planned; not created during task generation)
-Base commit: de93e24
+Base commit: c815887
 
 ## Goal
 
@@ -15,6 +15,10 @@ PHI-bearing merge latch, (2) versions affine guarded loop bodies into a proof-ch
 and an unchanged fallback, (3) unrolls only the proven fast path, and (4) groups the exposed
 address recurrences so repeated GEP arithmetic is replaced by a shared base recurrence plus
 constant offsets.
+
+Completion additionally requires a fresh `scripts/compare_perf.py` focused run in which Yoolang
+`-O1` is strictly faster than Clang `-O3` on each of `conv2d-1.sy`, `conv2d-2.sy`, and
+`conv2d-3.sy`; a geomean win may not hide a losing focused row.
 
 The transform must be selected entirely from ordinary IR facts and must benefit every program
 that satisfies the same structural, range, side-effect, alias, proof, and profitability
@@ -35,9 +39,9 @@ cases, not matcher inputs.
   shifts in this task. Unsupported proof expressions must reject the candidate.
 - Do not implement YIR/polyhedral recognition, vectorization, MIR-specific stencil combines, or
   ASM peepholes. MIR/ASM changes may only be downstream consequences of the OIR rewrite.
-- Do not tune the transformation from GCC/Clang names or timings. External compilers are context;
-  the same-Yoolang baseline is the attribution gate.
-- Do not modify the pre-existing unrelated `docs/README.md` or `docs/egraph-design.md` changes.
+- Do not tune the transformation from GCC/Clang names or timings. Clang is an absolute acceptance
+  target only; the same-Yoolang baseline remains the change-attribution gate.
+- Do not modify the out-of-scope `docs/README.md` or `docs/egraph-design.md` content.
 
 ## Affected Pipeline
 
@@ -69,7 +73,7 @@ Do not read unless explicitly needed:
   internals
 - Huffman sources/tasks or other benchmark-specific optimization records
 - performance inputs other than the three focused files before broad validation
-- `docs/README.md` and `docs/egraph-design.md`, which already contain unrelated user changes
+- `docs/README.md` and `docs/egraph-design.md`, which contain out-of-scope committed content
 
 ## Context Ledger
 
@@ -94,18 +98,18 @@ files to this ledger before reading them; do not compensate by scanning the pass
 
 ## Branch
 
-Decision: use a dedicated branch during implementation; task generation remains on the current
-`master` checkout.
+Decision: use a dedicated branch during implementation; task-document audit remains on the current
+`huff` checkout, whose HEAD is also `master` and `origin/master` at audit time.
 
 Reason:
 
 ```text
 The implementation changes CFG/PHI rewriting, proof gates, loop unrolling, and address induction,
-so it needs an isolated task branch. At task creation HEAD is master@de93e24 and the worktree has
-two unrelated user changes that must remain byte-for-byte untouched:
-
- M docs/README.md
-?? docs/egraph-design.md
+so it needs an isolated task branch. At the 2026-07-17 audit HEAD is `c815887` and the worktree is
+initially clean. The two task-document audits then produce the authorized dirty handoff described
+below. `docs/README.md` and `docs/egraph-design.md`, formerly uncommitted user work when the task was
+drafted, are now tracked content in `c815887`; they remain out of scope and must remain byte-for-byte
+untouched.
 ```
 
 Commands for the implementation subagent:
@@ -118,27 +122,28 @@ git checkout -b task/oir-guarded-small-loop-unroll
 git status --short
 ```
 
-Before editing, verify that the checkout still reports base `de93e24` and that the two unrelated
-paths above are unchanged. Do not stash, reset, commit, or edit them.
+Before editing, verify that the checkout still reports base `c815887`, run the exact initial-status
+gate below, and confirm that the protected paths are unchanged. Do not stash, reset, or edit them.
 
 ## Worktree Preservation Gates
 
-The implementation subagent must protect the two pre-existing user paths independently of the
-task-generated records. At task-generation handoff the complete expected `git status --short` set
-is exactly:
+The implementation subagent must protect `docs/README.md`, `docs/egraph-design.md`, the separately
+audited `docs/tasks/2026-07-17-context-inline-residual-pe.md`, and every
+`docs/tasks/README.md` byte outside this task's one Active Tasks row independently of this task's
+changes. At the coordinated post-audit handoff, the complete expected
+`git status --short` set is exactly the two authorized task-document edits:
 
 ```text
- M docs/README.md
- M docs/tasks/README.md
-?? docs/egraph-design.md
-?? docs/tasks/2026-07-17-context-inline-residual-pe.md
-?? docs/tasks/2026-07-17-oir-guarded-small-loop-unroll.md
+ M docs/tasks/2026-07-17-context-inline-residual-pe.md
+ M docs/tasks/2026-07-17-oir-guarded-small-loop-unroll.md
 ```
 
-The `docs/README.md` and `docs/egraph-design.md` entries are the user's pre-existing bytes. The
-remaining three entries are task-generation output. A different status set is a stop condition:
-record it in this task and ask the coordinator to reconcile it; do not stash, reset, clean, or
-overwrite anything.
+The unroll task file may continue changing during this implementation. P0 dynamically snapshots
+the other task file's audited bytes so they cannot be overwritten. The coordinator must not run
+the two implementation loops concurrently in this shared worktree: branch checkout, task-record
+updates, builds, and performance outputs are shared. A different initial status set is a stop
+condition; record it in this task and ask the coordinator to reconcile it without stashing,
+resetting, cleaning, or overwriting anything.
 
 Before branch creation, source edits, builds, or tests, run this initial snapshot gate from the
 current repository root. This command block is for the future implementation subagent; task-document
@@ -148,6 +153,7 @@ repair must not execute it or create its evidence files.
 set -eu
 TASK_ROOT="$(git rev-parse --show-toplevel)"
 test "$(pwd -P)" = "$(cd "$TASK_ROOT" && pwd -P)"
+test "$(git rev-parse --short=7 HEAD)" = "c815887"
 TASK_GUARD_DIR="$TASK_ROOT/build/task-evidence/oir-guarded-small-loop-unroll/worktree-guard"
 case "$TASK_GUARD_DIR" in
   "$TASK_ROOT"/build/task-evidence/oir-guarded-small-loop-unroll/worktree-guard) ;;
@@ -160,27 +166,43 @@ from pathlib import Path
 import sys
 
 expected = {
-    " M docs/README.md",
-    " M docs/tasks/README.md",
-    "?? docs/egraph-design.md",
-    "?? docs/tasks/2026-07-17-context-inline-residual-pe.md",
-    "?? docs/tasks/2026-07-17-oir-guarded-small-loop-unroll.md",
+    " M docs/tasks/2026-07-17-context-inline-residual-pe.md",
+    " M docs/tasks/2026-07-17-oir-guarded-small-loop-unroll.md",
 }
 actual = set(Path(sys.argv[1]).read_text().splitlines())
 if actual != expected:
     raise SystemExit(f"initial status mismatch: expected={sorted(expected)!r}, actual={sorted(actual)!r}")
 PY
-sha256sum docs/README.md docs/egraph-design.md > "$TASK_GUARD_DIR/initial-user-files.sha256"
-git diff --binary HEAD -- docs/README.md > "$TASK_GUARD_DIR/initial-docs-README.diff"
+sha256sum docs/README.md docs/egraph-design.md \
+  docs/tasks/2026-07-17-context-inline-residual-pe.md \
+  > "$TASK_GUARD_DIR/initial-protected-files.sha256"
+git diff --binary HEAD -- docs/README.md \
+  docs/tasks/2026-07-17-context-inline-residual-pe.md \
+  > "$TASK_GUARD_DIR/initial-protected-files.diff"
 git status --short -- docs/README.md docs/egraph-design.md \
+  docs/tasks/2026-07-17-context-inline-residual-pe.md \
   > "$TASK_GUARD_DIR/initial-protected-status.txt"
+python3 - docs/tasks/README.md \
+  "$TASK_GUARD_DIR/initial-tasks-README-without-unroll-row.txt" <<'PY'
+from pathlib import Path
+import sys
+
+source, output = map(Path, sys.argv[1:])
+needle = "(2026-07-17-oir-guarded-small-loop-unroll.md)"
+lines = source.read_text().splitlines()
+kept = [line for line in lines if needle not in line]
+if len(lines) - len(kept) != 1:
+    raise SystemExit("expected exactly one unroll Active Tasks row")
+output.write_text("\n".join(kept) + "\n")
+PY
 ```
 
 Run the following final gate after implementation, task updates, correctness checks, and performance
 closure, immediately before handoff to review. It records the complete final status, then proves
-that both protected files have the same hashes, that the tracked `docs/README.md` diff is identical,
-and that both protected status entries are identical. New task-scoped source/test entries are allowed
-in the complete final status; changes to either protected entry are not.
+that all three fully protected files have the same hashes, tracked diffs, and status entries as at
+P0, and that `docs/tasks/README.md` differs, if at all, only in this task's single row. New
+task-scoped source/test entries are allowed in the complete final status; changes to protected
+content are not.
 
 ```bash
 set -eu
@@ -188,21 +210,44 @@ TASK_ROOT="$(git rev-parse --show-toplevel)"
 test "$(pwd -P)" = "$(cd "$TASK_ROOT" && pwd -P)"
 TASK_GUARD_DIR="$TASK_ROOT/build/task-evidence/oir-guarded-small-loop-unroll/worktree-guard"
 test -f "$TASK_GUARD_DIR/initial-status.txt"
-test -f "$TASK_GUARD_DIR/initial-user-files.sha256"
-test -f "$TASK_GUARD_DIR/initial-docs-README.diff"
+test -f "$TASK_GUARD_DIR/initial-protected-files.sha256"
+test -f "$TASK_GUARD_DIR/initial-protected-files.diff"
 test -f "$TASK_GUARD_DIR/initial-protected-status.txt"
+test -f "$TASK_GUARD_DIR/initial-tasks-README-without-unroll-row.txt"
 git status --short > "$TASK_GUARD_DIR/final-status.txt"
-sha256sum -c "$TASK_GUARD_DIR/initial-user-files.sha256"
-git diff --binary HEAD -- docs/README.md > "$TASK_GUARD_DIR/final-docs-README.diff"
-cmp "$TASK_GUARD_DIR/initial-docs-README.diff" "$TASK_GUARD_DIR/final-docs-README.diff"
+sha256sum -c "$TASK_GUARD_DIR/initial-protected-files.sha256"
+git diff --binary HEAD -- docs/README.md \
+  docs/tasks/2026-07-17-context-inline-residual-pe.md \
+  > "$TASK_GUARD_DIR/final-protected-files.diff"
+cmp "$TASK_GUARD_DIR/initial-protected-files.diff" "$TASK_GUARD_DIR/final-protected-files.diff"
 git status --short -- docs/README.md docs/egraph-design.md \
+  docs/tasks/2026-07-17-context-inline-residual-pe.md \
   > "$TASK_GUARD_DIR/final-protected-status.txt"
 cmp "$TASK_GUARD_DIR/initial-protected-status.txt" "$TASK_GUARD_DIR/final-protected-status.txt"
+python3 - docs/tasks/README.md \
+  "$TASK_GUARD_DIR/final-tasks-README-without-unroll-row.txt" <<'PY'
+from pathlib import Path
+import sys
+
+source, output = map(Path, sys.argv[1:])
+needle = "(2026-07-17-oir-guarded-small-loop-unroll.md)"
+lines = source.read_text().splitlines()
+kept = [line for line in lines if needle not in line]
+if len(lines) - len(kept) != 1:
+    raise SystemExit("expected exactly one unroll Active Tasks row")
+output.write_text("\n".join(kept) + "\n")
+PY
+cmp "$TASK_GUARD_DIR/initial-tasks-README-without-unroll-row.txt" \
+  "$TASK_GUARD_DIR/final-tasks-README-without-unroll-row.txt"
 python3 - "$TASK_GUARD_DIR/initial-status.txt" "$TASK_GUARD_DIR/final-status.txt" <<'PY'
 from pathlib import Path
 import sys
 
-protected = {"docs/README.md", "docs/egraph-design.md"}
+protected = {
+    "docs/README.md",
+    "docs/egraph-design.md",
+    "docs/tasks/2026-07-17-context-inline-residual-pe.md",
+}
 
 def protected_lines(path: str) -> set[str]:
     lines = Path(path).read_text().splitlines()
@@ -458,9 +503,9 @@ No test may assert the presence of `conv2d`, `KSIZE`, or another benchmark name 
 
 | Gate | Command | Required? | Result | Notes |
 | --- | --- | --- | --- | --- |
-| Initial worktree protection | Run the exact initial snapshot block in `Worktree Preservation Gates` | before branch/build/edit/test | NOT_RUN | Must match the five-entry task-generation status exactly and save both user-file hashes plus the tracked diff |
+| Initial worktree protection | Run the exact initial snapshot block in `Worktree Preservation Gates` | before branch/build/edit/test | NOT_RUN | HEAD must be `c815887`; status must contain exactly the two authorized audited task-document edits; snapshot the three fully protected files and `docs/tasks/README.md` outside this task's row |
 | Legacy report context archive | Run `Legacy report archive` below | before any new perf run | NOT_RUN | Historical context only; forbidden as a same-machine or CI-parity baseline |
-| Baseline path/isolation preflight | Run the validation and `git worktree add` portion of `Same-machine de93e24 performance closure` below | at P8, before release builds | NOT_RUN | Executor must replace and validate the absolute empty-path placeholder before the state-changing command |
+| Baseline path/isolation preflight | Run the validation and `git worktree add` portion of `Same-machine c815887 performance closure` below | at P8, before release builds | NOT_RUN | Executor must replace and validate the absolute empty-path placeholder before the state-changing command |
 | Build | `xmake` | yes | NOT_RUN | Use release configuration before final perf |
 | Focused loop/versioning FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_guarded_small_loop_unroll --jobs 1` | yes | NOT_RUN | Include proof and rejection checks |
 | Focused LSR FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_lsr --jobs 1` | yes | NOT_RUN | Existing plus grouped recurrence coverage |
@@ -477,10 +522,10 @@ No test may assert the presence of `conv2d`, `KSIZE`, or another benchmark name 
 | P7 alias/order e2e | `python3 scripts/run_tests.py --suite e2e --filter guarded_boundary_peel --jobs 1 --o1` | only if P7 implemented | NOT_RUN | Must cover aliasing and lexicographic order |
 | Full FileCheck/poly | `python3 scripts/run_tests.py --suite filecheck --suite poly --jobs 1` | before review | NOT_RUN | Detect unrelated IR-shape regressions |
 | Full optimized correctness | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | before review | NOT_RUN | Record pass/fail/skip counts |
-| Baseline/current release builds | Run the two sequential release-build commands in `Same-machine de93e24 performance closure` | before the six perf runs | NOT_RUN | Isolated de93e24 compiler and current task compiler; one shared runtime archive |
+| Baseline/current release builds | Run the two sequential release-build commands in `Same-machine c815887 performance closure` | before the six perf runs | NOT_RUN | Isolated c815887 compiler and current task compiler; one shared runtime archive |
 | Focused baseline/current raw pair | Run the `focused` baseline call immediately followed by its current call | yes | NOT_RUN | Identical explicit three-file scope; archive raw MD/JSON and per-run provenance before continuing |
 | Focused delta | Run the exact focused `compare_perf_baseline.py` command below | yes | NOT_RUN | Outputs `delta/focused/perf-delta.{md,json}` and `instruction-count-compare.json` |
-| Focused delta adjudication | Run the exact focused adjudicator below | yes; also required if P7 implemented | NOT_RUN | PASS requires all three comparable rows, at least 1.05x geomean, no row below -3%, and no new spill/stack-slot growth |
+| Focused delta adjudication | Run the exact focused adjudicator below | yes; also required if P7 implemented | NOT_RUN | PASS requires all three comparable rows, each current Yoolang median strictly faster than its Clang `-O3` median, at least 1.05x same-Yoolang geomean, no row below -3%, and no new spill/stack-slot growth |
 | Affected baseline/current raw pair | Run the `affected` baseline call immediately followed by its current call | yes | NOT_RUN | Both select exactly `test/performance`, with no exclusions |
 | Affected delta | Run the exact affected `compare_perf_baseline.py` command below | yes | NOT_RUN | Outputs `delta/affected/perf-delta.{md,json}` and `instruction-count-compare.json` |
 | Affected delta adjudication | Run the exact broad-scope adjudicator for `affected` below | yes | NOT_RUN | Script heuristics plus spill/stack checks are hard gates; every smaller negative needs recorded attribution |
@@ -526,7 +571,7 @@ print(payload.get("generated_utc"), payload.get("compiler_binary"), payload.get(
 PY
 ```
 
-### Same-machine de93e24 performance closure
+### Same-machine c815887 performance closure
 
 Run this after P1--P6 and all required correctness gates for the current code pass. If P7 is
 attempted, finish its edits plus the two conditional correctness gates first, keep its disposition
@@ -537,7 +582,7 @@ edits and reruns the complete final pairs under a new run label (never use `git 
 on the machine during the six timed invocations. The historical report above cannot satisfy any
 gate in this section.
 
-The baseline is a clean detached worktree at `de93e24`; the current compiler is built from the task
+The baseline is a clean detached worktree at `c815887`; the current compiler is built from the task
 worktree. The future executor must replace `TASK_BASELINE_WT` with a new, empty, absolute path and
 must inspect `git worktree list --porcelain` before allowing `git worktree add`. The placeholder
 checks deliberately fail until it is replaced. Do not add an automatic worktree removal/cleanup
@@ -547,19 +592,19 @@ later removal.
 ```bash
 set -euo pipefail
 TASK_CURRENT_WT="$(git rev-parse --show-toplevel)"
-TASK_BASELINE_WT="/absolute/new/empty/path/to/yoolang-de93e24-baseline-REPLACE_ME"
-test "$TASK_BASELINE_WT" != "/absolute/new/empty/path/to/yoolang-de93e24-baseline-REPLACE_ME"
+TASK_BASELINE_WT="/absolute/new/empty/path/to/yoolang-c815887-baseline-REPLACE_ME"
+test "$TASK_BASELINE_WT" != "/absolute/new/empty/path/to/yoolang-c815887-baseline-REPLACE_ME"
 case "$TASK_BASELINE_WT" in /*) ;; *) echo "baseline path must be absolute" >&2; exit 1 ;; esac
 test "$TASK_BASELINE_WT" != "/"
 test "$TASK_BASELINE_WT" != "$TASK_CURRENT_WT"
 test -d "$(dirname "$TASK_BASELINE_WT")"
 test ! -e "$TASK_BASELINE_WT"
 git -C "$TASK_CURRENT_WT" worktree list --porcelain
-test "$(git -C "$TASK_CURRENT_WT" rev-parse --short=7 'de93e24^{commit}')" = "de93e24"
+test "$(git -C "$TASK_CURRENT_WT" rev-parse --short=7 'c815887^{commit}')" = "c815887"
 
 # State-changing only after every path check above and the executor's inspection of the list.
-git -C "$TASK_CURRENT_WT" worktree add --detach "$TASK_BASELINE_WT" de93e24
-test "$(git -C "$TASK_BASELINE_WT" rev-parse --short=7 HEAD)" = "de93e24"
+git -C "$TASK_CURRENT_WT" worktree add --detach "$TASK_BASELINE_WT" c815887
+test "$(git -C "$TASK_BASELINE_WT" rev-parse --short=7 HEAD)" = "c815887"
 test -z "$(git -C "$TASK_BASELINE_WT" status --short)"
 
 # Builds are sequential and occur before timing; do not rebuild between a paired baseline/current run.
@@ -773,8 +818,8 @@ python3 scripts/compare_perf_baseline.py \
   --out-md "$TASK_PERF_ROOT/delta/focused/perf-delta.md" \
   --out-json "$TASK_PERF_ROOT/delta/focused/perf-delta.json" \
   --out-insn-json "$TASK_PERF_ROOT/delta/focused/instruction-count-compare.json" \
-  --baseline-label "same-machine de93e24 focused" \
-  --baseline-commit-sha de93e24
+  --baseline-label "same-machine c815887 focused" \
+  --baseline-commit-sha c815887
 
 python3 scripts/compare_perf_baseline.py \
   --current "$TASK_PERF_ROOT/current/affected/perf-report.json" \
@@ -782,8 +827,8 @@ python3 scripts/compare_perf_baseline.py \
   --out-md "$TASK_PERF_ROOT/delta/affected/perf-delta.md" \
   --out-json "$TASK_PERF_ROOT/delta/affected/perf-delta.json" \
   --out-insn-json "$TASK_PERF_ROOT/delta/affected/instruction-count-compare.json" \
-  --baseline-label "same-machine de93e24 affected-test-performance" \
-  --baseline-commit-sha de93e24
+  --baseline-label "same-machine c815887 affected-test-performance" \
+  --baseline-commit-sha c815887
 
 python3 scripts/compare_perf_baseline.py \
   --current "$TASK_PERF_ROOT/current/ci-parity/perf-report.json" \
@@ -791,8 +836,8 @@ python3 scripts/compare_perf_baseline.py \
   --out-md "$TASK_PERF_ROOT/delta/ci-parity/perf-delta.md" \
   --out-json "$TASK_PERF_ROOT/delta/ci-parity/perf-delta.json" \
   --out-insn-json "$TASK_PERF_ROOT/delta/ci-parity/instruction-count-compare.json" \
-  --baseline-label "same-machine de93e24 current-CI-selection" \
-  --baseline-commit-sha de93e24
+  --baseline-label "same-machine c815887 current-CI-selection" \
+  --baseline-commit-sha c815887
 ```
 
 Focused adjudication writes its own durable result and exits nonzero on a blocker:
@@ -819,6 +864,15 @@ expected = {
 baseline_rows = {row["case"]: row for row in baseline["rows"]}
 current_rows = {row["case"]: row for row in current["rows"]}
 problems = []
+
+def parse_seconds(value):
+    if not isinstance(value, str) or not value.endswith("s"):
+        return None
+    try:
+        return float(value[:-1])
+    except ValueError:
+        return None
+
 if set(baseline_rows) != expected or set(current_rows) != expected or delta.get("comparable_cases") != 3:
     problems.append("focused case membership/comparable count is not exactly three")
 if (delta.get("case_speedup_geomean") or 0.0) < 1.05:
@@ -826,7 +880,17 @@ if (delta.get("case_speedup_geomean") or 0.0) < 1.05:
 slow = [row["case"] for row in delta.get("rows", []) if row.get("delta_pct", -100.0) < -3.0]
 if slow:
     problems.append(f"focused rows slower by more than 3%: {slow}")
-for case in sorted(expected):
+present_cases = expected & set(baseline_rows) & set(current_rows)
+for case in sorted(present_cases):
+    yoolang_sec = parse_seconds(current_rows[case].get("compiler"))
+    clang_sec = parse_seconds(current_rows[case].get("clang"))
+    if yoolang_sec is None or clang_sec is None:
+        problems.append(f"{case}: missing parseable Yoolang/Clang timing")
+    elif yoolang_sec >= clang_sec:
+        problems.append(
+            f"{case}: Yoolang -O1 {yoolang_sec:.4f}s is not faster than "
+            f"Clang -O3 {clang_sec:.4f}s"
+        )
     before = baseline_rows[case].get("codegen_metrics", {})
     after = current_rows[case].get("codegen_metrics", {})
     for key in ("spills", "stack_slots"):
@@ -836,7 +900,10 @@ if problems:
     print("BLOCKED")
     print("\n".join(f"- {item}" for item in problems))
     raise SystemExit(1)
-print("PASS: exact three-case pair, >=1.05x geomean, every row >=-3%, no spill/stack-slot growth")
+print(
+    "PASS: exact three-case pair, every current Yoolang row beats Clang -O3, "
+    ">=1.05x same-Yoolang geomean, every delta row >=-3%, no spill/stack-slot growth"
+)
 PY
 ```
 
@@ -898,17 +965,21 @@ Performance acceptance:
   may be reclassified or excluded to obtain a timing result.
 - Focused OIR/cost output must contain real generic unroll/versioning candidates, proof metadata
   `Proven`, and fail-closed negative decisions. The focused delta passes only under the adjudicator's
-  exact three-row, 1.05x geomean, per-row -3%, and spill/stack conditions.
+  exact three-row, per-row Yoolang-faster-than-Clang requirement, 1.05x same-Yoolang geomean,
+  per-row -3%, and spill/stack conditions. A focused geomean win does not excuse any row whose
+  Yoolang `-O1` median is equal to or slower than its Clang `-O3` median.
 - Affected and CI-parity deltas are mandatory hard same-Yoolang gates. Any
   threshold regression, new spill/stack-slot growth, or consistent smaller slowdown in related
   loop-heavy cases blocks review. Every negative row printed by the adjudicator must be investigated
   and attributed in this task; absent explicit user permission, a demonstrated regression is not
   accepted.
-- The newly measured clean `de93e24` report for each identical scope is the only baseline for its
+- The newly measured clean `c815887` report for each identical scope is the only baseline for its
   delta. The 2026-07-16 report remains durable context and cannot satisfy same-machine, affected, or
   CI-parity comparison requirements.
-- GCC/Clang ratios are external context only. Attribute the change primarily with same-Yoolang
-  deltas, loop/backedge/guard/address counts, MIR stage metrics, spills, and assembly.
+- The focused Clang comparison is a hard absolute acceptance target, but it must never influence
+  candidate identity or legality. Attribute the compiler change primarily with same-Yoolang
+  deltas, loop/backedge/guard/address counts, MIR stage metrics, spills, and assembly; GCC remains
+  external context.
 - Do not replace a bad pair with selectively chosen reruns. If machine noise invalidates a pair,
   retain it, record why, and rerun both baseline and current for that complete scope in the same
   order under a new archived run label.
@@ -941,6 +1012,12 @@ Performance acceptance:
   implementation, test, or performance command was run during this documentation repair.
 - 2026-07-17: fixed the raw-run provenance gate by importing `hashlib` in the same embedded Python
   block that hashes selected performance sources. No gate, test, or performance command was run.
+- 2026-07-17: re-audited the task at clean `c815887`, after the original documents were committed.
+  Rebased the implementation and same-machine attribution contract onto `c815887`; replaced the
+  obsolete five-entry dirty-state assumption with the coordinated two-task-document handoff and a
+  dynamic snapshot of the other task record; and made a strict per-row Yoolang `-O1` win over Clang
+  `-O3` mandatory for all three focused `conv2d-*` cases. This was a documentation-only audit: no
+  branch/worktree mutation, production edit, build, correctness test, or performance command ran.
 
 ## Open Questions
 
@@ -953,22 +1030,27 @@ Performance acceptance:
 Current state:
 
 - Task is scoped; no production code or tests have been changed or run.
-- Base is `master@de93e24`.
-- The complete task-generation status is the five-entry set under `Worktree Preservation Gates`:
-  user-owned `M docs/README.md` and `?? docs/egraph-design.md`, task-generated
-  `M docs/tasks/README.md` and the two untracked 2026-07-17 task files. The two user-owned paths
-  must remain byte-for-byte untouched.
+- Base is `c815887`; at audit time `huff`, `master`, and `origin/master` all pointed to this commit.
+- The coordinated implementation handoff must contain exactly two authorized dirty paths: the two
+  audited 2026-07-17 task files. This task may update its own record; P0 snapshots and protects the
+  context-inline task record, `docs/README.md`, `docs/egraph-design.md`, and every part of
+  `docs/tasks/README.md` except this task's own row. The coordinator must serialize the two
+  implementation loops in the shared worktree.
 - The 2026-07-16 performance report is durable context only. Completion requires new isolated
   same-machine baseline/current raw pairs and deltas for focused, affected-directory, and current
   CI-parity scopes exactly as specified above.
+- The focused `compare_perf.py` pair is also an absolute gate: current Yoolang `-O1` must be
+  strictly faster than Clang `-O3` on each of the three `conv2d-*` rows; geomean alone is
+  insufficient.
 - Current evidence proves the 5-iteration trip counts are available, but the PHI-bearing-latch
   rotation rejection and conditional-latch-only multi-block matcher prevent any `LoopUnroll`
   candidate from being emitted.
 
 Next action:
 
-- Execute P0 exactly: run `Initial worktree protection`, archive the legacy report, verify
-  `master@de93e24`, then create `task/oir-guarded-small-loop-unroll`. Implement and verify only P1,
+- After the coordinator confirms the other task audit is finished and no implementation loop is
+  running, execute P0 exactly: run `Initial worktree protection`, archive the legacy report, verify
+  `c815887`, then create `task/oir-guarded-small-loop-unroll`. Implement and verify only P1,
   update this file, and do not begin P2 until P1's three named gates pass. Create the validated
   isolated baseline worktree only when entering the final same-machine performance closure.
 

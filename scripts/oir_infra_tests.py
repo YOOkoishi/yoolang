@@ -74,7 +74,8 @@ void test_replace_all_uses_with_updates_use_lists() {
     oir::Module module("replace");
     auto *function =
         create_function(module, "f", module.types().int32_ty(), {module.types().int32_ty()});
-    auto *arg = function->add_argument(module.types().int32_ty(), "x");
+    auto *arg = function->args().front().get();
+    arg->set_name("x");
     auto *entry = function->create_block("entry");
 
     oir::IRBuilder builder(&module);
@@ -100,7 +101,8 @@ void test_erasing_instruction_drops_operand_uses() {
     oir::Module module("erase_inst");
     auto *function =
         create_function(module, "f", module.types().int32_ty(), {module.types().int32_ty()});
-    auto *arg = function->add_argument(module.types().int32_ty(), "x");
+    auto *arg = function->args().front().get();
+    arg->set_name("x");
     auto *entry = function->create_block("entry");
 
     oir::IRBuilder builder(&module);
@@ -130,7 +132,8 @@ void test_phi_incoming_removal_reindexes_use_lists() {
     oir::Module module("phi_remove");
     auto *function =
         create_function(module, "f", module.types().int32_ty(), {module.types().int1_ty()});
-    auto *cond = function->add_argument(module.types().int1_ty(), "c");
+    auto *cond = function->args().front().get();
+    cond->set_name("c");
     auto *entry = function->create_block("entry");
     auto *then_block = function->create_block("then");
     auto *else_block = function->create_block("else");
@@ -261,7 +264,8 @@ void test_memory_ssa_uses_phi_at_cfg_join() {
     auto *g = module.create_global("g", module.types().int32_ty(), false);
     auto *function =
         create_function(module, "f", module.types().int32_ty(), {module.types().int1_ty()});
-    auto *cond = function->add_argument(module.types().int1_ty(), "cond");
+    auto *cond = function->args().front().get();
+    cond->set_name("cond");
     auto *entry = function->create_block("entry");
     auto *then_block = function->create_block("then");
     auto *else_block = function->create_block("else");

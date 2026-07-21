@@ -196,14 +196,25 @@ bool is_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Store:
     case oir::Instruction::OpID::Call:
     case oir::Instruction::OpID::MemZero:
+    case oir::Instruction::OpID::Load:
         return false;
+    case oir::Instruction::OpID::SDiv:
+    case oir::Instruction::OpID::SRem: {
+        const auto *binary = dynamic_cast<const oir::BinaryInst *>(&inst);
+        const auto divisor =
+            binary == nullptr
+                ? std::optional<std::int64_t>{}
+                : int_constant(binary->rhs());
+        // A dynamic/zero divisor can trap, and keep -1 conservative for the
+        // signed-minimum overflow case.  Constant divisors outside those cases
+        // are side-effect-free and may be erased after their result is replaced.
+        return divisor && *divisor != 0 && *divisor != -1;
+    }
     case oir::Instruction::OpID::Add:
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::And:
     case oir::Instruction::OpID::Xor:
-    case oir::Instruction::OpID::SDiv:
-    case oir::Instruction::OpID::SRem:
     case oir::Instruction::OpID::FAdd:
     case oir::Instruction::OpID::FSub:
     case oir::Instruction::OpID::FMul:
@@ -211,7 +222,6 @@ bool is_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::ICmp:
     case oir::Instruction::OpID::FCmp:
     case oir::Instruction::OpID::Alloca:
-    case oir::Instruction::OpID::Load:
     case oir::Instruction::OpID::GetElementPtr:
     case oir::Instruction::OpID::ZExt:
     case oir::Instruction::OpID::SIToFP:

@@ -1,0 +1,79 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=COST
+
+int multi_return(int value, int select) {
+  if (select == 2) {
+    return value + 19;
+  }
+  if (select == 3) {
+    return value - 23;
+  }
+  return value * 5;
+}
+
+int commit_caller(int value) {
+  return multi_return(value, 2) + 7;
+}
+
+int reuse_caller(int value) {
+  return multi_return(value, 2) + 7;
+}
+
+int alpha_choice_left(int value, int select) {
+  if (select == 4) {
+    return value * 3;
+  }
+  return value - 13;
+}
+
+int alpha_choice_right(int flag, int renamed) {
+  if (flag == 4) {
+    return renamed * 3;
+  }
+  return renamed - 13;
+}
+
+int alpha_caller_left(int value) {
+  return alpha_choice_left(value, 4);
+}
+
+int alpha_caller_right(int renamed) {
+  return alpha_choice_right(4, renamed);
+}
+
+int main() {
+  int value = getint();
+  return commit_caller(value) + reuse_caller(value) +
+         alpha_caller_left(value) + alpha_caller_right(value);
+}
+
+// OIR-LABEL: define i32 @commit_caller
+// OIR-NOT: call i32 @multi_return
+// OIR-NOT: br i1
+// OIR: add i32 %value.arg, 19
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @reuse_caller
+// OIR-NOT: call i32 @multi_return
+// OIR: add i32 %value.arg, 19
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @alpha_caller_left
+// OIR-NOT: call i32 @alpha_choice_left
+// OIR: mul i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @alpha_caller_right
+// OIR-NOT: call i32 @alpha_choice_right
+// OIR: mul i32
+// OIR: ret i32
+
+// COST-NOT: direct-residual-tie-batch
+// COST: scope=direct-residual
+// COST-NOT: direct-residual-tie-batch
+// COST: scope=measured-persistent-reuse-member
+// COST: scope=measured-persistent-reuse-member
+// COST: measured-persistent-reuse
+// COST-NOT: direct-residual-tie-batch
+// COST: scope=direct-residual
+// COST-NOT: direct-residual-tie-batch

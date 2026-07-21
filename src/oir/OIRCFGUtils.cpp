@@ -1,5 +1,6 @@
 #include "oir/OIRCFGUtils.h"
 
+#include <algorithm>
 #include <memory>
 
 namespace oir::cfg {
@@ -63,8 +64,21 @@ void add_edge(BasicBlock *pred, BasicBlock *succ) {
     if (pred == nullptr || succ == nullptr) {
         return;
     }
+    const bool already_successor =
+        std::find(pred->successors().begin(), pred->successors().end(), succ) !=
+        pred->successors().end();
     pred->add_successor(succ);
-    succ->add_predecessor(pred);
+    try {
+        succ->add_predecessor(pred);
+    } catch (...) {
+        // Keep the bidirectional CFG edge update strongly exception safe.  In
+        // particular, a failed predecessor-vector allocation must not leave a
+        // successor pointing at a detached block that is about to be destroyed.
+        if (!already_successor) {
+            pred->remove_successor(succ);
+        }
+        throw;
+    }
 }
 
 void remove_edge_no_phi_update(BasicBlock *pred, BasicBlock *succ) {

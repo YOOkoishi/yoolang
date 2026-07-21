@@ -44,6 +44,19 @@ bool remove_unreachable_blocks(oir::Function &function, Stats &stats) {
     }
 
     std::unordered_set<oir::BasicBlock *> unreachable_set(unreachable.begin(), unreachable.end());
+    // Phi operands are the authoritative references to predecessor blocks.
+    // Remove every incoming edge from an unreachable block, even when an
+    // earlier transform left the cached successor list incomplete.  Otherwise
+    // erasing the predecessor leaves a dangling BasicBlock operand in a live
+    // phi and the next operand walk dereferences freed storage.
+    for (auto &candidate : function.blocks()) {
+        if (unreachable_set.find(candidate.get()) != unreachable_set.end()) {
+            continue;
+        }
+        for (auto *block : unreachable) {
+            oir::cfg::remove_phi_incoming_from(candidate.get(), block);
+        }
+    }
     for (auto *block : unreachable) {
         auto predecessors = block->predecessors();
         auto successors = block->successors();
@@ -54,9 +67,6 @@ bool remove_unreachable_blocks(oir::Function &function, Stats &stats) {
         for (auto *succ : successors) {
             succ->remove_predecessor(block);
             block->remove_successor(succ);
-            if (unreachable_set.find(succ) == unreachable_set.end()) {
-                oir::cfg::remove_phi_incoming_from(succ, block);
-            }
         }
     }
 

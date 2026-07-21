@@ -1,0 +1,168 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int visible_total;
+
+int stabilize_div_31() {
+  int remaining = 31;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int stabilize_div_32() {
+  int remaining = 32;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int stabilize_div_33() {
+  int remaining = 33;
+  int state = -2147483647 - 1;
+  while (remaining > 0) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int stabilize_rem_47() {
+  int remaining = 47;
+  int state = -5;
+  while (remaining != 0) {
+    state = state % 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_demanded_liveout_73() {
+  int remaining = 73;
+  int state = 123;
+  int observed = 0;
+  while (remaining != 0) {
+    state = state / 2;
+    observed = observed + 1;
+    remaining = remaining - 1;
+  }
+  return state + observed;
+}
+
+int keep_side_effect_73() {
+  int remaining = 73;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / 2;
+    visible_total = visible_total + 1;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_dynamic_divisor_73(int divisor) {
+  int remaining = 73;
+  int state = 123;
+  while (remaining != 0) {
+    state = state / divisor;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_boolean_cast_toggle_3() {
+  int remaining = 3;
+  int state = 1;
+  while (remaining != 0) {
+    state = state == 0;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_zero_divisor_3(int state) {
+  int remaining = 3;
+  while (remaining != 0) {
+    state = state / 0;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_single_value_guard_31() {
+  int remaining = 31;
+  int state = 1;
+  while (remaining == 1) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int keep_reversed_single_value_guard_31() {
+  int remaining = 31;
+  int state = 1;
+  while (1 == remaining) {
+    state = state / 2;
+    remaining = remaining - 1;
+  }
+  return state;
+}
+
+int main() {
+  visible_total = 0;
+  return stabilize_div_31() + stabilize_div_32() + stabilize_div_33() +
+         stabilize_rem_47() + keep_demanded_liveout_73() + keep_side_effect_73() +
+         keep_dynamic_divisor_73(2) + keep_boolean_cast_toggle_3() +
+         keep_single_value_guard_31() + keep_reversed_single_value_guard_31() +
+         visible_total;
+}
+
+// OIR-LABEL: define i32 @stabilize_div_31
+// OIR: %remaining.loop = phi [7,
+
+// OIR-LABEL: define i32 @stabilize_div_32
+// OIR: %remaining.loop = phi [7,
+
+// OIR-LABEL: define i32 @stabilize_div_33
+// OIR: %remaining.loop = phi [32,
+
+// OIR-LABEL: define i32 @stabilize_rem_47
+// OIR: %remaining.loop = phi [1,
+
+// OIR-LABEL: define i32 @keep_demanded_liveout_73
+// OIR: %remaining.loop = phi [73,
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @keep_side_effect_73
+// OIR: %remaining.loop = phi [73,
+// OIR: store i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @keep_dynamic_divisor_73
+// OIR: %remaining.loop = phi [73,
+// OIR: sdiv i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @keep_boolean_cast_toggle_3
+// OIR: %remaining.loop = phi [3,
+// OIR: zext i1
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @keep_zero_divisor_3
+// OIR: %remaining.loop = phi [3,
+// OIR: sdiv i32
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @keep_single_value_guard_31
+// OIR-NOT: sdiv i32
+// OIR: ret i32 1
+
+// OIR-LABEL: define i32 @keep_reversed_single_value_guard_31
+// OIR-NOT: sdiv i32
+// OIR: ret i32 1

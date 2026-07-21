@@ -6,6 +6,7 @@
 #include <functional>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -437,6 +438,10 @@ bool Value::has_uses() const {
     return !uses_.empty();
 }
 
+void Value::reserve_additional_uses(std::size_t additional) {
+    uses_.reserve(uses_.size() + additional);
+}
+
 void Value::replace_all_uses_with(Value *new_value) {
     if (new_value == nullptr || new_value == this || new_value->type() != type()) {
         return;
@@ -513,9 +518,12 @@ User::~User() {
 
 void User::add_operand(Value *value) {
     if (value != nullptr) {
-        value->add_use(this, operands_.size());
+        value->reserve_additional_uses(1);
     }
     operands_.push_back(value);
+    if (value != nullptr) {
+        value->add_use(this, operands_.size() - 1);
+    }
 }
 
 Value *User::operand(std::size_t index) const {
@@ -526,6 +534,11 @@ void User::set_operand(std::size_t index, Value *value) {
     auto *old_value = operands_[index];
     if (old_value == value) {
         return;
+    }
+    if (value != nullptr) {
+        // Allocate before mutating either use-list so failure leaves the old
+        // operand and both use lists unchanged.
+        value->reserve_additional_uses(1);
     }
     if (old_value != nullptr) {
         old_value->remove_use(this, index);
@@ -803,6 +816,15 @@ void CallInst::remove_arg(std::size_t arg_index) {
     erase_operands(arg_index + 1, 1);
 }
 
+void CallInst::reset_callee_and_args(Value *callee, const std::vector<Value *> &args) {
+    operands_.reserve(args.size() + 1);
+    drop_all_operands();
+    add_operand(callee);
+    for (auto *arg : args) {
+        add_operand(arg);
+    }
+}
+
 std::string CallInst::print() const {
     std::ostringstream oss;
     if (!name().empty()) {
@@ -960,6 +982,10 @@ std::size_t Argument::index() const {
     return index_;
 }
 
+void Argument::set_parent(Function *parent) {
+    parent_ = parent;
+}
+
 void Argument::set_index(std::size_t index) {
     index_ = index;
 }
@@ -1046,18 +1072,57 @@ Function *BasicBlock::parent() const {
     return parent_;
 }
 
+void BasicBlock::set_parent(Function *parent) {
+    parent_ = parent;
+}
+
 std::string BasicBlock::print() const {
     return name() + ":";
 }
 
-Function::Function(FunctionType *type, const std::string &name, Module *parent, bool is_external)
-    : Value(type, name), parent_(parent), is_external_(is_external), next_block_id_(0) {
+Function::Function(FunctionType *type, const std::string &name, Module *parent, bool is_external,
+                   FunctionID function_id, FunctionOrigin origin, FunctionID root_function_id)
+    : Value(type, name), parent_(parent), is_external_(is_external), function_id_(function_id),
+      root_function_id_(root_function_id == kInvalidFunctionID ? function_id : root_function_id),
+      origin_(origin), next_block_id_(0) {
 }
 
 Function::~Function() {
     for (auto &block : blocks_) {
         for (auto &inst : block->instructions()) {
             inst->drop_all_operands();
+        }
+    }
+}
+
+ModuleFunctionSet::ModuleFunctionSet(ModuleFunctionSet &&other) noexcept
+    : functions(std::move(other.functions)),
+      function_table(std::move(other.function_table)) {
+}
+
+ModuleFunctionSet &ModuleFunctionSet::operator=(ModuleFunctionSet &&other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    drop_all_references();
+    functions = std::move(other.functions);
+    function_table = std::move(other.function_table);
+    return *this;
+}
+
+ModuleFunctionSet::~ModuleFunctionSet() {
+    drop_all_references();
+}
+
+void ModuleFunctionSet::drop_all_references() noexcept {
+    for (auto &function : functions) {
+        if (function == nullptr) {
+            continue;
+        }
+        for (auto &block : function->blocks()) {
+            for (auto &instruction : block->instructions()) {
+                instruction->drop_all_operands();
+            }
         }
     }
 }
@@ -1084,6 +1149,18 @@ void Function::set_external(bool is_external) {
 
 void Function::set_function_type(FunctionType *type) {
     set_type(type);
+}
+
+FunctionID Function::function_id() const {
+    return function_id_;
+}
+
+FunctionID Function::root_function_id() const {
+    return root_function_id_;
+}
+
+FunctionOrigin Function::origin() const {
+    return origin_;
 }
 
 Argument *Function::add_argument(Type *type, const std::string &name) {
@@ -1154,6 +1231,37 @@ const std::list<std::unique_ptr<BasicBlock>> &Function::blocks() const {
     return blocks_;
 }
 
+std::size_t Function::block_allocator_state() const {
+    return next_block_id_;
+}
+
+void Function::set_block_allocator_state(std::size_t state) {
+    next_block_id_ = state;
+}
+
+void Function::swap_body(Function &other) noexcept {
+    auto *this_type = function_type();
+    set_function_type(other.function_type());
+    other.set_function_type(this_type);
+    args_.swap(other.args_);
+    blocks_.swap(other.blocks_);
+    std::swap(next_block_id_, other.next_block_id_);
+    auto reparent = [](Function &function) noexcept {
+        for (std::size_t index = 0; index < function.args_.size(); ++index) {
+            function.args_[index]->set_parent(&function);
+            function.args_[index]->set_index(index);
+        }
+        for (auto &block : function.blocks_) {
+            block->set_parent(&function);
+            for (auto &instruction : block->instructions()) {
+                instruction->set_parent(block.get());
+            }
+        }
+    };
+    reparent(*this);
+    reparent(other);
+}
+
 std::string Function::print() const {
     std::ostringstream oss;
     oss << return_type()->print() << " @" << name() << "(";
@@ -1203,7 +1311,20 @@ std::string GlobalVariable::print() const {
     return oss.str();
 }
 
-Module::Module(const std::string &name) : name_(name) {
+Module::Module(const std::string &name) : name_(name), next_function_id_(1) {
+}
+
+Module::~Module() {
+    // Functions can reference other functions owned by this module.  Clear every
+    // instruction operand while all Value use-lists are still alive; individual
+    // Function destructors may then run in any container destruction order.
+    for (auto &function : functions_) {
+        for (auto &block : function->blocks()) {
+            for (auto &instruction : block->instructions()) {
+                instruction->drop_all_operands();
+            }
+        }
+    }
 }
 
 const std::string &Module::name() const {
@@ -1218,13 +1339,16 @@ const TypeContext &Module::types() const {
     return types_;
 }
 
-Function *Module::create_function(const std::string &name, FunctionType *type, bool is_external) {
+Function *Module::create_function(const std::string &name, FunctionType *type, bool is_external,
+                                  FunctionOrigin origin, FunctionID root_function_id) {
     auto found = function_table_.find(name);
     if (found != function_table_.end()) {
         return found->second;
     }
 
-    auto fn = std::make_unique<Function>(type, name, this, is_external);
+    const FunctionID function_id = next_function_id_;
+    auto fn = std::make_unique<Function>(type, name, this, is_external, function_id, origin,
+                                         root_function_id);
     auto *raw = fn.get();
 
     const auto &param_types = type->param_types();
@@ -1232,8 +1356,27 @@ Function *Module::create_function(const std::string &name, FunctionType *type, b
         raw->add_argument(param_types[i], "arg" + std::to_string(i));
     }
 
+    // Complete every potentially-throwing preparation before consuming the
+    // stable ID.  If table-node allocation fails after the reserved vector
+    // insertion, pop the unpublished function and leave both public containers
+    // semantically unchanged.
+    functions_.reserve(functions_.size() + 1);
     functions_.push_back(std::move(fn));
-    function_table_[name] = raw;
+    decltype(function_table_)::iterator table_entry;
+    bool inserted = false;
+    try {
+        auto result = function_table_.emplace(name, raw);
+        table_entry = result.first;
+        inserted = result.second;
+    } catch (...) {
+        functions_.pop_back();
+        throw;
+    }
+    if (!inserted) {
+        functions_.pop_back();
+        return table_entry->second;
+    }
+    ++next_function_id_;
     return raw;
 }
 
@@ -1243,6 +1386,64 @@ Function *Module::get_function(const std::string &name) const {
         return nullptr;
     }
     return found->second;
+}
+
+const std::unordered_map<std::string, Function *> &
+Module::function_table_mappings() const {
+    return function_table_;
+}
+
+bool Module::erase_function(Function *function) {
+    if (function == nullptr || !function->uses().empty()) {
+        return false;
+    }
+    auto found = std::find_if(functions_.begin(), functions_.end(),
+                              [&](const auto &candidate) {
+                                  return candidate.get() == function;
+                              });
+    if (found == functions_.end()) {
+        return false;
+    }
+    const auto function_id = function->function_id();
+    for (auto &block : function->blocks()) {
+        for (auto &instruction : block->instructions()) {
+            instruction->drop_all_operands();
+        }
+    }
+    auto table_entry = function_table_.find(function->name());
+    if (table_entry != function_table_.end() && table_entry->second == function) {
+        function_table_.erase(table_entry);
+    }
+    functions_.erase(found);
+    if (function_id != kInvalidFunctionID && next_function_id_ == function_id + 1) {
+        next_function_id_ = function_id;
+    }
+    return true;
+}
+
+void Module::prepare_function_set(ModuleFunctionSet &set) const {
+    std::unordered_map<std::string, Function *> prepared;
+    prepared.reserve(set.functions.size());
+    for (const auto &function : set.functions) {
+        if (function == nullptr || function->parent() != this ||
+            !prepared.emplace(function->name(), function.get()).second) {
+            throw std::runtime_error("invalid staged OIR function set");
+        }
+    }
+    set.function_table = std::move(prepared);
+}
+
+void Module::exchange_function_set(ModuleFunctionSet &set) noexcept {
+    functions_.swap(set.functions);
+    function_table_.swap(set.function_table);
+}
+
+FunctionID Module::function_allocator_state() const {
+    return next_function_id_;
+}
+
+void Module::set_function_allocator_state(FunctionID state) {
+    next_function_id_ = state;
 }
 
 GlobalVariable *Module::create_global(const std::string &name, Type *value_type, bool is_const,
@@ -1302,6 +1503,28 @@ UndefValue *Module::create_undef(Type *type) {
     auto *raw = undef.get();
     owned_constants_.push_back(std::move(undef));
     return raw;
+}
+
+void Module::adopt_constants(std::vector<std::unique_ptr<Value>> &constants) {
+    owned_constants_.reserve(owned_constants_.size() + constants.size());
+    for (auto &constant : constants) {
+        owned_constants_.push_back(std::move(constant));
+    }
+    constants.clear();
+}
+
+bool Module::discard_constants_from(std::size_t first) {
+    if (first > owned_constants_.size()) {
+        return false;
+    }
+    for (std::size_t index = first; index < owned_constants_.size(); ++index) {
+        if (owned_constants_[index] != nullptr &&
+            owned_constants_[index]->has_uses()) {
+            return false;
+        }
+    }
+    owned_constants_.resize(first);
+    return true;
 }
 
 std::vector<std::unique_ptr<GlobalVariable>> &Module::globals() {
@@ -1494,6 +1717,64 @@ PhiInst *IRBuilder::create_phi(Type *type, const std::string &name) {
 VerifyResult Verifier::verify_module(const Module &module) {
     auto fail = [](std::string message) { return VerifyResult{false, std::move(message)}; };
 
+    // Reject dangling/cross-module operands by pointer identity before any
+    // verifier path performs RTTI or otherwise dereferences an operand.  This
+    // also makes detached/live ownership mistakes fail at their commit boundary
+    // instead of surfacing as allocator corruption in a later pass.
+    std::unordered_set<const Value *> owned_values;
+    std::unordered_map<const Value *, const Function *> body_owners;
+    owned_values.reserve(module.owned_constants().size() + module.globals().size() +
+                         module.functions().size());
+    for (const auto &constant : module.owned_constants()) {
+        owned_values.insert(constant.get());
+    }
+    for (const auto &global : module.globals()) {
+        owned_values.insert(global.get());
+    }
+    for (const auto &function : module.functions()) {
+        owned_values.insert(function.get());
+        for (const auto &argument : function->args()) {
+            owned_values.insert(argument.get());
+            body_owners.emplace(argument.get(), function.get());
+        }
+        for (const auto &block : function->blocks()) {
+            owned_values.insert(block.get());
+            body_owners.emplace(block.get(), function.get());
+            for (const auto &instruction : block->instructions()) {
+                owned_values.insert(instruction.get());
+                body_owners.emplace(instruction.get(), function.get());
+            }
+        }
+    }
+    for (const auto &function : module.functions()) {
+        for (const auto &block : function->blocks()) {
+            for (const auto &instruction : block->instructions()) {
+                std::size_t operand_index = 0;
+                for (auto *operand : instruction->operands()) {
+                    if (operand != nullptr &&
+                        owned_values.find(operand) == owned_values.end()) {
+                        return fail(
+                            "instruction operand references a value outside the module: @" +
+                            function->name() + " %" + block->name() + " op=" +
+                            std::to_string(static_cast<unsigned>(instruction->op())) +
+                            " operand=" + std::to_string(operand_index));
+                    }
+                    auto owner = body_owners.find(operand);
+                    if (owner != body_owners.end() &&
+                        owner->second != function.get()) {
+                        return fail(
+                            "instruction operand references a value owned by another function: @" +
+                            function->name() + " %" + block->name() + " op=" +
+                            std::to_string(static_cast<unsigned>(instruction->op())) +
+                            " operand=" + std::to_string(operand_index) +
+                            " owner=@" + owner->second->name());
+                    }
+                    ++operand_index;
+                }
+            }
+        }
+    }
+
     auto use_list_error = [](const Value *value) -> std::string {
         if (value == nullptr) {
             return "";
@@ -1519,19 +1800,20 @@ VerifyResult Verifier::verify_module(const Module &module) {
         if (function->parent() != &module) {
             return fail("function " + function_ref(function) + " has wrong module parent");
         }
-        if (function->is_external()) {
-            continue;
+        const auto &param_types = function->function_type()->param_types();
+        if (function->args().size() != param_types.size()) {
+            return fail("function " + function_ref(function) +
+                        " argument count does not match its function type");
         }
-
-        if (function->blocks().empty()) {
-            return fail("function " + function_ref(function) + " has no basic blocks");
-        }
-
         for (std::size_t i = 0; i < function->args().size(); ++i) {
             const auto *arg = function->args()[i].get();
             if (arg->parent() != function || arg->index() != i) {
                 return fail("argument %" + arg->name() + " in " + function_ref(function) +
                             " has inconsistent parent or index");
+            }
+            if (arg->type() != param_types[i]) {
+                return fail("argument %" + arg->name() + " in " + function_ref(function) +
+                            " does not match its function type");
             }
             if (auto error = use_list_error(arg); !error.empty()) {
                 return fail(error);
@@ -1539,6 +1821,13 @@ VerifyResult Verifier::verify_module(const Module &module) {
         }
         if (auto error = use_list_error(function); !error.empty()) {
             return fail(error);
+        }
+        if (function->is_external()) {
+            continue;
+        }
+
+        if (function->blocks().empty()) {
+            return fail("function " + function_ref(function) + " has no basic blocks");
         }
 
         std::unordered_set<const BasicBlock *> block_set;
@@ -1879,6 +2168,35 @@ VerifyResult Verifier::verify_module(const Module &module) {
                     if (count_ty == nullptr || count_ty->bit_width() != 32) {
                         return fail("memzero in " + block_ref(block) +
                                     " expects i32 byte count");
+                    }
+                    break;
+                }
+                case Instruction::OpID::Call: {
+                    const auto *call = dynamic_cast<const CallInst *>(inst);
+                    if (call == nullptr) {
+                        return fail("call instruction type mismatch in " + block_ref(block));
+                    }
+                    const auto *callee = dynamic_cast<const Function *>(call->callee());
+                    if (callee != nullptr) {
+                        const auto &callee_params = callee->function_type()->param_types();
+                        const auto call_args = call->args();
+                        if (call_args.size() != callee_params.size()) {
+                            return fail("call " + inst_ref(call) + " to " +
+                                        function_ref(callee) +
+                                        " has an argument-count mismatch");
+                        }
+                        for (std::size_t i = 0; i < call_args.size(); ++i) {
+                            if (call_args[i]->type() != callee_params[i]) {
+                                return fail("call " + inst_ref(call) + " to " +
+                                            function_ref(callee) + " has argument " +
+                                            std::to_string(i) + " type mismatch");
+                            }
+                        }
+                        if (call->type() != callee->return_type()) {
+                            return fail("call " + inst_ref(call) + " to " +
+                                        function_ref(callee) +
+                                        " has a return-type mismatch");
+                        }
                     }
                     break;
                 }

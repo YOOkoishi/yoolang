@@ -264,11 +264,27 @@ bool propagate_global_constants(oir::Module &module, Stats &stats) {
     }
 
     const unsigned replaced = apply_replacements(module, replacements);
-    if (replaced == 0) {
-        return false;
+    unsigned erased = 0;
+    for (auto &function : module.functions()) {
+        if (function->is_external()) {
+            continue;
+        }
+        for (auto &block : function->blocks()) {
+            for (auto it = block->instructions().begin();
+                 it != block->instructions().end();) {
+                if (replacements.find(it->get()) == replacements.end() ||
+                    !(*it)->uses().empty()) {
+                    ++it;
+                    continue;
+                }
+                (*it)->drop_all_operands();
+                it = block->instructions().erase(it);
+                ++erased;
+            }
+        }
     }
     stats.globals += static_cast<unsigned>(replacements.size());
-    return true;
+    return replaced != 0 || erased != 0;
 }
 
 

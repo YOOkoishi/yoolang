@@ -1,0 +1,152 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=COST
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=unsupported %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=UNSUPPORTED
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=cleanup-budget %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=CLEANUP
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=verify %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=VERIFY-FAIL
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=typed-import %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=TYPED-IMPORT
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=commit-preflight %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=PREFLIGHT
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=commit-after-first %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=AFTER-FIRST
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=cost-reject %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=COST-REJECT
+// RUN: env YOOLANG_TEST_OIR_RESIDUAL_FAILURE=tie-budget %compiler --emit-cost-model=json --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=TIE-BUDGET-COST
+
+int positional_branch(int left, int right) {
+  if (left == 0) {
+    return right + 17;
+  }
+  if (right == 0) {
+    return left - 19;
+  }
+  return left - right;
+}
+
+int tie_sink;
+
+int repeated_step(int value, int mode) {
+  tie_sink = tie_sink + value;
+  int mixed = value * 3 + 1;
+  mixed = mixed * 5 + 2;
+  mixed = mixed * 7 + 4;
+  mixed = mixed * 9 + 6;
+  if (mode == 0) {
+    return mixed + 3;
+  }
+  return mixed - 5;
+}
+
+int later_control_leaf(int value, int passthrough, int select) {
+  if (select == 7) {
+    return value + passthrough + 11;
+  }
+  return value - passthrough - 13;
+}
+
+int swapped_bindings(int input) {
+  int left_constant = positional_branch(0, input);
+  int right_constant = positional_branch(input, 0);
+  return left_constant + right_constant;
+}
+
+int same_block_dependent(int left, int right) {
+  int result = left + right;
+  int index = 0;
+  while (index < 4) {
+    int first = repeated_step(result, 0);
+    int second = repeated_step(result, 0);
+    result = first + second;
+    index = index + 1;
+  }
+  return result;
+}
+
+int later_control(int input) {
+  return later_control_leaf(input, input, 7);
+}
+
+int main() {
+  int input = getint();
+  return swapped_bindings(input) + same_block_dependent(input, input + 1) +
+         later_control(input);
+}
+
+// OIR-LABEL: define i32 @swapped_bindings
+// OIR-NOT: call i32 @positional_branch
+// OIR: ret i32
+// OIR-LABEL: define i32 @same_block_dependent
+// OIR-NOT: call i32 @repeated_step
+// OIR: ret i32
+// OIR-LABEL: define i32 @later_control
+// OIR-NOT: call i32 @later_control_leaf
+// OIR: ret i32
+
+// COST: "scope": "direct-residual"
+// COST: "action": "Accept"
+// COST: "reject_reason": "None"
+
+// UNSUPPORTED: "candidate_id": "specialize.1"
+// UNSUPPORTED: "action": "Reject"
+// UNSUPPORTED: "reject_reason": "ProofUnknown"
+// UNSUPPORTED: "summary": "detached residual rejected: test failpoint: unsupported detached instruction; live snapshot including function table unchanged"
+// UNSUPPORTED: "candidate_id": "specialize.2"
+// UNSUPPORTED: "action": "Accept"
+
+// CLEANUP: "candidate_id": "specialize.1"
+// CLEANUP: "action": "Reject"
+// CLEANUP: "reject_reason": "ProofUnknown"
+// CLEANUP: "summary": "detached residual rejected: test failpoint: detached cleanup budget exhausted; live snapshot including function table unchanged"
+// CLEANUP: "candidate_id": "specialize.2"
+// CLEANUP: "action": "Accept"
+
+// VERIFY-FAIL: "candidate_id": "specialize.1"
+// VERIFY-FAIL: "action": "Reject"
+// VERIFY-FAIL: "reject_reason": "ProofUnknown"
+// VERIFY-FAIL: "summary": "detached residual rejected: test failpoint: detached verifier failure; live snapshot including function table unchanged"
+// VERIFY-FAIL: "candidate_id": "specialize.2"
+// VERIFY-FAIL: "action": "Accept"
+
+// TYPED-IMPORT: "candidate_id": "specialize.1"
+// TYPED-IMPORT: "action": "Reject"
+// TYPED-IMPORT: "reject_reason": "ProofUnknown"
+// TYPED-IMPORT: "summary": "{{.*}}missing detached TypeContext import mapping; live snapshot including function table unchanged"
+// TYPED-IMPORT: "candidate_id": "specialize.2"
+// TYPED-IMPORT: "action": "Accept"
+
+// PREFLIGHT: "candidate_id": "specialize.1"
+// PREFLIGHT: "action": "Reject"
+// PREFLIGHT: "reject_reason": "CommitPreflightFailed"
+// PREFLIGHT: "summary": "direct residual commit verification failed; live snapshot including function table restored"
+// PREFLIGHT: "candidate_id": "specialize.2"
+// PREFLIGHT: "action": "Accept"
+
+// AFTER-FIRST: "candidate_id": "specialize.3"
+// AFTER-FIRST: "scope": "direct-residual-tie-batch"
+// AFTER-FIRST: "action": "Reject"
+// AFTER-FIRST: "reject_reason": "CommitPreflightFailed"
+// AFTER-FIRST: "summary": "residual tie batch commit failed; all live snapshots including function table restored"
+// AFTER-FIRST: "candidate_id": "specialize.5"
+// AFTER-FIRST: "action": "Accept"
+
+// COST-REJECT: "candidate_id": "specialize.1"
+// COST-REJECT: "action": "Reject"
+// COST-REJECT: "reject_reason": "CodeGrowthTooHigh"
+// COST-REJECT: "summary": "{{.*}}test failpoint cost rejection; live snapshot including function table unchanged"
+// COST-REJECT: "candidate_id": "specialize.2"
+// COST-REJECT: "action": "Accept"
+
+// TIE-BUDGET-COST: "scope": "direct-residual-tie-batch"
+// TIE-BUDGET-COST: "action": "Reject"
+// TIE-BUDGET-COST: "reject_reason": "CumulativeBudgetExhausted"
+// TIE-BUDGET-COST: "summary": "residual tie batch rejected atomically by all-member preflight"
+// COST: "scope": "direct-residual"
+// COST: "action": "Accept"
+// COST: "reject_reason": "None"
+// COST: "scope": "direct-residual-tie-batch"
+// COST: "action": "Accept"
+// COST: "reject_reason": "None"
+// COST: "summary": "independently verified detached residual and all-member tie preflight"
+// COST: "scope": "direct-residual-tie-batch"
+// COST: "action": "Accept"
+// COST: "reject_reason": "None"
+// COST: "summary": "independently verified detached residual and all-member tie preflight"
+// COST: "scope": "direct-residual"
+// COST: "action": "Accept"
+// COST: "reject_reason": "None"

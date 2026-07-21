@@ -26,10 +26,7 @@ int main() {
 }
 
 // OIR-LABEL: define i32 @passthrough_layer
-// OIR: inl.__yo_constprop.layer_accum.
+// OIR-NOT: call i32 @layer_accum
 // OIR-NOT: icmp eq i32 %level.arg
 // OIR: ret i32
-
-// OIR-LABEL: define i32 @__yo_constprop.layer_accum.
-// OIR-NOT: icmp eq i32 %level.arg
-// OIR: ret i32
+// OIR-NOT: define i32 @__yo_constprop

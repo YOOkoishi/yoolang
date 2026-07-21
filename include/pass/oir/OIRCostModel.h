@@ -55,12 +55,17 @@ struct OIRTransformCostEstimate {
     std::int64_t after_max_live_values = 0;
     std::int64_t proof_time_units = 0;
     std::int64_t smt_queries = 0;
+    std::int64_t dynamic_multiplier = 1;
+    std::int64_t proven_dynamic_instruction_savings = 0;
+    bool has_operation_breakdown = false;
     pass::cost_model::PartialEvalCost partial_eval;
     pass::cost_model::EGraphExtractCost egraph;
 
     pass::cost_model::RiskVector risk;
     bool bypass_profitability = false;
     std::string bypass_reason;
+    pass::cost_model::RejectReason forced_reject_reason =
+        pass::cost_model::RejectReason::None;
 };
 
 bool cost_model_allows_transform(Stats &stats, const OIRTransformCostEstimate &estimate);

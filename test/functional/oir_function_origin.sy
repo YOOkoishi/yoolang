@@ -1,0 +1,15 @@
+int select_offset(int value, int selector) {
+  if (selector == 1) {
+    return value + 7;
+  }
+  if (selector == 2) {
+    return value - 9;
+  }
+  return value * selector;
+}
+
+int main() {
+  putint(select_offset(11, 1) + select_offset(11, 2));
+  putch(10);
+  return 0;
+}

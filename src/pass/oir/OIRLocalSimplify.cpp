@@ -835,6 +835,7 @@ struct ConditionalAddDiamond {
 struct ShortCircuitBoolDiamond {
     oir::BasicBlock *arm = nullptr;
     oir::BasicBlock *merge = nullptr;
+    oir::BinaryInst *arm_value = nullptr;
     oir::CmpInst *arm_cmp = nullptr;
     oir::PhiInst *phi = nullptr;
     bool arm_is_true = true;
@@ -950,18 +951,32 @@ bool match_conditional_add_diamond(oir::BasicBlock &block, oir::BranchInst &bran
 bool match_bool_arm(oir::BasicBlock &pred, oir::BasicBlock *arm, oir::BasicBlock *merge,
                     bool arm_is_true, ShortCircuitBoolDiamond &out) {
     if (arm == nullptr || merge == nullptr || arm == merge || arm->predecessors().size() != 1 ||
-        arm->predecessors().front() != &pred || arm->instructions().size() != 2 ||
+        arm->predecessors().front() != &pred ||
+        (arm->instructions().size() != 2 && arm->instructions().size() != 3) ||
         !has_single_phi(*merge)) {
         return false;
     }
 
     auto inst_it = arm->instructions().begin();
+    oir::BinaryInst *arm_value = nullptr;
+    if (arm->instructions().size() == 3) {
+        arm_value = dynamic_cast<oir::BinaryInst *>(inst_it->get());
+        if (arm_value == nullptr ||
+            (arm_value->op() != oir::Instruction::OpID::And &&
+             arm_value->op() != oir::Instruction::OpID::Xor)) {
+            return false;
+        }
+        ++inst_it;
+    }
     auto *cmp = dynamic_cast<oir::CmpInst *>(inst_it->get());
     ++inst_it;
     auto *arm_branch = dynamic_cast<oir::BranchInst *>(inst_it->get());
     if (cmp == nullptr || cmp->type() != pred.parent()->parent()->types().int1_ty() ||
         arm_branch == nullptr || arm_branch->is_conditional() ||
         arm_branch->target_bb() != merge) {
+        return false;
+    }
+    if (arm_value != nullptr && cmp->lhs() != arm_value && cmp->rhs() != arm_value) {
         return false;
     }
 
@@ -988,7 +1003,7 @@ bool match_bool_arm(oir::BasicBlock &pred, oir::BasicBlock *arm, oir::BasicBlock
         return false;
     }
 
-    out = {arm, merge, cmp, phi, arm_is_true, *pred_value != 0};
+    out = {arm, merge, arm_value, cmp, phi, arm_is_true, *pred_value != 0};
     return true;
 }
 
@@ -1228,6 +1243,8 @@ bool convert_short_circuit_bool(oir::Module &module, oir::BasicBlock &block,
     if (only_controls_merge_branch(diamond)) {
         return false;
     }
+    // A pure arm expression is relocated, not duplicated in the residual CFG, so it does not
+    // increase the static instruction estimate relative to the existing short-circuit case.
     if (!cost_model_allows_if_conversion(stats, "short_circuit_bool", 3, 0)) {
         return false;
     }
@@ -1235,9 +1252,25 @@ bool convert_short_circuit_bool(oir::Module &module, oir::BasicBlock &block,
     auto *arm_condition =
         insert_arm_condition(module, block, term_it, branch->cond(), diamond.arm_is_true);
 
+    oir::Value *cloned_arm_value = nullptr;
+    if (diamond.arm_value != nullptr) {
+        auto cloned_value = std::make_unique<oir::BinaryInst>(
+            diamond.arm_value->type(), diamond.arm_value->op(), diamond.arm_value->lhs(),
+            diamond.arm_value->rhs(), &block,
+            diamond.arm_value->name().empty() ? "ifc.value"
+                                               : diamond.arm_value->name() + ".ifc");
+        cloned_arm_value = cloned_value.get();
+        cloned_value->set_parent(&block);
+        block.instructions().insert(term_it, std::move(cloned_value));
+    }
+
+    auto *cmp_lhs = diamond.arm_cmp->lhs() == diamond.arm_value ? cloned_arm_value
+                                                                : diamond.arm_cmp->lhs();
+    auto *cmp_rhs = diamond.arm_cmp->rhs() == diamond.arm_value ? cloned_arm_value
+                                                                : diamond.arm_cmp->rhs();
     auto cloned_cmp = std::make_unique<oir::CmpInst>(
-        diamond.arm_cmp->type(), diamond.arm_cmp->op(), diamond.arm_cmp->pred(),
-        diamond.arm_cmp->lhs(), diamond.arm_cmp->rhs(), &block,
+        diamond.arm_cmp->type(), diamond.arm_cmp->op(), diamond.arm_cmp->pred(), cmp_lhs, cmp_rhs,
+        &block,
         diamond.arm_cmp->name().empty() ? "ifc.cmp" : diamond.arm_cmp->name() + ".ifc");
     auto *cmp_raw = cloned_cmp.get();
     cmp_raw->set_parent(&block);

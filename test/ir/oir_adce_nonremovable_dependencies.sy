@@ -1,0 +1,58 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int dynamic_div(int x, int y) {
+  int numerator = x + 1;
+  int unused = numerator / y;
+  return 0;
+}
+
+int dynamic_rem(int x, int y) {
+  int numerator = x * 3;
+  int unused = numerator % y;
+  return 0;
+}
+
+int argument_load(int values[], int index) {
+  int unused = values[index];
+  return 0;
+}
+
+int side_effect_argument(int x) {
+  putint(x * 5);
+  return 0;
+}
+
+int safe_constant_divisor(int x) {
+  int numerator = x + 1;
+  int unused = numerator / 7;
+  return 0;
+}
+
+int main() {
+  return 0;
+}
+
+// OIR-LABEL: define i32 @dynamic_div
+// OIR: add i32 %x.arg, 1
+// OIR: sdiv i32 {{.*}}, %y.arg
+// OIR: ret i32 0
+
+// OIR-LABEL: define i32 @dynamic_rem
+// OIR: mul i32 %x.arg, 3
+// OIR: srem i32 {{.*}}, %y.arg
+// OIR: ret i32 0
+
+// OIR-LABEL: define i32 @argument_load
+// OIR: gep i32*
+// OIR: load i32
+// OIR: ret i32 0
+
+// OIR-LABEL: define i32 @side_effect_argument
+// OIR: mul i32 %x.arg, 5
+// OIR: call void @putint
+// OIR: ret i32 0
+
+// OIR-LABEL: define i32 @safe_constant_divisor
+// OIR-NOT: add i32
+// OIR-NOT: sdiv i32
+// OIR: ret i32 0
