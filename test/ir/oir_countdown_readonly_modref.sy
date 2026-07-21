@@ -1,0 +1,99 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int observed_calls;
+int readonly_values[20];
+
+int readonly_fold(int values[], int limit) {
+  if (limit == -1) return values[0] / 2;
+  if (limit == -2) return values[1] / 2;
+  if (limit == -3) return values[2] / 2;
+  if (limit == -4) return values[3] / 2;
+  if (limit == -5) return values[4] / 2;
+  if (limit == -6) return values[5] / 2;
+  if (limit == -7) return values[6] / 2;
+  if (limit == -8) return values[7] / 2;
+  if (limit == -9) return values[8] / 2;
+  if (limit == -10) return values[9] / 2;
+  if (limit == -11) return values[10] / 2;
+  if (limit == -12) return values[11] / 2;
+  if (limit == -13) return values[12] / 2;
+  int index = 0;
+  int total = 0;
+  while (index < limit) {
+    total = total + values[index] / 2;
+    index = index + 1;
+  }
+  return total;
+}
+
+int dynamic_div_fold(int values[], int index, int divisor) {
+  if (index <= 0) {
+    return values[0] / divisor;
+  }
+  return dynamic_div_fold(values, index - 1, divisor) + values[index] / divisor;
+}
+
+int observed_fold(int values[], int index) {
+  observed_calls = observed_calls + 1;
+  if (index <= 0) {
+    return values[0] / 2;
+  }
+  return observed_fold(values, index - 1) + values[index] / 2;
+}
+
+int collapse_readonly_countdown() {
+  int remaining = 19;
+  int result = 0;
+  while (remaining != 0) {
+    result = readonly_fold(readonly_values, remaining);
+    remaining = remaining - 1;
+  }
+  return result;
+}
+
+int keep_dynamic_div_countdown(int values[], int divisor) {
+  int remaining = 19;
+  int result = 0;
+  while (remaining != 0) {
+    result = dynamic_div_fold(values, remaining, divisor);
+    remaining = remaining - 1;
+  }
+  return result;
+}
+
+int keep_observable_countdown(int values[]) {
+  int remaining = 19;
+  int result = 0;
+  while (remaining != 0) {
+    result = observed_fold(values, remaining);
+    remaining = remaining - 1;
+  }
+  return result;
+}
+
+int main() {
+  return 0;
+}
+
+// A readonly call through a concrete Global actual has no unconditional effect.
+// The overwritten countdown needs only its final call.  Formal forwarding is
+// separately fail-closed as a current-body removability question in infra tests.
+// OIR-LABEL: define i32 @collapse_readonly_countdown
+// OIR-NOT: phi
+// OIR: %[[READONLY_VALUES:[A-Za-z0-9_.]+]] = gep [20 x i32]* @readonly_values
+// OIR: call i32 @readonly_fold(i32* %[[READONLY_VALUES]], i32 1)
+// OIR-NOT: phi
+// OIR-NOT: call i32 @readonly_fold
+// OIR: ret i32
+
+// A dynamic signed divisor remains potentially trapping and blocks the rewrite.
+// OIR-LABEL: define i32 @keep_dynamic_div_countdown
+// OIR: %remaining.loop = phi [19,
+// OIR: call i32 @dynamic_div_fold
+// OIR: br i1
+
+// A transitively visible write remains an unconditional call effect.
+// OIR-LABEL: define i32 @keep_observable_countdown
+// OIR: %remaining.loop = phi [19,
+// OIR: call i32 @observed_fold
+// OIR: br i1

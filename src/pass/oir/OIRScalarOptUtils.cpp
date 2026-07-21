@@ -142,6 +142,13 @@ bool eval_fcmp(oir::CmpPred pred, float lhs, float rhs) {
 std::optional<std::int64_t> fold_int_binary(oir::Instruction::OpID op, std::int64_t lhs,
                                             std::int64_t rhs) {
     const std::int64_t min_i32 = std::numeric_limits<std::int32_t>::min();
+    const std::int64_t max_i32 = std::numeric_limits<std::int32_t>::max();
+    // ConstantInt currently permits a non-canonical payload even when its OIR
+    // type is i32.  Reject it before host arithmetic: besides being outside
+    // the fold's semantic domain, INT64_MIN / -1 and % -1 are C++ UB.
+    if (lhs < min_i32 || lhs > max_i32 || rhs < min_i32 || rhs > max_i32) {
+        return std::nullopt;
+    }
     switch (op) {
     case oir::Instruction::OpID::Add:
         return static_cast<std::int32_t>(lhs + rhs);
@@ -158,7 +165,7 @@ std::optional<std::int64_t> fold_int_binary(oir::Instruction::OpID op, std::int6
             return std::nullopt;
         }
         if (lhs == min_i32 && rhs == -1) {
-            return static_cast<std::int32_t>(lhs);
+            return std::nullopt;
         }
         return static_cast<std::int32_t>(lhs / rhs);
     case oir::Instruction::OpID::SRem:
@@ -166,7 +173,7 @@ std::optional<std::int64_t> fold_int_binary(oir::Instruction::OpID op, std::int6
             return std::nullopt;
         }
         if (lhs == min_i32 && rhs == -1) {
-            return 0;
+            return std::nullopt;
         }
         return static_cast<std::int32_t>(lhs % rhs);
     default:

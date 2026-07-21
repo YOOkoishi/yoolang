@@ -1,5 +1,5 @@
 // RUN: %compiler --emit-cost-model=json -O1 %s | FileCheck %s --check-prefix=JSON
-// RUN: %compiler --emit-cost-model --cost-model-policy=conservative --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=TEXT
+// RUN: env YOOLANG_TEST_OIR_CALL_GROWTH_BUDGET=1000 %compiler --emit-cost-model --cost-model-policy=conservative --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=TEXT
 // RUN: %compiler -S -O1 %s | FileCheck %s --check-prefix=ASM
 
 int add1(int x) {
@@ -32,7 +32,7 @@ int main() {
 
 // TEXT: [cost-model] target=rv64gc/lp64d policy=conservative filter=Inline
 // TEXT: [cost-model] summary stage=OIR
-// TEXT: [cost-model] summary stage=OIR label=oir functions={{[0-9]+}} blocks={{[0-9]+}} instrs={{[0-9]+}} loads=0 stores=0 branches={{[0-9]+}} calls=1
+// TEXT: [cost-model] summary stage=OIR label=oir functions={{[0-9]+}} blocks={{[0-9]+}} instrs={{[0-9]+}} loads=0 stores=0 branches={{[0-9]+}} calls=2
 // TEXT: [cost-model] summary stage=FinalMIR
 // TEXT: [cost-model] OIRInlinePass Reject transform=Inline
 // TEXT: reason=CodeGrowthTooHigh

@@ -1,0 +1,53 @@
+int termination_values[32];
+
+int readonly_maybe_infinite(int values[], int flag) {
+  int index = 0;
+  int total = 0;
+  while (index < flag) {
+    total = total + values[index] / 2;
+  }
+  return total;
+}
+
+int readonly_conditional_recursion(int values[], int value) {
+  if (value == 0) {
+    return values[0] / 2;
+  }
+  return readonly_conditional_recursion(values, value - 1) + 1;
+}
+
+int readonly_le_progression(int values[], int limit) {
+  int index = 0;
+  int total = 0;
+  while (index <= limit) {
+    total = total + values[index] / 2;
+    index = index + 1;
+  }
+  return total;
+}
+
+int constant_wrap_progression() {
+  int index = 2147483646;
+  while (index < 2147483647) {
+    index = index + 2;
+  }
+  return index;
+}
+
+int main() {
+  int index = 0;
+  while (index < 32) {
+    termination_values[index] = index * 2;
+    index = index + 1;
+  }
+
+  // Exercise only terminating inputs.  The OIR fixture separately verifies
+  // that calls which can reach each nonterminating shape remain observable.
+  putint(readonly_maybe_infinite(termination_values, 0));
+  putch(32);
+  putint(readonly_conditional_recursion(termination_values, 0));
+  putch(32);
+  putint(readonly_le_progression(termination_values, 1));
+  putch(10);
+  return 0;
+}

@@ -49,6 +49,8 @@ constexpr unsigned kMinRecursiveInlineProbabilityBasisPoints = 1000;
 // 512 OIR instructions is the corresponding bounded-growth envelope.
 constexpr unsigned kMaxRecursiveInlineGrowth = 512;
 constexpr unsigned kMaxAffectedCleanupRounds = 3;
+constexpr unsigned kMaxScratchCleanupRounds = 8;
+constexpr std::uint64_t kSpecializationAttemptBudget = 128;
 constexpr std::uint64_t kRV64IntegerArgumentRegisters = 8;
 
 bool residual_test_failure_is(const char *name) {
@@ -109,6 +111,12 @@ using BlockMap = std::unordered_map<oir::BasicBlock *, oir::BasicBlock *>;
 using TypeMap = std::unordered_map<oir::Type *, oir::Type *>;
 using SpecializationMask = std::vector<bool>;
 
+enum class CallGrowthClass {
+    Specialization,
+    Ordinary,
+    Recursive,
+};
+
 struct CalleeInfo {
     unsigned blocks = 0;
     unsigned cost = 0;
@@ -134,10 +142,6 @@ struct InlineContext {
     std::unordered_set<const oir::Function *> defer_recursive_expansion;
     std::unordered_map<const oir::CallInst *, unsigned> exposed_call_depths;
     std::unordered_set<oir::Function *> affected_functions;
-    std::unordered_map<oir::FunctionID, std::uint64_t> root_growth;
-    std::uint64_t cumulative_growth = 0;
-    std::uint64_t module_growth_budget = std::numeric_limits<std::uint64_t>::max();
-    std::uint64_t root_growth_budget = std::numeric_limits<std::uint64_t>::max();
     bool cleanup_budget_exhausted = false;
 };
 
@@ -580,13 +584,210 @@ unsigned recursive_inline_growth_budget(const pass::cost_model::CostModelPolicy 
     return std::min(kMaxRecursiveInlineGrowth, std::max(policy_growth, inline_scaled));
 }
 
+std::uint64_t cloned_instruction_growth(const CalleeInfo &info) {
+    return saturating_u64_add(
+        saturating_u64_add(info.static_instrs, info.branches),
+        saturating_u64_add(info.phis, info.returns > 1 ? 1 : 0));
+}
+
+const char *call_growth_class_name(CallGrowthClass growth_class) {
+    if (growth_class == CallGrowthClass::Specialization) {
+        return "specialization";
+    }
+    if (growth_class == CallGrowthClass::Ordinary) {
+        return "ordinary nonrecursive inline";
+    }
+    return "self-recursive inline";
+}
+
+std::uint64_t call_class_cumulative_growth(
+    const Stats &stats, CallGrowthClass growth_class) {
+    if (growth_class == CallGrowthClass::Specialization) {
+        return stats.cumulative_call_specialization_growth;
+    }
+    if (growth_class == CallGrowthClass::Ordinary) {
+        return stats.cumulative_call_ordinary_growth;
+    }
+    return stats.cumulative_call_recursive_growth;
+}
+
+std::uint64_t call_class_module_growth_budget(
+    const Stats &stats, CallGrowthClass growth_class) {
+    if (growth_class == CallGrowthClass::Specialization) {
+        return stats.call_specialization_module_growth_budget;
+    }
+    if (growth_class == CallGrowthClass::Ordinary) {
+        return stats.call_ordinary_module_growth_budget;
+    }
+    return stats.call_recursive_module_growth_budget;
+}
+
+std::uint64_t call_class_root_growth_budget(
+    const Stats &stats, CallGrowthClass growth_class) {
+    if (growth_class == CallGrowthClass::Specialization) {
+        return stats.call_specialization_root_growth_budget;
+    }
+    if (growth_class == CallGrowthClass::Ordinary) {
+        return stats.call_ordinary_root_growth_budget;
+    }
+    return stats.call_recursive_root_growth_budget;
+}
+
+const std::unordered_map<oir::FunctionID, std::uint64_t> &
+call_class_root_growth(const Stats &stats, CallGrowthClass growth_class) {
+    if (growth_class == CallGrowthClass::Specialization) {
+        return stats.call_specialization_root_growth;
+    }
+    if (growth_class == CallGrowthClass::Ordinary) {
+        return stats.call_ordinary_root_growth;
+    }
+    return stats.call_recursive_root_growth;
+}
+
+std::unordered_map<oir::FunctionID, std::uint64_t> &
+call_class_root_growth(Stats &stats, CallGrowthClass growth_class) {
+    return const_cast<std::unordered_map<oir::FunctionID, std::uint64_t> &>(
+        call_class_root_growth(static_cast<const Stats &>(stats), growth_class));
+}
+
+struct CallGrowthBudgetFit {
+    bool class_module = true;
+    bool class_root = true;
+    bool total_module = true;
+    bool total_root = true;
+
+    bool fits() const {
+        return class_module && class_root && total_module && total_root;
+    }
+};
+
+bool call_growth_amount_fits(std::uint64_t committed,
+                             std::uint64_t added,
+                             std::uint64_t budget) {
+    return added <= budget - std::min(committed, budget);
+}
+
+CallGrowthBudgetFit call_growth_budget_fit(
+    const Stats &stats, CallGrowthClass growth_class,
+    std::uint64_t added_growth,
+    const std::unordered_map<oir::FunctionID, std::uint64_t> &added_roots) {
+    CallGrowthBudgetFit fit;
+    fit.class_module = call_growth_amount_fits(
+        call_class_cumulative_growth(stats, growth_class), added_growth,
+        call_class_module_growth_budget(stats, growth_class));
+    fit.total_module = call_growth_amount_fits(
+        stats.cumulative_call_growth, added_growth,
+        stats.call_module_growth_budget);
+    const auto &class_roots =
+        call_class_root_growth(stats, growth_class);
+    for (const auto &[root, growth] : added_roots) {
+        const auto class_position = class_roots.find(root);
+        const auto class_committed =
+            class_position == class_roots.end() ? 0 : class_position->second;
+        const auto total_position = stats.call_root_growth.find(root);
+        const auto total_committed =
+            total_position == stats.call_root_growth.end()
+                ? 0
+                : total_position->second;
+        fit.class_root &= call_growth_amount_fits(
+            class_committed, growth,
+            call_class_root_growth_budget(stats, growth_class));
+        fit.total_root &= call_growth_amount_fits(
+            total_committed, growth, stats.call_root_growth_budget);
+    }
+    return fit;
+}
+
+CallGrowthBudgetFit call_growth_budget_fit(
+    const Stats &stats, CallGrowthClass growth_class,
+    oir::FunctionID root, std::uint64_t growth) {
+    const std::unordered_map<oir::FunctionID, std::uint64_t> roots{
+        {root, growth}};
+    return call_growth_budget_fit(stats, growth_class, growth, roots);
+}
+
+void append_call_growth_budget_summary(
+    std::string &summary, CallGrowthClass growth_class,
+    const CallGrowthBudgetFit &fit) {
+    if (!fit.class_module || !fit.class_root) {
+        summary += "; ";
+        summary += call_growth_class_name(growth_class);
+        summary += " class module/root growth quota exhausted";
+    }
+    if (!fit.total_module || !fit.total_root) {
+        summary += "; total call module/root growth hard cap exhausted";
+    }
+}
+
+struct CallGrowthReservation {
+    std::vector<oir::FunctionID> total_roots;
+    std::vector<oir::FunctionID> class_roots;
+};
+
+bool reserve_call_growth_entries(
+    Stats &stats, CallGrowthClass growth_class,
+    const std::vector<oir::FunctionID> &roots,
+    CallGrowthReservation &reservation) {
+    if (!reserve_growth_entries(stats.call_root_growth, roots,
+                                reservation.total_roots)) {
+        return false;
+    }
+    if (!reserve_growth_entries(
+            call_class_root_growth(stats, growth_class), roots,
+            reservation.class_roots)) {
+        erase_reserved_growth_entries(stats.call_root_growth,
+                                      reservation.total_roots);
+        return false;
+    }
+    return true;
+}
+
+void erase_reserved_call_growth_entries(
+    Stats &stats, CallGrowthClass growth_class,
+    const CallGrowthReservation &reservation) {
+    erase_reserved_growth_entries(stats.call_root_growth,
+                                  reservation.total_roots);
+    erase_reserved_growth_entries(
+        call_class_root_growth(stats, growth_class),
+        reservation.class_roots);
+}
+
+void commit_call_growth(
+    Stats &stats, CallGrowthClass growth_class,
+    std::uint64_t growth,
+    const std::unordered_map<oir::FunctionID, std::uint64_t> &root_growth) {
+    stats.cumulative_call_growth =
+        saturating_u64_add(stats.cumulative_call_growth, growth);
+    auto *class_cumulative =
+        growth_class == CallGrowthClass::Specialization
+            ? &stats.cumulative_call_specialization_growth
+            : (growth_class == CallGrowthClass::Ordinary
+                   ? &stats.cumulative_call_ordinary_growth
+                   : &stats.cumulative_call_recursive_growth);
+    *class_cumulative = saturating_u64_add(*class_cumulative, growth);
+    auto &class_roots = call_class_root_growth(stats, growth_class);
+    for (const auto &[root, added] : root_growth) {
+        stats.call_root_growth.at(root) = saturating_u64_add(
+            stats.call_root_growth.at(root), added);
+        class_roots.at(root) =
+            saturating_u64_add(class_roots.at(root), added);
+    }
+}
+
+void commit_call_growth(Stats &stats, CallGrowthClass growth_class,
+                        oir::FunctionID root, std::uint64_t growth) {
+    const std::unordered_map<oir::FunctionID, std::uint64_t> roots{
+        {root, growth}};
+    commit_call_growth(stats, growth_class, growth, roots);
+}
+
 void initialize_call_growth_budget(
     const oir::Module &module, Stats &stats,
     const pass::cost_model::CostModelPolicy &policy) {
     if (stats.call_growth_budget_initialized) {
         return;
     }
-    std::uint64_t initial_module_instructions = 0;
+    std::uint64_t initial_module_growth = 0;
     std::uint64_t initial_loads = 0;
     std::uint64_t initial_stores = 0;
     for (const auto &function : module.functions()) {
@@ -596,25 +797,60 @@ void initialize_call_growth_budget(
         }
         if (!function->is_external()) {
             const auto info = inspect_callee(*function);
-            initial_module_instructions = saturating_u64_add(
-                initial_module_instructions, info.static_instrs);
+            initial_module_growth = saturating_u64_add(
+                initial_module_growth, cloned_instruction_growth(info));
             initial_loads = saturating_u64_add(initial_loads, info.loads);
             initial_stores = saturating_u64_add(initial_stores, info.stores);
         }
     }
-    const auto policy_growth = static_cast<std::uint64_t>(
-        std::max<std::int64_t>(1, policy.max_function_code_growth));
+    const auto allowance = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, policy.small_code_growth_allowance));
     const auto growth_percent = static_cast<std::uint64_t>(
-        std::max<std::int64_t>(1, policy.max_module_code_growth_percent));
-    stats.call_module_growth_budget = std::max(
-        saturating_u64_multiply(policy_growth, 8),
-        saturating_u64_multiply(initial_module_instructions, growth_percent) / 100);
-    stats.call_root_growth_budget = std::max(
-        saturating_u64_multiply(recursive_inline_growth_budget(policy), 2),
-        saturating_u64_multiply(policy_growth, 8));
-    const auto pressure_scale = saturating_u64_multiply(policy_growth, 16);
+        std::max<std::int64_t>(0, policy.max_module_code_growth_percent));
+    const auto function_growth = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, policy.max_function_code_growth));
+    const __uint128_t percent_product =
+        static_cast<__uint128_t>(initial_module_growth) * growth_percent;
+    const __uint128_t rounded_percent =
+        (percent_product + static_cast<__uint128_t>(99)) / 100;
+    const auto percent_budget = static_cast<std::uint64_t>(
+        std::min<__uint128_t>(rounded_percent,
+                              std::numeric_limits<std::uint64_t>::max()));
+    const auto module_growth = std::max(allowance, percent_budget);
+    const auto root_growth = std::max(allowance, function_growth);
+    const auto recursive_growth = static_cast<std::uint64_t>(
+        recursive_inline_growth_budget(policy));
+    stats.call_specialization_module_growth_budget = module_growth;
+    stats.call_specialization_root_growth_budget = root_growth;
+    stats.call_ordinary_module_growth_budget = module_growth;
+    stats.call_ordinary_root_growth_budget = root_growth;
+    stats.call_recursive_module_growth_budget = recursive_growth;
+    stats.call_recursive_root_growth_budget = recursive_growth;
+    stats.call_module_growth_budget = saturating_u64_add(
+        saturating_u64_add(module_growth, module_growth), recursive_growth);
+    stats.call_root_growth_budget = saturating_u64_add(
+        saturating_u64_add(root_growth, root_growth), recursive_growth);
+    if (const auto *forced_budget =
+            std::getenv("YOOLANG_TEST_OIR_CALL_GROWTH_BUDGET")) {
+        char *end = nullptr;
+        const auto parsed = std::strtoull(forced_budget, &end, 10);
+        if (end != forced_budget && end != nullptr && *end == '\0') {
+            stats.call_specialization_module_growth_budget = parsed;
+            stats.call_specialization_root_growth_budget = parsed;
+            stats.call_ordinary_module_growth_budget = parsed;
+            stats.call_ordinary_root_growth_budget = parsed;
+            stats.call_recursive_module_growth_budget = parsed;
+            stats.call_recursive_root_growth_budget = parsed;
+            const auto total_budget = saturating_u64_add(
+                saturating_u64_add(parsed, parsed), parsed);
+            stats.call_module_growth_budget = total_budget;
+            stats.call_root_growth_budget = total_budget;
+        }
+    }
+    const auto pressure_scale =
+        saturating_u64_multiply(function_growth, 16);
     stats.call_pressure_budget.live_pointers =
-        std::max<std::uint64_t>(32, saturating_u64_multiply(policy_growth, 2));
+        std::max<std::uint64_t>(32, saturating_u64_multiply(function_growth, 2));
     stats.call_pressure_budget.alias_uncertainty =
         std::max<std::uint64_t>(64, pressure_scale);
     stats.call_pressure_budget.loads =
@@ -629,12 +865,108 @@ void initialize_call_growth_budget(
     stats.call_pressure_budget.register_pressure =
         saturating_u64_multiply(pressure_scale, 2);
     stats.call_pressure_budget.spill_proxy =
-        std::max<std::uint64_t>(32, saturating_u64_multiply(policy_growth, 4));
+        std::max<std::uint64_t>(32, saturating_u64_multiply(function_growth, 4));
     stats.call_growth_budget_initialized = true;
 }
 
-unsigned cloned_instruction_growth(const CalleeInfo &info) {
-    return info.static_instrs + info.branches + info.phis + (info.returns > 1 ? 1 : 0);
+void initialize_call_specialization_work_budget(
+    Stats &stats, const pass::cost_model::CostModelPolicy &policy) {
+    if (stats.call_specialization_work_initialized) {
+        return;
+    }
+    stats.call_specialization_attempt_budget =
+        kSpecializationAttemptBudget;
+    stats.call_specialization_work_budget = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, policy.max_compile_time_growth));
+    if (residual_test_failure_is("work-budget")) {
+        stats.call_specialization_work_budget = 1;
+    }
+    stats.call_specialization_work_initialized = true;
+}
+
+bool specialization_work_has_capacity(const Stats &stats,
+                                      std::uint64_t attempts,
+                                      std::uint64_t work_units) {
+    if (stats.call_specialization_work_exhausted) {
+        return false;
+    }
+    const auto remaining_attempts =
+        stats.call_specialization_attempt_budget -
+        std::min(stats.call_specialization_attempts,
+                 stats.call_specialization_attempt_budget);
+    const auto remaining_work =
+        stats.call_specialization_work_budget -
+        std::min(stats.call_specialization_work_units,
+                 stats.call_specialization_work_budget);
+    return attempts <= remaining_attempts && work_units <= remaining_work;
+}
+
+bool require_specialization_work_capacity(
+    Stats &stats, std::uint64_t attempts, std::uint64_t work_units,
+    const std::string &proof_rule_id, const std::string &summary) {
+    if (specialization_work_has_capacity(stats, attempts, work_units)) {
+        return true;
+    }
+    if (stats.call_specialization_work_exhausted) {
+        return false;
+    }
+    stats.call_specialization_work_exhausted = true;
+    OIRTransformCostEstimate rejected;
+    rejected.kind =
+        pass::cost_model::TransformKind::ConstantArgumentSpecialization;
+    rejected.pass_name = "OIRInlinePass";
+    rejected.candidate_id =
+        "specialize.work." +
+        std::to_string(++stats.cost_model_candidates);
+    rejected.scope = "specialization-work-budget";
+    rejected.proof_kind = pass::cost_model::ProofKind::Structural;
+    rejected.proof_status = pass::cost_model::ProofStatus::Proven;
+    rejected.proof_rule_id = proof_rule_id;
+    rejected.proof_summary = summary;
+    rejected.confidence = 1.0;
+    rejected.risk.compile_time_growth = static_cast<std::int64_t>(
+        std::min<std::uint64_t>(work_units,
+                                std::numeric_limits<std::int64_t>::max()));
+    rejected.forced_reject_reason =
+        pass::cost_model::RejectReason::CompileTimeTooHigh;
+    (void)cost_model_allows_transform(stats, rejected);
+    return false;
+}
+
+void consume_specialization_work(Stats &stats, std::uint64_t attempts,
+                                 std::uint64_t work_units) {
+    stats.call_specialization_attempts = saturating_u64_add(
+        stats.call_specialization_attempts, attempts);
+    stats.call_specialization_work_units = saturating_u64_add(
+        stats.call_specialization_work_units, work_units);
+}
+
+std::uint64_t specialization_scratch_base(const CalleeInfo &original) {
+    return std::max<std::uint64_t>(1, original.cost);
+}
+
+std::uint64_t specialization_scratch_reservation(
+    const CalleeInfo &original) {
+    return saturating_u64_multiply(
+        specialization_scratch_base(original),
+        1 + static_cast<std::uint64_t>(kMaxScratchCleanupRounds));
+}
+
+std::uint64_t specialization_plan_work_units(const CalleeInfo &residual) {
+    return std::max<std::uint64_t>(1,
+                                   cloned_instruction_growth(residual));
+}
+
+bool charge_specialization_plan_work(
+    Stats &stats, const CalleeInfo &residual,
+    const std::string &proof_rule_id, const std::string &summary) {
+    const auto work_units = specialization_plan_work_units(residual);
+    if (!require_specialization_work_capacity(
+            stats, 0, work_units, proof_rule_id, summary)) {
+        return false;
+    }
+    consume_specialization_work(stats, 0, work_units);
+    return true;
 }
 
 unsigned recursive_pressure_growth(const oir::CallInst &call, const CalleeInfo &info,
@@ -789,6 +1121,7 @@ std::string structural_hash_text(const std::string &text);
 struct CanonicalFunctionColors {
     std::unordered_map<const oir::BasicBlock *, std::string> blocks;
     std::unordered_map<const oir::Instruction *, std::string> instructions;
+    std::unordered_map<const oir::CallInst *, std::size_t> call_occurrences;
 };
 
 struct StructuralKeyCache {
@@ -955,6 +1288,21 @@ CanonicalFunctionColors refine_canonical_function_colors(
         }
         colors = std::move(next);
     }
+    for (auto *block : blocks) {
+        std::unordered_map<std::string, std::size_t> occurrences;
+        // A block's instruction sequence is semantic program order, unlike module,
+        // block-list, or successor-container insertion order.  Rank only calls in
+        // the same refined-color class so equivalent positions in symmetric blocks
+        // remain a tie while repeated calls at distinct positions do not collapse.
+        for (const auto &instruction : block->instructions()) {
+            auto *call = dynamic_cast<const oir::CallInst *>(instruction.get());
+            if (call == nullptr) {
+                continue;
+            }
+            const auto &color = colors.instructions.at(call);
+            colors.call_occurrences.emplace(call, occurrences[color]++);
+        }
+    }
     return colors;
 }
 
@@ -1021,7 +1369,8 @@ std::string canonical_callsite_position(const oir::Function &function,
     }
     auto value_position = [&](const oir::Value *value) {
         if (auto *argument = dynamic_cast<const oir::Argument *>(value)) {
-            return std::string("A:") + argument->type()->print();
+            return std::string("A:") + std::to_string(argument->index()) + ':' +
+                   argument->type()->print();
         }
         if (auto *block = dynamic_cast<const oir::BasicBlock *>(value)) {
             return std::string("B:") + orbit_colors->blocks.at(block);
@@ -1034,8 +1383,11 @@ std::string canonical_callsite_position(const oir::Function &function,
         }
         return structural_value_leaf(value);
     };
+    const auto &call_color = orbit_colors->instructions.at(&call);
     std::ostringstream position;
     position << "block=" << orbit_colors->blocks.at(call.parent())
+             << ":instruction=" << call_color
+             << ":occurrence=" << orbit_colors->call_occurrences.at(&call)
              << ":callee=" << value_position(call.callee());
     for (auto *argument : call.args()) {
         position << ":arg=" << value_position(argument);
@@ -2452,11 +2804,12 @@ OIRTransformCostEstimate measured_residual_estimate(
         0, static_cast<std::int64_t>(original.branches) - residual.branches);
     const auto eliminated_calls = std::max<std::int64_t>(
         0, static_cast<std::int64_t>(original.calls) - residual.calls);
-    estimate.risk.code_growth =
-        direct_residual
-            ? std::max<std::int64_t>(
-                  0, (estimate.after_code_bytes - estimate.before_code_bytes) / 16)
-            : 0;
+    estimate.risk.code_growth = direct_residual
+                                    ? static_cast<std::int64_t>(
+                                          std::min<std::uint64_t>(
+                                              cloned_instruction_growth(residual),
+                                              std::numeric_limits<std::int64_t>::max()))
+                                    : 0;
     estimate.risk.register_pressure_growth =
         direct_residual
             ? static_cast<std::int64_t>((residual.loads + residual.stores) / 6)
@@ -2492,13 +2845,10 @@ OIRTransformCostEstimate measured_residual_estimate(
             ? dynamic_savings * caller_multiplier
             : max_savings);
 
-    const auto committed_growth = static_cast<std::uint64_t>(
-        residual.static_instrs + residual.blocks + residual.phis);
-    const auto root_growth_it =
-        stats.call_root_growth.find(callee.root_function_id());
-    const auto committed_root_growth =
-        root_growth_it == stats.call_root_growth.end() ? 0
-                                                       : root_growth_it->second;
+    const auto committed_growth = cloned_instruction_growth(residual);
+    const auto growth_fit = call_growth_budget_fit(
+        stats, CallGrowthClass::Specialization,
+        callee.root_function_id(), committed_growth);
     const auto committed_pressure =
         estimate_call_pressure(residual, call, &mask);
     estimate.risk.live_range_growth = static_cast<std::int64_t>(
@@ -2510,20 +2860,12 @@ OIRTransformCostEstimate measured_residual_estimate(
     const auto pressure_reject = pressure_reject_reason(
         stats.cumulative_call_pressure, committed_pressure,
         stats.call_pressure_budget);
-    const bool cumulative_budget_exhausted =
-        committed_growth >
-            stats.call_module_growth_budget -
-                std::min(stats.cumulative_call_growth,
-                         stats.call_module_growth_budget) ||
-        committed_growth >
-            stats.call_root_growth_budget -
-                std::min(committed_root_growth,
-                         stats.call_root_growth_budget);
-    if (cumulative_budget_exhausted) {
+    if (!growth_fit.fits()) {
         estimate.forced_reject_reason =
             pass::cost_model::RejectReason::CumulativeBudgetExhausted;
-        estimate.proof_summary +=
-            "; cumulative module/root growth budget exhausted";
+        append_call_growth_budget_summary(
+            estimate.proof_summary, CallGrowthClass::Specialization,
+            growth_fit);
     }
     if (pressure_reject != pass::cost_model::RejectReason::None) {
         estimate.forced_reject_reason = pressure_reject;
@@ -2892,7 +3234,6 @@ ScratchResidual build_detached_constant_residual(oir::Module &live, oir::Functio
         return result;
     }
     Stats scratch_stats;
-    constexpr unsigned kMaxScratchCleanupRounds = 8;
     bool converged = false;
     for (unsigned round = 0; round < kMaxScratchCleanupRounds; ++round) {
         bool changed = false;
@@ -2938,6 +3279,32 @@ ScratchResidual build_detached_constant_residual(oir::Module &live, oir::Functio
         }
     }
     result.status = ScratchResidualStatus::Success;
+    return result;
+}
+
+ScratchResidual build_charged_detached_constant_residual(
+    oir::Module &live, oir::Function &callee, const oir::CallInst &call,
+    const SpecializationMask &mask, ReturnDemandMask return_demand,
+    const CalleeInfo &original, Stats &stats,
+    const std::string &proof_rule_id) {
+    const auto reserved_work =
+        specialization_scratch_reservation(original);
+    if (!require_specialization_work_capacity(
+            stats, 1, reserved_work, proof_rule_id,
+            "detached residual scratch build would exceed the persistent specialization work budget")) {
+        ScratchResidual rejected;
+        rejected.detail = "specialization work budget exhausted before scratch build";
+        return rejected;
+    }
+    consume_specialization_work(stats, 1, reserved_work);
+    auto result = build_detached_constant_residual(
+        live, callee, call, mask, return_demand);
+    const auto actual_work = saturating_u64_multiply(
+        specialization_scratch_base(original),
+        1 + static_cast<std::uint64_t>(result.cleanup_rounds));
+    const auto refund = reserved_work - std::min(reserved_work, actual_work);
+    stats.call_specialization_work_units -=
+        std::min(stats.call_specialization_work_units, refund);
     return result;
 }
 
@@ -3354,6 +3721,28 @@ void record_inline_transaction_rejection(Stats &stats,
     (void)cost_model_allows_transform(stats, rejected);
 }
 
+void merge_call_specialization_work_ledger(Stats &live,
+                                           const Stats &staged) noexcept {
+    if (!staged.call_specialization_work_initialized) {
+        return;
+    }
+    if (!live.call_specialization_work_initialized) {
+        live.call_specialization_attempt_budget =
+            staged.call_specialization_attempt_budget;
+        live.call_specialization_work_budget =
+            staged.call_specialization_work_budget;
+    }
+    live.call_specialization_work_initialized = true;
+    live.call_specialization_work_exhausted |=
+        staged.call_specialization_work_exhausted;
+    live.call_specialization_attempts = std::max(
+        live.call_specialization_attempts,
+        staged.call_specialization_attempts);
+    live.call_specialization_work_units = std::max(
+        live.call_specialization_work_units,
+        staged.call_specialization_work_units);
+}
+
 template <typename Transform>
 bool run_transactional_inline_transform(oir::Module &module, Stats &stats,
                                         const std::string &scope,
@@ -3394,6 +3783,7 @@ bool run_transactional_inline_transform(oir::Module &module, Stats &stats,
                     "failed to restore unchanged staged OIR inline transaction");
             }
         } else if (!publish_staged_inline_module(module, state)) {
+            merge_call_specialization_work_ledger(stats, staged_stats);
             record_inline_transaction_rejection(
                 stats, scope,
                 "live publication verification failed; complete inline snapshot restored");
@@ -3406,6 +3796,7 @@ bool run_transactional_inline_transform(oir::Module &module, Stats &stats,
         stats = std::move(staged_stats);
         return changed;
     } catch (const std::exception &error) {
+        merge_call_specialization_work_ledger(stats, staged_stats);
         if (installed && !state.originals.functions.empty()) {
             if (!restore_original_inline_module(module, state)) {
                 throw;
@@ -3414,6 +3805,7 @@ bool run_transactional_inline_transform(oir::Module &module, Stats &stats,
         record_inline_transaction_rejection(stats, scope, error.what());
         return false;
     } catch (...) {
+        merge_call_specialization_work_ledger(stats, staged_stats);
         if (installed && !state.originals.functions.empty()) {
             if (!restore_original_inline_module(module, state)) {
                 throw;
@@ -4697,6 +5089,14 @@ struct InlineCommitStatsSnapshot {
     bool cleanup_budget_exhausted = false;
     std::uint64_t cumulative_growth = 0;
     std::unordered_map<oir::FunctionID, std::uint64_t> root_growth;
+    std::uint64_t specialization_growth = 0;
+    std::unordered_map<oir::FunctionID, std::uint64_t>
+        specialization_root_growth;
+    std::uint64_t ordinary_growth = 0;
+    std::unordered_map<oir::FunctionID, std::uint64_t> ordinary_root_growth;
+    std::uint64_t recursive_growth = 0;
+    std::unordered_map<oir::FunctionID, std::uint64_t>
+        recursive_root_growth;
     std::unordered_map<oir::FunctionID, unsigned> root_specializations;
     CallPressureVector pressure;
 };
@@ -4707,6 +5107,12 @@ InlineCommitStatsSnapshot capture_inline_commit_stats(const Stats &stats) {
             stats.call_cleanup_budget_exhausted,
             stats.cumulative_call_growth,
             stats.call_root_growth,
+            stats.cumulative_call_specialization_growth,
+            stats.call_specialization_root_growth,
+            stats.cumulative_call_ordinary_growth,
+            stats.call_ordinary_root_growth,
+            stats.cumulative_call_recursive_growth,
+            stats.call_recursive_root_growth,
             stats.call_root_specializations,
             stats.cumulative_call_pressure};
 }
@@ -4730,13 +5136,26 @@ bool inline_commit_stats_match(const Stats &stats,
                snapshot.cleanup_budget_exhausted &&
            stats.cumulative_call_growth == snapshot.cumulative_growth &&
            stats.call_root_growth == snapshot.root_growth &&
+           stats.cumulative_call_specialization_growth ==
+               snapshot.specialization_growth &&
+           stats.call_specialization_root_growth ==
+               snapshot.specialization_root_growth &&
+           stats.cumulative_call_ordinary_growth ==
+               snapshot.ordinary_growth &&
+           stats.call_ordinary_root_growth ==
+               snapshot.ordinary_root_growth &&
+           stats.cumulative_call_recursive_growth ==
+               snapshot.recursive_growth &&
+           stats.call_recursive_root_growth ==
+               snapshot.recursive_root_growth &&
            stats.call_root_specializations == snapshot.root_specializations &&
            call_pressure_equal(stats.cumulative_call_pressure,
                                snapshot.pressure);
 }
 
 bool inline_detached_residual_batch(oir::Module &module, InlineContext &context,
-                                    const std::vector<DetachedInlineRequest> &requests) {
+                                    const std::vector<DetachedInlineRequest> &requests,
+                                    Stats *specialization_work_stats = nullptr) {
     if (requests.empty()) {
         return false;
     }
@@ -4811,6 +5230,14 @@ bool inline_detached_residual_batch(oir::Module &module, InlineContext &context,
                     return instruction.get() == request.call;
                 });
             if (call_it == request.block->instructions().end()) {
+                return false;
+            }
+            if (specialization_work_stats != nullptr &&
+                !charge_specialization_plan_work(
+                    *specialization_work_stats,
+                    inspect_callee(*request.scratch->function),
+                    "specialization.detached-inline-plan",
+                    "detached inline plan would exceed the persistent specialization work budget")) {
                 return false;
             }
             auto plan = build_detached_inline_plan(
@@ -4976,14 +5403,16 @@ bool inline_detached_residual(
     oir::BasicBlock *block,
     std::list<std::unique_ptr<oir::Instruction>>::iterator call_it,
     const ScratchResidual &scratch, const SpecializationMask &mask,
-    ReturnDemandMask return_demand, unsigned inline_index) {
+    ReturnDemandMask return_demand, unsigned inline_index,
+    Stats *specialization_work_stats = nullptr) {
     auto *call = dynamic_cast<oir::CallInst *>(call_it->get());
     if (call == nullptr) {
         return false;
     }
     return inline_detached_residual_batch(
         module, context,
-        {{&caller, block, call, &scratch, &mask, return_demand, inline_index}});
+        {{&caller, block, call, &scratch, &mask, return_demand, inline_index}},
+        specialization_work_stats);
 }
 
 bool inline_call(oir::Module &module, InlineContext &context, oir::Function &caller,
@@ -5070,24 +5499,20 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     estimate.risk.cleanup_dependency = 1;
     const auto committed_growth = static_cast<std::uint64_t>(cloned_instruction_growth(info));
     const auto root_id = clone_source->root_function_id();
-    const auto root_growth_position = context.root_growth.find(root_id);
-    const auto root_growth = root_growth_position == context.root_growth.end()
-                                 ? 0
-                                 : root_growth_position->second;
+    const auto growth_class = self_recursive ? CallGrowthClass::Recursive
+                                             : CallGrowthClass::Ordinary;
+    const auto growth_fit = call_growth_budget_fit(
+        stats, growth_class, root_id, committed_growth);
     const auto committed_pressure = estimate_call_pressure(info, *call);
     const auto pressure_reject = pressure_reject_reason(
         stats.cumulative_call_pressure, committed_pressure,
         stats.call_pressure_budget);
-    const bool cumulative_budget_exhausted =
-        committed_growth > context.module_growth_budget -
-                               std::min(context.cumulative_growth,
-                                        context.module_growth_budget) ||
-        committed_growth >
-            context.root_growth_budget - std::min(root_growth, context.root_growth_budget);
+    const bool cumulative_budget_exhausted = !growth_fit.fits();
     if (cumulative_budget_exhausted) {
         estimate.forced_reject_reason =
             pass::cost_model::RejectReason::CumulativeBudgetExhausted;
-        estimate.proof_summary += "; cumulative module/root growth budget exhausted";
+        append_call_growth_budget_summary(estimate.proof_summary, growth_class,
+                                          growth_fit);
     }
     if (pressure_reject != pass::cost_model::RejectReason::None) {
         estimate.forced_reject_reason = pressure_reject;
@@ -5101,15 +5526,10 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     if (dry_run) {
         return true;
     }
-    std::vector<oir::FunctionID> inserted_context_roots;
-    std::vector<oir::FunctionID> inserted_stats_roots;
+    CallGrowthReservation growth_reservation;
     const std::vector<oir::FunctionID> roots{root_id};
-    if (!reserve_growth_entries(context.root_growth, roots,
-                                inserted_context_roots) ||
-        !reserve_growth_entries(stats.call_root_growth, roots,
-                                inserted_stats_roots)) {
-        erase_reserved_growth_entries(context.root_growth,
-                                      inserted_context_roots);
+    if (!reserve_call_growth_entries(stats, growth_class, roots,
+                                     growth_reservation)) {
         return false;
     }
     auto affected_scc = collect_caller_scc(module, caller);
@@ -5164,12 +5584,7 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     }
     (*call_it)->drop_all_operands();
     block->instructions().erase(call_it);
-    context.cumulative_growth =
-        saturating_u64_add(context.cumulative_growth, committed_growth);
-    context.root_growth.at(root_id) =
-        saturating_u64_add(root_growth, committed_growth);
-    stats.cumulative_call_growth = context.cumulative_growth;
-    stats.call_root_growth.at(root_id) = context.root_growth.at(root_id);
+    commit_call_growth(stats, growth_class, root_id, committed_growth);
     add_call_pressure(stats.cumulative_call_pressure, committed_pressure);
     mark_affected_functions(context, affected_scc);
     return true;
@@ -5245,15 +5660,26 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
         oir::Function *caller = nullptr;
         oir::Function *callee = nullptr;
         oir::CallInst *call = nullptr;
-        std::string key;
-        std::string reuse_key;
+        // The decision key includes canonical intra-function position.  It is
+        // the only key allowed to define an atomic direct-inline tie.
+        std::string decision_key;
+        // The reuse-group key deliberately omits callsite position.  It is only
+        // a deterministic coarse bucket; actual callee/root identity is checked
+        // again before members may share a persistent residual.
+        std::string reuse_group_key;
+        std::string binding_key;
         SpecializationMask mask;
+        ReturnDemandMask return_demand = ReturnDemandMask::Scalar;
     };
 
     std::vector<Site> sites;
     StructuralKeyCache structural_keys;
     const auto policy = pass::cost_model::policy_for_kind(stats.cost_model_policy);
     initialize_call_growth_budget(module, stats, policy);
+    initialize_call_specialization_work_budget(stats, policy);
+    if (stats.call_specialization_work_exhausted) {
+        return false;
+    }
     for (auto &function : module.functions()) {
         if (function->is_external()) {
             continue;
@@ -5278,12 +5704,31 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                                                              existing_for_callee, mask)) {
                     continue;
                 }
-                auto reuse_key = specialization_key(*call, mask);
-                sites.push_back({function.get(), callee, call,
-                                 reuse_key + "|" +
-                                     structural_callsite_key(*function, *call, callee,
-                                                             &structural_keys),
-                                 std::move(reuse_key), std::move(mask)});
+                auto binding_key = specialization_key(*call, mask);
+                const auto return_demand =
+                    call->type()->is_void() || call->uses().empty()
+                        ? ReturnDemandMask::Dead
+                        : ReturnDemandMask::Scalar;
+                std::ostringstream reuse_group_key;
+                reuse_group_key
+                    << "callee="
+                    << canonical_function_shape(*callee, &structural_keys)
+                    << "|mask=";
+                for (const bool selected : mask) {
+                    reuse_group_key << (selected ? '1' : '0');
+                }
+                reuse_group_key
+                    << "|binding=" << binding_key << "|demand="
+                    << (return_demand == ReturnDemandMask::Dead ? "dead"
+                                                                : "scalar")
+                    << "|return=" << call->type()->print();
+                sites.push_back(
+                    {function.get(), callee, call,
+                     binding_key + "|" + structural_callsite_key(
+                                              *function, *call, callee,
+                                              &structural_keys),
+                     reuse_group_key.str(), std::move(binding_key),
+                     std::move(mask), return_demand});
             }
         }
     }
@@ -5292,7 +5737,7 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
         return false;
     }
     std::sort(sites.begin(), sites.end(), [](const Site &lhs, const Site &rhs) {
-        return lhs.key < rhs.key;
+        return lhs.decision_key < rhs.decision_key;
     });
 
     // Apply the compile-time cap only after canonical ordering, and never split an
@@ -5302,7 +5747,8 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
     while (capped_sites < sites.size()) {
         std::size_t batch_end = capped_sites + 1;
         while (batch_end < sites.size() &&
-               sites[batch_end].key == sites[capped_sites].key) {
+               sites[batch_end].decision_key ==
+                   sites[capped_sites].decision_key) {
             ++batch_end;
         }
         if (batch_end > kMaxSpecializedCallSites) {
@@ -5321,8 +5767,39 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
     unsigned direct_inline_index = stats.inlined;
     InlineContext direct_inline_context;
     std::unordered_set<std::string> rejected_pe_ties;
+    std::unordered_set<oir::CallInst *> attempted_persistent_reuse_calls;
+    auto current_return_demand = [](const oir::CallInst &call) {
+        return call.type()->is_void() || call.uses().empty()
+                   ? ReturnDemandMask::Dead
+                   : ReturnDemandMask::Scalar;
+    };
+    auto live_residual_signature = [](const ScratchResidual &scratch)
+        -> std::optional<std::string> {
+        if (scratch.function == nullptr) {
+            return std::nullopt;
+        }
+        const auto return_type =
+            scratch.live_types.find(scratch.function->return_type());
+        if (return_type == scratch.live_types.end() ||
+            return_type->second == nullptr) {
+            return std::nullopt;
+        }
+        std::ostringstream signature;
+        signature << return_type->second->print() << '(';
+        for (const auto &argument : scratch.function->args()) {
+            const auto live_type = scratch.live_types.find(argument->type());
+            if (live_type == scratch.live_types.end() ||
+                live_type->second == nullptr) {
+                return std::nullopt;
+            }
+            signature << live_type->second->print() << ';';
+        }
+        signature << ')';
+        return signature.str();
+    };
     for (auto &site : sites) {
-        if (rejected_pe_ties.find(site.key) != rejected_pe_ties.end()) {
+        if (rejected_pe_ties.find(site.decision_key) !=
+            rejected_pe_ties.end()) {
             continue;
         }
         if (site.call == nullptr || site.callee == nullptr ||
@@ -5349,6 +5826,491 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
             }
         };
 
+        // Persistent residual reuse is deliberately considered before the
+        // position-sensitive direct-tie path.  The string key is only a stable
+        // coarse bucket: pointer/root identity and every semantic condition are
+        // revalidated below.  Calls from different canonical positions may share
+        // one clone, but they can never become one atomic direct-inline batch.
+        if (attempted_persistent_reuse_calls.find(site.call) ==
+                attempted_persistent_reuse_calls.end() &&
+            site.return_demand == ReturnDemandMask::Scalar) {
+            std::vector<Site *> reuse_sites;
+            for (auto &candidate : sites) {
+                if (candidate.call == nullptr || candidate.callee == nullptr ||
+                    candidate.reuse_group_key != site.reuse_group_key ||
+                    dynamic_cast<oir::Function *>(candidate.call->callee()) !=
+                        candidate.callee ||
+                    candidate.callee != site.callee ||
+                    candidate.callee->root_function_id() !=
+                        site.callee->root_function_id() ||
+                    candidate.mask != site.mask ||
+                    candidate.return_demand != site.return_demand ||
+                    current_return_demand(*candidate.call) !=
+                        site.return_demand ||
+                    candidate.call->type() != site.call->type() ||
+                    !same_specialization_binding(
+                        *site.call, site.mask, *candidate.call,
+                        candidate.mask)) {
+                    continue;
+                }
+                reuse_sites.push_back(&candidate);
+            }
+            for (auto *candidate : reuse_sites) {
+                attempted_persistent_reuse_calls.insert(candidate->call);
+            }
+
+            if (reuse_sites.size() >= 2) {
+                std::uint64_t reuse_scratch_work = 0;
+                for (const auto *candidate : reuse_sites) {
+                    reuse_scratch_work = saturating_u64_add(
+                        reuse_scratch_work,
+                        specialization_scratch_reservation(
+                            inspect_callee(*candidate->callee)));
+                }
+                if (!require_specialization_work_capacity(
+                        stats,
+                        static_cast<std::uint64_t>(reuse_sites.size()),
+                        reuse_scratch_work,
+                        "reuse." +
+                            structural_hash_text(site.reuse_group_key),
+                        "persistent residual reuse group scratch builds would exceed the persistent specialization work budget")) {
+                    return false;
+                }
+                struct PersistentReuseMember {
+                    Site *site = nullptr;
+                    ScratchResidual scratch;
+                    CalleeInfo original_info;
+                    CalleeInfo residual_info;
+                    OIRTransformCostEstimate estimate;
+                    std::string residual_signature;
+                    std::uint64_t growth = 0;
+                    std::uint64_t savings = 0;
+                    CallPressureVector pressure;
+                    bool direct_candidate = false;
+                    bool direct_ready = false;
+                };
+                std::vector<PersistentReuseMember> reuse_members;
+                reuse_members.reserve(reuse_sites.size());
+                std::uint64_t aggregate_reuse_savings = 0;
+                CallPressureVector aggregate_reuse_pressure;
+                std::optional<std::string> expected_residual_signature;
+                bool persistent_preflight_ok = true;
+
+                for (auto *candidate : reuse_sites) {
+                    SpecializationMask revalidated_mask;
+                    const auto existing_for_candidate =
+                        existing_specialization_count(module,
+                                                      *candidate->callee);
+                    const auto candidate_demand =
+                        current_return_demand(*candidate->call);
+                    if (candidate->call->parent() == nullptr ||
+                        dynamic_cast<oir::Function *>(
+                            candidate->call->callee()) != candidate->callee ||
+                        candidate->callee != site.callee ||
+                        candidate->callee->root_function_id() !=
+                            site.callee->root_function_id() ||
+                        !is_eligible_for_constant_specialization(
+                            *candidate->caller, *candidate->call,
+                            candidate->callee, policy,
+                            existing_for_candidate, revalidated_mask) ||
+                        revalidated_mask != candidate->mask ||
+                        specialization_key(*candidate->call,
+                                           revalidated_mask) !=
+                            candidate->binding_key ||
+                        candidate->binding_key != site.binding_key ||
+                        candidate_demand != candidate->return_demand ||
+                        candidate_demand != ReturnDemandMask::Scalar ||
+                        candidate->call->type() != site.call->type() ||
+                        !same_specialization_binding(
+                            *site.call, site.mask, *candidate->call,
+                            revalidated_mask)) {
+                        persistent_preflight_ok = false;
+                        break;
+                    }
+
+                    const auto candidate_original =
+                        inspect_callee(*candidate->callee);
+                    auto candidate_scratch =
+                        build_charged_detached_constant_residual(
+                            module, *candidate->callee, *candidate->call,
+                            revalidated_mask, candidate_demand,
+                            candidate_original, stats,
+                            structural_callsite_fingerprint(
+                                candidate->decision_key));
+                    if (candidate_scratch.status !=
+                            ScratchResidualStatus::Success ||
+                        candidate_scratch.function == nullptr) {
+                        persistent_preflight_ok = false;
+                        break;
+                    }
+                    if (consume_residual_test_failure("typed-import")) {
+                        candidate_scratch.live_types.erase(
+                            candidate_scratch.function->return_type());
+                        candidate_scratch.detail =
+                            "test failpoint: missing detached TypeContext import mapping; live snapshot including function table unchanged";
+                    }
+                    const auto signature =
+                        live_residual_signature(candidate_scratch);
+                    if (!signature ||
+                        (expected_residual_signature &&
+                         *signature != *expected_residual_signature)) {
+                        persistent_preflight_ok = false;
+                        break;
+                    }
+                    if (!expected_residual_signature) {
+                        expected_residual_signature = *signature;
+                    }
+
+                    const auto candidate_residual =
+                        inspect_callee(*candidate_scratch.function);
+                    const bool candidate_reduced =
+                        candidate_residual.static_instrs <
+                            candidate_original.static_instrs ||
+                        candidate_residual.branches <
+                            candidate_original.branches ||
+                        candidate_residual.calls < candidate_original.calls ||
+                        candidate_scratch.fixed_point_suffix
+                                .eliminated_dynamic_instructions != 0;
+                    const bool candidate_commit_supported =
+                        detached_residual_commit_is_supported(
+                            candidate_scratch, *candidate->call,
+                            revalidated_mask, candidate_demand);
+                    const bool candidate_direct =
+                        !same_call_graph_scc(*candidate->caller,
+                                             *candidate->callee) &&
+                        candidate_reduced && candidate_commit_supported &&
+                        candidate_residual.blocks <=
+                            kMaxSpecializedInlineBlocks &&
+                        candidate_residual.cost <=
+                            static_cast<unsigned>(
+                                policy.max_inline_callee_cost * 3) &&
+                        candidate_residual.returns != 0 &&
+                        candidate_residual.returns <=
+                            kMaxSpecializedInlineReturns;
+                    if (!candidate_reduced || !candidate_commit_supported ||
+                        candidate->call->uses().empty()) {
+                        persistent_preflight_ok = false;
+                        break;
+                    }
+
+                    const auto growth =
+                        cloned_instruction_growth(candidate_residual);
+                    const auto eliminated_instrs =
+                        candidate_original.static_instrs >
+                                candidate_residual.static_instrs
+                            ? candidate_original.static_instrs -
+                                  candidate_residual.static_instrs
+                            : 0;
+                    const auto eliminated_branches =
+                        candidate_original.branches >
+                                candidate_residual.branches
+                            ? candidate_original.branches -
+                                  candidate_residual.branches
+                            : 0;
+                    const auto eliminated_phis =
+                        candidate_original.phis > candidate_residual.phis
+                            ? candidate_original.phis -
+                                  candidate_residual.phis
+                            : 0;
+                    const auto savings = saturating_u64_add(
+                        saturating_u64_add(eliminated_instrs,
+                                           eliminated_branches),
+                        saturating_u64_add(
+                            eliminated_phis,
+                            candidate_scratch.fixed_point_suffix
+                                .eliminated_dynamic_instructions));
+                    const auto pressure = estimate_call_pressure(
+                        candidate_residual, *candidate->call,
+                        &revalidated_mask);
+                    aggregate_reuse_savings = saturating_u64_add(
+                        aggregate_reuse_savings, savings);
+                    add_call_pressure(aggregate_reuse_pressure, pressure);
+                    reuse_members.push_back(
+                        {candidate, std::move(candidate_scratch),
+                         candidate_original, candidate_residual, {},
+                         *signature, growth, savings, pressure,
+                         candidate_direct, false});
+                }
+
+                if (persistent_preflight_ok &&
+                    reuse_members.size() == reuse_sites.size()) {
+                    std::uint64_t reuse_plan_work = 0;
+                    for (const auto &member : reuse_members) {
+                        reuse_plan_work = saturating_u64_add(
+                            reuse_plan_work,
+                            specialization_plan_work_units(
+                                member.residual_info));
+                    }
+                    if (!require_specialization_work_capacity(
+                            stats, 0, reuse_plan_work,
+                            "reuse." + structural_hash_text(
+                                           site.reuse_group_key),
+                            "persistent residual member plans would exceed the persistent specialization work budget")) {
+                        return false;
+                    }
+                    for (std::size_t index = 0;
+                         index < reuse_members.size(); ++index) {
+                        auto &member = reuse_members[index];
+                        if (!charge_specialization_plan_work(
+                                stats, member.residual_info,
+                                structural_callsite_fingerprint(
+                                    member.site->decision_key),
+                                "persistent residual member plan would exceed the persistent specialization work budget")) {
+                            return false;
+                        }
+                        const auto staged_direct =
+                            build_detached_inline_plan(
+                                module, *member.site->caller,
+                                *member.site->call, member.scratch,
+                                member.site->mask,
+                                member.site->return_demand,
+                                direct_inline_index +
+                                    static_cast<unsigned>(index) + 1);
+                        member.direct_ready =
+                            member.direct_candidate &&
+                            staged_direct.has_value();
+                    }
+                    for (auto &member : reuse_members) {
+                        member.estimate = measured_residual_estimate(
+                            *member.site->callee, *member.site->call,
+                            member.site->mask,
+                            member.site->return_demand, member.scratch,
+                            member.original_info, member.residual_info,
+                            is_directly_recursive(*member.site->callee),
+                            member.direct_ready, policy, stats,
+                            "specialize." + std::to_string(
+                                                ++stats.cost_model_candidates));
+                        member.estimate.scope =
+                            "measured-persistent-reuse-member";
+                        member.estimate.proof_rule_id =
+                            structural_callsite_fingerprint(
+                                member.site->decision_key);
+                        member.estimate.proof_summary =
+                            "independently revalidated and measured persistent-reuse member with fresh residual signature and charged direct-plan preflight";
+                        if (consume_residual_test_failure("cost-reject")) {
+                            member.estimate.forced_reject_reason =
+                                pass::cost_model::RejectReason::CodeGrowthTooHigh;
+                            member.estimate.proof_summary +=
+                                "; test failpoint cost rejection; live snapshot including function table unchanged";
+                        }
+                    }
+                }
+
+                const auto specialization_limit = static_cast<unsigned>(
+                    std::max<std::int64_t>(
+                        0, policy.max_specializations_per_function));
+                const auto persistent_growth =
+                    reuse_members.empty() ? 0 : reuse_members.front().growth;
+                const auto persistent_root =
+                    reuse_members.empty()
+                        ? oir::kInvalidFunctionID
+                        : reuse_members.front().site->callee->root_function_id();
+                const auto persistent_growth_fit = call_growth_budget_fit(
+                    stats, CallGrowthClass::Specialization,
+                    persistent_root, persistent_growth);
+                const auto persistent_specialization_it =
+                    stats.call_root_specializations.find(persistent_root);
+                const auto persistent_specializations =
+                    persistent_specialization_it ==
+                            stats.call_root_specializations.end()
+                        ? 0U
+                        : persistent_specialization_it->second;
+                const auto persistent_pressure_reject =
+                    pressure_reject_reason(
+                        stats.cumulative_call_pressure,
+                        aggregate_reuse_pressure,
+                        stats.call_pressure_budget);
+                const bool persistent_growth_fits =
+                    !residual_test_failure_is("tie-budget") &&
+                    persistent_growth_fit.fits();
+                const bool measured_persistent_reuse =
+                    persistent_preflight_ok &&
+                    reuse_members.size() == reuse_sites.size() &&
+                    reuse_members.size() >= 2 &&
+                    aggregate_reuse_savings >= persistent_growth &&
+                    persistent_growth_fits &&
+                    persistent_pressure_reject ==
+                        pass::cost_model::RejectReason::None &&
+                    persistent_specializations < specialization_limit &&
+                    existing_specialization_count(
+                        module, *reuse_members.front().site->callee) <
+                        std::min<unsigned>(kMaxSpecializedFunctions,
+                                           specialization_limit);
+
+                if (measured_persistent_reuse) {
+                    if (!require_specialization_work_capacity(
+                            stats, 0,
+                            specialization_plan_work_units(
+                                reuse_members.front().residual_info),
+                            "reuse." +
+                                structural_hash_text(site.reuse_group_key),
+                            "persistent residual import would exceed the persistent specialization work budget")) {
+                        return false;
+                    }
+                    const auto report_size_before_persistent =
+                        stats.cost_model_report == nullptr
+                            ? 0
+                            : stats.cost_model_report->decisions.size();
+                    bool every_member_profitable = true;
+                    auto member_reject_reason =
+                        pass::cost_model::RejectReason::None;
+                    for (auto &member : reuse_members) {
+                        if (!cost_model_allows_transform(stats,
+                                                         member.estimate)) {
+                            every_member_profitable = false;
+                            if (stats.cost_model_report != nullptr &&
+                                stats.cost_model_report->decisions.size() >
+                                    report_size_before_persistent) {
+                                member_reject_reason =
+                                    stats.cost_model_report->decisions.back()
+                                        .reject_reason;
+                            } else {
+                                member_reject_reason =
+                                    member.estimate.forced_reject_reason ==
+                                            pass::cost_model::RejectReason::None
+                                        ? pass::cost_model::RejectReason::NegativeGain
+                                        : member.estimate.forced_reject_reason;
+                            }
+                            break;
+                        }
+                    }
+
+                    auto persistent_estimate = reuse_members.front().estimate;
+                    persistent_estimate.candidate_id += ".reuse";
+                    persistent_estimate.scope =
+                        "measured-persistent-reuse";
+                    persistent_estimate.proof_rule_id =
+                        "reuse." + structural_hash_text(
+                                       site.reuse_group_key);
+                    persistent_estimate.proof_summary =
+                        "position-independent group independently revalidated; multi-call savings cover one persistent clone";
+                    persistent_estimate.dynamic_multiplier =
+                        std::max<std::int64_t>(
+                            persistent_estimate.dynamic_multiplier,
+                            static_cast<std::int64_t>(
+                                reuse_members.size()));
+                    fill_after_from_residual(
+                        persistent_estimate,
+                        reuse_members.front().residual_info, 1);
+                    persistent_estimate.after_code_bytes =
+                        persistent_estimate.before_code_bytes +
+                        static_cast<std::int64_t>(
+                            reuse_members.front().residual_info.static_instrs *
+                            4);
+                    persistent_estimate.risk.code_growth =
+                        static_cast<std::int64_t>(persistent_growth);
+                    persistent_estimate.partial_eval.cloned_functions = 1;
+                    persistent_estimate.partial_eval.cloned_blocks =
+                        reuse_members.front().residual_info.blocks;
+                    persistent_estimate.partial_eval.residual_instrs =
+                        reuse_members.front().residual_info.static_instrs;
+
+                    bool aggregate_profitable = false;
+                    auto aggregate_reject_reason =
+                        pass::cost_model::RejectReason::NegativeGain;
+                    if (every_member_profitable) {
+                        aggregate_profitable = cost_model_allows_transform(
+                            stats, persistent_estimate);
+                        if (!aggregate_profitable &&
+                            stats.cost_model_report != nullptr &&
+                            stats.cost_model_report->decisions.size() >
+                                report_size_before_persistent) {
+                            aggregate_reject_reason =
+                                stats.cost_model_report->decisions.back()
+                                    .reject_reason;
+                        }
+                    }
+                    if (every_member_profitable && aggregate_profitable) {
+                        const std::vector<oir::FunctionID> roots{
+                            persistent_root};
+                        CallGrowthReservation growth_reservation;
+                        const bool growth_slot_ready =
+                            reserve_call_growth_entries(
+                                stats, CallGrowthClass::Specialization,
+                                roots, growth_reservation);
+                        const bool import_work_ready =
+                            growth_slot_ready &&
+                            charge_specialization_plan_work(
+                                stats,
+                                reuse_members.front().residual_info,
+                                "reuse." + structural_hash_text(
+                                               site.reuse_group_key),
+                                "persistent residual import would exceed the persistent specialization work budget");
+                        if (growth_slot_ready && !import_work_ready) {
+                            erase_reserved_call_growth_entries(
+                                stats, CallGrowthClass::Specialization,
+                                growth_reservation);
+                            return false;
+                        }
+                        auto persistent =
+                            import_work_ready
+                                ? import_persistent_residual_clone(
+                                      module,
+                                      reuse_members.front().scratch,
+                                      *reuse_members.front().site->call,
+                                      reuse_members.front().site->mask,
+                                      *reuse_members.front().site->callee)
+                                : std::nullopt;
+                        std::vector<oir::CallInst *> reuse_calls;
+                        reuse_calls.reserve(reuse_members.size());
+                        for (const auto &member : reuse_members) {
+                            reuse_calls.push_back(member.site->call);
+                        }
+                        if (persistent &&
+                            retarget_calls_to_persistent_residual(
+                                module, *persistent, reuse_calls,
+                                reuse_members.front().site->mask)) {
+                            commit_call_growth(
+                                stats, CallGrowthClass::Specialization,
+                                persistent_root, persistent_growth);
+                            ++stats.call_root_specializations.at(
+                                persistent_root);
+                            add_call_pressure(
+                                stats.cumulative_call_pressure,
+                                aggregate_reuse_pressure);
+                            stats.specialized += static_cast<unsigned>(
+                                reuse_members.size());
+                            return true;
+                        }
+                        erase_reserved_call_growth_entries(
+                            stats, CallGrowthClass::Specialization,
+                            growth_reservation);
+                        if (stats.cost_model_report != nullptr &&
+                            stats.cost_model_report->decisions.size() >
+                                report_size_before_persistent) {
+                            stats.cost_model_report->decisions.resize(
+                                report_size_before_persistent);
+                        }
+                        persistent_estimate.forced_reject_reason =
+                            pass::cost_model::RejectReason::CommitPreflightFailed;
+                        persistent_estimate.proof_summary =
+                            "persistent residual commit failed; group snapshots restored before per-position fallback";
+                        (void)cost_model_allows_transform(
+                            stats, persistent_estimate);
+                        assert_test_rejection_snapshot();
+                    } else {
+                        if (stats.cost_model_report != nullptr &&
+                            stats.cost_model_report->decisions.size() >
+                                report_size_before_persistent) {
+                            stats.cost_model_report->decisions.resize(
+                                report_size_before_persistent);
+                        }
+                        persistent_estimate.forced_reject_reason =
+                            every_member_profitable
+                                ? aggregate_reject_reason
+                                : member_reject_reason;
+                        persistent_estimate.proof_summary =
+                            every_member_profitable
+                                ? "persistent reuse aggregate rejected before per-position fallback"
+                                : "persistent reuse member rejected before per-position fallback";
+                        (void)cost_model_allows_transform(
+                            stats, persistent_estimate);
+                        assert_test_rejection_snapshot();
+                    }
+                }
+            }
+        }
+
         const bool recursive_layer = is_directly_recursive(*site.callee);
         const auto constant_arg_count = count_specializable_constants(site.mask);
         const auto info = inspect_callee(*site.callee);
@@ -5356,15 +6318,40 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
             site.call->type()->is_void() || site.call->uses().empty()
                 ? ReturnDemandMask::Dead
                 : ReturnDemandMask::Scalar;
-        auto scratch = build_detached_constant_residual(module, *site.callee, *site.call,
-                                                        site.mask, return_demand);
+        std::unordered_set<oir::CallInst *> exact_tie_calls;
+        std::uint64_t exact_tie_scratch_work = 0;
+        for (auto &candidate : sites) {
+            if (candidate.decision_key == site.decision_key &&
+                candidate.call != nullptr &&
+                dynamic_cast<oir::Function *>(candidate.call->callee()) ==
+                    candidate.callee &&
+                exact_tie_calls.insert(candidate.call).second) {
+                exact_tie_scratch_work = saturating_u64_add(
+                    exact_tie_scratch_work,
+                    specialization_scratch_reservation(
+                        inspect_callee(*candidate.callee)));
+            }
+        }
+        const auto exact_tie_size = exact_tie_calls.size();
+        if (!require_specialization_work_capacity(
+                stats, static_cast<std::uint64_t>(exact_tie_size),
+                exact_tie_scratch_work,
+                structural_callsite_fingerprint(site.decision_key),
+                "direct residual tie scratch builds would exceed the persistent specialization work budget")) {
+            return false;
+        }
+        auto scratch = build_charged_detached_constant_residual(
+            module, *site.callee, *site.call, site.mask, return_demand,
+            info, stats,
+            structural_callsite_fingerprint(site.decision_key));
         OIRTransformCostEstimate estimate;
         estimate.kind = pass::cost_model::TransformKind::ConstantArgumentSpecialization;
         estimate.pass_name = "OIRInlinePass";
         estimate.candidate_id = "specialize." + std::to_string(++stats.cost_model_candidates);
         estimate.scope = "call";
         estimate.proof_kind = pass::cost_model::ProofKind::PartialEvaluation;
-        estimate.proof_rule_id = structural_callsite_fingerprint(site.key);
+        estimate.proof_rule_id =
+            structural_callsite_fingerprint(site.decision_key);
         estimate.proof_summary =
             recursive_layer
                 ? "verified detached residual; bounded direct-recursive layer"
@@ -5404,31 +6391,18 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
             *site.callee, *site.call, site.mask, return_demand, scratch,
             info, residual_info, recursive_layer, direct_residual, policy, stats,
             std::move(estimate.candidate_id));
-        estimate.proof_rule_id = structural_callsite_fingerprint(site.key);
+        estimate.proof_rule_id =
+            structural_callsite_fingerprint(site.decision_key);
         if (consume_residual_test_failure("cost-reject")) {
             estimate.forced_reject_reason =
                 pass::cost_model::RejectReason::CodeGrowthTooHigh;
             estimate.proof_summary +=
                 "; test failpoint cost rejection; live snapshot including function table unchanged";
         }
-        const auto committed_growth = static_cast<std::uint64_t>(
-            residual_info.static_instrs + residual_info.blocks + residual_info.phis);
+        const auto committed_growth = cloned_instruction_growth(residual_info);
         const auto root_id = site.callee->root_function_id();
-        const auto root_growth_it = stats.call_root_growth.find(root_id);
-        const auto committed_root_growth =
-            root_growth_it == stats.call_root_growth.end() ? 0 : root_growth_it->second;
         const auto committed_pressure =
             estimate_call_pressure(residual_info, *site.call, &site.mask);
-
-        std::unordered_set<oir::CallInst *> exact_tie_calls;
-        for (auto &candidate : sites) {
-            if (candidate.key == site.key && candidate.call != nullptr &&
-                dynamic_cast<oir::Function *>(candidate.call->callee()) ==
-                    candidate.callee) {
-                exact_tie_calls.insert(candidate.call);
-            }
-        }
-        const auto exact_tie_size = exact_tie_calls.size();
 
         if (exact_tie_size > 1) {
             struct DirectTieMember {
@@ -5444,13 +6418,12 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
             std::unordered_map<oir::FunctionID, std::uint64_t> root_growth;
             std::unordered_map<oir::FunctionID, unsigned> root_specializations;
             std::uint64_t batch_growth = 0;
-            std::uint64_t aggregate_reuse_savings = 0;
             CallPressureVector batch_pressure;
             bool batch_preflight_ok = true;
             bool direct_batch_preflight_ok = true;
-            bool persistent_batch_preflight_ok = true;
             for (auto &candidate : sites) {
-                if (candidate.key != site.key || candidate.call == nullptr ||
+                if (candidate.decision_key != site.decision_key ||
+                    candidate.call == nullptr ||
                     dynamic_cast<oir::Function *>(candidate.call->callee()) !=
                         candidate.callee) {
                     continue;
@@ -5465,7 +6438,7 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                         policy, existing_for_candidate, revalidated_mask) ||
                     revalidated_mask != candidate.mask ||
                     specialization_key(*candidate.call, revalidated_mask) !=
-                        candidate.reuse_key) {
+                        candidate.binding_key) {
                     batch_preflight_ok = false;
                     break;
                 }
@@ -5474,18 +6447,22 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                             candidate.call->uses().empty()
                         ? ReturnDemandMask::Dead
                         : ReturnDemandMask::Scalar;
+                const auto candidate_original =
+                    inspect_callee(*candidate.callee);
                 auto candidate_scratch =
                     &candidate == &site
                         ? std::move(scratch)
-                        : build_detached_constant_residual(
+                        : build_charged_detached_constant_residual(
                               module, *candidate.callee, *candidate.call,
-                              candidate.mask, candidate_demand);
+                              candidate.mask, candidate_demand,
+                              candidate_original, stats,
+                              structural_callsite_fingerprint(
+                                  candidate.decision_key));
                 if (candidate_scratch.status != ScratchResidualStatus::Success ||
                     candidate_scratch.function == nullptr) {
                     batch_preflight_ok = false;
                     break;
                 }
-                const auto candidate_original = inspect_callee(*candidate.callee);
                 const auto candidate_residual =
                     inspect_callee(*candidate_scratch.function);
                 const bool candidate_reduced =
@@ -5507,35 +6484,9 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                         static_cast<unsigned>(policy.max_inline_callee_cost * 3) &&
                     candidate_residual.returns != 0 &&
                     candidate_residual.returns <= kMaxSpecializedInlineReturns;
-                const auto staged_plan =
-                    candidate_direct
-                        ? build_detached_inline_plan(
-                              module, *candidate.caller, *candidate.call,
-                              candidate_scratch, candidate.mask,
-                              candidate_demand,
-                              direct_inline_index + members.size() + 1)
-                        : std::nullopt;
-                const bool candidate_direct_ready =
-                    candidate_direct && staged_plan.has_value();
-                direct_batch_preflight_ok &= candidate_direct_ready;
-                const bool candidate_persistent_ready =
-                    candidate_demand == ReturnDemandMask::Scalar &&
-                    candidate_reduced &&
-                    detached_residual_commit_is_supported(
-                        candidate_scratch, *candidate.call, candidate.mask,
-                        candidate_demand) &&
-                    candidate.callee == site.callee &&
-                    candidate.reuse_key == site.reuse_key &&
-                    !candidate.call->uses().empty() &&
-                    candidate.call->type() == site.call->type() &&
-                    same_specialization_binding(
-                        *site.call, site.mask, *candidate.call,
-                        candidate.mask);
-                persistent_batch_preflight_ok &=
-                    candidate_persistent_ready;
-                const auto growth = static_cast<std::uint64_t>(
-                    candidate_residual.static_instrs + candidate_residual.blocks +
-                    candidate_residual.phis);
+                direct_batch_preflight_ok &= candidate_direct;
+                const auto growth =
+                    cloned_instruction_growth(candidate_residual);
                 auto member_estimate =
                     &candidate == &site
                         ? estimate
@@ -5550,36 +6501,12 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                                                    ++stats.cost_model_candidates));
                 member_estimate.scope = "direct-residual-tie-batch";
                 member_estimate.proof_rule_id =
-                    structural_callsite_fingerprint(candidate.key);
+                    structural_callsite_fingerprint(candidate.decision_key);
                 member_estimate.proof_summary =
                     "independently verified detached residual and all-member tie preflight";
                 const auto member_pressure = estimate_call_pressure(
                     candidate_residual, *candidate.call, &candidate.mask);
-                const auto eliminated_member_instrs =
-                    candidate_original.static_instrs >
-                            candidate_residual.static_instrs
-                        ? candidate_original.static_instrs -
-                              candidate_residual.static_instrs
-                        : 0;
-                const auto eliminated_member_branches =
-                    candidate_original.branches > candidate_residual.branches
-                        ? candidate_original.branches -
-                              candidate_residual.branches
-                        : 0;
-                const auto eliminated_member_phis =
-                    candidate_original.phis > candidate_residual.phis
-                        ? candidate_original.phis - candidate_residual.phis
-                        : 0;
-                const auto measured_savings = saturating_u64_add(
-                    saturating_u64_add(eliminated_member_instrs,
-                                       eliminated_member_branches),
-                    saturating_u64_add(
-                        eliminated_member_phis,
-                        candidate_scratch.fixed_point_suffix
-                            .eliminated_dynamic_instructions));
                 batch_growth = saturating_u64_add(batch_growth, growth);
-                aggregate_reuse_savings = saturating_u64_add(
-                    aggregate_reuse_savings, measured_savings);
                 auto &per_root = root_growth[candidate.callee->root_function_id()];
                 per_root = saturating_u64_add(per_root, growth);
                 ++root_specializations[candidate.callee->root_function_id()];
@@ -5588,202 +6515,70 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                                    candidate_residual, std::move(member_estimate),
                                    growth, member_pressure});
             }
+            if (batch_preflight_ok && direct_batch_preflight_ok &&
+                members.size() == exact_tie_size) {
+                std::uint64_t preflight_plan_work = 0;
+                for (const auto &member : members) {
+                    preflight_plan_work = saturating_u64_add(
+                        preflight_plan_work,
+                        specialization_plan_work_units(
+                            member.residual_info));
+                }
+                if (!require_specialization_work_capacity(
+                        stats, 0, preflight_plan_work,
+                        structural_callsite_fingerprint(
+                            site.decision_key),
+                        "direct residual tie preflight plans would exceed the persistent specialization work budget")) {
+                    return false;
+                }
+                for (std::size_t index = 0; index < members.size();
+                     ++index) {
+                    auto &member = members[index];
+                    const auto member_demand =
+                        member.site->call->type()->is_void() ||
+                                member.site->call->uses().empty()
+                            ? ReturnDemandMask::Dead
+                            : ReturnDemandMask::Scalar;
+                    if (!charge_specialization_plan_work(
+                            stats, member.residual_info,
+                            structural_callsite_fingerprint(
+                                member.site->decision_key),
+                            "direct residual tie preflight plan would exceed the persistent specialization work budget")) {
+                        return false;
+                    }
+                    const auto staged_plan = build_detached_inline_plan(
+                        module, *member.site->caller,
+                        *member.site->call, member.scratch,
+                        member.site->mask, member_demand,
+                        direct_inline_index +
+                            static_cast<unsigned>(index) + 1);
+                    if (!staged_plan) {
+                        direct_batch_preflight_ok = false;
+                        break;
+                    }
+                }
+            }
             const auto specialization_limit = static_cast<unsigned>(
                 std::max<std::int64_t>(
                     0, policy.max_specializations_per_function));
             const bool forced_tie_budget_reject =
                 residual_test_failure_is("tie-budget");
-            const auto persistent_growth =
-                members.empty() ? 0 : members.front().growth;
-            const auto persistent_root =
-                members.empty() ? oir::kInvalidFunctionID
-                                : members.front().site->callee->root_function_id();
-            const auto persistent_root_growth_it =
-                stats.call_root_growth.find(persistent_root);
-            const auto persistent_committed_root_growth =
-                persistent_root_growth_it == stats.call_root_growth.end()
-                    ? 0
-                    : persistent_root_growth_it->second;
-            const auto persistent_specialization_it =
-                stats.call_root_specializations.find(persistent_root);
-            const auto persistent_specializations =
-                persistent_specialization_it ==
-                        stats.call_root_specializations.end()
-                    ? 0U
-                    : persistent_specialization_it->second;
-            const auto persistent_pressure_reject = pressure_reject_reason(
-                stats.cumulative_call_pressure, batch_pressure,
-                stats.call_pressure_budget);
-            const bool persistent_growth_fits =
-                !forced_tie_budget_reject &&
-                persistent_growth <=
-                    stats.call_module_growth_budget -
-                        std::min(stats.cumulative_call_growth,
-                                 stats.call_module_growth_budget) &&
-                persistent_growth <=
-                    stats.call_root_growth_budget -
-                        std::min(persistent_committed_root_growth,
-                                 stats.call_root_growth_budget);
-            const bool measured_persistent_reuse =
-                batch_preflight_ok && members.size() == exact_tie_size &&
-                members.size() >= 2 && persistent_batch_preflight_ok &&
-                aggregate_reuse_savings >= persistent_growth &&
-                persistent_growth_fits &&
-                persistent_pressure_reject ==
-                    pass::cost_model::RejectReason::None &&
-                persistent_specializations < specialization_limit &&
-                existing_specialization_count(
-                    module, *members.front().site->callee) <
-                    std::min<unsigned>(kMaxSpecializedFunctions,
-                                       specialization_limit);
-            if (measured_persistent_reuse) {
-                const auto report_size_before_persistent =
-                    stats.cost_model_report == nullptr
-                        ? 0
-                        : stats.cost_model_report->decisions.size();
-                bool every_member_profitable = true;
-                auto member_reject_reason =
-                    pass::cost_model::RejectReason::None;
-                for (auto &member : members) {
-                    member.estimate.scope =
-                        "measured-persistent-reuse-member";
-                    member.estimate.proof_summary =
-                        "independently revalidated and measured exact-tie member for persistent reuse";
-                    if (!cost_model_allows_transform(stats,
-                                                     member.estimate)) {
-                        every_member_profitable = false;
-                        member_reject_reason =
-                            member.estimate.forced_reject_reason ==
-                                    pass::cost_model::RejectReason::None
-                                ? pass::cost_model::RejectReason::NegativeGain
-                                : member.estimate.forced_reject_reason;
-                        break;
-                    }
-                }
-                if (!every_member_profitable) {
-                    if (stats.cost_model_report != nullptr &&
-                        stats.cost_model_report->decisions.size() >
-                            report_size_before_persistent) {
-                        stats.cost_model_report->decisions.resize(
-                            report_size_before_persistent);
-                    }
-                    auto rejected = members.front().estimate;
-                    rejected.scope = "measured-persistent-reuse";
-                    rejected.proof_summary =
-                        "persistent exact-tie batch rejected atomically because a measured member was not profitable";
-                    rejected.forced_reject_reason = member_reject_reason;
-                    (void)cost_model_allows_transform(stats, rejected);
-                    rejected_pe_ties.insert(site.key);
-                    assert_test_rejection_snapshot();
-                    continue;
-                }
-
-                auto persistent_estimate = members.front().estimate;
-                persistent_estimate.candidate_id += ".reuse";
-                persistent_estimate.scope = "measured-persistent-reuse";
-                persistent_estimate.proof_summary =
-                    "all exact-tie members independently revalidated and measured; multi-call savings cover one persistent clone";
-                persistent_estimate.dynamic_multiplier =
-                    std::max<std::int64_t>(
-                        persistent_estimate.dynamic_multiplier,
-                        static_cast<std::int64_t>(members.size()));
-                fill_after_from_residual(persistent_estimate,
-                                         members.front().residual_info, 1);
-                persistent_estimate.after_code_bytes =
-                    persistent_estimate.before_code_bytes +
-                    static_cast<std::int64_t>(
-                        members.front().residual_info.static_instrs * 4);
-                persistent_estimate.risk.code_growth =
-                    static_cast<std::int64_t>(persistent_growth);
-                persistent_estimate.partial_eval.cloned_functions = 1;
-                persistent_estimate.partial_eval.cloned_blocks =
-                    members.front().residual_info.blocks;
-                persistent_estimate.partial_eval.residual_instrs =
-                    members.front().residual_info.static_instrs;
-                if (!cost_model_allows_transform(stats,
-                                                 persistent_estimate)) {
-                    rejected_pe_ties.insert(site.key);
-                    assert_test_rejection_snapshot();
-                    continue;
-                }
-
-                std::vector<oir::FunctionID> inserted_growth_roots;
-                const std::vector<oir::FunctionID> roots{persistent_root};
-                const bool growth_slot_ready = reserve_growth_entries(
-                    stats.call_root_growth, roots, inserted_growth_roots);
-                auto persistent =
-                    growth_slot_ready
-                        ? import_persistent_residual_clone(
-                              module, members.front().scratch,
-                              *members.front().site->call,
-                              members.front().site->mask,
-                              *members.front().site->callee)
-                        : std::nullopt;
-                std::vector<oir::CallInst *> reuse_calls;
-                reuse_calls.reserve(members.size());
-                for (const auto &member : members) {
-                    reuse_calls.push_back(member.site->call);
-                }
-                if (persistent &&
-                    retarget_calls_to_persistent_residual(
-                        module, *persistent, reuse_calls,
-                        members.front().site->mask)) {
-                    stats.cumulative_call_growth = saturating_u64_add(
-                        stats.cumulative_call_growth, persistent_growth);
-                    stats.call_root_growth.at(persistent_root) =
-                        saturating_u64_add(persistent_committed_root_growth,
-                                           persistent_growth);
-                    ++stats.call_root_specializations.at(persistent_root);
-                    add_call_pressure(stats.cumulative_call_pressure,
-                                      batch_pressure);
-                    stats.specialized +=
-                        static_cast<unsigned>(members.size());
-                    return true;
-                }
-                erase_reserved_growth_entries(stats.call_root_growth,
-                                              inserted_growth_roots);
-                if (stats.cost_model_report != nullptr &&
-                    stats.cost_model_report->decisions.size() >
-                        report_size_before_persistent) {
-                    stats.cost_model_report->decisions.resize(
-                        report_size_before_persistent);
-                }
-                persistent_estimate.forced_reject_reason =
-                    pass::cost_model::RejectReason::CommitPreflightFailed;
-                persistent_estimate.proof_summary =
-                    "persistent residual commit failed; exact-tie live snapshots restored";
-                (void)cost_model_allows_transform(stats,
-                                                  persistent_estimate);
-                rejected_pe_ties.insert(site.key);
-                assert_test_rejection_snapshot();
-                continue;
-            }
             // Every detached plan is built from the same pre-commit snapshot.  A
             // caller may therefore also be another member's callee without making
             // module insertion order choose a prefix of the tie.
             auto batch_reject = pressure_reject_reason(
                 stats.cumulative_call_pressure, batch_pressure,
                 stats.call_pressure_budget);
-            bool batch_cumulative_fits =
-                batch_growth <=
-                stats.call_module_growth_budget -
-                    std::min(stats.cumulative_call_growth,
-                             stats.call_module_growth_budget);
+            const auto batch_growth_fit = call_growth_budget_fit(
+                stats, CallGrowthClass::Specialization, batch_growth,
+                root_growth);
+            bool batch_cumulative_fits = batch_growth_fit.fits();
             if (forced_tie_budget_reject) {
                 // Keep this failpoint persistent across fixed-point pipeline
                 // revisits.  The focused fixture uses it to prove that a
                 // same-block structural tie is never split when the combined
                 // cumulative budget cannot cover every member.
                 batch_cumulative_fits = false;
-            }
-            for (const auto &[member_root, growth] : root_growth) {
-                const auto found = stats.call_root_growth.find(member_root);
-                const auto committed =
-                    found == stats.call_root_growth.end() ? 0 : found->second;
-                batch_cumulative_fits &=
-                    growth <= stats.call_root_growth_budget -
-                                  std::min(committed,
-                                           stats.call_root_growth_budget);
             }
             bool batch_specialization_fits = true;
             for (const auto &[member_root, count] : root_specializations) {
@@ -5814,6 +6609,30 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                     }
                 }
             }
+            if (batch_preflight_ok) {
+                std::uint64_t commit_plan_work = 0;
+                for (const auto &member : members) {
+                    commit_plan_work = saturating_u64_add(
+                        commit_plan_work,
+                        specialization_plan_work_units(
+                            member.residual_info));
+                }
+                if (!specialization_work_has_capacity(
+                        stats, 0, commit_plan_work)) {
+                    if (stats.cost_model_report != nullptr &&
+                        stats.cost_model_report->decisions.size() >
+                            report_size_before_tie) {
+                        stats.cost_model_report->decisions.resize(
+                            report_size_before_tie);
+                    }
+                    (void)require_specialization_work_capacity(
+                        stats, 0, commit_plan_work,
+                        structural_callsite_fingerprint(
+                            site.decision_key),
+                        "direct residual tie commit plans would exceed the persistent specialization work budget");
+                    return false;
+                }
+            }
             if (!batch_preflight_ok) {
                 if (stats.cost_model_report != nullptr &&
                     stats.cost_model_report->decisions.size() >
@@ -5825,6 +6644,12 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                 rejected.scope = "direct-residual-tie-batch";
                 rejected.proof_summary =
                     "residual tie batch rejected atomically by all-member preflight";
+                if (!batch_growth_fit.fits()) {
+                    append_call_growth_budget_summary(
+                        rejected.proof_summary,
+                        CallGrowthClass::Specialization,
+                        batch_growth_fit);
+                }
                 rejected.forced_reject_reason =
                     batch_reject != pass::cost_model::RejectReason::None
                         ? batch_reject
@@ -5834,7 +6659,7 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                                ? pass::cost_model::RejectReason::CumulativeBudgetExhausted
                                : pass::cost_model::RejectReason::CommitPreflightFailed));
                 (void)cost_model_allows_transform(stats, rejected);
-                rejected_pe_ties.insert(site.key);
+                rejected_pe_ties.insert(site.decision_key);
                 assert_test_rejection_snapshot();
                 continue;
             }
@@ -5859,14 +6684,16 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                 (void)growth;
                 tie_roots.push_back(member_root);
             }
-            std::vector<oir::FunctionID> inserted_growth_roots;
-            const bool growth_slots_ready = reserve_growth_entries(
-                stats.call_root_growth, tie_roots, inserted_growth_roots);
+            CallGrowthReservation growth_reservation;
+            const bool growth_slots_ready = reserve_call_growth_entries(
+                stats, CallGrowthClass::Specialization, tie_roots,
+                growth_reservation);
             if (!growth_slots_ready ||
                 !inline_detached_residual_batch(module, direct_inline_context,
-                                                tie_requests)) {
-                erase_reserved_growth_entries(stats.call_root_growth,
-                                              inserted_growth_roots);
+                                                tie_requests, &stats)) {
+                erase_reserved_call_growth_entries(
+                    stats, CallGrowthClass::Specialization,
+                    growth_reservation);
                 if (stats.cost_model_report != nullptr &&
                     stats.cost_model_report->decisions.size() >
                         report_size_before_tie) {
@@ -5880,20 +6707,14 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                 rejected.forced_reject_reason =
                     pass::cost_model::RejectReason::CommitPreflightFailed;
                 (void)cost_model_allows_transform(stats, rejected);
-                rejected_pe_ties.insert(site.key);
+                rejected_pe_ties.insert(site.decision_key);
                 assert_test_rejection_snapshot();
                 continue;
             }
             direct_inline_index += static_cast<unsigned>(members.size());
-            stats.cumulative_call_growth = saturating_u64_add(
-                stats.cumulative_call_growth, batch_growth);
-            for (const auto &[member_root, growth] : root_growth) {
-                const auto found = stats.call_root_growth.find(member_root);
-                const auto committed =
-                    found == stats.call_root_growth.end() ? 0 : found->second;
-                stats.call_root_growth.at(member_root) =
-                    saturating_u64_add(committed, growth);
-            }
+            commit_call_growth(
+                stats, CallGrowthClass::Specialization, batch_growth,
+                root_growth);
             for (const auto &[member_root, count] : root_specializations) {
                 stats.call_root_specializations.at(member_root) += count;
             }
@@ -5923,10 +6744,27 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
             assert_test_rejection_snapshot();
             continue;
         }
-        std::vector<oir::FunctionID> inserted_growth_roots;
+        const auto direct_plan_work =
+            specialization_plan_work_units(residual_info);
+        if (!specialization_work_has_capacity(stats, 0,
+                                               direct_plan_work)) {
+            if (stats.cost_model_report != nullptr &&
+                stats.cost_model_report->decisions.size() >
+                    report_size_before_commit) {
+                stats.cost_model_report->decisions.resize(
+                    report_size_before_commit);
+            }
+            (void)require_specialization_work_capacity(
+                stats, 0, direct_plan_work,
+                structural_callsite_fingerprint(site.decision_key),
+                "direct residual commit plan would exceed the persistent specialization work budget");
+            return false;
+        }
+        CallGrowthReservation growth_reservation;
         const std::vector<oir::FunctionID> roots{root_id};
-        if (!reserve_growth_entries(stats.call_root_growth, roots,
-                                    inserted_growth_roots)) {
+        if (!reserve_call_growth_entries(
+                stats, CallGrowthClass::Specialization, roots,
+                growth_reservation)) {
             if (stats.cost_model_report != nullptr &&
                 stats.cost_model_report->decisions.size() >
                     report_size_before_commit) {
@@ -5949,7 +6787,8 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
                 }
                 committed = inline_detached_residual(
                     module, direct_inline_context, *site.caller, block.get(), it, scratch,
-                    site.mask, return_demand, direct_inline_index + 1);
+                    site.mask, return_demand, direct_inline_index + 1,
+                    &stats);
                 break;
             }
             if (committed) {
@@ -5957,8 +6796,9 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
             }
         }
         if (!committed) {
-            erase_reserved_growth_entries(stats.call_root_growth,
-                                          inserted_growth_roots);
+            erase_reserved_call_growth_entries(
+                stats, CallGrowthClass::Specialization,
+                growth_reservation);
             if (stats.cost_model_report != nullptr &&
                 stats.cost_model_report->decisions.size() > report_size_before_commit) {
                 stats.cost_model_report->decisions.resize(report_size_before_commit);
@@ -5972,10 +6812,8 @@ bool specialize_constant_argument_calls_impl(oir::Module &module, Stats &stats) 
             continue;
         }
         ++direct_inline_index;
-        stats.cumulative_call_growth = saturating_u64_add(
-            stats.cumulative_call_growth, committed_growth);
-        stats.call_root_growth.at(root_id) = saturating_u64_add(
-            committed_root_growth, committed_growth);
+        commit_call_growth(stats, CallGrowthClass::Specialization,
+                           root_id, committed_growth);
         ++stats.call_root_specializations.at(root_id);
         add_call_pressure(stats.cumulative_call_pressure, committed_pressure);
         ++stats.inlined;
@@ -6004,10 +6842,6 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
     InlineContext context;
     const auto policy = pass::cost_model::policy_for_kind(stats.cost_model_policy);
     initialize_call_growth_budget(module, stats, policy);
-    context.module_growth_budget = stats.call_module_growth_budget;
-    context.root_growth_budget = stats.call_root_growth_budget;
-    context.cumulative_growth = stats.cumulative_call_growth;
-    context.root_growth = stats.call_root_growth;
 
     struct Candidate {
         oir::Function *caller = nullptr;
@@ -6089,6 +6923,23 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
                    candidates[end].structural_key == candidates[begin].structural_key) {
                 ++end;
             }
+            if (candidates[begin].recursive) {
+                auto &candidate = candidates[begin];
+                oir::BasicBlock *block = nullptr;
+                std::list<std::unique_ptr<oir::Instruction>>::iterator position;
+                if (locate_call(*candidate.caller, candidate.call, block,
+                                position) &&
+                    inline_call(module, context, *candidate.caller, block,
+                                position, inline_index + 1, stats, false,
+                                false)) {
+                    ++inline_index;
+                    ++stats.inlined;
+                    changed = true;
+                    window_changed = true;
+                }
+                begin = end;
+                continue;
+            }
             std::uint64_t batch_growth = 0;
             std::unordered_map<oir::FunctionID, std::uint64_t> batch_root_growth;
             CallPressureVector batch_pressure;
@@ -6110,21 +6961,13 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
             const auto batch_pressure_reject = pressure_reject_reason(
                 stats.cumulative_call_pressure, batch_pressure,
                 stats.call_pressure_budget);
+            const auto batch_growth_fit = call_growth_budget_fit(
+                stats, CallGrowthClass::Ordinary, batch_growth,
+                batch_root_growth);
             bool batch_fits =
-                batch_growth <= context.module_growth_budget -
-                                    std::min(context.cumulative_growth,
-                                             context.module_growth_budget) &&
+                batch_growth_fit.fits() &&
                 batch_pressure_reject == pass::cost_model::RejectReason::None &&
                 end - begin <= kMaxInlineSites - inline_index;
-            for (const auto &[root_id, growth] : batch_root_growth) {
-                const auto position = context.root_growth.find(root_id);
-                const auto committed = position == context.root_growth.end()
-                                           ? 0
-                                           : position->second;
-                batch_fits &= growth <=
-                              context.root_growth_budget -
-                                  std::min(committed, context.root_growth_budget);
-            }
             if (!batch_fits) {
                 for (std::size_t index = begin; index < end; ++index) {
                     auto *callee =
@@ -6142,7 +6985,20 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
                     rejected.proof_rule_id = structural_callsite_fingerprint(
                         candidates[index].structural_key);
                     rejected.proof_summary =
-                        "structural tie batch rejected atomically by cumulative call budget";
+                        "structural tie batch rejected atomically";
+                    if (!batch_growth_fit.fits()) {
+                        append_call_growth_budget_summary(
+                            rejected.proof_summary,
+                            CallGrowthClass::Ordinary,
+                            batch_growth_fit);
+                    } else if (batch_pressure_reject !=
+                               pass::cost_model::RejectReason::None) {
+                        rejected.proof_summary +=
+                            "; cumulative call pressure budget exhausted";
+                    } else {
+                        rejected.proof_summary +=
+                            "; inline site cap exhausted";
+                    }
                     rejected.confidence = 0.65;
                     fill_before_after_from_callee(rejected, inspect_callee(*callee), 1, 0);
                     rejected.forced_reject_reason =
@@ -6297,15 +7153,11 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
                     (void)growth;
                     roots.push_back(root);
                 }
-                std::vector<oir::FunctionID> inserted_context_roots;
-                std::vector<oir::FunctionID> inserted_stats_roots;
+                CallGrowthReservation growth_reservation;
                 std::vector<const oir::Function *> inserted_deferred;
-                bool metadata_ready = reserve_growth_entries(
-                    context.root_growth, roots, inserted_context_roots);
-                if (metadata_ready) {
-                    metadata_ready = reserve_growth_entries(
-                        stats.call_root_growth, roots, inserted_stats_roots);
-                }
+                bool metadata_ready = reserve_call_growth_entries(
+                    stats, CallGrowthClass::Ordinary, roots,
+                    growth_reservation);
                 if (metadata_ready) {
                     try {
                         inserted_deferred.reserve(members.size());
@@ -6325,10 +7177,9 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
                     for (auto *function : inserted_deferred) {
                         context.defer_recursive_expansion.erase(function);
                     }
-                    erase_reserved_growth_entries(context.root_growth,
-                                                  inserted_context_roots);
-                    erase_reserved_growth_entries(stats.call_root_growth,
-                                                  inserted_stats_roots);
+                    erase_reserved_call_growth_entries(
+                        stats, CallGrowthClass::Ordinary,
+                        growth_reservation);
                     reject_batch(
                         pass::cost_model::RejectReason::CommitPreflightFailed,
                         "structural tie batch accounting preflight failed");
@@ -6340,10 +7191,9 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
                     for (auto *function : inserted_deferred) {
                         context.defer_recursive_expansion.erase(function);
                     }
-                    erase_reserved_growth_entries(context.root_growth,
-                                                  inserted_context_roots);
-                    erase_reserved_growth_entries(stats.call_root_growth,
-                                                  inserted_stats_roots);
+                    erase_reserved_call_growth_entries(
+                        stats, CallGrowthClass::Ordinary,
+                        growth_reservation);
                     reject_batch(
                         pass::cost_model::RejectReason::CommitPreflightFailed,
                         "structural tie batch commit failed; every live snapshot was restored");
@@ -6351,15 +7201,8 @@ bool inline_functions_impl(oir::Module &module, Stats &stats) {
                     continue;
                 }
 
-                context.cumulative_growth = saturating_u64_add(
-                    context.cumulative_growth, batch_growth);
-                stats.cumulative_call_growth = context.cumulative_growth;
-                for (const auto &[root, growth] : batch_root_growth) {
-                    context.root_growth.at(root) = saturating_u64_add(
-                        context.root_growth.at(root), growth);
-                    stats.call_root_growth.at(root) =
-                        context.root_growth.at(root);
-                }
+                commit_call_growth(stats, CallGrowthClass::Ordinary,
+                                   batch_growth, batch_root_growth);
                 add_call_pressure(stats.cumulative_call_pressure,
                                   batch_pressure);
                 inline_index += static_cast<unsigned>(members.size());

@@ -1,0 +1,70 @@
+// RUN: python3 %S/../../scripts/context_inline_cross_position_reuse_test.py --compiler %compiler --source %s --pipeline-source %S/../../src/pass/oir/OIROptimizationPipelinePass.cpp | FileCheck %s
+
+int cross_position_sink;
+
+int reusable_choice(int left, int right, int mode) {
+  cross_position_sink = cross_position_sink + left;
+  if (mode == 2) {
+    return left + right + 19;
+  }
+  if (mode == 3) {
+    return left - right - 23;
+  }
+  return left * 5 + right;
+}
+
+// Deliberately alpha-identical to reusable_choice.  A canonical-shape reuse
+// bucket may collide, but actual callee identity must keep this function out of
+// reusable_choice's persistent group.
+int reusable_choice_twin(int left, int right, int mode) {
+  cross_position_sink = cross_position_sink + left;
+  if (mode == 2) {
+    return left + right + 19;
+  }
+  if (mode == 3) {
+    return left - right - 23;
+  }
+  return left * 5 + right;
+}
+
+int cross_position_pair(int value) {
+  int first = reusable_choice(value, value + 1, 2);
+  cross_position_sink = cross_position_sink + 1;
+  int second = reusable_choice(value + 2, value + 3, 2);
+  return first + second;
+}
+
+int different_constant(int value) {
+  return reusable_choice(value, value + 1, 3);
+}
+
+int different_mask(int value) {
+  return reusable_choice(5, value, 2);
+}
+
+int different_callee(int value) {
+  return reusable_choice_twin(value, value + 1, 2);
+}
+
+int dead_return(int value) {
+  reusable_choice(value, value + 1, 2);
+  return cross_position_sink + value;
+}
+
+int main() {
+  int value = getint();
+  return cross_position_pair(value) + different_constant(value) +
+         different_mask(value) + different_callee(value) +
+         dead_return(value);
+}
+
+// CHECK: "aggregate_clone_growth":
+// CHECK-SAME: "direct_candidates":
+// CHECK-SAME: "exact_fit_growth": 6
+// CHECK-SAME: "fallback_direct_candidates":
+// CHECK-SAME: "fallback_growth_sixes":
+// CHECK-SAME: "member_fingerprints": ["callsite.
+// CHECK-SAME: "callsite.
+// CHECK-SAME: "negative_groups_excluded": 4
+// CHECK-SAME: "pipeline_round_cap": 12
+// CHECK-SAME: "work_budget_rejections": 1

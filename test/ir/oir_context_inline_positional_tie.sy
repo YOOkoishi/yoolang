@@ -46,16 +46,14 @@ int swapped_bindings(int input) {
   return left_constant + right_constant;
 }
 
-int same_block_dependent(int left, int right) {
-  int result = left + right;
-  int index = 0;
-  while (index < 4) {
-    int first = repeated_step(result, 0);
-    int second = repeated_step(result, 0);
-    result = first + second;
-    index = index + 1;
-  }
-  return result;
+int symmetric_tie_left(int value) {
+  repeated_step(value, 0);
+  return value + 1;
+}
+
+int symmetric_tie_right(int renamed) {
+  repeated_step(renamed, 0);
+  return renamed + 1;
 }
 
 int later_control(int input) {
@@ -64,14 +62,17 @@ int later_control(int input) {
 
 int main() {
   int input = getint();
-  return swapped_bindings(input) + same_block_dependent(input, input + 1) +
-         later_control(input);
+  return swapped_bindings(input) + symmetric_tie_left(input) +
+         symmetric_tie_right(input + 1) + later_control(input);
 }
 
 // OIR-LABEL: define i32 @swapped_bindings
 // OIR-NOT: call i32 @positional_branch
 // OIR: ret i32
-// OIR-LABEL: define i32 @same_block_dependent
+// OIR-LABEL: define i32 @symmetric_tie_left
+// OIR-NOT: call i32 @repeated_step
+// OIR: ret i32
+// OIR-LABEL: define i32 @symmetric_tie_right
 // OIR-NOT: call i32 @repeated_step
 // OIR: ret i32
 // OIR-LABEL: define i32 @later_control

@@ -29,19 +29,19 @@ int main() {
 // The ordinary helper must be inlined before the recursive template is captured.
 // INLINE: OIRInlinePass Accept transform=Inline scope=call
 // INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-2
 // INLINE-NOT: scope=direct-recursive-depth-3
 
 // Fourteen accepted inlines replace two calls with sixteen residual leaf calls;

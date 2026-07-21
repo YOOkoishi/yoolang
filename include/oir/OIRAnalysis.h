@@ -185,6 +185,10 @@ struct FunctionMemorySummary {
     bool reads_all = false;
     bool writes_all = false;
     bool has_side_effect = false;
+    // True unless every reachable local CFG cycle and every transitive call is
+    // proven to terminate.  This is deliberately a must-return fact encoded in
+    // the conservative direction so unknown and recursive SCCs fail closed.
+    bool may_not_return = false;
 
     bool operator==(const FunctionMemorySummary &other) const;
     bool operator!=(const FunctionMemorySummary &other) const;

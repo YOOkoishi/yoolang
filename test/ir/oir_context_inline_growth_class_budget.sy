@@ -1,0 +1,38 @@
+// RUN: python3 %S/../../scripts/context_inline_growth_class_budget_test.py --compiler %compiler --source %s | FileCheck %s
+
+// This callee is deliberately too large for ordinary inlining, but a constant
+// mode leaves a tiny measured residual.  The small forwarding wrapper initially
+// hides that constant from the callee: the first specialization window cannot
+// commit, ordinary inlining exposes it, and the second window must still own an
+// untouched specialization growth quota.
+int choose(int value, int mode) {
+  if (mode == 0) return value + 3;
+  if (mode == 1) return value + 5;
+  if (mode == 2) return value + 7;
+  if (mode == 3) return value + 11;
+  if (mode == 4) return value + 13;
+  if (mode == 5) return value + 17;
+  if (mode == 6) return value + 19;
+  if (mode == 7) return value + 23;
+  if (mode == 8) return value + 29;
+  if (mode == 9) return value + 31;
+  if (mode == 10) return value + 37;
+  if (mode == 11) return value + 41;
+  return value - 43;
+}
+
+int forward(int value, int mode) {
+  return choose(value, mode);
+}
+
+int main() {
+  return forward(getint(), 7);
+}
+
+// CHECK: "accepted_scopes": ["call", "direct-residual"]
+// CHECK-SAME: "class_only_rejections":
+// CHECK-SAME: "combined_class_total_rejections":
+// CHECK-SAME: "exact_budget": 2
+// CHECK-SAME: "first_window_rejections":
+// CHECK-SAME: "one_short_budget": 1
+// CHECK-SAME: "second_window_growth": 2

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <sstream>
 
@@ -1215,20 +1216,396 @@ void merge_summary(FunctionMemorySummary &dst, const FunctionMemorySummary &src)
     dst.reads_all = dst.reads_all || src.reads_all;
     dst.writes_all = dst.writes_all || src.writes_all;
     dst.has_side_effect = dst.has_side_effect || src.has_side_effect;
+    dst.may_not_return = dst.may_not_return || src.may_not_return;
+}
+
+CmpPred negate_predicate(CmpPred pred) {
+    switch (pred) {
+    case CmpPred::EQ:
+        return CmpPred::NE;
+    case CmpPred::NE:
+        return CmpPred::EQ;
+    case CmpPred::LT:
+        return CmpPred::GE;
+    case CmpPred::LE:
+        return CmpPred::GT;
+    case CmpPred::GT:
+        return CmpPred::LE;
+    case CmpPred::GE:
+        return CmpPred::LT;
+    }
+    return pred;
+}
+
+bool loop_sets_are_laminar(const std::vector<Loop> &loops) {
+    auto subset = [](const Loop &lhs, const Loop &rhs) {
+        return std::all_of(lhs.blocks.begin(), lhs.blocks.end(),
+                           [&](const BasicBlock *block) { return loop_contains(rhs, block); });
+    };
+    for (std::size_t i = 0; i < loops.size(); ++i) {
+        for (std::size_t j = i + 1; j < loops.size(); ++j) {
+            const bool intersects =
+                std::any_of(loops[i].blocks.begin(), loops[i].blocks.end(),
+                            [&](const BasicBlock *block) { return loop_contains(loops[j], block); });
+            if (intersects && !subset(loops[i], loops[j]) && !subset(loops[j], loops[i])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+struct CanonicalLoopRecurrence {
+    const BasicBlock *latch = nullptr;
+    const PhiInst *phi = nullptr;
+    const Value *start = nullptr;
+    const Value *next = nullptr;
+    std::int64_t step = 0;
+};
+
+std::optional<CanonicalLoopRecurrence> canonical_loop_recurrence(const Loop &loop,
+                                                                  const PhiInst &phi) {
+    if (loop.header == nullptr || loop.latches.size() != 1 || phi.parent() != loop.header ||
+        phi.incoming().size() != 2) {
+        return std::nullopt;
+    }
+
+    const auto *latch = loop.latches.front();
+    const Value *start = nullptr;
+    const Value *next = nullptr;
+    for (const auto &[value, predecessor] : phi.incoming()) {
+        if (predecessor == latch) {
+            if (next != nullptr) {
+                return std::nullopt;
+            }
+            next = value;
+        } else if (!loop_contains(loop, predecessor)) {
+            if (start != nullptr) {
+                return std::nullopt;
+            }
+            start = value;
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (start == nullptr || next == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto *update = dynamic_cast<const BinaryInst *>(next);
+    if (update == nullptr) {
+        return std::nullopt;
+    }
+    std::optional<std::int64_t> step;
+    if (update->op() == Instruction::OpID::Add) {
+        if (update->lhs() == &phi) {
+            step = constant_int_value(update->rhs());
+        } else if (update->rhs() == &phi) {
+            step = constant_int_value(update->lhs());
+        }
+    } else if (update->op() == Instruction::OpID::Sub && update->lhs() == &phi) {
+        if (auto magnitude = constant_int_value(update->rhs())) {
+            // Match only the two values that can produce a unit step.  Avoid
+            // negating an arbitrary ConstantInt: OIR construction does not
+            // normalize i32 payloads, so INT64_MIN must fail closed without
+            // triggering host signed-overflow UB.
+            if (*magnitude == 1) {
+                step = -1;
+            } else if (*magnitude == -1) {
+                step = 1;
+            }
+        }
+    }
+    if (!step || (*step != 1 && *step != -1)) {
+        return std::nullopt;
+    }
+    return CanonicalLoopRecurrence{latch, &phi, start, next, *step};
+}
+
+bool canonical_loop_is_single_entry(const Loop &loop, const DominatorTree &dom_tree) {
+    if (loop.header == nullptr || loop.latches.size() != 1) {
+        return false;
+    }
+    std::size_t inside_header_predecessors = 0;
+    std::size_t outside_header_predecessors = 0;
+    for (auto *predecessor : loop.header->predecessors()) {
+        if (!dom_tree.is_reachable(predecessor)) {
+            continue;
+        }
+        if (loop_contains(loop, predecessor)) {
+            ++inside_header_predecessors;
+        } else {
+            ++outside_header_predecessors;
+        }
+    }
+    if (inside_header_predecessors != 1 || outside_header_predecessors != 1) {
+        return false;
+    }
+    for (auto *block : loop.blocks) {
+        if (block == loop.header) {
+            continue;
+        }
+        for (auto *predecessor : block->predecessors()) {
+            if (dom_tree.is_reachable(predecessor) && !loop_contains(loop, predecessor)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool recurrence_proves_finite(const CanonicalLoopRecurrence &recurrence, const Value *candidate,
+                              const Value *bound, CmpPred pred, const Loop &loop,
+                              const ScalarEvolution &scev) {
+    const auto *integer_type = dynamic_cast<const IntegerType *>(recurrence.phi->type());
+    if (integer_type == nullptr || integer_type->bit_width() != 32 || bound == nullptr ||
+        bound->type() != recurrence.phi->type() || !scev.is_loop_invariant(bound, loop)) {
+        return false;
+    }
+
+    const bool tests_next = candidate == recurrence.next;
+    if (!tests_next && candidate != recurrence.phi) {
+        return false;
+    }
+    const auto start = constant_int_value(recurrence.start);
+    const auto in_i32_range = [](std::int64_t value) {
+        return value >= std::numeric_limits<std::int32_t>::min() &&
+               value <= std::numeric_limits<std::int32_t>::max();
+    };
+    const auto constant_bound = constant_int_value(bound);
+    if (!start || !in_i32_range(*start) ||
+        (constant_bound && !in_i32_range(*constant_bound))) {
+        return false;
+    }
+
+    // Unit-step strict inequalities are finite for every invariant signed i32
+    // bound.  The continuing predicate itself proves that the next update cannot
+    // cross INT_MAX/INT_MIN.  A rotated latch-tested loop performs one update
+    // before its first test, so validate that update separately.
+    if (pred == CmpPred::LT && recurrence.step == 1) {
+        return !tests_next || *start < std::numeric_limits<std::int32_t>::max();
+    }
+    if (pred == CmpPred::GT && recurrence.step == -1) {
+        return !tests_next || *start > std::numeric_limits<std::int32_t>::min();
+    }
+
+    // Exact constant != countdowns cover canonical fixed-trip loops without
+    // relying on ScalarEvolution::constant_trip_count, whose broader historical
+    // contract does not prove a no-wrap exit recurrence.
+    if (pred != CmpPred::NE) {
+        return false;
+    }
+    if (!constant_bound) {
+        return false;
+    }
+    const std::int64_t distance = *constant_bound - *start;
+    if (distance % recurrence.step != 0) {
+        return false;
+    }
+    const std::int64_t updates_to_exit = distance / recurrence.step;
+    return tests_next ? updates_to_exit >= 1 : updates_to_exit >= 0;
+}
+
+bool prove_finite_canonical_loop(const Loop &loop, const DominatorTree &dom_tree,
+                                 const ScalarEvolution &scev) {
+    if (!canonical_loop_is_single_entry(loop, dom_tree)) {
+        return false;
+    }
+    const auto *branch = dynamic_cast<const BranchInst *>(loop.header->terminator());
+    if (branch == nullptr || !branch->is_conditional()) {
+        return false;
+    }
+    const bool true_continues = loop_contains(loop, branch->true_bb());
+    const bool false_continues = loop_contains(loop, branch->false_bb());
+    if (true_continues == false_continues) {
+        return false;
+    }
+    const auto *cmp = dynamic_cast<const CmpInst *>(branch->cond());
+    if (cmp == nullptr || cmp->op() != Instruction::OpID::ICmp) {
+        return false;
+    }
+
+    CmpPred pred = true_continues ? cmp->pred() : negate_predicate(cmp->pred());
+    for (const auto &instruction : loop.header->instructions()) {
+        const auto *phi = dynamic_cast<const PhiInst *>(instruction.get());
+        if (phi == nullptr) {
+            break;
+        }
+        auto recurrence = canonical_loop_recurrence(loop, *phi);
+        if (!recurrence) {
+            continue;
+        }
+        const Value *candidate = nullptr;
+        const Value *bound = nullptr;
+        CmpPred normalized_pred = pred;
+        if (cmp->lhs() == phi || cmp->lhs() == recurrence->next) {
+            candidate = cmp->lhs();
+            bound = cmp->rhs();
+        } else if (cmp->rhs() == phi || cmp->rhs() == recurrence->next) {
+            candidate = cmp->rhs();
+            bound = cmp->lhs();
+            normalized_pred = inverse_predicate(normalized_pred);
+        } else {
+            continue;
+        }
+        if (recurrence_proves_finite(*recurrence, candidate, bound, normalized_pred, loop,
+                                     scev)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool residual_cfg_is_acyclic(
+    const Function &function, const DominatorTree &dom_tree,
+    const std::unordered_map<const BasicBlock *, std::unordered_set<const BasicBlock *>>
+        &certified_backedges) {
+    enum class Color { White, Gray, Black };
+    std::unordered_map<const BasicBlock *, Color> colors;
+    std::function<bool(const BasicBlock *)> visit = [&](const BasicBlock *block) {
+        colors[block] = Color::Gray;
+        for (auto *successor : block->successors()) {
+            if (!dom_tree.is_reachable(successor)) {
+                continue;
+            }
+            auto found = certified_backedges.find(block);
+            if (found != certified_backedges.end() &&
+                found->second.find(successor) != found->second.end()) {
+                continue;
+            }
+            auto color = colors.find(successor);
+            if (color != colors.end() && color->second == Color::Gray) {
+                return false;
+            }
+            if ((color == colors.end() || color->second == Color::White) && !visit(successor)) {
+                return false;
+            }
+        }
+        colors[block] = Color::Black;
+        return true;
+    };
+
+    if (!visit(function.entry_block())) {
+        return false;
+    }
+    for (const auto &block : function.blocks()) {
+        if (!dom_tree.is_reachable(block.get()) || !block->successors().empty()) {
+            continue;
+        }
+        if (dynamic_cast<const ReturnInst *>(block->terminator()) == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool locally_proven_to_return(const Function &function) {
+    if (function.is_external() || function.entry_block() == nullptr) {
+        return false;
+    }
+    DominatorTree dom_tree(function);
+    LoopInfo loop_info(function, dom_tree);
+    if (!loop_sets_are_laminar(loop_info.loops())) {
+        return false;
+    }
+    ScalarEvolution scev(function, loop_info);
+    std::unordered_map<const BasicBlock *, std::unordered_set<const BasicBlock *>>
+        certified_backedges;
+    for (const auto &loop : loop_info.loops()) {
+        if (prove_finite_canonical_loop(loop, dom_tree, scev)) {
+            certified_backedges[loop.latches.front()].insert(loop.header);
+        }
+    }
+    return residual_cfg_is_acyclic(function, dom_tree, certified_backedges);
 }
 
 bool is_pointer_value(const Value *value) {
     return value != nullptr && value->type() != nullptr && value->type()->is_pointer();
 }
 
-const Argument *argument_base(const Value *value) {
-    if (auto *arg = dynamic_cast<const Argument *>(value)) {
-        return arg;
+struct PointerBaseProvenance {
+    std::unordered_set<const Argument *> arguments;
+    std::unordered_set<const GlobalVariable *> globals;
+    bool has_alloca = false;
+    bool has_unknown = false;
+
+    bool has_known_root() const {
+        return has_alloca || !arguments.empty() || !globals.empty();
+    }
+};
+
+void collect_pointer_base_provenance(const Value *value,
+                                     std::unordered_set<const Value *> &visited,
+                                     PointerBaseProvenance &out) {
+    if (!is_pointer_value(value)) {
+        out.has_unknown = true;
+        return;
+    }
+    if (!visited.insert(value).second) {
+        // A pointer induction phi can revisit itself through its GEP backedge.
+        // The completed graph still needs a concrete known root below.
+        return;
+    }
+
+    if (auto *argument = dynamic_cast<const Argument *>(value)) {
+        out.arguments.insert(argument);
+        return;
+    }
+    if (auto *global = dynamic_cast<const GlobalVariable *>(value)) {
+        out.globals.insert(global);
+        return;
+    }
+    if (dynamic_cast<const AllocaInst *>(value) != nullptr) {
+        out.has_alloca = true;
+        return;
     }
     if (auto *gep = dynamic_cast<const GetElementPtrInst *>(value)) {
-        return argument_base(gep->base_ptr());
+        collect_pointer_base_provenance(gep->base_ptr(), visited, out);
+        return;
     }
-    return nullptr;
+    if (auto *phi = dynamic_cast<const PhiInst *>(value)) {
+        auto incoming = phi->incoming();
+        if (incoming.empty()) {
+            out.has_unknown = true;
+            return;
+        }
+        for (const auto &[incoming_value, predecessor] : incoming) {
+            (void)predecessor;
+            collect_pointer_base_provenance(incoming_value, visited, out);
+        }
+        return;
+    }
+
+    out.has_unknown = true;
+}
+
+PointerBaseProvenance pointer_base_provenance(const Value *value) {
+    PointerBaseProvenance out;
+    std::unordered_set<const Value *> visited;
+    collect_pointer_base_provenance(value, visited, out);
+    if (!out.has_known_root()) {
+        out.has_unknown = true;
+    }
+    return out;
+}
+
+bool has_known_live_storage_base(const Value *value,
+                                 const OIRAliasAnalysis &alias_analysis) {
+    if (!is_pointer_value(value)) {
+        return false;
+    }
+
+    auto location = alias_analysis.memory_location(value);
+    if (dynamic_cast<const GlobalVariable *>(location.base) != nullptr ||
+        dynamic_cast<const AllocaInst *>(location.base) != nullptr) {
+        return true;
+    }
+
+    // On every defined SysY call, an array formal denotes live caller-owned
+    // storage.  Carry that obligation through GEPs and pointer induction phis;
+    // a cycle alone is insufficient, and any unknown incoming fails closed.
+    const auto provenance = pointer_base_provenance(value);
+    return provenance.has_known_root() && !provenance.has_unknown;
 }
 
 void add_pointer_effect(FunctionMemorySummary &summary, const Value *ptr,
@@ -1243,23 +1620,32 @@ void add_pointer_effect(FunctionMemorySummary &summary, const Value *ptr,
         return;
     }
 
-    if (auto *arg = argument_base(ptr)) {
-        if (is_write) {
-            summary.written_param_indices.insert(arg->index());
-        } else {
-            summary.read_param_indices.insert(arg->index());
-        }
-        return;
-    }
-
     if (dynamic_cast<const AllocaInst *>(loc.base) != nullptr) {
         return;
     }
 
-    if (is_write) {
-        summary.writes_unknown = true;
-    } else {
-        summary.reads_unknown = true;
+    const auto provenance = pointer_base_provenance(ptr);
+    for (auto *global : provenance.globals) {
+        if (is_write) {
+            summary.written_globals.insert(global);
+        } else {
+            summary.read_globals.insert(global);
+        }
+    }
+    for (auto *argument : provenance.arguments) {
+        if (is_write) {
+            summary.written_param_indices.insert(argument->index());
+        } else {
+            summary.read_param_indices.insert(argument->index());
+        }
+    }
+
+    if (provenance.has_unknown) {
+        if (is_write) {
+            summary.writes_unknown = true;
+        } else {
+            summary.reads_unknown = true;
+        }
     }
 }
 
@@ -1274,13 +1660,20 @@ FunctionMemorySummary project_call_summary(const CallInst &call,
     out.reads_all = callee_summary.reads_all;
     out.writes_all = callee_summary.writes_all;
     out.has_side_effect = callee_summary.has_side_effect;
+    out.may_not_return = callee_summary.may_not_return;
 
     auto args = call.args();
     for (auto index : callee_summary.read_param_indices) {
         if (index < args.size() && is_pointer_value(args[index])) {
             add_pointer_effect(out, args[index], alias_analysis, false);
+            if (!has_known_live_storage_base(args[index], alias_analysis)) {
+                // The callee read is removable only after its actual pointer is
+                // proven to retain valid SysY array-object provenance.
+                out.has_side_effect = true;
+            }
         } else {
             out.reads_unknown = true;
+            out.has_side_effect = true;
         }
     }
     for (auto index : callee_summary.written_param_indices) {
@@ -1299,6 +1692,7 @@ bool FunctionMemorySummary::operator==(const FunctionMemorySummary &other) const
     return reads_unknown == other.reads_unknown && writes_unknown == other.writes_unknown &&
            reads_all == other.reads_all && writes_all == other.writes_all &&
            has_side_effect == other.has_side_effect &&
+           may_not_return == other.may_not_return &&
            set_equal(read_globals, other.read_globals) &&
            set_equal(written_globals, other.written_globals) &&
            set_equal(read_param_indices, other.read_param_indices) &&
@@ -1323,12 +1717,18 @@ FunctionModRefAnalysis::FunctionModRefAnalysis(const Module &module) : module_(&
         if (function->is_external()) {
             summaries_[function.get()] = external_summary(*function);
         } else {
-            summaries_[function.get()] = {};
+            FunctionMemorySummary pessimistic;
+            pessimistic.may_not_return = true;
+            summaries_[function.get()] = std::move(pessimistic);
         }
     }
 
+    // Memory facts grow from bottom while may_not_return shrinks from top.  The
+    // product lattice is finite and the transfer functions use only union/OR in
+    // their respective conservative orders.  Starting must-return at top keeps
+    // every recursive SCC fail-closed while acyclic leaves clear their callers.
     bool changed = true;
-    for (unsigned iteration = 0; changed && iteration < 64; ++iteration) {
+    while (changed) {
         changed = false;
         for (const auto &function : module.functions()) {
             FunctionMemorySummary next =
@@ -1348,6 +1748,7 @@ const FunctionMemorySummary &FunctionModRefAnalysis::summary(const Function *fun
         out.reads_all = true;
         out.writes_all = true;
         out.has_side_effect = true;
+        out.may_not_return = true;
         return out;
     }();
 
@@ -1360,11 +1761,13 @@ FunctionMemorySummary FunctionModRefAnalysis::unknown_external_summary() const {
     out.reads_all = true;
     out.writes_all = true;
     out.has_side_effect = true;
+    out.may_not_return = true;
     return out;
 }
 
 FunctionMemorySummary FunctionModRefAnalysis::external_summary(const Function &function) const {
     FunctionMemorySummary out;
+    out.may_not_return = true;
     const auto &name = function.name();
 
     if (name == "getint" || name == "getch" || name == "getfloat") {
@@ -1398,17 +1801,17 @@ FunctionMemorySummary FunctionModRefAnalysis::external_summary(const Function &f
 
 FunctionMemorySummary FunctionModRefAnalysis::scan_function(const Function &function) const {
     FunctionMemorySummary out;
+    out.may_not_return = !locally_proven_to_return(function);
     OIRAliasAnalysis alias_analysis;
 
     for (const auto &block : function.blocks()) {
         for (const auto &inst : block->instructions()) {
             if (auto *load = dynamic_cast<const LoadInst *>(inst.get())) {
                 add_pointer_effect(out, load->ptr(), alias_analysis, false);
-                auto location = alias_analysis.memory_location(load->ptr());
-                if (location.base == nullptr ||
-                    dynamic_cast<const Argument *>(location.base) != nullptr) {
-                    // A read through an escaped/argument pointer can fault even when
-                    // its value is dead.  Preserve callers that contain such a read.
+                if (!has_known_live_storage_base(load->ptr(), alias_analysis)) {
+                    // Unknown pointer provenance can fault even when the loaded
+                    // value is dead.  Parameter reads remain conditional until
+                    // projected onto a proven live array actual.
                     out.has_side_effect = true;
                 }
                 continue;
@@ -1547,8 +1950,20 @@ bool FunctionModRefAnalysis::call_may_read(
 }
 
 bool FunctionModRefAnalysis::call_has_side_effect(const CallInst &call) const {
-    const auto info = call_summary(call);
-    return info.has_side_effect || info.may_write_memory();
+    const auto raw_info = call_summary(call);
+    OIRAliasAnalysis alias_analysis;
+    const auto projected_info = project_call_summary(call, raw_info, alias_analysis);
+
+    // A formal/unknown read remains conditional in the enclosing function's
+    // outward summary, but it has not yet been discharged at this callsite and
+    // therefore cannot be removed from the current function body.  Projection
+    // may also intentionally hide writes to caller-local allocas; keep using
+    // the raw callee write summary so later local loads remain observable.
+    const bool has_unresolved_read =
+        projected_info.reads_all || projected_info.reads_unknown ||
+        !projected_info.read_param_indices.empty();
+    return projected_info.has_side_effect || projected_info.may_not_return ||
+           has_unresolved_read || raw_info.may_write_memory();
 }
 
 bool FunctionModRefAnalysis::call_may_read_memory(const CallInst &call) const {

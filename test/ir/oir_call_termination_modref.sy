@@ -1,0 +1,112 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int termination_values[32];
+
+int readonly_maybe_infinite(int values[], int flag) {
+  int index = 0;
+  int total = 0;
+  while (index < flag) {
+    total = total + values[index] / 2;
+  }
+  return total;
+}
+
+int readonly_conditional_recursion(int values[], int value) {
+  if (value == 0) {
+    return values[0] / 2;
+  }
+  return readonly_conditional_recursion(values, value - 1) + 1;
+}
+
+int readonly_le_progression(int values[], int limit) {
+  int index = 0;
+  int total = 0;
+  while (index <= limit) {
+    total = total + values[index] / 2;
+    index = index + 1;
+  }
+  return total;
+}
+
+int constant_wrap_progression() {
+  int index = 2147483646;
+  while (index < 2147483647) {
+    index = index + 2;
+  }
+  return index;
+}
+
+int keep_nonterminating_countdown(int flag) {
+  int remaining = 7;
+  int result = 0;
+  while (remaining != 0) {
+    result = readonly_maybe_infinite(termination_values, flag);
+    remaining = remaining - 1;
+  }
+  return result;
+}
+
+int keep_conditional_recursion_countdown(int value) {
+  int remaining = 7;
+  int result = 0;
+  while (remaining != 0) {
+    result = readonly_conditional_recursion(termination_values, value);
+    remaining = remaining - 1;
+  }
+  return result;
+}
+
+int keep_le_countdown(int limit) {
+  int remaining = 7;
+  int result = 0;
+  while (remaining != 0) {
+    result = readonly_le_progression(termination_values, limit);
+    remaining = remaining - 1;
+  }
+  return result;
+}
+
+int keep_wrap_countdown() {
+  int remaining = 7;
+  int result = 0;
+  while (remaining != 0) {
+    result = constant_wrap_progression();
+    remaining = remaining - 1;
+  }
+  return result;
+}
+
+int main() {
+  return 0;
+}
+
+// A reachable pure CFG cycle with no ranking proof remains observable through
+// termination even when the call only reads a known Global array.
+// OIR-LABEL: define i32 @readonly_le_progression
+// OIR: icmp le i32
+// OIR: add i32 {{.*}}, 1
+// OIR-LABEL: define i32 @keep_nonterminating_countdown
+// OIR: [[SPIN:inl.readonly_maybe_infinite[A-Za-z0-9_.]+]]:
+// OIR-NEXT: br %[[SPIN]]
+// OIR: %remaining.loop.usw = phi
+// OIR: br i1
+
+// A recursive SCC is initialized pessimistically and cannot manufacture a
+// must-return fact from its own summary.  Mutual SCCs are covered by infra,
+// because SysY has no function-prototype syntax for a source-level pair.
+// OIR-LABEL: define i32 @keep_conditional_recursion_countdown
+// OIR: %remaining.loop = phi [7,
+// OIR: call i32 @readonly_conditional_recursion
+// OIR: br i1
+
+// Non-strict symbolic progress and a constant update that wraps before the
+// mathematical exit are deliberately outside the finite-loop proof.
+// OIR-LABEL: define i32 @keep_le_countdown
+// OIR: %remaining.loop = phi [7,
+// OIR-NEXT: {{.*}}call i32 @readonly_le_progression
+// OIR-NEXT: {{.*}}sub i32 %remaining.loop, 1
+// OIR: br i1 {{.*}}, %while.body.2, %while.end.3
+// OIR-LABEL: define i32 @keep_wrap_countdown
+// OIR: %remaining.loop = phi [7,
+// OIR: icmp lt i32 {{.*}}, 2147483647
+// OIR: add i32 {{.*}}, 2

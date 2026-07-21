@@ -1,0 +1,21 @@
+// RUN: python3 %S/../../scripts/context_inline_metamorphic_test.py --compiler %compiler --distinct-occurrence-source %s --expect-distinct-count 2 | FileCheck %s
+// CHECK: "distinct_occurrence_fingerprints"
+
+int occurrence_sink;
+
+int occurrence_leaf(int value, int mode) {
+  occurrence_sink = occurrence_sink + value;
+  int mixed = value * 3 + 1;
+  mixed = mixed * 5 + 2;
+  mixed = mixed * 7 + 4;
+  if (mode == 0) return mixed + 3;
+  return mixed - 5;
+}
+
+int same_block_occurrences(int value) {
+  int first = occurrence_leaf(value, 0);
+  int second = occurrence_leaf(value, 0);
+  return first + second;
+}
+
+int main() { return same_block_occurrences(getint()); }

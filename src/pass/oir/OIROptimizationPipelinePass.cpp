@@ -87,9 +87,10 @@ bool cleanup_after_tail_recursion(oir::Module &module, oir_opt::Stats &stats) {
 
 bool run_call_specialization_window(oir::Module &module, oir_opt::Stats &stats) {
     bool changed = false;
-    constexpr unsigned kMaxRounds = 128;
+    constexpr unsigned kMaxRounds = 12;
     for (unsigned round = 0; round < kMaxRounds; ++round) {
-        if (stats.call_cleanup_budget_exhausted) {
+        if (stats.call_cleanup_budget_exhausted ||
+            stats.call_specialization_work_exhausted) {
             break;
         }
         if (!oir_opt::specialize_constant_argument_calls(module, stats)) {

@@ -565,7 +565,7 @@ row.
 | P0 | Verify/classify tracked base `c815887`, snapshot the independent audited task and filtered task index, then freeze all required `de93e24` compiler-baseline reports/provenance and create the auditable Clang 22 artifact set | none | Tracked-base protection, baseline build/perf, and Clang rows in Verification Matrix | completed | Protection/branch gates passed. Release baseline and all four required `compare_perf.py` scopes passed and were frozen with provenance; Clang 22 artifact set and inspection are complete. No `PERF_MAX_CASES`. |
 | P1a | Add minimal OIR `FunctionOrigin`, stable function ID, and stable root ID with default-original creation/copy APIs | `include/oir/OIR.h`, `src/oir/OIR.cpp` | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_function_origin --jobs 1` | completed | Module creation assigns monotonic stable IDs; originals root to self; detached template copies identity; no AST/YIR/entrypoint/intrinsic metadata. Build and focused FileCheck pass. |
 | P1b | Replace `__yo_constprop.*` prefix decisions/counting with origin/root lineage while retaining generated names only for display/collision avoidance | `src/pass/oir/OIRInlinePass.cpp` | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_function_origin --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --filter oir_function_origin --jobs 1 --o1` | completed | Eligibility/counting now use `FunctionOrigin::ResidualSpecialization` plus root ID; generated names are display/collision-only. Build, 1 FileCheck, and 1 OIR stage case pass. |
-| P2 | Add lightweight direct-call graph/SCC context and deterministic worklist with tie-batch/global-budget policy | `src/pass/oir/OIRInlinePass.cpp`, optional `include/pass/oir/OIRInlineWorklist.h`, optional `src/pass/oir/OIRInlineWorklist.cpp` | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_worklist --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --filter oir_context_inline_worklist --jobs 1 --o1` | in_progress | Canonical CFG/data-flow refinement now supplies a normalized intra-function call position and stable `callsite.<hash>` audit fingerprint without names, IDs, addresses, block labels, module/block insertion, or successor-container order. Same-block structurally equivalent calls retain atomic tie semantics. Focused release/ASAN gates pass; fresh independent review and broad closure remain. |
+| P2 | Add lightweight direct-call graph/SCC context and deterministic worklist with tie-batch/global-budget policy | `src/pass/oir/OIRInlinePass.cpp`, optional `include/pass/oir/OIRInlineWorklist.h`, optional `src/pass/oir/OIRInlineWorklist.cpp` | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_worklist --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --filter oir_context_inline_worklist --jobs 1 --o1` | in_progress | P12a now augments canonical CFG/data-flow colors with the call's refined instruction color and its same-color semantic occurrence within the canonical block class. Distinct same-block positions no longer collapse, while equivalent positions in symmetric callers remain an atomic tie. Names, IDs, addresses, block labels, module/block insertion, and successor-container order remain excluded. Focused release gates pass; fresh independent review and broad closure remain. |
 | P3 | Add bounded affected cleanup after an accepted inline and requeue every function/callsite actually changed | `src/pass/oir/OIRInlinePass.cpp`, `src/pass/oir/OIROptimizationPipelinePass.cpp`, optional one cleanup helper | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_cleanup_budget --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --filter oir_context_inline_cleanup_budget --jobs 1 --o1` | in_progress | Three-round verified module cleanup, exposed-call retention, and exhausted-cap diagnostic/decision stop are present; the cleanup FileCheck passes within common 10/10. Keep open for independent review and broad affected-function/full-suite closure. |
 | P4 | Build a detached scratch clone and substitute exact constant-lattice arguments without live-module ownership | `src/pass/oir/OIRInlinePass.cpp`, optional `include/pass/oir/OIRResidualPE.h`, optional `src/pass/oir/OIRResidualPE.cpp` | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_clone --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --filter oir_context_inline_residual_pe_clone --jobs 1 --o1` | in_progress | Detached module/function/type/global/function-shadow cloning, exact constant substitution, and unsupported/error rollback gates pass within common 10/10. Keep open for broad ownership/sanitizer closure. |
 | P4a | Make the detached/live OIR ownership substrate strongly exception-safe, including use lists, function sets/body swap, destruction, verifier ownership checks, and bidirectional CFG edge insertion | `include/oir/OIR.h`, `src/oir/OIR.cpp`, `src/oir/OIRCFGUtils.cpp` | `python3 scripts/run_tests.py --suite infra --jobs 1`; P4/P8 clone and rollback gates | in_progress | Named clone/ownership/rollback fixtures now pass, and post-repair release OIR infra passes 1/1. Keep open for the exact debug+ASAN reproducer and final sanitizer/full-suite closure. |
@@ -576,17 +576,99 @@ row.
 | P7 | Implement atomic direct residual commit and measured persistent-clone reuse semantics | `src/pass/oir/OIRInlinePass.cpp`, residual helper/header | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_commit --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --filter oir_context_inline_residual_pe_commit --jobs 1 --o1`; `python3 scripts/run_tests.py --suite e2e --filter context_inline_residual_pe_commit --jobs 1 --o1` | in_progress | The commit fixture now proves two independent `measured-persistent-reuse-member` cost decisions followed by one aggregate reusable-clone decision. Direct and persistent publication remain atomic; keep open for fresh independent review and broad/full-suite closure. |
 | P8 | Prove rollback for cost reject, scratch cleanup budget exhaustion, unsupported/error, verifier failure, and commit-preflight failure | `src/pass/oir/OIRInlinePass.cpp`, residual helper/header | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_rollback --jobs 1`; `python3 scripts/run_tests.py --suite e2e --filter context_inline_residual_pe_rollback --jobs 1 --o1` | completed | Dedicated failpoints cover every named failure and subsequent control acceptance. The exact snapshot now copies and compares the complete live `Module` function-table name-to-`Function*` mapping in addition to object/use identity, allocators, stats, growth, and pressure; rollback and common FileChecks pass under release and debug+ASAN. |
 | P9 | Add cumulative module/root growth and live-pointer/memory/register/spill-pressure limits to inline and residual commit | `src/pass/oir/OIRInlinePass.cpp`, `include/pass/oir/OIRCostModel.h`, at most one shared cost header | `xmake`; `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_pressure --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage mir --stage asm --suite e2e --filter crypto- --jobs 1 --o1` | in_progress | Combined direct-tie module/root growth preflight is covered by the persistent `tie-budget` rejection fixture, and the generic large mutable-pointer pressure FileCheck passes. Keep open for required crypto MIR/ASM/e2e and performance preservation gates. |
-| P10 | Add the complete generic metamorphic/signed/alias/SCC test battery | no production files | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --stage mir --stage asm --filter context_inline --jobs 1 --o1`; `python3 scripts/run_tests.py --suite e2e --filter context_inline_residual_pe --jobs 1 --o1` | in_progress | Common FileCheck now passes 12/12. New paired definition-reorder and CFG/block/successor-container permutation fixtures compare accepted structural-fingerprint multisets, reject-reason multisets, and four consumed risk/growth budget totals in normal and forced tie-budget modes. Context OIR/MIR/ASM/e2e passes 8/8; full-suite closure remains. |
+| P10 | Add the complete generic metamorphic/signed/alias/SCC test battery | no production files | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline --jobs 1`; `python3 scripts/run_tests.py --suite stage --stage oir --stage mir --stage asm --filter context_inline --jobs 1 --o1`; `python3 scripts/run_tests.py --suite e2e --filter context_inline_residual_pe --jobs 1 --o1` | in_progress | P12a common FileCheck passes 13/13. Paired definition-reorder and CFG/block/successor-container permutation fixtures compare accepted structural-fingerprint multisets, reject-reason multisets, and four consumed risk/growth budget totals in normal and forced tie-budget modes. The new positional occurrence fixture separately proves two same-block calls receive distinct fingerprints, while a truly symmetric cross-caller tie remains all-fit/all-reject. Context OIR reruns 2/2; prior MIR/ASM/e2e passes 6/6 remain focused evidence; full-suite closure remains. |
 | P10a | Keep the standalone OIR infrastructure fixtures on the live function-argument API so ownership/use-list checks exercise valid construction | `scripts/oir_infra_tests.py` | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite infra --jobs 1 --infra-timeout 60` | in_progress | Post-blocker repair release rerun passes 1/1 in 3.35s. Keep open until the final full optimized suite reruns this fixture in context. |
 | P10b | Repair the downstream address-mode-combine operand-lifetime UAF exposed by context-generated OIR | `src/pass/mir/MIRAddressModeCombinePass.cpp` | exact five-case debug+ASAN reproducer command must be recorded/rerun; focused MIR/ASM/e2e; final broad gates | in_progress | Independent re-review rebuilt the current debug+ASAN compiler and passed the explicit five-file MIR reproducer 5/5 (three Huffman plus both `context_inline_*` functional cases). The exact command is now recorded in the Verification Matrix. Keep open only for the still-required final broad sanitizer/correctness closure. |
 | P11 | Run full correctness and every required sequential baseline/current performance row, preserve reports, generate four explicit deltas, inspect results, and update task | none | complete Verification Matrix | pending | Required timeout/failure keeps task out of `ready_for_review`. |
+| P12a | Replace the coarse canonical position class with a real name/order-independent call occurrence while preserving genuine tie semantics | `src/pass/oir/OIRInlinePass.cpp` | release build; positional/common/metamorphic FileChecks; focused OIR stage; persistent-reuse commit FileCheck | completed | Formal caller arguments retain their semantic index. Each reachable call records its refined instruction color plus its occurrence among same-color calls in the block's semantic instruction sequence; the map is computed once with the scan-local canonical-color cache. New evidence reports distinct fingerprints `callsite.571d2498a5879b67` and `callsite.bebc4ca3677330ab` for different same-block positions. A pair of alpha-equivalent callers at matching canonical positions retains fingerprint `callsite.41ff3a493ac777fe`, accepts both members normally, and rejects both as `CumulativeBudgetExhausted` in forced-budget mode. Release/common/metamorphic/commit/OIR gates pass; fresh independent review remains required before performance. |
+| P12b | Separate direct trapping-load retention from callsite mod/ref so a proven readonly call over a concrete live-storage actual does not block overwritten-countdown elimination | `src/oir/OIRAnalysis.cpp` | release build; direct ADCE and readonly-countdown FileChecks; focused OIR/e2e; CRC OIR stage and `countdown.final` inspection | completed | Function summaries keep formal reads parameterized instead of making them unconditional effects. Cycle-safe GEP/Phi provenance requires an Argument/Global/Alloca root and rejects any unknown incoming. With P12b.1, projection through an Argument remains a conditional formal read in the enclosing summary and is non-removable in that current body; only a concrete Global/Alloca actual discharges it at the current callsite. Raw callee writes, unknown provenance, external effects, and dynamic/zero/`-1` signed div/rem remain fail-closed. The Global positive collapses to one final call while dynamic-divisor and visible-write negatives retain their loops; CRC's Alloca actual again reaches `countdown.final.7` with only `crc32(..., i32 1)`. |
+| P12b.1 | Close independent-review wrapper projection, fixed-point depth, and constant div/rem trap-folding gaps without widening pointer facts | `src/oir/OIRAnalysis.cpp`, `src/pass/oir/OIRScalarOptUtils.cpp` | release build; ADCE/countdown FileChecks; OIR infra; focused OIR/e2e; CRC OIR shape | completed | `call_has_side_effect` now keeps projected formal/all/unknown reads non-removable in the current body while outward wrapper summaries remain parameterized; raw writes still retain calls that write caller-local allocas. Summary iteration reaches the true finite monotone fixed point rather than stopping at 64 rounds. Infra covers known/unknown wrapper actuals, inner formal forwarding, local writes, mixed Phi, a rootless pointer cycle, and a 96-function reverse chain ending in a recursive SCC. Constant `0`/`-1` div/rem guards include `INT_MIN / -1` and `INT_MIN % -1`; the scalar folder no longer folds those two trapping constants away. |
+| P12b.2 | Require a conservative must-return/termination proof before a result-dead readonly call can be removed | `include/oir/OIRAnalysis.h`, `src/oir/OIRAnalysis.cpp` | dedicated non-returning readonly direct/recursive/SCC negatives; existing P12b.1 gates | completed | `may_not_return` starts pessimistically for every internal, external, and unknown function and clears only through the converged greatest fixed point. A local proof accepts only single-entry natural loops whose unit signed-i32 recurrence has a strict no-wrap exit (`LT/+1`, `GT/-1`, or an exact constant `NE` countdown); removing all certified backedges must leave a reachable DAG ending in returns. Direct/mutual recursion, unknown externals, irreducible cycles, non-strict progress, and wrapping updates fail closed. Rotated fixed countdowns and CRC remain removable. |
+| P12b.3 | Reject non-canonical i32 constant payloads before scalar integer folding performs host arithmetic | `src/pass/oir/OIRScalarOptUtils.cpp` | direct scalar-fold infra; release build; ADCE/termination/readonly/context FileChecks and e2e; CRC OIR shape | completed | `fold_int_binary` now requires both operands to be within `INT32_MIN..INT32_MAX` before every Add/Sub/Mul/And/Xor/SDiv/SRem path. This prevents host UB such as `INT64_MIN / -1` and uniformly rejects values outside the fold's semantic domain while preserving canonical i32 wrapping and safe div/rem results. Direct infra links the real scalar utility and covers both operands on both range sides, i64 extremes, `INT64_MIN / -1` and `% -1`, canonical wrapping, safe division/remainder, zero divisors, and canonical `INT_MIN / -1` traps. |
+| P12c | Separate position-sensitive structural decisions from position-independent persistent residual reuse | `src/pass/oir/OIRInlinePass.cpp`, one focused fixture/checker | release build; cross-position/common/commit/cost/metamorphic FileChecks; focused OIR stage | completed | `decision_key` alone controls ordering, cap, diagnostics, and atomic direct ties. A separate name/ID/address-free reuse bucket omits position and includes canonical callee shape, mask, exact typed binding, return demand/type; membership then rechecks actual callee/root identity and a fresh mapped residual signature. Every member receives fresh eligibility, scratch, reduction, direct-legality, cost, and pressure evaluation. Aggregate accounting charges one clone growth/root specialization while summing callsite savings/pressure. Any persistent failure rolls diagnostics/state back and resumes only the member's true decision tie. The focused fixture records distinct fingerprints `callsite.5a6b164f05aa8be8` and `callsite.c2eb1914b325b750`, one `reuse.*` aggregate with clone growth 6, and excludes different constant/mask/callee/dead-return sites. |
+| P12d | Restore a single residual-growth unit and deterministic cross-window specialization work bounds | `src/pass/oir/OIRInlinePass.cpp`, `src/pass/oir/OIROptimizationPipelinePass.cpp`, `include/oir/OIRScalarOpt.h` | serial release build; growth/work focused checker; P12c common/commit/cost/metamorphic/OIR gates; CRC OIR shape | completed | All specialization risk, commit, aggregate, module, and root accounting use `G=static_instrs+branches+phis+(returns>1)`. Initial module/root budgets use exact nonnegative policy units and ceil-percent arithmetic; the specialization window cap is 12. A persistent ledger caps 128 scratch attempts and policy compile-time work across both windows, reserves/settles every actual scratch, charges every actual detached plan/import, rejects true ties and persistent groups atomically, and survives rollback/publication failure/exception. Focused evidence proves aggregate G=6, direct fallback G, cost G=2, exact-fit 6 versus 5, and one persistent `CompileTimeTooHigh` diagnostic with no second-window retry. |
+| P12e | Partition call growth so specialization, ordinary nonrecursive inlining, and self-recursive inlining cannot steal one another's intended capacity | `src/pass/oir/OIRInlinePass.cpp`, `include/oir/OIRScalarOpt.h` | serial release build; dedicated recursive/cost/termination FileChecks; cross-window growth-class checker; P12c gates; CRC OIR shape; full FileCheck/poly | completed | Three non-borrowable class module/root growth ledgers cover Specialization, Ordinary, and Recursive, while every commit must also fit one shared total hard cap. For initial non-external growth `B`, specialization and ordinary quotas are `M=max(A,ceil(B*P/100))` per module and `Q=max(A,F)` per root; self-recursive quotas are `R` for both. Saturated total hard caps are `2M+R` and `2Q+R`. The test override gives every class `N` and the total `3N`. Every specialization/ordinary/recursive singleton and tie path checks, reserves, rolls back, and commits its class plus total; dry runs do not charge, pressure stays global, and P12d's rollback-external work ledger is unchanged. Exact-budget evidence proves an ordinary `G=2` commit cannot consume the untouched specialization quota used by a second-window `G=2` residual. |
 
 ## Pre-Performance Independent Review
 
-Disposition: **PRE-PERF BLOCKED pending canonical-key/metamorphic repair and fresh independent
-review. Do not run `compare_perf.py`.**
-The fresh 2026-07-21 independent re-review accepts the two immediately preceding repairs but keeps
-performance blocked on two older task invariants that are still not implemented/proven:
+Disposition: **PRE-PERF BLOCKED only on the currently running final broad ASAN closure, followed by
+release restore/provenance and the final protected-path checks. Do not run `compare_perf.py` yet.**
+
+Fresh independent read-only reviews of both P12d and P12e report **PASS** with no code blocker.
+P12d's single saturated residual growth unit, cross-window attempt/work ledger, group-atomic
+capacity checks, charged scratch/plan/import paths, and rollback-external monotonic merge remain
+intact. P12e closes the shared-pool finding with three non-borrowable module/root growth classes:
+Specialization, Ordinary nonrecursive, and self-Recursive. Every acceptance must fit both its class
+ledger and the shared total hard cap.
+
+For P12e, `B` is the saturated initial sum of non-external residual instruction growth `G`, `A` is
+the nonnegative small-code allowance, `P` is the nonnegative module growth percentage, `F` is the
+nonnegative per-function growth cap, and `R=recursive_inline_growth_budget(policy)` is the existing
+recursive-inline growth allowance.
+Thus `M=max(A,ceil(B*P/100))`, `Q=max(A,F)`, class module/root caps are `M/Q`, `M/Q`, and `R/R`, and
+the saturated shared total module/root caps are `2M+R` and `2Q+R`. The test override assigns `N` to
+each class and saturated `3N` to the shared total. Dry-run performs no accounting; failed reserve,
+commit, publication, or transaction paths restore the new class/total growth state; the monotonic
+specialization work ledger remains deliberately outside rollback.
+
+The P12e review's only non-blocking test-strength suggestion is to add a future recursive-class
+exact-fit case that executes the full `3N` endpoint. The current checker already covers `N=2`,
+`N=1`, class-only exhaustion, shared-total exhaustion, and the ordinary-first/second-window
+specialization non-borrowing behavior; static review covers the recursive class and exact formula.
+Release Full FileCheck/poly, full downstream stage+e2e, and full optimized gates now pass. The
+current-source final broad ASAN gate is still running, so no sanitizer outcome is claimed here.
+
+The following P12a/P12b paragraphs preserve the implementation evidence that preceded their now
+passing combined review:
+
+The independent review of committed checkpoint `d07bb33` found that its purported position class
+still collapsed two distinct same-block calls: the key hashed only block/callee/argument colors and
+did not identify the call occurrence itself. P12a is the current uncommitted repair on top of that
+checkpoint. It adds the refined call-instruction color and same-color semantic occurrence, retains
+formal argument indexes, and moves atomic all-fit/all-reject coverage to a genuine symmetric tie.
+Release build, positional 2/2, common context 13/13, definition/CFG metamorphic 2/2,
+persistent-reuse commit 1/1, `cost_model_pe` 1/1, and focused OIR 2/2 pass. This implementation
+evidence is not independent approval; performance remains blocked.
+
+P12b/P12b.1 are separate current uncommitted repairs for the observed mod/ref regression. They
+change no countdown or ADCE rewrite rule. Direct loads remain non-removable liveness roots. A
+formal read projected through another Argument remains in `read_param_indices`, and the inner call
+is non-removable in that current function body; a concrete Global/Alloca actual can discharge the
+read at its outer callsite. Unknown/all reads, rootless or mixed-unknown pointer cycles, raw callee
+writes, external effects, and dynamic/zero/`-1` signed div/rem remain fail-closed. The summary
+solver now iterates to its actual finite monotone fixed point, with a 96-function reverse chain plus
+recursive SCC guard. Constant `INT_MIN / -1` and `INT_MIN % -1` are no longer folded around the
+trap-retention rule. Release build, both focused FileChecks, infra, OIR/e2e, and CRC OIR stage pass;
+direct CRC inspection still shows no outer `%n.loop` and the sole `crc32(..., i32 1)` call in
+`countdown.final.7`.
+
+This pointer classification is deliberately **not** a bounds or range proof. P12b.1 preserves the
+`d07bb33`-preexisting OIR fault abstraction and the valid SysY defined-execution contract: an
+executed array access in a defined program is within its live object. The new analysis distinguishes
+known live Global/Alloca/Argument storage roots from invalid/unknown provenance only; every unknown
+or mixed-unknown graph fails closed. No new in-bounds conclusion is derived from provenance.
+
+P12b.2 closes that implementation hole with a separate conservative termination dimension. The
+local proof recognizes only strict unit-step signed-i32 loops with a no-wrap exit and requires the
+remaining reachable CFG to be acyclic; the transitive fixed point is initialized so recursive SCCs,
+unknown/external calls, and every unproved local cycle remain `may_not_return`. Direct loop,
+recursion, mutual-SCC, irreducible, non-strict, and wraparound negatives pass, while rotated fixed
+countdowns and the CRC positive still collapse. This implementation evidence is not independent
+approval; fresh combined review, now including P12b.3, and broad correctness still block
+performance.
+
+The second review round found one additional host-language safety blocker outside the termination
+matcher: `fold_int_binary` accepted arbitrary `int64_t` payloads even though its semantic type is
+i32, and `Module::create_i32` plus the verifier currently permit such non-canonical constants.
+Consequently `SDiv`/`SRem(INT64_MIN, -1)` could execute host C++ UB, while Add/Sub/Mul and bitwise
+folds also consumed values outside their declared OIR domain. P12b.3 rejects either operand unless
+it lies in `INT32_MIN..INT32_MAX` before any operation. Direct infra invokes the real helper for all
+seven integer ops, both operands and both range directions, both i64 extremes, canonical wrapping,
+safe div/rem, zero divisors, and canonical signed-minimum/`-1` traps. Focused implementation gates
+pass, but P12b.3 still requires fresh independent review and does not unblock performance.
+
+The following pre-P12a review record is preserved as the reason for this repair. That review
+accepted the two immediately preceding persistent-reuse/rollback repairs but found:
 
 - The persistent exact-tie path now independently revalidates every member's eligibility, mask,
   typed binding and live callee, builds and verifies a fresh detached residual, measures residual
@@ -599,12 +681,12 @@ performance blocked on two older task invariants that are still not implemented/
   typed-import, cost, commit-preflight and commit-after-first failpoints all execute that assertion
   and demonstrate a later accepted control candidate.  The staged cleanup-publication failure also
   restores the complete prepared function set/table and retains its existing control IR checks.
-- **Blocker:** `structural_callsite_key` still has no canonical intra-function instruction-position
+- **Pre-P12a blocker:** `structural_callsite_key` still had no canonical intra-function instruction-position
   component.  It contains SCC/caller/callee shapes, loop/dead-return facts and positional typed
   argument bindings, but two otherwise identical calls at different program positions receive the
   same key.  The current same-block fixture relies on this collapse.  This does not satisfy the
   recorded invariant requiring normalized intra-function instruction position in the key.
-- **Blocker:** the focused battery contains alpha-renamed structural pairs, SCC and same-block tie
+- **Pre-P12a blocker:** the focused battery contained alpha-renamed structural pairs, SCC and same-block tie
   coverage, but no paired function-definition-reordered input and no paired equivalent-CFG/block
   permutation that compare accepted structural fingerprints, rejection reasons and consumed
   budgets.  Passing the existing fixtures therefore is not sufficient evidence for the two
@@ -742,9 +824,10 @@ Focused tests must cover:
 
 ### Correctness, Scope, And Protection
 
-Normative unexecuted gates remain `NOT_RUN`; interim evidence never substitutes for them. The
-post-review implementation repair ran only the focused build/correctness gates updated below; it
-ran no sanitizer or performance command and does not supersede the older reported evidence.
+Unexecuted current performance rows remain `NOT_RUN`; interim evidence never substitutes for them.
+The normative P12e release broad-correctness rows below now pass. Earlier release and sanitizer
+checkpoints remain historical evidence, while the final current-source broad ASAN gate is still
+running and no performance command has run.
 
 | Gate | Command | Required? | Result | Notes |
 | --- | --- | --- | --- | --- |
@@ -753,34 +836,48 @@ ran no sanitizer or performance command and does not supersede the older reporte
 | Pre-check protected docs/task/index | `git diff --exit-code c815887 -- docs/README.md docs/egraph-design.md`; run the independent-task `sha256sum -c` and filtered-index `cmp` | yes | PASS | Base-doc diff empty; independent-task SHA and filtered-index comparison passed. |
 | Post-checkout/worktree state | rerun the base-doc diff, other-task SHA-256, and filtered-index `cmp` from the Branch safe sequence | yes | PASS | Created `task/context-inline-residual-pe` at `c815887`; protected checks and single-row count passed. |
 | P0 Clang 22 diagnosis | run all commands in `P0 Auditable Clang 22 Reproduction` and save every listed artifact | yes before source edits | PASS | Clang 22.1.8 LL/ASM/remarks/opt-record/driver/source hashes saved. Inspection confirms standalone 32-trip helper backedges and nested decoder/read-state inlining, not a whole-loop bitop. |
-| Build | `xmake f -m release && xmake` | yes after each source patch | PASS (canonical repair) | Current repair release and debug+ASAN builds passed; final release configuration was restored after sanitizer checks. |
+| Build | `xmake f -m release`; `xmake -j1` | yes after each source patch | PASS (P12e release) | The current P12e source built successfully for the completed release gates. P12d's serial full rebuild/link in 85.598s and charged persistent staged-plan rebuild/link in 11.863s remain recorded, as do the earlier P12c/P12b.3/P12b.2/P12b.1/P12b/P12a rebuilds. Final current-source debug+ASAN broad evidence is tracked separately and remains open. |
 | Origin FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_function_origin --jobs 1` | yes | PASS | Recovery rerun: 1/1 FileCheck; OIR/MIR/ASM stage plus e2e 4/4. Cost assertion now records the detached demanded-scalar residual summary. |
 | Fixed-point suffix FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_fixed_point_suffix --jobs 1` | yes for the current residual cleanup | PASS | 1/1. Exact 31/32/33/47 loops shorten from ordinary IR facts to 7/7/32/1; demanded-live-out, side-effect, and dynamic-divisor 73-trip negatives remain 73. |
 | Fixed-point suffix stages/e2e | `python3 scripts/run_tests.py --suite stage --stage oir --stage mir --stage asm --filter context_inline_fixed_point_suffix --jobs 1 --o1`; `python3 scripts/run_tests.py --suite e2e --filter context_inline_fixed_point_suffix --jobs 1 --o1` | yes for the current residual cleanup | PASS | OIR/MIR/ASM 3/3 and e2e 1/1; covers positive/negative/INT_MIN signed div, negative srem, exact 31/32/33 and non-32 47/73 counts. |
+| P12b mod/ref focused guards | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_adce_nonremovable_dependencies --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12b-adce`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_countdown_readonly_modref --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12b-countdown-filecheck`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite infra --jobs 1 --infra-timeout 60 --work-dir /tmp/yoolang-p12b-infra` | yes | PASS (P12b) | FileChecks passed 1/1 and 1/1; infra passed 1/1 in 3.43s. The direct ADCE fixture retains Argument loads and dynamic div/rem dependencies. The new FileCheck collapses only the readonly valid-array case and retains both `%remaining.loop` plus the call for dynamic-divisor and observable-write negatives. Infra separately proves a valid Alloca actual is removable but an `undef i32*` actual is fail-closed by `call_has_side_effect`. Two development-only FileCheck failures (typed `i32 1` spelling, then unintended fixture inlining) were corrected before these final reruns. |
+| P12b OIR/e2e and CRC shape | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --filter oir_countdown_readonly_modref --jobs 1 --o1 --compile-timeout 180 --work-dir /tmp/yoolang-p12b-countdown-oir`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite e2e --filter oir_countdown_readonly_modref --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --work-dir /tmp/yoolang-p12b-countdown-e2e`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --filter crc1 --jobs 1 --o1 --compile-timeout 180 --work-dir /tmp/yoolang-p12b-crc-oir`; `build/linux/x86_64/release/compiler --emit-oir -O1 test/performance/crc1.sy \| rg -n -C 5 'countdown\\.final|\\.final = call i32 @crc32|%n\\.loop|call i32 @crc32'`; `build/linux/x86_64/release/compiler --emit-oir -O1 test/ir/oir_countdown_readonly_modref.sy \| rg -n -A 18 'define i32 @(keep_dynamic_div_countdown|keep_observable_countdown)'` | yes | PASS (P12b) | New OIR stage 1/1 and e2e 1/1; CRC OIR stage 1/1. Direct CRC output has `br ... %countdown.final.7`, exit phi from that block, and the sole `%v14.final = call i32 @crc32(..., i32 1)`; no outer `%n.loop` remains. Direct negative output shows `%remaining.loop`, the respective helper call, and a conditional backedge in both dynamic-divisor and observable-write functions. |
+| P12b.1 wrapper/fixed-point/divrem guards | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_adce_nonremovable_dependencies --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12b1-adce`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_countdown_readonly_modref --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12b1-countdown-filecheck`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite infra --jobs 1 --infra-timeout 60 --work-dir /tmp/yoolang-p12b1-infra` | yes | PASS (P12b.1) | FileChecks passed 1/1 and 1/1; infra passed 1/1 in 3.37s. ADCE now explicitly retains constant divisor/remainder `0` and `-1`, including `INT_MIN / -1` and `INT_MIN % -1`. Infra proves a wrapper summary keeps formal read parameter 0 without unconditional side effect, its inner formal call remains non-removable, an outer Alloca call is removable, and `undef`, mixed-known/unknown Phi, rootless pointer-cycle, and caller-local write cases fail closed. A 96-function reverse chain ending in a two-function SCC propagates read/write/side-effect facts to the top, which the removed 64-round cap could not guarantee. The first development rerun correctly rejected the old Argument-based positive; the final fixture uses a concrete Global actual rather than weakening the current-body formal-read rule. |
+| P12b.1 OIR/e2e and CRC shape | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --filter oir_countdown_readonly_modref --jobs 1 --o1 --compile-timeout 180 --work-dir /tmp/yoolang-p12b1-countdown-oir`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite e2e --filter oir_countdown_readonly_modref --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --work-dir /tmp/yoolang-p12b1-countdown-e2e`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --filter crc1 --jobs 1 --o1 --compile-timeout 180 --work-dir /tmp/yoolang-p12b1-crc-oir`; `build/linux/x86_64/release/compiler --emit-oir -O1 test/performance/crc1.sy \| rg -n -C 5 'countdown\\.final|\\.final = call i32 @crc32|%n\\.loop|call i32 @crc32'`; `build/linux/x86_64/release/compiler --emit-oir -O1 test/ir/oir_countdown_readonly_modref.sy \| rg -n -A 18 'define i32 @(keep_dynamic_div_countdown|keep_observable_countdown)'` | yes | PASS (P12b.1) | OIR stage, e2e, and CRC OIR stage each passed 1/1. Direct CRC output retains `countdown.final.7` and the sole `%v14.final = call i32 @crc32(..., i32 1)` with no `%n.loop`. Both dynamic-divisor and observable-write negatives retain `%remaining.loop`, their helper call, and the conditional backedge. |
+| P12b.2 nontermination guard | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_call_termination_modref --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12b2-termination-filecheck-final3`; matching `--suite e2e --filter oir_call_termination_modref --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --work-dir /tmp/yoolang-p12b2-termination-e2e-final3`; `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite infra --jobs 1 --infra-timeout 60 --work-dir /tmp/yoolang-p12b2-infra-final3`; rerun the P12b.1 ADCE/countdown FileCheck, OIR/e2e, CRC stage/direct-shape commands with `/tmp/yoolang-p12b2-*-final3`; rerun P12a positional/common/commit FileChecks | yes before performance | PASS (P12b.2 implementation + focused review) | Termination FileCheck 1/1, terminating-input e2e 1/1, and infra 1/1 in 3.61s. Infra proves two rotated fixed countdowns, symbolic strict `LT/+1` and `GT/-1`, false-edge/swapped-operand normalization, and an acyclic caller clear `may_not_return`; direct recursion, mutual SCC, unknown external, irreducible CFG, symbolic `LE/+1`, constant wrap `+2`, and an unnormalized i32 `INT64_MIN` step stay set. ADCE and readonly-countdown FileChecks passed 1/1 each; countdown OIR/e2e and CRC OIR passed 1/1 each. Direct CRC output retains `countdown.final.7` and the sole `crc32(..., i32 1)` with no outer `%n.loop`. P12a positional 2/2, common 13/13, and commit 1/1 passed. Development-only failures exposed and corrected a recursive/non-strict old positive, unsupported source prototypes for mutual recursion, inlining-sensitive FileCheck spelling, and arbitrary ConstantInt negation in the matcher. A post-fix focused independent review found no remaining P12b.2 blocker; combined P12a/P12b.1/P12b.2 review is still required. No performance command ran. |
+| P12b.3 canonical scalar-fold domain | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite infra --jobs 1 --infra-timeout 60 --work-dir /tmp/yoolang-p12b3-infra`; FileChecks with `--filter oir_adce_nonremovable_dependencies --work-dir /tmp/yoolang-p12b3-adce`, `--filter oir_call_termination_modref --work-dir /tmp/yoolang-p12b3-termination-filecheck`, `--filter oir_countdown_readonly_modref --work-dir /tmp/yoolang-p12b3-readonly-filecheck`, and `--filter oir_context_inline --work-dir /tmp/yoolang-p12b3-context-filecheck`; matching termination e2e and readonly OIR/e2e under `/tmp/yoolang-p12b3-*`; CRC OIR stage under `/tmp/yoolang-p12b3-crc-oir`; direct CRC `countdown.final`/`%n.loop` inspection | yes before performance | PASS (P12b.3 implementation) | Infra passed 1/1 in 4.01s and directly exercised the linked scalar helper. ADCE, termination, and readonly FileChecks passed 1/1 each; termination e2e passed 1/1; readonly OIR/e2e passed 1/1 each; context common passed 13/13; CRC OIR passed 1/1. Direct CRC output still contains `countdown.final.7` and the sole `%v14.final = call i32 @crc32(..., i32 1)` with no `%n.loop`. No sanitizer or performance command ran; fresh review remains required. |
 | OIR infrastructure fixture repair | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite infra --jobs 1 --infra-timeout 60 --work-dir /tmp/yoolang-huffman-repair-final-infra` | yes because test infrastructure changed | PASS (current repair) | Final post-repair release rerun passed 1/1 in 3.22s. Rerun again as part of the final full suite. |
 | MIR address-combine ASAN reproducer | `xmake f -m debug && xmake`; then `for source in test/performance/huffman-01.sy test/performance/huffman-02.sy test/performance/huffman-03.sy test/functional/context_inline_fixed_point_suffix.sy test/functional/context_inline_residual_pe.sy; do env ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 build/linux/x86_64/debug/compiler --emit-mir -O1 "$source" >/dev/null || exit 1; done` | yes because MIR production changed | PASS (current repair) | Post-repair current-source debug+ASAN rebuild and all five explicit MIR compilations passed, 5/5. This remains focused rather than the final broad sanitizer gate. |
 | Debug+ASAN FileCheck/poly checkpoint | `env ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 python3 scripts/run_tests.py --binary build/linux/x86_64/debug/compiler --suite filecheck --filter oir_context_inline --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-huffman-repair-asan-filecheck`; then the analogous `--filter cost_model_pe --work-dir /tmp/yoolang-huffman-repair-asan-cost` command | yes for current OIR ownership/CFG changes | PASS (canonical repair); broad checkpoint remains interim | Current-source debug+ASAN passed context-inline 12/12, including both metamorphic pairs, and `cost_model_pe` 1/1. The earlier broad result remains interim. |
 | Debug+ASAN full stage/e2e checkpoint | `env ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 python3 scripts/run_tests.py --binary build/linux/x86_64/debug/compiler --suite stage --suite e2e --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60` | repair checkpoint; final sanitizer rerun required after blockers | INCOMPLETE | 1412 PASS, 6 compile timeouts at 180s, 1 SKIP. The six timeouts belonged to two groups; implementation reported each group later passed 3/3 in release, which does not provide ASAN closure. |
-| Release full-suite checkpoint | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite all --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --filecheck-timeout 60`; then the exact focused infra command above | repair checkpoint only | INTERIM_PASS | Initial full run: 1480 PASS, 1 infra FAIL, 1 SKIP. After the fixture-only repair, focused infra passed 1/1, giving a combined checkpoint of 1481 PASS, 0 FAIL, 1 SKIP. Remaining source blockers mean the normative final full gate below stays `NOT_RUN`. |
+| Final current-source debug+ASAN broad closure | current final broad debug+ASAN rerun; preserve the exact invocation, log, and summary when it exits | yes before performance | RUNNING | Still running at this update. No PASS, failure, timeout, or skip count is inferred or claimed. The preceding 1412/6-timeout/1-skip checkpoint remains historical evidence only. |
+| Release full-suite checkpoint | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite all --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --filecheck-timeout 60`; then the exact focused infra command above | repair checkpoint only | INTERIM_PASS | Initial full run: 1480 PASS, 1 infra FAIL, 1 SKIP. After the fixture-only repair, focused infra passed 1/1, giving a combined checkpoint of 1481 PASS, 0 FAIL, 1 SKIP. This historical checkpoint is superseded by the normative final P12e release rows below. |
 | Worklist FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_worklist --jobs 1` | yes | PASS | 1/1 in 2.87s. The broader common-prefix rerun passed 10/10 and adds positional binding plus same-block all-accept/all-budget-reject coverage. |
-| Canonical metamorphic evidence | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_metamorphic --jobs 1 --filecheck-timeout 180` | yes | PASS (canonical repair) | 2/2. Definition reorder and CFG/block/successor-container permutation compare accepted structural fingerprints, reject reasons, and consumed budget totals in normal and forced tie-budget modes. |
+| Canonical positional occurrence/tie | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_positional --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12a-positional-final` | yes | PASS (P12a) | 2/2. Different same-block calls have distinct fingerprints and ordinary `direct-residual` scopes. Two alpha-equivalent callers at matching canonical positions retain one structural key: both accept normally and both reject as `CumulativeBudgetExhausted` under forced tie budget. |
+| Canonical common FileCheck | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12d-context-common-final` | yes | PASS (P12d) | Final-source release run passed 14/14. The first run exposed that the positional-only checker saw a later transformed call after the new B=24 default budget; its dedicated sub-process now uses an ample test-only growth budget and again proves exactly the two original direct decisions without weakening production policy. |
+| Canonical metamorphic evidence | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_metamorphic --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12d-metamorphic` | yes | PASS (P12d) | 2/2. Definition reorder and CFG/block/successor-container permutation preserve accepted structural fingerprints, rejection reasons, and consumed budget totals under the unified growth unit. |
 | Cleanup FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_cleanup_budget --jobs 1` | yes | PASS | Included in the post-repair common-prefix FileCheck 10/10. |
 | Scratch clone FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_clone --jobs 1` | yes | PASS | Included in the post-repair common-prefix FileCheck 10/10. |
 | Return-demand FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_return_demand --jobs 1` | yes | PASS | Included in the post-repair common-prefix FileCheck 10/10. |
-| Residual-cost FileChecks | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_cost --jobs 1`; `python3 scripts/run_tests.py --suite filecheck --filter cost_model_pe --jobs 1` | yes | PASS | Residual-cost passed within common-prefix 10/10; `cost_model_pe` separately passed 1/1 and contains measured metrics, zero-SMT, and restored `CodeGrowthTooHigh` rejection assertions. |
-| Commit FileCheck | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_residual_pe_commit --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-huffman-repair-commit` | yes | PASS (current repair) | Dedicated 1/1 and final common-prefix 10/10 pass. Cost output contains two independent `measured-persistent-reuse-member` accepts before one aggregate reuse accept. |
+| Residual-cost FileChecks | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_residual_pe_cost --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12d-residual-cost`; matching `--filter cost_model_pe --work-dir /tmp/yoolang-p12d-cost-model-pe` | yes | PASS (P12d) | Both dedicated rows passed 1/1. `cost_model_pe` now asserts exact direct residual `code_growth: 2`, proving the old byte-delta `/16` estimate is gone. |
+| Commit FileCheck | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_residual_pe_commit --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12d-commit` | yes | PASS (P12d) | Dedicated 1/1 and final common 14/14 pass. The existing genuine cross-caller group still records two independently evaluated members and charged staged-plan legality before one aggregate reuse accept. |
+| Cross-position persistent reuse and P12d budgets | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_cross_position_reuse --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-p12d-cross-position-final` | yes | PASS (P12d) | 1/1. Aggregate and both members report exact G=6; ample forced fallback has five accepted direct candidates and four independent G=6 risks. Growth budget 6 accepts an exact fit while 5 rejects it. Forced work exhaustion emits exactly one `CompileTimeTooHigh` decision and no accept/retry in the second window. The checker also statically requires pipeline `kMaxRounds = 12`. |
+| P12e growth-class budgets | `python3 scripts/context_inline_growth_class_budget_test.py --compiler build/linux/x86_64/release/compiler --source test/ir/oir_context_inline_growth_class_budget.sy` | yes | PASS (P12e) | `N=2` accepts the Ordinary `G=2` exposure and second-window Specialization `G=2` without borrowing; the checker distinguishes class-only from class-plus-total exhaustion. `N=1` accepts neither. Dry-run and recursive/default-policy behavior remain covered by the focused gates and independent code review. |
+| Independent P12d/P12e pre-performance reviews | fresh read-only audits of P12d growth/work accounting and P12e class/total accounting, including rollback and checker coverage | yes before performance | PASS | Both reviews found no code blocker. The P12e recursive-class exact-fit/`3N` endpoint test is a non-blocking future strengthening suggestion, not an acceptance gap. |
 | Rollback FileCheck | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite filecheck --filter oir_context_inline_residual_pe_rollback --jobs 1 --filecheck-timeout 180 --work-dir /tmp/yoolang-huffman-repair-rollback` | yes | PASS (current repair) | Dedicated 1/1 and release/debug+ASAN common-prefix 10/10 pass. Every named failpoint explicitly asserts unchanged/restored function-table-inclusive snapshot state and a subsequent control acceptance. |
 | Pressure FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter oir_context_inline_residual_pe_pressure --jobs 1` | yes | PASS | Included in common-prefix 10/10. Direct-tie combined-budget rejection is additionally covered by `oir_context_inline_positional_tie`. |
-| Focused OIR stage | `python3 scripts/run_tests.py --suite stage --stage oir --filter context_inline --jobs 1 --o1` | yes | PASS (current focused) | Post-repair functional context-inline scope passed 2/2: fixed-point suffix and residual PE. Broader full-stage closure remains separate. |
+| Focused OIR stage | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --filter context_inline --jobs 1 --o1 --compile-timeout 180 --work-dir /tmp/yoolang-p12d-oir-stage` | yes | PASS (P12d) | Final-source fixed-point suffix and residual PE OIR stages passed 2/2. Broader full-stage closure remains separate. |
+| P12d CRC OIR shape | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --filter crc1 --jobs 1 --o1 --compile-timeout 180 --work-dir /tmp/yoolang-p12d-crc-oir`; direct `--emit-oir` inspection | yes | PASS (P12d) | Stage passed 1/1. Direct OIR retains `countdown.final.7` and the sole `%v14.final = call i32 @crc32(i32 0, i32* %v0, i32 1)` with no outer `%n.loop`. |
 | Focused downstream O1 | `python3 scripts/run_tests.py --suite stage --stage mir --stage asm --filter context_inline --jobs 1 --o1` | yes | PASS (current focused) | Post-repair functional context-inline MIR/ASM scope passed 4/4. Broader full-stage closure remains separate. |
 | Focused semantic e2e | `python3 scripts/run_tests.py --suite e2e --filter context_inline_residual_pe --jobs 1 --o1` | yes | PASS (current focused) | The common `context_inline` filter passed both residual-PE and fixed-point functional cases, 2/2, including ordered positional constants, dependent same-block calls, signed division/remainder, and visible side effects. |
-| Huffman stages/e2e | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --stage mir --stage asm --suite e2e --filter huffman-0 --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --work-dir /tmp/yoolang-huffman-repair-final-huffman` | yes | PASS (current repair) | Post-repair OIR/MIR/ASM 9/9 and e2e 3/3 passed. Performance remains blocked pending independent review. |
+| Huffman stages/e2e | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --stage mir --stage asm --suite e2e --filter huffman-0 --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --work-dir /tmp/yoolang-huffman-repair-final-huffman` | yes | PASS (current repair) | Post-repair OIR/MIR/ASM 9/9 and e2e 3/3 passed. Performance remains blocked on final ASAN and post-ASAN release/provenance/protected closure. |
 | `pseudo_md5` stages/e2e | `python3 scripts/run_tests.py --binary build/linux/x86_64/release/compiler --suite stage --stage oir --stage mir --stage asm --suite e2e --filter crypto- --jobs 1 --o1 --compile-timeout 180 --link-timeout 60 --run-timeout 60 --work-dir /tmp/yoolang-huffman-repair-final-crypto` | yes | PASS (current repair) | Post-repair OIR/MIR/ASM 9/9 and e2e 3/3 passed. MIR clone/spill/stack performance-report preservation remains a later performance gate. |
-| Full FileCheck/poly | `python3 scripts/run_tests.py --suite filecheck --suite poly --jobs 1` | yes | NOT_RUN | Required before broad perf. |
-| Full downstream correctness | `python3 scripts/run_tests.py --suite stage --suite e2e --jobs 1 --o1` | yes | NOT_RUN | Required O1 downstream coverage. |
-| Full optimized correctness | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | yes | NOT_RUN | Report every skip/failure. |
+| Full FileCheck/poly | `python3 scripts/run_tests.py --suite filecheck --suite poly --jobs 1` | yes | PASS | 70/70 PASS. |
+| Full downstream correctness | `python3 scripts/run_tests.py --suite stage --suite e2e --jobs 1 --o1` | yes | PASS | 1428 PASS, 0 FAIL, 1 SKIP, 0 timeout. Preserved log: `/tmp/yoolang-p12e-final-stage-e2e.log`. |
+| Full optimized correctness | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | yes | PASS | 1499 PASS, 0 FAIL, 1 SKIP, 0 timeout out of 1500 total. The sole skip is `test/performance/shuffle1.sy [-O1] e2e`. Preserved log: `/tmp/yoolang-p12e-final-all.log`. |
 | Final protected-doc/independent-task gate | verify whole-file and base-diff hashes from `protection/resume-2026-07-21-protection.txt` | yes before review | PASS (current repair closure) | Final repair check: base-doc diff hash remains empty (`e3b0c442...`); `docs/README.md`, `docs/egraph-design.md`, and the independently audited loop task match `93478982...`, `d3c17fe3...`, and `9ef4b99e...`; the independent-task binary-diff hash remains `fd2be95f...`. |
 | Final shared-index/ownership gate | hash the index after excluding lines containing the actual relative link target `2026-07-17-context-inline-residual-pe.md`; compare with `protection/resume-2026-07-21-protection.txt`; inspect status/diff | yes before review | PASS (current repair closure) | Correctly filtered index hash remains `2416f730...`, this task row count is exactly one, and the index diff remains limited to this task's status/branch row. |
+| Post-ASAN release restore/provenance/protected closure | after ASAN exits, restore the release build, record exact source/compiler provenance, and rerun both protected-path/index gates above | yes before performance | PENDING | The earlier protected checks remain valid historical evidence, but the final pre-performance state must be re-established after the running ASAN gate. |
 
 The exact final protected-path closure is:
 
@@ -1071,6 +1168,110 @@ be reported as the current accepted performance level.
   build, context FileCheck 12/12, cost 1/1, infra 1/1, context 8/8, Huffman 12/12 and crypto 12/12
   passed; debug+ASAN build, context FileCheck 12/12 and cost 1/1 passed. No performance command ran;
   PRE-PERF awaits fresh independent review and the previously recorded broad gates.
+- 2026-07-21: independent review of committed checkpoint `d07bb33` showed that its position class
+  still did not identify a call occurrence: two observable same-block calls at different program
+  positions retained one fingerprint and were incorrectly treated as a tie. P12a repairs that
+  exact gap by retaining formal argument indexes and caching, per canonical function coloring, the
+  occurrence of each call among same-refined-color calls in its block's semantic instruction
+  sequence. No name, address, mutable ID, raw block label, module/block insertion order, or
+  successor-container order participates. Added a dedicated two-call fixture that reports distinct
+  fingerprints and replaced the false same-block tie evidence with two alpha-equivalent callers at
+  matching canonical positions. The genuine tie accepts both members normally and rejects both as
+  `CumulativeBudgetExhausted` under forced budget. Final release build, positional 2/2, common
+  context 13/13, definition/CFG metamorphic 2/2, persistent-reuse commit 1/1, `cost_model_pe` 1/1,
+  and OIR stage 2/2 passed. No performance or sanitizer command ran; PRE-PERF remains blocked for a
+  fresh independent P12a review and the recorded broad gates.
+- 2026-07-21: P12b repaired the general mod/ref regression without changing direct trapping-load
+  or div/rem removability. Formal array reads remain in `read_param_indices`; GEP/pointer-Phi
+  provenance is discharged only when its complete reachable graph has an Argument/Global/Alloca
+  root and no unknown incoming. Pure cycles, `undef`/unknown actuals, writes, external effects, and
+  dynamic/zero/`-1` signed div/rem remain fail-closed. Added a generic readonly-countdown positive,
+  dynamic-divisor and observable-write loop negatives, an unknown-pointer infra negative, and a
+  focused e2e. Final release build, both FileChecks 2/2, infra 1/1, focused OIR/e2e 2/2, CRC OIR
+  stage 1/1, and `git diff --check` passed. Direct CRC OIR contains `countdown.final.7` with only
+  `crc32(..., i32 1)` and no outer `%n.loop`. No performance command ran; PRE-PERF remains blocked
+  for independent P12a/P12b review and the recorded broad gates.
+- 2026-07-21: independent review blocked P12b on four distinct issues: a readonly formal read could
+  leak through a wrapper into current-body removability, summary propagation silently stopped after
+  64 rounds, constant folding could erase the `INT_MIN / -1` and `INT_MIN % -1` trap guards, and no
+  termination fact prevented removal of a diverging readonly call. P12b.1 closes the first three
+  without weakening fail-closed behavior. Wrapper summaries remain parameterized while inner formal
+  calls stay non-removable; concrete Global/Alloca actuals discharge the read, raw local writes stay
+  observable, and unknown/mixed/rootless-cycle provenance is rejected. The fixed-point solver now
+  reaches convergence, guarded by a 96-function reverse chain plus recursive SCC. Constant
+  zero/`-1` div/rem FileChecks include both signed-minimum cases. Release build, both FileChecks,
+  infra, focused OIR/e2e, CRC OIR shape, and `git diff --check` pass. This is not a bounds proof: it
+  preserves the preexisting OIR fault abstraction and valid SysY defined-execution contract. The
+  separate P12b.2 must-return proof remains a hard PRE-PERF blocker; no performance command ran.
+- 2026-07-21: P12b.2 added a conservative `may_not_return` dimension to function summaries. Every
+  internal summary starts pessimistically, external/unknown calls remain pessimistic, and the
+  converged product fixed point clears a function only when both its local CFG and all transitive
+  callees are proven terminating. The local proof accepts only single-entry natural loops with an
+  exact unit signed-i32 recurrence and a strict no-wrap exit (`LT/+1`, `GT/-1`, or constant `NE`),
+  then requires the CFG left after removing certified backedges to be a reachable return-ending
+  DAG. Added direct-loop, direct-recursion, mutual-SCC, unknown-external, irreducible, non-strict,
+  and wraparound negatives plus rotated fixed-countdown, symbolic strict-loop, caller-chain, and
+  terminating-input positives. Final release build, termination FileCheck/e2e, infra, all focused
+  P12b.1 gates, CRC shape, and P12a positional/common/commit gates pass. Development-only failures
+  corrected the old recursive/non-strict positive, unsupported source-level mutual prototypes, and
+  inlining-sensitive checks. A focused independent review additionally found that negating an
+  unnormalized i32 `ConstantInt(INT64_MIN)` could overflow the host; step matching now accepts
+  `Sub` magnitudes only when they are exactly `1` or `-1`, with GT, normalized false-edge/swapped
+  operand, and `INT64_MIN` infra guards. The post-fix focused P12b.2 review passed. No performance
+  command ran; fresh independent combined review and broad correctness remain PRE-PERF blockers.
+- 2026-07-21: the second independent review round found that the scalar integer folder still
+  accepted non-canonical i32 payloads. Because `create_i32` and the verifier permit an arbitrary
+  `int64_t` payload, `INT64_MIN / -1` or `% -1` could execute host C++ UB and every other integer
+  op could fold outside its OIR semantic domain. P12b.3 adds one entry range guard for both operands
+  before Add/Sub/Mul/And/Xor/SDiv/SRem. The infra harness now links `OIRScalarOptUtils.cpp` and
+  directly proves rejection on both operand positions, both bounds, i64 extremes, and the two
+  `INT64_MIN/-1` cases; it also preserves canonical Add/Sub/Mul wrapping, bitwise results, safe
+  div/rem, zero-divisor rejection, and canonical `INT_MIN/-1` traps. Release build, infra, ADCE,
+  termination, readonly, context common 13/13, CRC OIR, direct shape, and `git diff --check` pass.
+  No sanitizer or performance command ran; fresh independent combined review and broad correctness
+  remain PRE-PERF blockers.
+- 2026-07-21: after the combined P12a/P12b.1/P12b.2/P12b.3 independent review passed, P12c repaired
+  the remaining Huffman specialization regression. `Site` now has a position-bearing
+  `decision_key` for deterministic ordering/cap/diagnostics/true atomic direct ties and a separate
+  position-free reuse bucket containing canonical callee shape, explicit mask, exact typed binding,
+  return demand and return type. Actual callee/root identity, eligibility, binding, mapped residual
+  signature, reduction, direct legality, cost and pressure are freshly checked for every member.
+  Persistent publication charges one clone/root specialization, sums member savings/pressure, and
+  rolls diagnostics/live state back before per-decision fallback on any failure. A new focused
+  source/checker proves two distinct-position fingerprints share exactly one aggregate clone while
+  different constant, mask, actual callee, and dead-return calls do not join. Release build passed;
+  focused cross-position 1/1, common 14/14, commit 1/1, cost 2/2, metamorphic 2/2, and OIR stage 2/2
+  passed serially. No sanitizer, broad suite, or performance command ran; PRE-PERF remains blocked
+  on fresh P12c review and the recorded broad correctness gates.
+- 2026-07-21: after focused P12c review passed, P12d repaired the compile-time and growth regressions
+  without benchmark-specific policy. Residual risk, direct/tie/persistent commit, and cumulative
+  module/root accounting now share `G=static_instrs+branches+phis+(returns>1)`. Module percent
+  growth uses exact ceil arithmetic over the initial non-external G sum, root growth uses the policy
+  function cap, and exact fits are accepted. Specialization windows are capped at 12 rounds and
+  share a persistent 128-attempt/policy-work ledger. Every actual scratch reserves worst-case work
+  and settles against cleanup rounds; every actual direct plan and persistent import is charged.
+  Persistent and true-tie groups precheck whole-group capacity, and ledger use survives false
+  transactions, publication failure, and exceptions while live IR/growth rollback remains exact.
+  Release builds passed; focused growth/work 1/1, common 14/14, commit 1/1, cost 2/2, metamorphic
+  2/2, OIR stage 2/2, and CRC OIR 1/1 passed serially. No sanitizer, broad suite, or performance
+  command ran; PRE-PERF remains blocked on fresh P12d review and recorded broad correctness.
+- 2026-07-21: fresh independent read-only review passed P12d's unified `G`, exact-fit/saturating
+  arithmetic, cross-window monotonic work ledger, atomic group reservations, charged work paths,
+  and rollback behavior. P12e then closed the identified shared-growth-pool defect with
+  non-borrowable Specialization, Ordinary, and Recursive module/root ledgers plus shared saturated
+  total caps `2M+R` and `2Q+R`; its override uses per-class `N` and total `3N`. Dry-run remains
+  uncharged, failed/transactional paths restore all growth ledgers, and the work ledger remains
+  rollback-external. A separate independent P12e review also passed with no code blocker. Its only
+  non-blocking suggestion is a future recursive-class exact-fit test that executes the full `3N`
+  endpoint; the current checker already covers `N=2`, `N=1`, class-only/shared-total exhaustion,
+  and ordinary-to-second-window-specialization non-borrowing.
+- 2026-07-21: final P12e release broad gates passed: Full FileCheck/poly 70/70; full downstream
+  stage+e2e 1428 PASS/0 FAIL/1 SKIP/0 timeout in
+  `/tmp/yoolang-p12e-final-stage-e2e.log`; and full optimized `--build --suite all` 1499 PASS/0
+  FAIL/1 SKIP/0 timeout out of 1500 in `/tmp/yoolang-p12e-final-all.log`. The sole optimized-suite
+  skip is `test/performance/shuffle1.sy [-O1] e2e`. The final current-source broad ASAN gate is
+  still running, so PRE-PERF remains blocked only on its closure and the subsequent release
+  restore/provenance/protected-path recheck. No performance command ran.
 
 ## Open Questions
 
@@ -1084,9 +1285,11 @@ be reported as the current accepted performance level.
 
 Current state:
 
-- Implementation is active on `task/context-inline-residual-pe@c815887`; the dirty worktree is the
-  authoritative uncommitted implementation. Do not reset, restore, clean, switch branches, or
-  overwrite any path. P0 baseline/provenance/Clang evidence and P1 origin/root lineage are present.
+- Implementation is active on `task/context-inline-residual-pe`; committed checkpoint `d07bb33`
+  contains the preceding implementation, and the current authoritative dirty diff is P12a plus
+  P12b/P12b.1/P12b.2/P12b.3/P12c/P12d/P12e on top of it. Do not reset, restore, clean, switch
+  branches, or overwrite any path. P0 baseline/provenance/Clang evidence and P1 origin/root lineage
+  are present.
 - The live diff also contains name-independent call-graph/context scoring, bounded verified cleanup,
   detached scratch residualization, dead/scalar return demand, measured PE cost fields, direct
   residual inline, and a generic exact constant fixed-point suffix proof. P6 and P8 are completed;
@@ -1096,22 +1299,64 @@ Current state:
   live-out/side-effect/dynamic-divisor negatives, including negative, INT_MIN, signed division and
   signed remainder semantics. The transform uses no testcase/function/variable name, parameter
   tuple, runtime input, source hash, expected output, or fixed 32 selector.
+- P12b.1 keeps direct loads as non-removable ADCE roots and keeps dynamic/zero/`-1` signed div/rem
+  fail-closed. A wrapper's formal read stays parameterized in its outward summary and makes the
+  inner current-body call non-removable; a concrete Global/Alloca outer actual can discharge it.
+  Raw writes remain observable even when projection reaches a caller-local Alloca. Unknown,
+  mixed-known/unknown Phi, and rootless pointer-cycle actuals fail closed. The 96-function
+  reverse-chain/SCC guard proves convergence beyond the removed 64-round cap. The Global positive
+  collapses to one final call; dynamic-divisor and observable-write loops/calls remain. CRC's Alloca
+  path passes with `countdown.final.7`, one `crc32(..., i32 1)`, and no outer `%n.loop`. Provenance
+  establishes no bounds: this patch preserves the `d07bb33` OIR fault abstraction and valid SysY
+  defined-execution contract only.
+- P12b.2 adds `may_not_return` to the same converged summary fixed point. Local termination clears
+  only after strict unit-step signed-i32 natural loops are certified and their removed backedges
+  leave a return-ending DAG; recursive SCCs, external/unknown calls, irreducible cycles, `LE/+1`,
+  and wrapping updates fail closed. Two rotated fixed countdowns, a symbolic `LT/+1` loop, and an
+  acyclic caller chain clear the bit in infra. The existing broader
+  `ScalarEvolution::constant_trip_count` helper was deliberately not reused because its historical
+  interface does not establish no-wrap recurrence semantics; audit it before any future
+  termination-sensitive use.
+- P12b.3 puts `fold_int_binary` behind a canonical i32-domain guard. Either operand outside
+  `INT32_MIN..INT32_MAX` returns `nullopt` before host arithmetic, preventing
+  `SDiv`/`SRem(INT64_MIN, -1)` UB and making Add/Sub/Mul/And/Xor equally fail closed on malformed
+  payloads. Canonical wrapping and safe div/rem remain unchanged. The standalone infra now links
+  the real scalar utility and covers the full direct API contract.
 - Protected closure source of truth is now
   `build/perf-ci/context-inline-residual-pe/protection/resume-2026-07-21-protection.txt`; exclude this
   task row with the actual relative link substring, not the superseded `docs/tasks/...` predicate.
 - A current-binary top-level focused report already crossed the Clang hard gate, but it has not yet
   been rerun/archived as final evidence. The older reported ratio is about 1.19x Clang `-O3`, but it
-  predates the current safety/MIR revisions and is not current acceptance evidence. Required
-  focused, pseudo-MD5, complete performance, CI-parity, deltas, complete correctness, and a passing
-  independent review remain open.
-- The latest two pre-performance findings are repaired in the dirty worktree. Persistent exact ties
-  now receive per-member revalidation, detached residualization, measurement, pressure review and
-  cost decisions before the aggregate one-clone decision. Rollback snapshots explicitly compare
-  the full function-table name-to-pointer mapping on every named failure path, and each fixture
-  still observes a following control acceptance. Canonical intra-function position and paired
-  definition-reorder/CFG-permutation evidence are now also implemented and pass focused release
-  and debug+ASAN gates. **PRE-PERF remains BLOCKED** pending fresh independent review of this latest
-  repair and the recorded broad correctness gates.
+  predates the current safety/MIR revisions and is not current acceptance evidence. Release broad
+  correctness and the P12d/P12e independent reviews are complete. Required focused, pseudo-MD5,
+  complete performance, CI-parity, and delta evidence remain open behind final ASAN closure and
+  release restore/provenance/protected checks.
+- P12c separates position-sensitive decisions from persistent reuse. `decision_key` alone defines
+  deterministic ordering/cap/diagnostics and true atomic direct ties; the reuse bucket omits
+  position and is followed by actual callee/root, mask/binding, demand/type, and fresh residual
+  signature revalidation. Every member owns its scratch through commit, receives an independent
+  legal/cost/pressure decision, and contributes savings/pressure, while aggregate growth and root
+  specialization are charged exactly once. A failed persistent attempt never forwards the
+  cross-position vector into direct batching; it falls through to the current genuine decision tie.
+  The dedicated fixture reports two distinct member fingerprints, one aggregate growth of 6, four
+  excluded negative groups, and no direct-tie scope. Rollback snapshots still compare the full
+  function table and the old positional true-tie/rollback fixtures pass within common 14/14.
+  P12a/P12b.1/P12b.2/P12b.3 and P12c have independent approval.
+- P12d uses one saturated residual instruction-growth unit for risk, commit, aggregate, and
+  cumulative budgets. Initial module/root budgets follow the exact policy formula, and the two
+  specialization windows share a monotonic attempt/work ledger outside rollback. Scratch work is
+  reserved before construction and settled after cleanup; every persistent-member legality plan,
+  direct tie preflight/commit plan, singleton plan, and one persistent import is charged. Whole
+  persistent/true-tie groups stop atomically on insufficient capacity, record one
+  `CompileTimeTooHigh`, and are not retried by the second window. Focused release evidence passes,
+  and fresh independent review reports PASS with no blocker.
+- P12e gives Specialization, Ordinary nonrecursive, and self-Recursive calls separate non-borrowable
+  module/root growth ledgers while retaining one shared total hard cap and global pressure budget.
+  With initial non-external `G` sum `B`, policy allowance/percent/function cap `A/P/F`, and recursive
+  cap `R`, its class caps are `M/Q`, `M/Q`, and `R/R`, where
+  `M=max(A,ceil(B*P/100))` and `Q=max(A,F)`; total caps are saturated `2M+R` and `2Q+R`. Override
+  `N` gives three `N` class caps and total `3N`. Class and total reserve/rollback/commit are paired,
+  dry-run is free, and P12d's work-ledger semantics are unchanged. Independent review reports PASS.
 - Actual scope now explicitly includes the OIR ownership/use-list, ADCE/CFG/phi/analysis/scalar/
   global safety repairs and `scripts/oir_infra_tests.py`. It also includes exactly one MIR production
   repair in `MIRAddressModeCombinePass.cpp`; no separate prerequisite task was created.
@@ -1120,17 +1365,22 @@ Current state:
   PASS/6 timeouts/1 SKIP, and the release checkpoint combined to 1481 PASS/0 FAIL/1 SKIP after a
   focused infra repair. Independent re-review has now recorded and passed an exact current-source
   five-file MIR command 5/5 and focused debug+ASAN FileCheck 10/10 plus `cost_model_pe` 1/1. The
-  earlier broad 62-case command is still not preserved, so that broad report remains interim rather
-  than final verification.
+  earlier broad 62-case command is still not preserved and those completed sanitizer results
+  predate P12a/P12b.1/P12b.2/P12b.3/P12c/P12d/P12e, so they remain interim. Current release broad
+  closure is 70/70 FileCheck/poly, 1428 PASS/0 FAIL/1 SKIP/0 timeout downstream, and 1499 PASS/0
+  FAIL/1 SKIP/0 timeout out of 1500 optimized. The final current-source broad ASAN run is still in
+  progress; no result is recorded yet. **PRE-PERF remains BLOCKED only on that ASAN closure and the
+  subsequent release restore/provenance/protected-path checks.**
 
 Next action:
 
-1. Obtain a fresh independent review of the canonical-position implementation and paired
-   definition-reorder/CFG-permutation evidence. Do not invoke `compare_perf.py` before it passes.
-2. Close the remaining P2-P10 invariant gaps and named alias/SCC fixtures.
-4. Run focused/full correctness in the matrix. Every test remains serialized with `--jobs 1` in the
-   implementation/review subagent; do not treat release reruns as closure for ASAN timeouts.
-5. Only after independent pre-performance review passes, build current release, then invoke
+1. Let the currently running final broad ASAN gate finish; preserve its exact command/log and record
+   every PASS, failure, skip, and timeout. Do not substitute release reruns for ASAN closure and do
+   not invoke `compare_perf.py` while it is running or if it does not pass.
+2. After ASAN closure, restore the current release build, record exact source/compiler provenance,
+   and rerun the protected-doc/independent-task and shared-index/ownership checks. Preserve their
+   outputs as the final pre-performance state.
+3. Only after those remaining gates pass, invoke
    `python3 scripts/compare_perf.py` sequentially for focused,
    pseudo-MD5, complete `test/performance`, and current CI-parity. Copy JSON/MD immediately after
    each run, generate/inspect the four deltas, and enforce every hard Clang/baseline/spill/regression
@@ -1142,7 +1392,19 @@ Read next:
 - `docs/tasks/2026-07-17-context-inline-residual-pe.md`
 - `/home/yoo/.codex/skills/yoolang-optimization/references/compiler-state.md`
 - `/home/yoo/.codex/skills/yoolang-optimization/references/performance-workflow.md`
+- `src/oir/OIRAnalysis.cpp` at pointer provenance, call projection, function scan, and
+  `call_has_side_effect`
+- `src/pass/oir/OIRScalarOptUtils.cpp` at `fold_int_binary`, plus the direct scalar-fold assertions
+  in `scripts/oir_infra_tests.py`
+- `test/ir/oir_countdown_readonly_modref.sy`, `test/ir/oir_call_termination_modref.sy`, and the
+  matching functional/infra fixtures
 - `src/pass/oir/OIRInlinePass.cpp` at eligibility, call scan, clone, specialization, and cost ranges
+- `scripts/context_inline_cross_position_reuse_test.py` and
+  `test/ir/oir_context_inline_cross_position_reuse.sy`
+- `scripts/context_inline_growth_class_budget_test.py` and
+  `test/ir/oir_context_inline_growth_class_budget.sy`
+- `scripts/context_inline_metamorphic_test.py` and the two
+  `test/ir/oir_context_inline_positional_*.sy` fixtures
 - `src/pass/oir/OIROptimizationPipelinePass.cpp` at current call cleanup windows
 - `include/oir/OIR.h` and only the recorded `src/oir/OIR.cpp` function-creation,
   ownership/use-list, function-set/body-swap, destruction, and verifier ranges

@@ -22,6 +22,7 @@ int main() {
 // JSON: "kind": "PartialEvaluation"
 // JSON: "summary": "verified detached residual with direct inline preflight"
 // JSON: "calls": 0
+// JSON: "code_growth": 2
 // JSON: "cleanup_dependency": 0
 // JSON: "reject_reason": "CodeGrowthTooHigh"
 // JSON: "summary": "verified detached residual with direct inline preflight; specialization budget exceeded"

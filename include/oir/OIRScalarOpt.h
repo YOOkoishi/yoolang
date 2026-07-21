@@ -53,10 +53,31 @@ struct Stats {
     unsigned cost_model_candidates = 0;
     bool call_cleanup_budget_exhausted = false;
     bool call_growth_budget_initialized = false;
+    bool call_specialization_work_initialized = false;
+    bool call_specialization_work_exhausted = false;
     std::uint64_t cumulative_call_growth = 0;
     std::uint64_t call_module_growth_budget = 0;
     std::uint64_t call_root_growth_budget = 0;
+    std::uint64_t cumulative_call_specialization_growth = 0;
+    std::uint64_t call_specialization_module_growth_budget = 0;
+    std::uint64_t call_specialization_root_growth_budget = 0;
+    std::uint64_t cumulative_call_ordinary_growth = 0;
+    std::uint64_t call_ordinary_module_growth_budget = 0;
+    std::uint64_t call_ordinary_root_growth_budget = 0;
+    std::uint64_t cumulative_call_recursive_growth = 0;
+    std::uint64_t call_recursive_module_growth_budget = 0;
+    std::uint64_t call_recursive_root_growth_budget = 0;
+    std::uint64_t call_specialization_attempts = 0;
+    std::uint64_t call_specialization_attempt_budget = 128;
+    std::uint64_t call_specialization_work_units = 0;
+    std::uint64_t call_specialization_work_budget = 0;
     std::unordered_map<oir::FunctionID, std::uint64_t> call_root_growth;
+    std::unordered_map<oir::FunctionID, std::uint64_t>
+        call_specialization_root_growth;
+    std::unordered_map<oir::FunctionID, std::uint64_t>
+        call_ordinary_root_growth;
+    std::unordered_map<oir::FunctionID, std::uint64_t>
+        call_recursive_root_growth;
     std::unordered_map<oir::FunctionID, unsigned> call_root_specializations;
     CallPressureVector cumulative_call_pressure;
     CallPressureVector call_pressure_budget;

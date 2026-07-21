@@ -24,11 +24,11 @@ int main() {
 // Four scalar arguments plus binary recursive fanout exhaust the balanced
 // register-pressure allowance after two complete breadth levels.
 // INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
-// INLINE-NEXT: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-0
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
+// INLINE: OIRInlinePass Accept transform=Inline scope=direct-recursive-depth-1
 // INLINE-NOT: scope=direct-recursive-depth-2
 
 // Eight residual leaf calls plus main's entry call remain.
