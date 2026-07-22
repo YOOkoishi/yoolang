@@ -97,6 +97,36 @@ bool run_call_specialization_window(oir::Module &module, oir_opt::Stats &stats) 
     return changed;
 }
 
+bool cleanup_after_inline(oir::Module &module, oir_opt::Stats &stats) {
+    bool changed = false;
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::ConstantFold);
+    changed |= oir_opt::local_simplify(module, stats, oir_opt::SimplifyMode::Algebraic);
+    changed |= oir_opt::run_sccp(module, stats);
+    changed |= oir_opt::simplify_branches(module, stats);
+    changed |= oir_opt::cleanup_cfg(module, stats);
+    changed |= oir_opt::value_range_propagation(module, stats);
+    changed |= oir_opt::global_value_numbering(module, stats);
+    changed |= oir_opt::eliminate_dead_code(module, stats);
+    return changed;
+}
+
+bool run_inline_cleanup_window(oir::Module &module, oir_opt::Stats &stats) {
+    bool changed = false;
+    constexpr unsigned kMaxRounds = 4;
+    for (unsigned round = 0; round < kMaxRounds; ++round) {
+        if (!oir_opt::inline_functions(module, stats)) {
+            break;
+        }
+        changed = true;
+        changed |= cleanup_after_inline(module, stats);
+        if (oir_opt::eliminate_tail_recursion(module, stats)) {
+            changed = true;
+            changed |= cleanup_after_tail_recursion(module, stats);
+        }
+    }
+    return changed;
+}
+
 } // namespace
 
 namespace oir_opt {
@@ -118,32 +148,9 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= run_call_specialization_window(module, stats);
     changed |= pre_inline_load_call_cse(module, stats);
     changed |= eliminate_dead_code(module, stats);
-    changed |= inline_functions(module, stats);
-    if (changed) {
-        changed |= run_sccp(module, stats);
-        changed |= value_range_propagation(module, stats);
-        changed |= global_value_numbering(module, stats);
-        changed |= eliminate_dead_code(module, stats);
-        changed |= if_convert_conditional_adds(module, stats);
-        changed |= cleanup_cfg(module, stats);
-        if (eliminate_tail_recursion(module, stats)) {
-            changed = true;
-            changed |= cleanup_after_tail_recursion(module, stats);
-        }
-    }
+    changed |= run_inline_cleanup_window(module, stats);
     changed |= run_call_specialization_window(module, stats);
-    if (inline_functions(module, stats)) {
-        changed = true;
-        changed |= run_sccp(module, stats);
-        changed |= value_range_propagation(module, stats);
-        changed |= global_value_numbering(module, stats);
-        changed |= eliminate_dead_code(module, stats);
-        changed |= if_convert_conditional_adds(module, stats);
-        changed |= cleanup_cfg(module, stats);
-        if (eliminate_tail_recursion(module, stats)) {
-            changed |= cleanup_after_tail_recursion(module, stats);
-        }
-    }
+    changed |= run_inline_cleanup_window(module, stats);
 
     constexpr unsigned kMaxIterations = 8;
     for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {

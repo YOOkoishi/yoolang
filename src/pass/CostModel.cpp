@@ -447,9 +447,13 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
         return decision;
     }
 
+    const bool hot_inline_growth =
+        candidate.kind == TransformKind::Inline && candidate.frequency.scale >= 4 &&
+        candidate.risk.code_growth <= policy.small_code_growth_allowance * 2;
     const bool small_inline_growth =
         candidate.kind == TransformKind::Inline &&
-        candidate.risk.code_growth <= policy.small_code_growth_allowance;
+        (candidate.risk.code_growth <= policy.small_code_growth_allowance ||
+         hot_inline_growth);
     const bool exceeds_growth_percent =
         !small_inline_growth && candidate.before.static_instrs > 0 &&
         candidate.risk.code_growth * 100 >
