@@ -128,17 +128,34 @@ CalleeInfo inspect_callee(const oir::Function &function) {
             }
             ++info.static_instrs;
             ++info.cost;
-            if (inst->op() == oir::Instruction::OpID::Call) {
-                info.cost += 4;
+            if (auto *call = dynamic_cast<const oir::CallInst *>(inst.get())) {
+                // LLVM's default call penalty is 25 abstract units and each
+                // ordinary argument costs another instruction unit. OIR uses
+                // units normalized by LLVM's ordinary instruction cost of 5.
+                info.cost += 5 + static_cast<unsigned>(call->args().size());
             }
         }
     }
     return info;
 }
 
-bool within_inline_resource_limit(const CalleeInfo &info,
+bool below_inline_cost_threshold(const CalleeInfo &info, const oir::CallInst &call,
+                                 const pass::cost_model::CostModelPolicy &policy) {
+    const auto threshold =
+        policy.inline_base_threshold +
+        (info.blocks == 1 ? policy.inline_single_block_bonus : 0);
+    const auto callsite_credit =
+        policy.inline_callsite_base_credit +
+        policy.inline_callsite_argument_credit *
+            static_cast<std::int64_t>(call.args().size());
+    const auto adjusted_cost =
+        static_cast<std::int64_t>(info.cost) - callsite_credit;
+    return adjusted_cost < threshold;
+}
+
+bool within_inline_resource_limit(const CalleeInfo &info, const oir::CallInst &call,
                                   const pass::cost_model::CostModelPolicy &policy) {
-    return info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost) &&
+    return below_inline_cost_threshold(info, call, policy) &&
            info.returns != 0 && info.returns <= kMaxCalleeReturns;
 }
 
@@ -278,10 +295,8 @@ unsigned recursive_inline_probability(unsigned depth) {
 
 unsigned recursive_inline_growth_budget(const pass::cost_model::CostModelPolicy &policy) {
     const auto policy_growth = static_cast<unsigned>(
-        std::max<std::int64_t>(1, policy.max_function_code_growth));
-    const auto inline_scaled = static_cast<unsigned>(
-        std::max<std::int64_t>(1, policy.max_inline_callee_cost) * 6);
-    return std::min(kMaxRecursiveInlineGrowth, std::max(policy_growth, inline_scaled));
+        std::max<std::int64_t>(1, policy.max_recursive_inline_growth));
+    return std::min(kMaxRecursiveInlineGrowth, policy_growth);
 }
 
 unsigned cloned_instruction_growth(const CalleeInfo &info) {
@@ -364,11 +379,13 @@ bool is_eligible_non_recursive_call(const oir::Function &caller, const oir::Call
     auto info = inspect_callee(*callee);
     if (is_constprop_specialization(*callee)) {
         return info.blocks <= kMaxSpecializedInlineBlocks &&
-               info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost * 3) &&
+               info.cost <=
+                   static_cast<unsigned>(policy.max_specialized_inline_callee_cost) &&
                info.returns != 0 &&
                info.returns <= kMaxSpecializedInlineReturns;
     }
-    return info.blocks <= kMaxCalleeBlocks && within_inline_resource_limit(info, policy);
+    return info.blocks <= kMaxCalleeBlocks &&
+           within_inline_resource_limit(info, call, policy);
 }
 
 bool is_eligible_recursive_call(const oir::Function &caller, const oir::CallInst &call,
@@ -387,7 +404,8 @@ bool is_eligible_recursive_call(const oir::Function &caller, const oir::CallInst
     return recursive_inline_probability(depth) >=
                kMinRecursiveInlineProbabilityBasisPoints &&
            info.blocks <= kMaxRecursiveCalleeBlocks &&
-           info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost * 2) &&
+           info.cost <=
+               static_cast<unsigned>(policy.max_recursive_inline_callee_cost) &&
            info.returns != 0 && info.returns <= kMaxRecursiveCalleeReturns &&
            recursive_pressure_growth(call, info, depth) <=
                static_cast<unsigned>(std::max<std::int64_t>(
@@ -847,12 +865,13 @@ bool is_eligible_for_constant_specialization(const oir::Function &caller, const 
     }
 
     if ((info.blocks > kMaxCalleeBlocks ||
-         info.cost > static_cast<unsigned>(policy.max_inline_callee_cost)) &&
+         !below_inline_cost_threshold(info, call, policy)) &&
         has_live_pointer_argument_after_specialization(call, *callee, mask)) {
         return false;
     }
     return info.blocks <= kMaxSpecializationCalleeBlocks &&
-           info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost * 3) &&
+           info.cost <=
+               static_cast<unsigned>(policy.max_specialization_callee_cost) &&
            info.returns != 0;
 }
 

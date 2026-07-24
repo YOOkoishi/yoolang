@@ -1,0 +1,89 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=LLVM-O3
+// RUN: %compiler --emit-oir --cost-model-policy=aggressive -O1 %s | FileCheck %s --check-prefix=AGGRESSIVE
+
+int llvm_o3_single_block_accept() {
+    int value = getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    return value;
+}
+
+int llvm_o3_single_block_reject() {
+    int value = getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    value = value + getint();
+    return value;
+}
+
+int llvm_o3_argument_credit_accept(int value) {
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    return value;
+}
+
+int llvm_o3_argument_credit_reject(int value) {
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    putint(value);
+    return value;
+}
+
+int main() {
+    int result = llvm_o3_single_block_accept();
+    result = result + llvm_o3_single_block_reject();
+    result = result + llvm_o3_argument_credit_accept(result);
+    return result + llvm_o3_argument_credit_reject(result);
+}
+
+// LLVM -O3 uses a normalized threshold of 50, a 25-unit single-block
+// bonus, and a 6-unit direct-call credit. The first helper costs 76 OIR
+// units and is accepted (76 - 6 < 75); the second costs 83 and is rejected.
+// LLVM-O3-LABEL: define i32 @main
+// LLVM-O3-NOT: call i32 @llvm_o3_single_block_accept
+// LLVM-O3: call i32 @llvm_o3_single_block_reject
+// Eleven one-argument nested calls cost 77 units; the outer one-argument
+// callsite credit of 7 makes that eligible. Twelve cost 84 and remain above
+// the threshold after the same credit.
+// LLVM-O3-NOT: call i32 @llvm_o3_argument_credit_accept
+// LLVM-O3: call i32 @llvm_o3_argument_credit_reject
+
+// AGGRESSIVE-LABEL: define i32 @main
+// AGGRESSIVE-NOT: call i32 @llvm_o3_single_block_accept
+// AGGRESSIVE-NOT: call i32 @llvm_o3_single_block_reject
+// AGGRESSIVE-NOT: call i32 @llvm_o3_argument_credit_accept
+// AGGRESSIVE-NOT: call i32 @llvm_o3_argument_credit_reject

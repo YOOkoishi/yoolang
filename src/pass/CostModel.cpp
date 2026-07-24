@@ -294,7 +294,16 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
         policy.max_register_pressure_growth = 4;
         policy.max_live_range_growth = 8;
         policy.max_memory_pressure_growth = 8;
-        policy.max_inline_callee_cost = 45;
+        // Strict cost < 46 preserves the former conservative cap of 45.
+        policy.inline_base_threshold = 46;
+        policy.inline_single_block_bonus = 0;
+        policy.inline_callsite_base_credit = 0;
+        policy.inline_callsite_argument_credit = 0;
+        policy.inline_code_growth_allowance = 0;
+        policy.max_specialized_inline_callee_cost = 135;
+        policy.max_recursive_inline_callee_cost = 90;
+        policy.max_specialization_callee_cost = 135;
+        policy.max_recursive_inline_growth = 270;
         policy.max_specializations_per_function = 2;
         policy.max_egraph_nodes = 1500;
         policy.max_smt_time_us = 2500;
@@ -304,6 +313,7 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
         policy.allow_smt = true;
         break;
     case CostModelPolicyKind::Balanced:
+        // The defaults implement the no-profile LLVM -O3 inline envelope.
         break;
     case CostModelPolicyKind::Aggressive:
         policy.min_final_score = 0;
@@ -315,7 +325,16 @@ CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
         policy.max_live_range_growth = 28;
         policy.max_memory_pressure_growth = 28;
         policy.max_compile_time_growth = 25000;
-        policy.max_inline_callee_cost = 140;
+        // Strict cost < 141 preserves the former aggressive cap of 140.
+        policy.inline_base_threshold = 141;
+        policy.inline_single_block_bonus = 0;
+        policy.inline_callsite_base_credit = 0;
+        policy.inline_callsite_argument_credit = 0;
+        policy.inline_code_growth_allowance = 48;
+        policy.max_specialized_inline_callee_cost = 420;
+        policy.max_recursive_inline_callee_cost = 280;
+        policy.max_specialization_callee_cost = 420;
+        policy.max_recursive_inline_growth = 512;
         policy.max_specializations_per_function = 8;
         policy.max_egraph_nodes = 12000;
         policy.max_smt_time_us = 12000;
@@ -419,7 +438,11 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
     decision.estimated_gain =
         weighted_cost(candidate.before, target) - weighted_cost(candidate.after, target);
     decision.setup_cost = weighted_cost(candidate.setup, target);
-    decision.risk_penalty = weighted_risk(candidate.risk, policy);
+    auto risk_policy = policy;
+    if (candidate.kind == TransformKind::Inline) {
+        risk_policy.small_code_growth_allowance = policy.inline_code_growth_allowance;
+    }
+    decision.risk_penalty = weighted_risk(candidate.risk, risk_policy);
     decision.final_score =
         decision.estimated_gain - decision.setup_cost - decision.risk_penalty;
 
@@ -449,7 +472,7 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
 
     const bool small_inline_growth =
         candidate.kind == TransformKind::Inline &&
-        candidate.risk.code_growth <= policy.small_code_growth_allowance;
+        candidate.risk.code_growth <= policy.inline_code_growth_allowance;
     const bool exceeds_growth_percent =
         !small_inline_growth && candidate.before.static_instrs > 0 &&
         candidate.risk.code_growth * 100 >

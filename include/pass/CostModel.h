@@ -311,7 +311,26 @@ struct CostModelPolicy {
     std::int64_t max_memory_pressure_growth = 16;
     std::int64_t max_compile_time_growth = 10000;
 
-    std::int64_t max_inline_callee_cost = 80;
+    // LLVM -O3 starts from a threshold of 250 abstract units and charges 5
+    // units per ordinary instruction. OIR normalizes those values by 5.
+    // The callsite credit models the removed call instruction (1), LLVM's
+    // default call penalty (5), and one unit per ordinary argument.
+    std::int64_t inline_base_threshold = 50;
+    std::int64_t inline_single_block_bonus = 25;
+    std::int64_t inline_callsite_base_credit = 6;
+    std::int64_t inline_callsite_argument_credit = 1;
+    std::int64_t inline_code_growth_allowance = 80;
+
+    // Keep independent eligibility envelopes for Yoolang-specific clone
+    // paths. These do not have a direct LLVM scalar equivalent and preserve
+    // the pre-cost-model prefilter limits instead of coupling them to the
+    // ordinary inliner threshold. The common profitability/risk gates still
+    // apply after these checks.
+    std::int64_t max_specialized_inline_callee_cost = 260;
+    std::int64_t max_recursive_inline_callee_cost = 90;
+    std::int64_t max_specialization_callee_cost = 180;
+    std::int64_t max_recursive_inline_growth = 480;
+
     std::int64_t max_specializations_per_function = 4;
     std::int64_t max_egraph_nodes = 5000;
     std::int64_t max_smt_time_us = 5000;
