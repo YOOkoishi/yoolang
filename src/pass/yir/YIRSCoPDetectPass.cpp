@@ -216,6 +216,9 @@ private:
                     }
                     if (!validate_loop(*for_op)) {
                         complete = false;
+                        scan_region_for_scops(for_op->body_region(), loop_stack, info);
+                        // Do not retry the same rejected loop forever.
+                        ++i;
                         break;
                     }
                     complete = collect_poly_loop(*for_op, loop_stack, scop) && complete;
