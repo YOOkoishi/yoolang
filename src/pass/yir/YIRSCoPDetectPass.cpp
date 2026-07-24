@@ -88,6 +88,31 @@ private:
         return finish(false);
     }
 
+    bool is_affine_condition(const yir::Value* value,
+                             const std::unordered_set<const yir::Region*>& regions,
+                             std::unordered_set<const yir::Value*>& visiting) const {
+        if (value == nullptr || value->type() == nullptr ||
+            value->type()->kind() != yir::Type::Kind::I1) {
+            return false;
+        }
+        auto* def = value->defining_op();
+        if (def == nullptr || regions.find(def->parent()) == regions.end() ||
+            dynamic_cast<const yir::ConstBoolOp*>(def) != nullptr) {
+            return true;
+        }
+        if (auto* cmp = dynamic_cast<const yir::ICmpOp*>(def)) {
+            return is_affine_value(cmp->lhs(), regions, visiting) &&
+                   is_affine_value(cmp->rhs(), regions, visiting);
+        }
+        if (auto* not_op = dynamic_cast<const yir::NotOp*>(def)) {
+            return is_affine_condition(not_op->operands().front(), regions, visiting);
+        }
+        if (auto* to_bool = dynamic_cast<const yir::ToBoolOp*>(def)) {
+            return is_affine_value(to_bool->operands().front(), regions, visiting);
+        }
+        return false;
+    }
+
     void collect_regions(const yir::Region& region,
                          std::unordered_set<const yir::Region*>& regions) const {
         if (!regions.insert(&region).second) {
@@ -138,7 +163,7 @@ private:
                 return false;
             }
             if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
-                if (!is_affine_value(if_op->condition(), regions, visiting) ||
+                if (!is_affine_condition(if_op->condition(), regions, visiting) ||
                     !validate_region(if_op->then_region(), regions, visiting) ||
                     (if_op->has_else() && !validate_region(if_op->else_region(), regions, visiting))) {
                     return false;
