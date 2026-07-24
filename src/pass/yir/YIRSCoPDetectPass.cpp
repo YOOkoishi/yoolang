@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <vector>
 #include <utility>
+#include <cstdint>
 
 namespace pass {
 
@@ -42,6 +43,130 @@ private:
         return for_op != nullptr && poly_loops_.find(for_op) != poly_loops_.end();
     }
 
+    // A SCoP is only useful if every control predicate and subscript can be
+    // represented in the affine model. Values defined outside the candidate
+    // region are treated as parameters; values defined inside must be built
+    // from constants, loop IVs, and affine integer arithmetic.
+    bool is_affine_value(const yir::Value* value,
+                         const std::unordered_set<const yir::Region*>& regions,
+                         std::unordered_set<const yir::Value*>& visiting) const {
+        if (value == nullptr || value->type() == nullptr ||
+            value->type()->kind() != yir::Type::Kind::I32) {
+            return false;
+        }
+        if (!visiting.insert(value).second) {
+            return false;
+        }
+        const auto finish = [&](bool result) {
+            visiting.erase(value);
+            return result;
+        };
+        auto* def = value->defining_op();
+        if (def == nullptr || regions.find(def->parent()) == regions.end()) {
+            return finish(true);
+        }
+        if (dynamic_cast<const yir::ConstI32Op*>(def) != nullptr) {
+            return finish(true);
+        }
+        if (auto* add = dynamic_cast<const yir::AddIOp*>(def)) {
+            return finish(is_affine_value(add->lhs(), regions, visiting) &&
+                          is_affine_value(add->rhs(), regions, visiting));
+        }
+        if (auto* sub = dynamic_cast<const yir::SubIOp*>(def)) {
+            return finish(is_affine_value(sub->lhs(), regions, visiting) &&
+                          is_affine_value(sub->rhs(), regions, visiting));
+        }
+        if (auto* mul = dynamic_cast<const yir::MulIOp*>(def)) {
+            const auto* lhs = mul->lhs();
+            const auto* rhs = mul->rhs();
+            const auto is_const = [](const yir::Value* v) {
+                return v != nullptr && dynamic_cast<const yir::ConstI32Op*>(v->defining_op()) != nullptr;
+            };
+            return finish((is_const(lhs) && is_affine_value(rhs, regions, visiting)) ||
+                          (is_const(rhs) && is_affine_value(lhs, regions, visiting)));
+        }
+        return finish(false);
+    }
+
+    void collect_regions(const yir::Region& region,
+                         std::unordered_set<const yir::Region*>& regions) const {
+        if (!regions.insert(&region).second) {
+            return;
+        }
+        for (const auto& op : region.operations()) {
+            if (auto* for_op = dynamic_cast<const yir::ForOp*>(op.get())) {
+                collect_regions(for_op->body_region(), regions);
+            } else if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
+                collect_regions(if_op->then_region(), regions);
+                if (if_op->has_else()) collect_regions(if_op->else_region(), regions);
+            }
+        }
+    }
+
+    bool validate_loop(const yir::ForOp& for_op) const {
+        std::unordered_set<const yir::Region*> regions;
+        collect_regions(for_op.body_region(), regions);
+        std::unordered_set<const yir::Value*> visiting;
+        if (!is_affine_value(for_op.lower_bound(), regions, visiting) ||
+            !is_affine_value(for_op.upper_bound(), regions, visiting)) {
+            return false;
+        }
+        auto* step_def = for_op.step() == nullptr ? nullptr : for_op.step()->defining_op();
+        auto* step_const = dynamic_cast<const yir::ConstI32Op*>(step_def);
+        if (step_const == nullptr || step_const->value() <= 0) {
+            return false;
+        }
+        return validate_region(for_op.body_region(), regions, visiting);
+    }
+
+    bool validate_region(const yir::Region& region,
+                         const std::unordered_set<const yir::Region*>& regions,
+                         std::unordered_set<const yir::Value*>& visiting) const {
+        for (const auto& op : region.operations()) {
+            if (dynamic_cast<const yir::CallOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::LoadOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::StoreOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ElemAddrOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::DecayOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::AllocaOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ArrayInitOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::WhileOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::BreakOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ContinueOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ReturnOp*>(op.get()) != nullptr ||
+                dynamic_cast<const yir::CondOp*>(op.get()) != nullptr) {
+                return false;
+            }
+            if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
+                if (!is_affine_value(if_op->condition(), regions, visiting) ||
+                    !validate_region(if_op->then_region(), regions, visiting) ||
+                    (if_op->has_else() && !validate_region(if_op->else_region(), regions, visiting))) {
+                    return false;
+                }
+                continue;
+            }
+            if (auto* nested = dynamic_cast<const yir::ForOp*>(op.get())) {
+                if (!is_poly_loop(nested) || !validate_loop(*nested)) return false;
+                continue;
+            }
+            if (auto* load = dynamic_cast<const yir::ArrayLoadOp*>(op.get())) {
+                for (auto* index : load->indices()) {
+                    if (!is_affine_value(index, regions, visiting)) return false;
+                }
+                continue;
+            }
+            if (auto* store = dynamic_cast<const yir::ArrayStoreOp*>(op.get())) {
+                for (auto* index : store->indices()) {
+                    if (!is_affine_value(index, regions, visiting)) return false;
+                }
+                continue;
+            }
+            // Remaining scalar operations are harmless to discovery; their
+            // dependences are still preserved by the structured loop IR.
+        }
+        return true;
+    }
+
     static bool is_poly_statement(const yir::Operation& op) {
         return dynamic_cast<const yir::ArrayLoadOp*>(&op) != nullptr ||
                dynamic_cast<const yir::ArrayStoreOp*>(&op) != nullptr;
@@ -62,6 +187,10 @@ private:
                 while (i < ops.size()) {
                     for_op = dynamic_cast<const yir::ForOp*>(ops[i].get());
                     if (!is_poly_loop(for_op)) {
+                        break;
+                    }
+                    if (!validate_loop(*for_op)) {
+                        complete = false;
                         break;
                     }
                     complete = collect_poly_loop(*for_op, loop_stack, scop) && complete;
