@@ -49,6 +49,7 @@ private:
     // from constants, loop IVs, and affine integer arithmetic.
     bool is_affine_value(const yir::Value* value,
                          const std::unordered_set<const yir::Region*>& regions,
+                         const std::unordered_set<const yir::Value*>& active_ivs,
                          std::unordered_set<const yir::Value*>& visiting) const {
         if (value == nullptr || value->type() == nullptr ||
             value->type()->kind() != yir::Type::Kind::I32) {
@@ -69,12 +70,12 @@ private:
             return finish(true);
         }
         if (auto* add = dynamic_cast<const yir::AddIOp*>(def)) {
-            return finish(is_affine_value(add->lhs(), regions, visiting) &&
-                          is_affine_value(add->rhs(), regions, visiting));
+            return finish(is_affine_value(add->lhs(), regions, active_ivs, visiting) &&
+                          is_affine_value(add->rhs(), regions, active_ivs, visiting));
         }
         if (auto* sub = dynamic_cast<const yir::SubIOp*>(def)) {
-            return finish(is_affine_value(sub->lhs(), regions, visiting) &&
-                          is_affine_value(sub->rhs(), regions, visiting));
+            return finish(is_affine_value(sub->lhs(), regions, active_ivs, visiting) &&
+                          is_affine_value(sub->rhs(), regions, active_ivs, visiting));
         }
         if (auto* mul = dynamic_cast<const yir::MulIOp*>(def)) {
             const auto* lhs = mul->lhs();
@@ -82,14 +83,26 @@ private:
             const auto is_const = [](const yir::Value* v) {
                 return v != nullptr && dynamic_cast<const yir::ConstI32Op*>(v->defining_op()) != nullptr;
             };
-            return finish((is_const(lhs) && is_affine_value(rhs, regions, visiting)) ||
-                          (is_const(rhs) && is_affine_value(lhs, regions, visiting)));
+            if ((is_const(lhs) && is_affine_value(rhs, regions, active_ivs, visiting)) ||
+                (is_const(rhs) && is_affine_value(lhs, regions, active_ivs, visiting))) {
+                return finish(true);
+            }
+            // Parametric strides such as `i * rowsize` are valid affine
+            // subscripts in Polly's model. Keep the product limited to one
+            // active induction variable and one loop-invariant operand.
+            const bool lhs_iv = active_ivs.count(lhs) != 0;
+            const bool rhs_iv = active_ivs.count(rhs) != 0;
+            if (lhs_iv == rhs_iv) return finish(false);
+            const auto *invariant = lhs_iv ? rhs : lhs;
+            const auto *invariant_def = invariant->defining_op();
+            return finish(invariant_def == nullptr || regions.find(invariant_def->parent()) == regions.end());
         }
         return finish(false);
     }
 
     bool is_affine_condition(const yir::Value* value,
                              const std::unordered_set<const yir::Region*>& regions,
+                             const std::unordered_set<const yir::Value*>& active_ivs,
                              std::unordered_set<const yir::Value*>& visiting) const {
         if (value == nullptr || value->type() == nullptr ||
             value->type()->kind() != yir::Type::Kind::I1) {
@@ -101,14 +114,14 @@ private:
             return true;
         }
         if (auto* cmp = dynamic_cast<const yir::ICmpOp*>(def)) {
-            return is_affine_value(cmp->lhs(), regions, visiting) &&
-                   is_affine_value(cmp->rhs(), regions, visiting);
+            return is_affine_value(cmp->lhs(), regions, active_ivs, visiting) &&
+                   is_affine_value(cmp->rhs(), regions, active_ivs, visiting);
         }
         if (auto* not_op = dynamic_cast<const yir::NotOp*>(def)) {
-            return is_affine_condition(not_op->operands().front(), regions, visiting);
+            return is_affine_condition(not_op->operands().front(), regions, active_ivs, visiting);
         }
         if (auto* to_bool = dynamic_cast<const yir::ToBoolOp*>(def)) {
-            return is_affine_value(to_bool->operands().front(), regions, visiting);
+            return is_affine_value(to_bool->operands().front(), regions, active_ivs, visiting);
         }
         return false;
     }
@@ -128,12 +141,13 @@ private:
         }
     }
 
-    bool validate_loop(const yir::ForOp& for_op) const {
+    bool validate_loop(const yir::ForOp& for_op,
+                       const std::unordered_set<const yir::Value*>& enclosing_ivs = {}) const {
         std::unordered_set<const yir::Region*> regions;
         collect_regions(for_op.body_region(), regions);
         std::unordered_set<const yir::Value*> visiting;
-        if (!is_affine_value(for_op.lower_bound(), regions, visiting) ||
-            !is_affine_value(for_op.upper_bound(), regions, visiting)) {
+        if (!is_affine_value(for_op.lower_bound(), regions, enclosing_ivs, visiting) ||
+            !is_affine_value(for_op.upper_bound(), regions, enclosing_ivs, visiting)) {
             return false;
         }
         auto* step_def = for_op.step() == nullptr ? nullptr : for_op.step()->defining_op();
@@ -141,11 +155,17 @@ private:
         if (step_const == nullptr || step_const->value() <= 0) {
             return false;
         }
-        return validate_region(for_op.body_region(), regions, visiting);
+        auto active_ivs = enclosing_ivs;
+        active_ivs.insert(for_op.induction_var());
+        if (!validate_region(for_op.body_region(), regions, active_ivs, visiting)) {
+            return false;
+        }
+        return true;
     }
 
     bool validate_region(const yir::Region& region,
                          const std::unordered_set<const yir::Region*>& regions,
+                         const std::unordered_set<const yir::Value*>& active_ivs,
                          std::unordered_set<const yir::Value*>& visiting) const {
         for (const auto& op : region.operations()) {
             if (dynamic_cast<const yir::CallOp*>(op.get()) != nullptr ||
@@ -163,26 +183,31 @@ private:
                 return false;
             }
             if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
-                if (!is_affine_condition(if_op->condition(), regions, visiting) ||
-                    !validate_region(if_op->then_region(), regions, visiting) ||
-                    (if_op->has_else() && !validate_region(if_op->else_region(), regions, visiting))) {
+                if (!is_affine_condition(if_op->condition(), regions, active_ivs, visiting) ||
+                    !validate_region(if_op->then_region(), regions, active_ivs, visiting) ||
+                    (if_op->has_else() &&
+                     !validate_region(if_op->else_region(), regions, active_ivs, visiting))) {
                     return false;
                 }
                 continue;
             }
             if (auto* nested = dynamic_cast<const yir::ForOp*>(op.get())) {
-                if (!is_poly_loop(nested) || !validate_loop(*nested)) return false;
+                if (!is_poly_loop(nested) || !validate_loop(*nested, active_ivs)) return false;
                 continue;
             }
             if (auto* load = dynamic_cast<const yir::ArrayLoadOp*>(op.get())) {
                 for (auto* index : load->indices()) {
-                    if (!is_affine_value(index, regions, visiting)) return false;
+                    if (!is_affine_value(index, regions, active_ivs, visiting)) {
+                        return false;
+                    }
                 }
                 continue;
             }
             if (auto* store = dynamic_cast<const yir::ArrayStoreOp*>(op.get())) {
                 for (auto* index : store->indices()) {
-                    if (!is_affine_value(index, regions, visiting)) return false;
+                    if (!is_affine_value(index, regions, active_ivs, visiting)) {
+                        return false;
+                    }
                 }
                 continue;
             }
