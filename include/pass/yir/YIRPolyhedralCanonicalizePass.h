@@ -3,10 +3,12 @@
 #include "pass/PassManager.h"
 
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace yir {
 class ForOp;
+class Function;
 class Value;
 } // namespace yir
 
@@ -20,6 +22,15 @@ struct YIRPolyhedralLoopInfo {
 
 struct YIRPolyhedralCanonicalInfo {
     std::vector<YIRPolyhedralLoopInfo> loops;
+};
+
+// In Auto mode, only functions selected by the profitability pre-scan are
+// allowed to receive polyhedral canonicalization rewrites. Force mode leaves
+// this artifact absent and preserves the historical whole-module behavior.
+struct YIRPolyhedralFunctionSelection {
+    std::unordered_set<const yir::Function *> functions;
+
+    static constexpr std::string_view kArtifactKey = "YIRPolyhedralFunctionSelection";
 };
 
 class YIRPolyhedralCanonicalizePass final : public Pass {

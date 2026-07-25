@@ -217,6 +217,89 @@ bool region_has_nested_loop(const yir::Region &region) {
     return false;
 }
 
+bool is_unsupported_poly_loop_op(const yir::Operation &op) {
+    return dynamic_cast<const yir::CallOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::LoadOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::StoreOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ElemAddrOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::DecayOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::AllocaOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ArrayInitOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::BreakOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ContinueOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ReturnOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::CondOp *>(&op) != nullptr;
+}
+
+bool loop_body_has_affine_memory_candidate(const yir::Region &region,
+                                            bool &has_array_access) {
+    for (const auto &op : region.operations()) {
+        if (is_unsupported_poly_loop_op(*op)) {
+            return false;
+        }
+        if (dynamic_cast<const yir::ArrayLoadOp *>(op.get()) != nullptr ||
+            dynamic_cast<const yir::ArrayStoreOp *>(op.get()) != nullptr) {
+            has_array_access = true;
+            continue;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (!loop_body_has_affine_memory_candidate(if_op->then_region(), has_array_access) ||
+                (if_op->has_else() &&
+                 !loop_body_has_affine_memory_candidate(if_op->else_region(), has_array_access))) {
+                return false;
+            }
+            continue;
+        }
+        if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            if (!loop_body_has_affine_memory_candidate(while_op->cond_region(), has_array_access) ||
+                !loop_body_has_affine_memory_candidate(while_op->body_region(), has_array_access)) {
+                return false;
+            }
+            continue;
+        }
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            if (!loop_body_has_affine_memory_candidate(for_op->body_region(), has_array_access)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool function_has_polyhedral_candidate(const yir::Region &region) {
+    for (const auto &op : region.operations()) {
+        if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+            bool has_array_access = false;
+            if (loop_body_has_affine_memory_candidate(for_op->body_region(), has_array_access) &&
+                has_array_access) {
+                return true;
+            }
+            if (function_has_polyhedral_candidate(for_op->body_region())) {
+                return true;
+            }
+            continue;
+        }
+        if (auto *while_op = dynamic_cast<const yir::WhileOp *>(op.get())) {
+            bool has_array_access = false;
+            if (loop_body_has_affine_memory_candidate(while_op->body_region(), has_array_access) &&
+                has_array_access) {
+                return true;
+            }
+            if (function_has_polyhedral_candidate(while_op->body_region())) {
+                return true;
+            }
+            continue;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (function_has_polyhedral_candidate(if_op->then_region()) ||
+                (if_op->has_else() && function_has_polyhedral_candidate(if_op->else_region()))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool access_uses_dim(const std::vector<yir::Value *> &indices, const yir::Value *dim) {
     return std::any_of(indices.begin(), indices.end(), [dim](const yir::Value *index) {
         AffineDimOffset parsed;
@@ -502,7 +585,10 @@ void estimate_region_profitability(
     }
 }
 
-PolyhedralProfitabilityEstimate estimate_module_profitability(const yir::Module &module) {
+bool module_is_profitable_for_auto_polyhedral(const yir::Module &module,
+                                              PolyhedralProfitabilityEstimate &estimate,
+                                              YIRPolyhedralFunctionSelection &selection) {
+    constexpr int kAutoProfitabilityThreshold = 150;
     std::vector<const yir::Value *> constant_initialized_arrays;
     for (const auto &function : module.functions()) {
         if (function != nullptr) {
@@ -510,20 +596,24 @@ PolyhedralProfitabilityEstimate estimate_module_profitability(const yir::Module 
         }
     }
 
-    PolyhedralProfitabilityEstimate estimate;
+    estimate = {};
+    selection.functions.clear();
     for (const auto &function : module.functions()) {
-        if (function != nullptr) {
-            estimate_region_profitability(function->body(), constant_initialized_arrays, estimate);
+        if (function == nullptr) {
+            continue;
+        }
+        PolyhedralProfitabilityEstimate function_estimate;
+        estimate_region_profitability(function->body(), constant_initialized_arrays,
+                                       function_estimate);
+        if (function_estimate.score >= kAutoProfitabilityThreshold &&
+            function_has_polyhedral_candidate(function->body())) {
+            selection.functions.insert(function.get());
+        }
+        if (function_estimate.score > estimate.score) {
+            estimate = function_estimate;
         }
     }
-    return estimate;
-}
-
-bool module_is_profitable_for_auto_polyhedral(const yir::Module &module,
-                                              PolyhedralProfitabilityEstimate &estimate) {
-    constexpr int kAutoProfitabilityThreshold = 150;
-    estimate = estimate_module_profitability(module);
-    return estimate.score >= kAutoProfitabilityThreshold;
+    return !selection.functions.empty();
 }
 
 } // namespace
@@ -544,6 +634,7 @@ PassKind YIRPolyhedralPipelinePass::kind() const {
 }
 
 PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
+    context.erase_artifact(std::string(YIRPolyhedralFunctionSelection::kArtifactKey));
     if (mode_ == YIRPolyhedralPipelineMode::Auto) {
         auto *artifact =
             context.get_artifact<std::unique_ptr<yir::Module>>(ASTToYIRPass::kArtifactKey);
@@ -551,7 +642,8 @@ PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
             return PassResult::fail("YIRPolyhedralPipelinePass requires YIR module in pass context");
         }
         PolyhedralProfitabilityEstimate estimate;
-        if (!module_is_profitable_for_auto_polyhedral(**artifact, estimate)) {
+        YIRPolyhedralFunctionSelection selection;
+        if (!module_is_profitable_for_auto_polyhedral(**artifact, estimate, selection)) {
             std::ostringstream message;
             message << "skipped auto polyhedral pipeline: score=" << estimate.score
                     << ", rank=" << estimate.best_rank
@@ -560,6 +652,8 @@ PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
                     << ", distinct_offsets=" << estimate.best_distinct_offsets;
             return PassResult::ok(false, message.str());
         }
+        context.set_artifact<YIRPolyhedralFunctionSelection>(
+            std::string(YIRPolyhedralFunctionSelection::kArtifactKey), std::move(selection));
     }
 
     PassManager pm;
@@ -588,6 +682,12 @@ PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
 
     std::ostringstream message;
     message << "ran " << result.executions.size() << " polyhedral passes";
+    if (mode_ == YIRPolyhedralPipelineMode::Auto) {
+        const auto *selection = context.get_artifact<YIRPolyhedralFunctionSelection>(
+            std::string(YIRPolyhedralFunctionSelection::kArtifactKey));
+        message << ", selected_functions="
+                << (selection == nullptr ? 0 : selection->functions.size());
+    }
     return PassResult::ok(result.changed, message.str());
 }
 

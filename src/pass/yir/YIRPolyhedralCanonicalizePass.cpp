@@ -699,21 +699,30 @@ class Canonicalizer final {
     explicit Canonicalizer(Stats &stats) : stats_(stats), materializer_(stats) {
     }
 
-    bool run(yir::Module &module) {
+    bool run(yir::Module &module,
+             const std::unordered_set<const yir::Function *> *selected_functions = nullptr) {
         for (auto &function : module.functions()) {
+            if (!is_selected(function.get(), selected_functions)) continue;
             normalize_loops(function->body());
         }
         for (auto &function : module.functions()) {
+            if (!is_selected(function.get(), selected_functions)) continue;
             canonicalize_affine_operands(function->body());
         }
         for (auto &function : module.functions()) {
+            if (!is_selected(function.get(), selected_functions)) continue;
             hoist_loop_invariants(function->body());
         }
-        eliminate_dead_affine_ops(module);
+        eliminate_dead_affine_ops(module, selected_functions);
         return stats_.changed();
     }
 
   private:
+    static bool is_selected(const yir::Function *function,
+                            const std::unordered_set<const yir::Function *> *selected) {
+        return selected == nullptr || (function != nullptr && selected->count(function) != 0);
+    }
+
     void normalize_loops(yir::Region &region) {
         auto &ops = region.operations();
         for (std::size_t i = 0; i < ops.size(); ++i) {
@@ -1091,13 +1100,16 @@ class Canonicalizer final {
         return changed;
     }
 
-    void eliminate_dead_affine_ops(yir::Module &module) {
+    void eliminate_dead_affine_ops(
+        yir::Module &module,
+        const std::unordered_set<const yir::Function *> *selected_functions) {
         bool changed = false;
         do {
             UseCounts uses;
             collect_uses(module, uses);
             changed = false;
             for (auto &function : module.functions()) {
+                if (!is_selected(function.get(), selected_functions)) continue;
                 changed = sweep_dead_ops(function->body(), uses, stats_) || changed;
             }
         } while (changed);
@@ -1112,10 +1124,16 @@ class PolyhedralInfoCollector final {
     explicit PolyhedralInfoCollector(Stats &stats) : stats_(stats) {
     }
 
-    YIRPolyhedralCanonicalInfo collect(const yir::Module &module) {
+    YIRPolyhedralCanonicalInfo collect(
+        const yir::Module &module,
+        const std::unordered_set<const yir::Function *> *selected_functions = nullptr) {
         YIRPolyhedralCanonicalInfo info;
         std::vector<const yir::Value *> dimensions;
         for (const auto &function : module.functions()) {
+            if (selected_functions != nullptr &&
+                (function == nullptr || selected_functions->count(function.get()) == 0)) {
+                continue;
+            }
             scan_region(function->body(), dimensions, info);
         }
         return info;
@@ -1201,7 +1219,10 @@ PassResult YIRPolyhedralCanonicalizePass::run(PassContext &context) {
 
     Stats stats;
     Canonicalizer canonicalizer(stats);
-    canonicalizer.run(**artifact);
+    const auto *selection = context.get_artifact<YIRPolyhedralFunctionSelection>(
+        std::string(YIRPolyhedralFunctionSelection::kArtifactKey));
+    const auto *selected_functions = selection == nullptr ? nullptr : &selection->functions;
+    canonicalizer.run(**artifact, selected_functions);
 
     auto verify = yir::verify_high_level_yir(**artifact);
     if (!verify.success) {
@@ -1209,7 +1230,7 @@ PassResult YIRPolyhedralCanonicalizePass::run(PassContext &context) {
     }
 
     PolyhedralInfoCollector info_collector(stats);
-    auto info = info_collector.collect(**artifact);
+    auto info = info_collector.collect(**artifact, selected_functions);
     context.set_artifact<YIRPolyhedralCanonicalInfo>(std::string(kArtifactKey), std::move(info));
     context.erase_artifact(typeid(yir::LoopAnalysis).name());
 
