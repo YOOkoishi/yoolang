@@ -1,0 +1,77 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+
+int src[64][64];
+int dst[64][64];
+int dependent[64][64];
+int lhs[256][256];
+int rhs[256][256];
+int product[256][256];
+
+int guarded_interchange() {
+  int i = 0;
+  int j = 0;
+  while (i < 64) {
+    j = 0;
+    while (j < 64) {
+      if (i + j < 64) {
+        dst[j][i] = src[j][i];
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return dst[0][0];
+}
+
+int rejected_dependence_interchange() {
+  int i = 1;
+  int j = 0;
+  while (i < 64) {
+    j = 0;
+    while (j < 63) {
+      dependent[j][i] = dependent[j + 1][i - 1] + 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return dependent[0][63];
+}
+
+int tile_with_local_iv(int n) {
+  int i = 0;
+  while (i < n) {
+    int j = 0;
+    while (j < n) {
+      int k = 0;
+      int sum = 0;
+      while (k < n) {
+        sum = sum + lhs[i][k] * rhs[k][j];
+        k = k + 1;
+      }
+      product[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return product[0][0];
+}
+
+int main() {
+  return 0;
+}
+
+// YIR-LABEL: yir.func @guarded_interchange
+// YIR: yir.for %j =
+// YIR: yir.for %i =
+
+// YIR-LABEL: yir.func @rejected_dependence_interchange
+// YIR: yir.for %i =
+// YIR: yir.for %j =
+
+// YIR-LABEL: yir.func @tile_with_local_iv
+// YIR: %poly.tile.step{{[0-9]+}} = yir.const.i32 16
+// YIR: yir.for %poly.tile.outer
+// YIR: yir.for %poly.tile.inner
+// YIR: yir.for %i =
+// YIR: yir.for %j =
+// YIR: yir.for %k =
