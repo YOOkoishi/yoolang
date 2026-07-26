@@ -99,14 +99,52 @@ std::string value_list(const std::vector<const yir::Value *> &values) {
 
 std::string domain_string(const PolyStmt &stmt) {
     std::ostringstream out;
-    for (std::size_t i = 0; i < stmt.domain.size(); ++i) {
+    for (std::size_t i = 0; i < stmt.loop_bounds.size(); ++i) {
         if (i != 0) {
             out << "; ";
         }
-        const auto &bound = stmt.domain[i];
+        const auto &bound = stmt.loop_bounds[i];
         out << value_name(bound.iv) << " in [" << affine_expr(bound.lower) << ", "
             << affine_expr(bound.upper) << ')';
     }
+    return out.str();
+}
+
+std::string predicate_string(PolyPredicate predicate) {
+    switch (predicate) {
+    case PolyPredicate::Eq: return "==";
+    case PolyPredicate::Ne: return "!=";
+    case PolyPredicate::Lt: return "<";
+    case PolyPredicate::Le: return "<=";
+    case PolyPredicate::Gt: return ">";
+    case PolyPredicate::Ge: return ">=";
+    }
+    return "?";
+}
+
+std::string explicit_domain_string(const PolyStmt &stmt) {
+    std::ostringstream out;
+    out << "dims=" << value_list(stmt.domain.dims)
+        << " params=" << value_list(sorted_values(stmt.domain.params)) << " { ";
+    for (std::size_t i = 0; i < stmt.domain.constraints.size(); ++i) {
+        if (i != 0) out << " and ";
+        const auto &constraint = stmt.domain.constraints[i];
+        out << affine_expr(constraint.lhs) << ' ' << predicate_string(constraint.predicate)
+            << ' ' << affine_expr(constraint.rhs);
+    }
+    out << " }";
+    if (!stmt.domain.valid) out << " <invalid>";
+    return out.str();
+}
+
+std::string schedule_map_string(const PolyStmt &stmt) {
+    std::ostringstream out;
+    out << value_list(stmt.schedule.input_dims) << " -> [";
+    for (std::size_t i = 0; i < stmt.schedule.output_dims.size(); ++i) {
+        if (i != 0) out << ", ";
+        out << affine_expr(stmt.schedule.output_dims[i]);
+    }
+    out << ']';
     return out.str();
 }
 
@@ -204,6 +242,8 @@ void dump_models(std::ostream &out, const PolyModelInfo &model_info) {
             out << "    stmt #" << stmt.id << " op=" << stmt.op_name << '\n';
             out << "      schedule: " << value_list(stmt.schedule_dims) << '\n';
             out << "      domain: " << domain_string(stmt) << '\n';
+            out << "      schedule-map: " << schedule_map_string(stmt) << '\n';
+            out << "      domain-set: " << explicit_domain_string(stmt) << '\n';
             for (const auto &read : stmt.reads) {
                 out << "      " << access_string(read) << '\n';
             }
@@ -235,7 +275,12 @@ void dump_dependences(std::ostream &out, const PolyDependenceInfo &dep_info) {
         out << "  dependence " << dependence_kind(dep.kind) << " stmt #" << dep.source_stmt_id
             << " -> stmt #" << dep.target_stmt_id << " memory=" << value_name(dep.memory)
             << " dependent=" << (dep.is_dependent ? "true" : "false")
-            << dependence_distance(dep) << '\n';
+            << dependence_distance(dep)
+            << " relation={source=" << value_list(dep.relation.source_dims)
+            << ", target=" << value_list(dep.relation.target_dims)
+            << ", params=" << value_list(sorted_values(dep.relation.params))
+            << ", disjuncts=" << dep.relation.constraints.disjuncts().size()
+            << ", exact=" << (dep.relation.exact ? "true" : "false") << "}" << '\n';
     }
 }
 

@@ -234,6 +234,7 @@ private:
                 scop.region = &region;
 
                 bool complete = true;
+                std::vector<YIRSCoPStatement::PathCondition> condition_stack;
                 while (i < ops.size()) {
                     for_op = dynamic_cast<const yir::ForOp*>(ops[i].get());
                     if (!is_poly_loop(for_op)) {
@@ -246,7 +247,7 @@ private:
                         ++i;
                         break;
                     }
-                    complete = collect_poly_loop(*for_op, loop_stack, scop) && complete;
+                    complete = collect_poly_loop(*for_op, loop_stack, condition_stack, scop) && complete;
                     ++i;
                     if (!complete) {
                         break;
@@ -287,16 +288,18 @@ private:
 
     bool collect_poly_loop(const yir::ForOp& for_op,
                            std::vector<const yir::ForOp*>& loop_stack,
+                           std::vector<YIRSCoPStatement::PathCondition>& condition_stack,
                            YIRSCoP& scop) {
         append_loop_symbols(for_op, scop);
         loop_stack.push_back(&for_op);
-        bool complete = collect_statements(for_op.body_region(), loop_stack, scop);
+        bool complete = collect_statements(for_op.body_region(), loop_stack, condition_stack, scop);
         loop_stack.pop_back();
         return complete;
     }
 
     bool collect_statements(const yir::Region& region,
                             std::vector<const yir::ForOp*>& loop_stack,
+                            std::vector<YIRSCoPStatement::PathCondition>& condition_stack,
                             YIRSCoP& scop) {
         for (const auto& op : region.operations()) {
             if (is_poly_statement(*op)) {
@@ -308,23 +311,32 @@ private:
                 stmt.op = op.get();
                 stmt.op_name = op->op_name();
                 stmt.enclosing_loops = loop_stack;
+                stmt.path_conditions = condition_stack;
                 scop.statements.push_back(std::move(stmt));
             }
 
             if (auto* for_op = dynamic_cast<const yir::ForOp*>(op.get())) {
-                if (is_poly_loop(for_op) && !collect_poly_loop(*for_op, loop_stack, scop)) {
+                if (is_poly_loop(for_op) &&
+                    !collect_poly_loop(*for_op, loop_stack, condition_stack, scop)) {
                     return false;
                 }
                 continue;
             }
 
             if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
-                if (!collect_statements(if_op->then_region(), loop_stack, scop)) {
+                condition_stack.push_back({if_op->condition(), false});
+                const bool then_complete = collect_statements(
+                    if_op->then_region(), loop_stack, condition_stack, scop);
+                condition_stack.pop_back();
+                if (!then_complete) {
                     return false;
                 }
-                if (if_op->has_else() &&
-                    !collect_statements(if_op->else_region(), loop_stack, scop)) {
-                    return false;
+                if (if_op->has_else()) {
+                    condition_stack.push_back({if_op->condition(), true});
+                    const bool else_complete = collect_statements(
+                        if_op->else_region(), loop_stack, condition_stack, scop);
+                    condition_stack.pop_back();
+                    if (!else_complete) return false;
                 }
             }
         }

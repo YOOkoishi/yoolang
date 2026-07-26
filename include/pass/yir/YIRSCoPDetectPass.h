@@ -16,10 +16,16 @@ class Value;
 namespace pass {
 
 struct YIRSCoPStatement {
+    struct PathCondition {
+        const yir::Value *condition = nullptr;
+        bool negated = false;
+    };
+
     std::size_t id;
     const yir::Operation *op;
     std::string op_name;
     std::vector<const yir::ForOp *> enclosing_loops;
+    std::vector<PathCondition> path_conditions;
 };
 
 struct YIRSCoP {

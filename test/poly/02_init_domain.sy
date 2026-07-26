@@ -48,7 +48,5 @@ int main() {
 // POLY: schedule: [%i, %j, %k]
 // POLY: domain: %i in [0, %N); %j in [0, %N); %k in [0, %N)
 // POLY: write @y[%i, %j, %k]
-// POLY: dependences: 2
-// POLY-DAG: dependence WAW stmt #0 -> stmt #0 memory=@x dependent=true
-// POLY-DAG: dependence WAW stmt #1 -> stmt #1 memory=@y dependent=true
+// POLY: dependences: 0
 // POLY: }

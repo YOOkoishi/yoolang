@@ -42,10 +42,8 @@ int main() {
 // POLY: schedule: [%i]
 // POLY: domain: %i in [0, %N - 1)
 // POLY: write @a[%i + 1]
-// POLY: dependences: 5
+// POLY: dependences: 3
 // POLY-DAG: dependence WAR stmt #0 -> stmt #3 memory=@a dependent=true
-// POLY-DAG: dependence WAW stmt #1 -> stmt #1 memory=@b dependent=true
 // POLY-DAG: dependence RAW stmt #1 -> stmt #2 memory=@b dependent=true
 // POLY-DAG: dependence RAW stmt #3 -> stmt #0 memory=@a dependent=true distance=loop-carried [1]
-// POLY-DAG: dependence WAW stmt #3 -> stmt #3 memory=@a dependent=true
 // POLY: }

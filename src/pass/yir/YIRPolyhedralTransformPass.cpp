@@ -595,13 +595,13 @@ bool same_schedule_dims(const PolyStmt &lhs, const PolyStmt &rhs) {
 
 bool same_iteration_domain(const PolyStmt &write_stmt, const PolyStmt &read_stmt) {
     if (!same_schedule_dims(write_stmt, read_stmt) ||
-        write_stmt.domain.size() != read_stmt.domain.size()) {
+        write_stmt.loop_bounds.size() != read_stmt.loop_bounds.size()) {
         return false;
     }
 
-    for (std::size_t i = 0; i < write_stmt.domain.size(); ++i) {
-        const auto &write_bound = write_stmt.domain[i];
-        const auto &read_bound = read_stmt.domain[i];
+    for (std::size_t i = 0; i < write_stmt.loop_bounds.size(); ++i) {
+        const auto &write_bound = write_stmt.loop_bounds[i];
+        const auto &read_bound = read_stmt.loop_bounds[i];
         if (write_bound.iv != read_bound.iv) {
             return false;
         }
@@ -1530,7 +1530,7 @@ private:
             num_writes += stmt.writes.size();
             max_schedule_depth = std::max(max_schedule_depth, stmt.schedule_dims.size());
             if (anchor == nullptr && !stmt.writes.empty() && stmt.schedule_dims.size() == 2 &&
-                stmt.domain.size() == 2) {
+                stmt.loop_bounds.size() == 2) {
                 anchor = &stmt;
             }
         }
@@ -1575,9 +1575,9 @@ private:
         const auto *inner_iv = inner_loop->induction_var();
         for (const auto &stmt : scop.statements) {
             if (stmt.op == nullptr || stmt.op->parent() == nullptr ||
-                stmt.schedule_dims.size() < 2 || stmt.domain.size() < 2 ||
+                stmt.schedule_dims.size() < 2 || stmt.loop_bounds.size() < 2 ||
                 stmt.schedule_dims[0] != outer_iv || stmt.schedule_dims[1] != inner_iv ||
-                stmt.domain[0].iv != outer_iv || stmt.domain[1].iv != inner_iv) {
+                stmt.loop_bounds[0].iv != outer_iv || stmt.loop_bounds[1].iv != inner_iv) {
                 return false;
             }
 
@@ -1896,7 +1896,8 @@ private:
         }
 
         if (write_stmt == nullptr || num_reads < 6 || write_stmt->schedule_dims.size() != 3 ||
-            write_stmt->domain.size() != 3 || write_stmt->writes.front().indices.size() != 3) {
+            write_stmt->loop_bounds.size() != 3 ||
+            write_stmt->writes.front().indices.size() != 3) {
             return false;
         }
 
@@ -2498,13 +2499,13 @@ private:
 
     static bool loop_nest_matches_stmt(const EnclosingLoopNest &nest, const PolyStmt &stmt) {
         if (nest.outer_to_inner.size() != stmt.schedule_dims.size() ||
-            stmt.domain.size() != stmt.schedule_dims.size()) {
+            stmt.loop_bounds.size() != stmt.schedule_dims.size()) {
             return false;
         }
         for (std::size_t i = 0; i < stmt.schedule_dims.size(); ++i) {
             auto *loop = nest.outer_to_inner[i];
             if (loop == nullptr || loop->induction_var() != stmt.schedule_dims[i] ||
-                stmt.domain[i].iv != stmt.schedule_dims[i]) {
+                stmt.loop_bounds[i].iv != stmt.schedule_dims[i]) {
                 return false;
             }
             std::int64_t step = 0;
@@ -2517,22 +2518,22 @@ private:
 
     static bool simple_initializer_covers_unit_interior(const PolyStmt &init_stmt,
                                                        const PolyStmt &update_stmt) {
-        if (init_stmt.domain.size() != update_stmt.domain.size() ||
+        if (init_stmt.loop_bounds.size() != update_stmt.loop_bounds.size() ||
             init_stmt.schedule_dims != update_stmt.schedule_dims) {
             return false;
         }
 
-        for (std::size_t dim = 0; dim < init_stmt.domain.size(); ++dim) {
+        for (std::size_t dim = 0; dim < init_stmt.loop_bounds.size(); ++dim) {
             std::int64_t init_lower = 0;
             std::int64_t update_lower = 0;
-            if (!affine_constant_value(init_stmt.domain[dim].lower, init_lower) ||
-                !affine_constant_value(update_stmt.domain[dim].lower, update_lower) ||
+            if (!affine_constant_value(init_stmt.loop_bounds[dim].lower, init_lower) ||
+                !affine_constant_value(update_stmt.loop_bounds[dim].lower, update_lower) ||
                 update_lower - init_lower != 1) {
                 return false;
             }
 
-            if (!affine_terms_equal_with_constant_delta(update_stmt.domain[dim].upper,
-                                                        init_stmt.domain[dim].upper, -1)) {
+            if (!affine_terms_equal_with_constant_delta(update_stmt.loop_bounds[dim].upper,
+                                                        init_stmt.loop_bounds[dim].upper, -1)) {
                 return false;
             }
         }
@@ -2575,7 +2576,7 @@ private:
         const std::unordered_map<const yir::Region *, yir::ForOp *> &for_body_owners,
         ConstantInitialization &init) const {
         if (!stmt.reads.empty() || stmt.writes.size() != 1 ||
-            stmt.schedule_dims.empty() || stmt.domain.size() != stmt.schedule_dims.size()) {
+            stmt.schedule_dims.empty() || stmt.loop_bounds.size() != stmt.schedule_dims.size()) {
             return false;
         }
 

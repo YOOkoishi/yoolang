@@ -27,6 +27,28 @@ struct PolyLoopBound {
     PolyAffineExpr upper;
 };
 
+enum class PolyPredicate { Eq, Ne, Lt, Le, Gt, Ge };
+
+struct PolyDomainConstraint {
+    PolyAffineExpr lhs;
+    PolyAffineExpr rhs;
+    PolyPredicate predicate = PolyPredicate::Eq;
+};
+
+struct PolyDomain {
+    std::vector<const yir::Value *> dims;
+    std::vector<const yir::Value *> params;
+    std::vector<PolyDomainConstraint> constraints;
+    bool valid = true;
+};
+
+struct PolyAffineSchedule {
+    std::vector<const yir::Value *> input_dims;
+    std::vector<PolyAffineExpr> output_dims;
+    std::size_t lexical_order = 0;
+    bool valid = true;
+};
+
 struct PolyAccess {
     enum class Kind { Read, Write };
     Kind kind;
@@ -40,12 +62,15 @@ struct PolyStmt {
     std::string op_name;
     std::vector<const yir::Value *> dims; // The nested loops surrounding this stmt
     
-    std::vector<PolyLoopBound> domain;
+    // Compatibility summary used by the existing specialized transforms.
+    std::vector<PolyLoopBound> loop_bounds;
+    PolyDomain domain;
     std::vector<PolyAccess> reads;
     std::vector<PolyAccess> writes;
     
-    // Schedule: simply depth -> index, e.g., [i, j, stmt_lexical_id]
+    // Compatibility loop-IV summary used by the existing specialized transforms.
     std::vector<const yir::Value *> schedule_dims;
+    PolyAffineSchedule schedule;
     std::size_t lexical_id;
 };
 

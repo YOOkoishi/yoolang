@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pass/PassManager.h"
+#include "yir/Presburger.h"
 #include <cstdint>
 #include <string_view>
 #include <vector>
@@ -22,6 +23,13 @@ struct PolyDependence {
     const yir::Value *memory;
     DistanceKind distance_kind = DistanceKind::Unknown;
     std::vector<std::int64_t> distance;
+    struct Relation {
+        std::vector<const yir::Value *> source_dims;
+        std::vector<const yir::Value *> target_dims;
+        std::vector<const yir::Value *> params;
+        yir::presburger::PresburgerRelation constraints;
+        bool exact = false;
+    } relation;
     // For affine/GCD test, we can store whether it's conservatively dependent
     bool is_dependent = true;
 };
