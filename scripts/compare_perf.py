@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import os
+import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -27,6 +28,11 @@ class RunResult:
     instruction_count: int | None = None
     instruction_count_status: str = "DISABLED"
     instruction_count_detail: str = ""
+    elapsed_samples_sec: list[float] | None = None
+    assembly_sha256: str | None = None
+    assembly_size_bytes: int | None = None
+    executable_sha256: str | None = None
+    executable_size_bytes: int | None = None
 
 
 WORKSPACE = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[1])).resolve()
@@ -681,7 +687,10 @@ def _collect_codegen_metrics(src: Path, out_dir: Path) -> dict[str, object]:
     return metrics
 
 
-def _run_qemu(exe: Path, input_file: Optional[Path]) -> tuple[bool, float, str, str, Optional[int], str]:
+def _run_qemu(
+    exe: Path,
+    input_file: Optional[Path],
+) -> tuple[bool, float, str, str, Optional[int], str, list[float]]:
     stdin_data = input_file.read_bytes() if input_file and input_file.exists() else None
     times = []
     last_result = None
@@ -704,10 +713,10 @@ def _run_qemu(exe: Path, input_file: Optional[Path]) -> tuple[bool, float, str, 
                 break
         except subprocess.TimeoutExpired:
             elapsed = time.perf_counter() - start
-            return False, elapsed, "", "", None, "TIMEOUT"
+            return False, elapsed, "", "", None, "TIMEOUT", [*times, elapsed]
         except Exception as exc:  # pragma: no cover
             elapsed = time.perf_counter() - start
-            return False, elapsed, "", "", None, f"ERR: {exc}"
+            return False, elapsed, "", "", None, f"ERR: {exc}", [*times, elapsed]
 
     times.sort()
     median_elapsed = times[len(times) // 2]
@@ -715,7 +724,22 @@ def _run_qemu(exe: Path, input_file: Optional[Path]) -> tuple[bool, float, str, 
     stdout = last_result.stdout.decode(errors="replace") if last_result.stdout else ""
     stderr = last_result.stderr.decode(errors="replace") if last_result.stderr else ""
     ok = last_result.returncode == 0
-    return ok, median_elapsed, stdout, stderr, last_result.returncode, "OK" if ok else f"exit={last_result.returncode}"
+    return (
+        ok,
+        median_elapsed,
+        stdout,
+        stderr,
+        last_result.returncode,
+        "OK" if ok else f"exit={last_result.returncode}",
+        times,
+    )
+
+
+def _file_fingerprint(path: Path) -> tuple[str, int] | tuple[None, None]:
+    if not path.is_file():
+        return None, None
+    data = path.read_bytes()
+    return hashlib.sha256(data).hexdigest(), len(data)
 
 
 def _expected_input(case: Path) -> Optional[Path]:
@@ -799,8 +823,25 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, RunRes
             results[name] = RunResult(False, False, elapsed, detail=f"ERR: {exc}")
             continue
 
-        run_ok, elapsed, stdout, stderr, exit_code, detail = _run_qemu(exe, input_file)
-        results[name] = RunResult(True, run_ok, elapsed, stdout, stderr, exit_code, detail, exe_path=exe)
+        run_ok, elapsed, stdout, stderr, exit_code, detail, samples = _run_qemu(exe, input_file)
+        asm_stem = "clang" if name == "clang++" else name
+        asm_sha256, asm_size = _file_fingerprint(case_dir / f"{src.stem}.{asm_stem}.s")
+        exe_sha256, exe_size = _file_fingerprint(exe)
+        results[name] = RunResult(
+            True,
+            run_ok,
+            elapsed,
+            stdout,
+            stderr,
+            exit_code,
+            detail,
+            exe_path=exe,
+            elapsed_samples_sec=samples,
+            assembly_sha256=asm_sha256,
+            assembly_size_bytes=asm_size,
+            executable_sha256=exe_sha256,
+            executable_size_bytes=exe_size,
+        )
 
     if "compiler" in results and results["compiler"].compile_ok:
         results["compiler"].metrics = _collect_codegen_metrics(src, case_dir)
@@ -1470,6 +1511,39 @@ def main() -> int:
             instruction_counts["hy"] = hy.instruction_count
             instruction_count_statuses["hy"] = hy.instruction_count_status
             instruction_count_details["hy"] = hy.instruction_count_detail
+        timing_samples = {
+            "gcc": gcc.elapsed_samples_sec or [],
+            "clang": clang.elapsed_samples_sec or [],
+            "compiler": compiler.elapsed_samples_sec or [],
+        }
+        assembly_artifacts = {
+            "gcc": {
+                "sha256": gcc.assembly_sha256,
+                "size_bytes": gcc.assembly_size_bytes,
+                "executable_sha256": gcc.executable_sha256,
+                "executable_size_bytes": gcc.executable_size_bytes,
+            },
+            "clang": {
+                "sha256": clang.assembly_sha256,
+                "size_bytes": clang.assembly_size_bytes,
+                "executable_sha256": clang.executable_sha256,
+                "executable_size_bytes": clang.executable_size_bytes,
+            },
+            "compiler": {
+                "sha256": compiler.assembly_sha256,
+                "size_bytes": compiler.assembly_size_bytes,
+                "executable_sha256": compiler.executable_sha256,
+                "executable_size_bytes": compiler.executable_size_bytes,
+            },
+        }
+        if hy is not None:
+            timing_samples["hy"] = hy.elapsed_samples_sec or []
+            assembly_artifacts["hy"] = {
+                "sha256": hy.assembly_sha256,
+                "size_bytes": hy.assembly_size_bytes,
+                "executable_sha256": hy.executable_sha256,
+                "executable_size_bytes": hy.executable_size_bytes,
+            }
         row = {
             "case": rel,
             "gcc": _format_cell(gcc),
@@ -1484,6 +1558,8 @@ def main() -> int:
             "instruction_counts": instruction_counts,
             "instruction_count_statuses": instruction_count_statuses,
             "instruction_count_details": instruction_count_details,
+            "timing_samples_sec": timing_samples,
+            "assembly_artifacts": assembly_artifacts,
         }
         if hy is not None:
             row["hy"] = _format_cell(hy)

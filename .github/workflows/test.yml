@@ -155,6 +155,10 @@ jobs:
           mkdir -p build/github-actions
           python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --compile-timeout 60 2>&1 | tee build/github-actions/functional-tests.log
 
+      - name: Validate performance judgement
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
       - name: Run performance tests
         id: perf_tests
         if: always()

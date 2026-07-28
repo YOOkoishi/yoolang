@@ -13,6 +13,8 @@ from typing import Any
 TIME_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)s$")
 CASE_REGRESSION_DELTA_PCT = 20.0
 CASE_REGRESSION_DELTA_SEC = 0.05
+CASE_MEASURABLE_DELTA_PCT = 5.0
+CASE_MEASURABLE_DELTA_SEC = 0.01
 TOTAL_REGRESSION_DELTA_PCT = 10.0
 TOTAL_IMPROVEMENT_DELTA_PCT = 10.0
 MAX_REGRESSION_ROWS = 10
@@ -22,6 +24,9 @@ STATUS_EMOJI = {
     "IMPROVEMENT": "🚀",
     "OK": "✅",
     "REGRESSION": "⚠️",
+    "NO_CODE_CHANGE": "✅",
+    "NO_DYNAMIC_CHANGE": "✅",
+    "INCONCLUSIVE": "ℹ️",
     "NO BASELINE": "ℹ️",
 }
 
@@ -75,6 +80,81 @@ def instruction_count(row: dict[str, Any]) -> int | None:
         return counts["compiler"]
     value = row.get("instruction_count")
     return value if isinstance(value, int) else None
+
+
+def assembly_sha256(row: dict[str, Any]) -> str | None:
+    artifacts = row.get("assembly_artifacts")
+    if isinstance(artifacts, dict):
+        compiler = artifacts.get("compiler")
+        if isinstance(compiler, dict):
+            value = compiler.get("sha256")
+            if isinstance(value, str) and value:
+                return value
+    value = row.get("compiler_asm_sha256")
+    return value if isinstance(value, str) and value else None
+
+
+def executable_sha256(row: dict[str, Any]) -> str | None:
+    artifacts = row.get("assembly_artifacts")
+    if not isinstance(artifacts, dict):
+        return None
+    compiler = artifacts.get("compiler")
+    if not isinstance(compiler, dict):
+        return None
+    value = compiler.get("executable_sha256")
+    return value if isinstance(value, str) and value else None
+
+
+def timing_samples(row: dict[str, Any]) -> list[float]:
+    samples_by_compiler = row.get("timing_samples_sec")
+    if not isinstance(samples_by_compiler, dict):
+        return []
+    samples = samples_by_compiler.get("compiler")
+    if not isinstance(samples, list):
+        return []
+    return [float(value) for value in samples if isinstance(value, (int, float)) and value >= 0.0]
+
+
+def classify_change(
+    current_row: dict[str, Any],
+    baseline_row: dict[str, Any],
+    current_time: float,
+    baseline_time: float,
+) -> tuple[str, str]:
+    current_hash = assembly_sha256(current_row)
+    baseline_hash = assembly_sha256(baseline_row)
+    current_executable = executable_sha256(current_row)
+    baseline_executable = executable_sha256(baseline_row)
+    if current_executable is not None and baseline_executable is not None:
+        if current_executable == baseline_executable:
+            return "NO_CODE_CHANGE", "executed ELF SHA-256 is identical"
+    elif current_hash is not None and current_hash == baseline_hash:
+        return "NO_CODE_CHANGE", "compiler assembly SHA-256 is identical"
+
+    current_count = instruction_count(current_row)
+    baseline_count = instruction_count(baseline_row)
+    if current_count is not None and current_count == baseline_count:
+        return "NO_DYNAMIC_CHANGE", "QEMU dynamic instruction count is identical"
+
+    delta_sec = current_time - baseline_time
+    delta_pct = 0.0 if baseline_time == 0.0 else abs(delta_sec / baseline_time) * 100.0
+    if delta_pct < CASE_MEASURABLE_DELTA_PCT or abs(delta_sec) < CASE_MEASURABLE_DELTA_SEC:
+        return (
+            "INCONCLUSIVE",
+            f"wall-time delta is below {CASE_MEASURABLE_DELTA_PCT:.0f}%/{CASE_MEASURABLE_DELTA_SEC:.3f}s evidence floor",
+        )
+
+    current_samples = timing_samples(current_row)
+    baseline_samples = timing_samples(baseline_row)
+    if len(current_samples) >= 2 and len(baseline_samples) >= 2:
+        intervals_overlap = min(current_samples) <= max(baseline_samples) and min(baseline_samples) <= max(current_samples)
+        if intervals_overlap:
+            return "INCONCLUSIVE", "current and baseline timing sample ranges overlap"
+
+    return ("IMPROVEMENT", "measurable wall-time improvement") if current_time < baseline_time else (
+        "REGRESSION",
+        "measurable wall-time regression",
+    )
 
 
 def format_signed_sec(value: float) -> str:
@@ -163,6 +243,9 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
         "case_wins": 0,
         "case_losses": 0,
         "case_ties": 0,
+        "case_no_code_change": 0,
+        "case_no_dynamic_change": 0,
+        "case_inconclusive": 0,
         "rows": [],
     }
     args.out_json.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
@@ -318,6 +401,11 @@ def main() -> int:
     case_wins = 0
     case_losses = 0
     case_ties = 0
+    case_no_code_change = 0
+    case_no_dynamic_change = 0
+    case_inconclusive = 0
+    adjudicated_cases = 0
+    raw_current_total = 0.0
 
     for case in sorted(set(current_rows) & set(baseline_rows)):
         current_time = parse_time(compiler_cell(current_rows[case]))
@@ -325,19 +413,42 @@ def main() -> int:
         if current_time is None or baseline_time is None:
             continue
 
-        delta_sec = current_time - baseline_time
+        observed_delta_sec = current_time - baseline_time
         # Speed-based: positive = yoolang faster (comparing speed, not time)
-        delta_pct = 0.0 if baseline_time == 0.0 else ((baseline_time - current_time) / baseline_time) * 100.0
-        case_speedup = speedup_ratio(baseline_time, current_time)
+        observed_delta_pct = (
+            0.0 if baseline_time == 0.0 else ((baseline_time - current_time) / baseline_time) * 100.0
+        )
+        classification, evidence = classify_change(
+            current_rows[case], baseline_rows[case], current_time, baseline_time
+        )
+        if classification == "IMPROVEMENT":
+            case_wins += 1
+            adjudicated_cases += 1
+        elif classification == "REGRESSION":
+            case_losses += 1
+            adjudicated_cases += 1
+        elif classification == "NO_CODE_CHANGE":
+            case_no_code_change += 1
+            case_ties += 1
+        elif classification == "NO_DYNAMIC_CHANGE":
+            case_no_dynamic_change += 1
+            case_ties += 1
+        else:
+            case_inconclusive += 1
+            case_ties += 1
+
+        is_measurable = classification in {"IMPROVEMENT", "REGRESSION"}
+        effective_current_time = current_time if is_measurable else baseline_time
+        delta_sec = effective_current_time - baseline_time
+        delta_pct = 0.0 if not is_measurable else observed_delta_pct
+        case_speedup = speedup_ratio(baseline_time, effective_current_time)
         if case_speedup is not None:
             speedups.append(case_speedup)
-        if current_time < baseline_time:
-            case_wins += 1
-        elif current_time > baseline_time:
-            case_losses += 1
-        else:
-            case_ties += 1
-        is_regression = delta_pct <= -CASE_REGRESSION_DELTA_PCT and delta_sec >= CASE_REGRESSION_DELTA_SEC
+        is_regression = (
+            classification == "REGRESSION"
+            and observed_delta_pct <= -CASE_REGRESSION_DELTA_PCT
+            and observed_delta_sec >= CASE_REGRESSION_DELTA_SEC
+        )
         rows.append(
             {
                 "case": case,
@@ -345,12 +456,23 @@ def main() -> int:
                 "baseline": baseline_time,
                 "delta_sec": delta_sec,
                 "delta_pct": delta_pct,
+                "observed_delta_sec": observed_delta_sec,
+                "observed_delta_pct": observed_delta_pct,
                 "speedup": case_speedup,
-                "status": "REGRESSION" if is_regression else "OK",
+                "status": classification,
+                "evidence": evidence,
+                "important_regression": is_regression,
+                "assembly_changed": (
+                    assembly_sha256(current_rows[case]) != assembly_sha256(baseline_rows[case])
+                    if assembly_sha256(current_rows[case]) is not None
+                    and assembly_sha256(baseline_rows[case]) is not None
+                    else None
+                ),
             }
         )
-        current_total += current_time
+        current_total += effective_current_time
         baseline_total += baseline_time
+        raw_current_total += current_time
 
     if not rows:
         status = "NO BASELINE"
@@ -362,7 +484,13 @@ def main() -> int:
         total_delta_pct = 0.0 if baseline_total == 0.0 else ((baseline_total - current_total) / baseline_total) * 100.0
         total_speedup = speedup_ratio(baseline_total, current_total)
         case_speedup_geomean = geometric_mean(speedups)
-        if total_delta_pct <= -TOTAL_REGRESSION_DELTA_PCT:
+        if adjudicated_cases == 0 and case_no_code_change == len(rows):
+            status = "NO_CODE_CHANGE"
+        elif adjudicated_cases == 0 and case_inconclusive == 0:
+            status = "NO_DYNAMIC_CHANGE"
+        elif adjudicated_cases == 0:
+            status = "INCONCLUSIVE"
+        elif total_delta_pct <= -TOTAL_REGRESSION_DELTA_PCT:
             status = "REGRESSION"
         elif total_delta_pct >= TOTAL_IMPROVEMENT_DELTA_PCT:
             status = "IMPROVEMENT"
@@ -371,8 +499,8 @@ def main() -> int:
     if not rows:
         total_speedup = None
 
-    regressions = [row for row in rows if row["status"] == "REGRESSION"]
-    regressions.sort(key=lambda row: (row["delta_pct"], -row["delta_sec"]))
+    regressions = [row for row in rows if row["important_regression"]]
+    regressions.sort(key=lambda row: (row["observed_delta_pct"], -row["observed_delta_sec"]))
     shown_regressions = regressions[:MAX_REGRESSION_ROWS]
 
     args.out_md.parent.mkdir(parents=True, exist_ok=True)
@@ -385,10 +513,15 @@ def main() -> int:
         f"- Baseline: {args.baseline_label}",
         *baseline_md_lines(args),
         f"- Comparable cases: {len(rows)}",
+        f"- Evidence-backed changes: {adjudicated_cases}",
+        f"- No code change: {case_no_code_change}",
+        f"- No dynamic instruction change: {case_no_dynamic_change}",
+        f"- Inconclusive timing: {case_inconclusive}",
         f"- Current Yoolang runtime total: {current_total:.4f}s",
         f"- Baseline Yoolang runtime total: {baseline_total:.4f}s",
+        f"- Raw current runtime total (diagnostic only): {raw_current_total:.4f}s",
         f"- Overall speedup vs baseline: {format_speedup(total_speedup)}",
-        f"- Win/loss/tie: 🚀 {case_wins} faster / ⚠️ {case_losses} slower / ✅ {case_ties} tied",
+        f"- Win/loss/neutral: 🚀 {case_wins} faster / ⚠️ {case_losses} slower / ✅ {case_ties} neutral",
         f"- Delta: {format_signed_sec(total_delta_sec)} ({format_signed_pct(total_delta_pct)})",
         "",
     ]
@@ -465,8 +598,10 @@ def main() -> int:
         "baseline_commit_author": args.baseline_commit_author,
         "baseline_meta": baseline_meta(args),
         "comparable_cases": len(rows),
+        "adjudicated_cases": adjudicated_cases,
         "current_compiler_total": current_total,
         "baseline_compiler_total": baseline_total,
+        "raw_current_compiler_total": raw_current_total,
         "total_delta_sec": total_delta_sec,
         "total_delta_pct": total_delta_pct,
         "total_speedup": total_speedup,
@@ -474,6 +609,9 @@ def main() -> int:
         "case_wins": case_wins,
         "case_losses": case_losses,
         "case_ties": case_ties,
+        "case_no_code_change": case_no_code_change,
+        "case_no_dynamic_change": case_no_dynamic_change,
+        "case_inconclusive": case_inconclusive,
         "instruction_count": insn_compare,
         "regressions": regressions,
         "rows": rows,

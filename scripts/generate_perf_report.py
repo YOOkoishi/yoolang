@@ -145,6 +145,12 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
                 "delta_pct": delta_row.get("delta_pct") if isinstance(delta_row.get("delta_pct"), (int, float)) else None,
                 "baseline_speedup": delta_row.get("speedup") if isinstance(delta_row.get("speedup"), (int, float)) else None,
                 "baseline_status": str(delta_row.get("status", "")),
+                "baseline_evidence": str(delta_row.get("evidence", "")),
+                "observed_delta_pct": (
+                    delta_row.get("observed_delta_pct")
+                    if isinstance(delta_row.get("observed_delta_pct"), (int, float))
+                    else None
+                ),
                 "status": status,
                 "reason": detail,
             }
@@ -175,12 +181,12 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
     regressions = [
         row
         for row in rows
-        if isinstance(row["delta_pct"], (int, float)) and row["delta_pct"] > 0.0
+        if row["baseline_status"] == "REGRESSION"
     ]
     improvements = [
         row
         for row in rows
-        if isinstance(row["delta_pct"], (int, float)) and row["delta_pct"] < 0.0
+        if row["baseline_status"] == "IMPROVEMENT"
     ]
     total_yoolang = sum(row["yoolang_sec"] for row in ok_rows if isinstance(row["yoolang_sec"], float))
     total_gcc = sum(row["gcc_sec"] for row in ok_rows if isinstance(row["gcc_sec"], float))
@@ -220,8 +226,8 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
         [item for item in compiler_comparisons if item["speedup"] < 1.0],
         key=lambda item: item["speedup"],
     )[:10]
-    top_baseline_faster = sorted(improvements, key=lambda row: row.get("delta_pct", 0.0))[:10]
-    top_baseline_slower = sorted(regressions, key=lambda row: row.get("delta_pct", 0.0), reverse=True)[:10]
+    top_baseline_faster = sorted(improvements, key=lambda row: row.get("delta_pct", 0.0), reverse=True)[:10]
+    top_baseline_slower = sorted(regressions, key=lambda row: row.get("delta_pct", 0.0))[:10]
 
     return {
         "generated_china": datetime.now(CHINA_TZ).strftime("%Y-%m-%d %H:%M:%S CST"),
@@ -246,6 +252,9 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
             "yoolang_loses_clang": len(loses_clang),
             "baseline_improvements": len(improvements),
             "baseline_regressions": len(regressions),
+            "baseline_no_code_change": delta.get("case_no_code_change", 0),
+            "baseline_no_dynamic_change": delta.get("case_no_dynamic_change", 0),
+            "baseline_inconclusive": delta.get("case_inconclusive", 0),
             "total_runtime_sec": perf.get("total_runtime_sec"),
             "total_yoolang_sec": total_yoolang if ok_rows else None,
             "total_gcc_sec": total_gcc if ok_rows else None,
