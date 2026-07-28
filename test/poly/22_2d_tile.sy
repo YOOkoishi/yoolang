@@ -1,0 +1,36 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int src[128][128];
+int dst[128][128];
+
+int copy_2d(int n) {
+  int i = 0;
+  int j = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      dst[i][j] = src[i][0] + src[0][j];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return dst[0][0];
+}
+
+int main() {
+  return copy_2d(128);
+}
+
+// CHECK-LABEL: yir.func @copy_2d
+// CHECK: %poly.tile.step{{[0-9]+}} = yir.const.i32 16
+// CHECK: yir.for %poly.tile.outer
+// CHECK: yir.for %poly.tile.inner
+// CHECK: yir.for %i =
+// CHECK: yir.for %j =
+
+// COST: "transform": "LoopTiling"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-tile"
+// COST-NEXT: "scope": "0"
+// COST-NEXT: "action": "Accept"

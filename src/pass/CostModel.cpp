@@ -135,6 +135,8 @@ std::string_view to_string(TransformKind kind) {
         return "LoopInterchange";
     case TransformKind::LoopTiling:
         return "LoopTiling";
+    case TransformKind::LoopFusion:
+        return "LoopFusion";
     case TransformKind::LoopUnroll:
         return "LoopUnroll";
     case TransformKind::LoopIdiom:
@@ -450,8 +452,17 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
     const bool small_inline_growth =
         candidate.kind == TransformKind::Inline &&
         candidate.risk.code_growth <= policy.small_code_growth_allowance;
+    const bool small_loop_growth =
+        candidate.risk.code_growth <= policy.small_code_growth_allowance &&
+        (candidate.kind == TransformKind::LoopInterchange ||
+         candidate.kind == TransformKind::LoopTiling ||
+         candidate.kind == TransformKind::LoopFusion ||
+         candidate.kind == TransformKind::LoopUnroll ||
+         candidate.kind == TransformKind::LoopRotate ||
+         candidate.kind == TransformKind::LoopUnswitch ||
+         candidate.kind == TransformKind::LoopIdiom);
     const bool exceeds_growth_percent =
-        !small_inline_growth && candidate.before.static_instrs > 0 &&
+        !small_inline_growth && !small_loop_growth && candidate.before.static_instrs > 0 &&
         candidate.risk.code_growth * 100 >
             candidate.before.static_instrs * policy.max_module_code_growth_percent;
 

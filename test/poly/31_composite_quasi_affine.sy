@@ -1,0 +1,16 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s
+
+int A[64];
+
+int main() {
+  int i = 0;
+  while (i < 16) {
+    A[i / 4 + 1] = i;
+    i = i + 1;
+  }
+  return A[1];
+}
+
+// CHECK: models: 1
+// CHECK: write @A[add(floordiv(%i, 4), 1)]
+// CHECK: dependence WAW stmt #0 -> stmt #0 memory=@A dependent=true distance=unknown relation={source=[%i], target=[%i], params=[], disjuncts=4, exact=true, locals=2} reduction=false

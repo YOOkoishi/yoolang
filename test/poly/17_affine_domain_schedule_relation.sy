@@ -30,6 +30,7 @@ int main() {
 // POLY: statements: 4
 // POLY: stmt #0 op=yir.array_store
 // POLY: schedule-map: [%i] -> [{{[0-9]+}}, %i, {{[0-9]+}}, 0]
+// POLY: schedule-bands: [offset=1 count=1 permutable=true coincident=true reduction=false] optimized=true
 // POLY: domain-set: dims=[%i] params=[%k, %n] { 0 <= %i and %i < %n and %i < %k }
 // POLY: stmt #1 op=yir.array_store
 // POLY: schedule-map: [%i] -> [{{[0-9]+}}, %i, {{[0-9]+}}, 1]

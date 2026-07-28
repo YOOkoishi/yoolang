@@ -1,0 +1,44 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int source[64][64][64];
+int target[64][64][64];
+
+int move_outer_dimension_innermost() {
+  int i = 0;
+  int j = 0;
+  int k = 0;
+  while (i < 64) {
+    j = 0;
+    while (j < 64) {
+      k = 0;
+      while (k < 64) {
+        target[j][k][i] = source[j][k][i];
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return target[0][0][0];
+}
+
+int main() {
+  return move_outer_dimension_innermost();
+}
+
+// YIR-LABEL: yir.func @move_outer_dimension_innermost
+// YIR: yir.for %j =
+// YIR: yir.for %k =
+// YIR: yir.for %i =
+
+// COST: "transform": "LoopInterchange"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-interchange"
+// COST-NEXT: "scope": "0:0"
+// COST-NEXT: "action": "Accept"
+// COST: "transform": "LoopInterchange"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-interchange"
+// COST-NEXT: "scope": "0:1"
+// COST-NEXT: "action": "Accept"

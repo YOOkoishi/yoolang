@@ -1,0 +1,51 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int lhs[64][64];
+int rhs[64][64];
+int temporary[64][64];
+
+int nested_rmw_fusion(int n) {
+  int i = 0;
+  int j = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      temporary[i][j] = lhs[i][j] + rhs[i][j];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  i = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      int value = temporary[i][j];
+      temporary[i][j] = value * value + 7;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return temporary[0][0];
+}
+
+int main() {
+  return nested_rmw_fusion(64);
+}
+
+// CHECK-LABEL: yir.func @nested_rmw_fusion
+// CHECK-COUNT-1: yir.for %i =
+// CHECK-COUNT-1: yir.for %j =
+// CHECK: %[[SUM:.*]] = yir.addi
+// CHECK-NOT: yir.array_load @temporary, [%i, %j]
+// CHECK: %[[VALUE:.*]] = yir.var : i32 = %[[SUM]]
+// CHECK: %[[SQUARE:.*]] = yir.muli %[[VALUE]], %[[VALUE]]
+// CHECK: yir.array_store {{.*}}, @temporary, [%i, %j]
+
+// COST: "transform": "LoopFusion"
+// COST: "action": "Accept"
+// COST: "summary": "equal domains and same-iteration producer-consumer dependence; outer band preserves point order"
+// COST: "transform": "LoopFusion"
+// COST: "action": "Accept"
+// COST: "summary": "equal domains and same-iteration producer-consumer dependence"

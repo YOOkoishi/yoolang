@@ -31,6 +31,7 @@ enum class TransformKind {
     LoopRotate,
     LoopInterchange,
     LoopTiling,
+    LoopFusion,
     LoopUnroll,
     LoopIdiom,
     MemoryForwarding,

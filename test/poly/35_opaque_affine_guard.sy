@@ -1,0 +1,25 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s
+
+int a[16];
+int b[16];
+int c[16];
+
+int main() {
+  int i = 0;
+  while (i < 16) {
+    if (a[i] * b[i] % 2 == 0) {
+      c[i] = a[i] + b[i];
+    }
+    i = i + 1;
+  }
+  return c[0];
+}
+
+// CHECK: scops: 1
+// CHECK: opaque-conditions: true
+// CHECK: statements: 5
+// CHECK: models: 1
+// CHECK: stmt #0 op=yir.array_load
+// CHECK: opaque-condition=true
+// CHECK: domain: %i in [0, 16)
+// CHECK: write @c[%i]

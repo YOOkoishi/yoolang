@@ -1,0 +1,36 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int a[80][80];
+int c[80][80];
+
+int main() {
+  int i = 0;
+  while (i < 80) {
+    int j = 0;
+    while (j < 80) {
+      int k = 0;
+      int sum = 0;
+      while (k < 80) {
+        sum = sum + a[i][k] * a[k][j];
+        k = k + 1;
+      }
+      c[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return c[0][0];
+}
+
+// YIR-NOT: yir.for %i.tile
+// YIR-NOT: yir.for %j.tile
+// YIR-NOT: yir.for %k.tile
+// YIR: yir.for %i =
+// YIR: %sum = yir.var : i32
+// YIR: yir.for %k =
+// YIR: yir.array_store %sum, @c, [%i, %j]
+
+// COST-COUNT-2: "transform": "LoopTiling"
+// COST: "action": "Reject"
+// COST: "summary": "polyhedral dependence legality; point-order-preserving inner strip-mining tile=20"

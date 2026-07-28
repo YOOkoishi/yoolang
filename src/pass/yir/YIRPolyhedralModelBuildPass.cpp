@@ -15,6 +15,10 @@ namespace {
 
 class AffineExtractor {
 public:
+    explicit AffineExtractor(
+        const std::unordered_set<const yir::Value *> *known_nonnegative = nullptr)
+        : known_nonnegative_(known_nonnegative) {}
+
     PolyAffineExpr extract(const yir::Value* val) {
         if (val == nullptr) {
             return invalid();
@@ -44,6 +48,28 @@ public:
             }
             return invalid();
         }
+        if (auto *div = dynamic_cast<const yir::DivSIOp *>(def)) {
+            std::int64_t divisor = 0;
+            if (!const_i32_value(div->rhs(), divisor) || divisor <= 0) {
+                return invalid();
+            }
+            auto operand = extract(div->lhs());
+            if (!is_known_nonnegative(operand)) {
+                return invalid();
+            }
+            return quasi_affine(PolyAffineExprKind::FloorDiv, std::move(operand), divisor);
+        }
+        if (auto *rem = dynamic_cast<const yir::RemSIOp *>(def)) {
+            std::int64_t divisor = 0;
+            if (!const_i32_value(rem->rhs(), divisor) || divisor <= 0) {
+                return invalid();
+            }
+            auto operand = extract(rem->lhs());
+            if (!is_known_nonnegative(operand)) {
+                return invalid();
+            }
+            return quasi_affine(PolyAffineExprKind::Mod, std::move(operand), divisor);
+        }
 
         PolyAffineExpr expr;
         add_term(expr, val, 1);
@@ -51,9 +77,54 @@ public:
     }
 
 private:
+    bool is_known_nonnegative(const PolyAffineExpr &expr) const {
+        if (!expr.valid) {
+            return false;
+        }
+        if (expr.is_composite_affine()) {
+            const auto &lhs = *expr.operands[0];
+            const auto &rhs = *expr.operands[1];
+            if (expr.kind == PolyAffineExprKind::Add) {
+                return is_known_nonnegative(lhs) && is_known_nonnegative(rhs);
+            }
+            if (expr.kind == PolyAffineExprKind::Mul) {
+                if (lhs.is_linear() && lhs.terms.empty() && lhs.constant >= 0) {
+                    return lhs.constant == 0 || is_known_nonnegative(rhs);
+                }
+                if (rhs.is_linear() && rhs.terms.empty() && rhs.constant >= 0) {
+                    return rhs.constant == 0 || is_known_nonnegative(lhs);
+                }
+            }
+            return false;
+        }
+        if (expr.is_quasi_affine()) {
+            return expr.kind == PolyAffineExprKind::FloorDiv ||
+                   expr.kind == PolyAffineExprKind::CeilDiv ||
+                   expr.kind == PolyAffineExprKind::Mod;
+        }
+        if (!expr.is_linear() || expr.constant < 0 || known_nonnegative_ == nullptr) {
+            return expr.is_linear() && expr.terms.empty() && expr.constant >= 0;
+        }
+        return std::all_of(expr.terms.begin(), expr.terms.end(), [this](const auto &term) {
+            return term.second >= 0 && known_nonnegative_->count(term.first) != 0;
+        });
+    }
+
     static PolyAffineExpr invalid() {
         PolyAffineExpr expr;
         expr.valid = false;
+        return expr;
+    }
+
+    static PolyAffineExpr quasi_affine(PolyAffineExprKind kind, PolyAffineExpr operand,
+                                       std::int64_t divisor) {
+        if (!operand.valid || divisor <= 0) {
+            return invalid();
+        }
+        PolyAffineExpr expr;
+        expr.kind = kind;
+        expr.operand = std::make_shared<PolyAffineExpr>(std::move(operand));
+        expr.divisor = divisor;
         return expr;
     }
 
@@ -100,6 +171,13 @@ private:
         if (!lhs.valid || !rhs.valid) {
             return invalid();
         }
+        if (!lhs.is_linear() || !rhs.is_linear()) {
+            PolyAffineExpr expr;
+            expr.kind = sign == 1 ? PolyAffineExprKind::Add : PolyAffineExprKind::Sub;
+            expr.operands.push_back(std::make_shared<PolyAffineExpr>(std::move(lhs)));
+            expr.operands.push_back(std::make_shared<PolyAffineExpr>(rhs));
+            return expr;
+        }
         lhs.constant += sign * rhs.constant;
         for (const auto& term : rhs.terms) {
             add_term(lhs, term.first, sign * term.second);
@@ -110,7 +188,19 @@ private:
 
     static PolyAffineExpr scale_expr(PolyAffineExpr expr, std::int64_t scale) {
         if (!expr.valid) {
-            return expr;
+            return invalid();
+        }
+        if (!expr.is_linear()) {
+            if (scale == 1) {
+                return expr;
+            }
+            PolyAffineExpr factor;
+            factor.constant = scale;
+            PolyAffineExpr result;
+            result.kind = PolyAffineExprKind::Mul;
+            result.operands.push_back(std::make_shared<PolyAffineExpr>(std::move(factor)));
+            result.operands.push_back(std::make_shared<PolyAffineExpr>(std::move(expr)));
+            return result;
         }
         expr.constant *= scale;
         for (auto& term : expr.terms) {
@@ -119,6 +209,8 @@ private:
         normalize_terms(expr);
         return expr;
     }
+
+    const std::unordered_set<const yir::Value *> *known_nonnegative_;
 };
 
 class PolyhedralBuilder {
@@ -150,16 +242,24 @@ public:
                 poly_stmt.op = stmt.op;
                 poly_stmt.op_name = stmt.op == nullptr ? "<null>" : stmt.op->op_name();
                 poly_stmt.lexical_id = stmt.id;
+                poly_stmt.has_opaque_conditions = stmt.has_opaque_conditions;
 
+                const auto known_nonnegative =
+                    collect_known_nonnegative_ivs(stmt.enclosing_loops);
                 extract_domain(poly_stmt, scop.region, stmt.enclosing_loops,
-                               stmt.path_conditions, schedule_depth);
+                               stmt.path_conditions, schedule_depth, known_nonnegative);
                 append_domain_params(poly_stmt, params, poly_scop.params);
-                extract_accesses(*stmt.op, params, poly_stmt.reads, poly_stmt.writes);
+                extract_accesses(*stmt.op, params, known_nonnegative,
+                                 poly_stmt.reads, poly_stmt.writes);
 
                 if (!poly_stmt.reads.empty() || !poly_stmt.writes.empty()) {
                     poly_scop.statements.push_back(std::move(poly_stmt));
                 }
             }
+            if (scop.region != nullptr) {
+                annotate_reductions(poly_scop, *scop.region);
+            }
+            finalize_schedule_space(poly_scop);
             for (auto &stmt : poly_scop.statements) {
                 stmt.domain.params = poly_scop.params;
             }
@@ -171,6 +271,196 @@ public:
     }
 
 private:
+    static void finalize_schedule_space(PolyScop &scop) {
+        const PolyStmt *anchor = nullptr;
+        for (const auto &stmt : scop.statements) {
+            if (anchor == nullptr || stmt.schedule_dims.size() > anchor->schedule_dims.size()) {
+                anchor = &stmt;
+            }
+        }
+        if (anchor != nullptr) {
+            scop.schedule_space_dims = anchor->schedule_dims;
+        }
+
+        for (auto &stmt : scop.statements) {
+            auto &schedule = stmt.schedule;
+            schedule.space_dims = scop.schedule_space_dims;
+            schedule.matrix.assign(schedule.output_dims.size(),
+                                   std::vector<std::int64_t>(schedule.space_dims.size(), 0));
+            schedule.matrix_constants.assign(schedule.output_dims.size(), 0);
+            schedule.matrix_valid = true;
+            for (std::size_t row = 0; row < schedule.output_dims.size(); ++row) {
+                const auto &expr = schedule.output_dims[row];
+                if (!expr.is_linear()) {
+                    schedule.matrix_valid = false;
+                    continue;
+                }
+                schedule.matrix_constants[row] = expr.constant;
+                for (const auto &[value, coefficient] : expr.terms) {
+                    const auto local = std::find(stmt.schedule.input_dims.begin(),
+                                                  stmt.schedule.input_dims.end(), value);
+                    if (local == stmt.schedule.input_dims.end()) {
+                        schedule.matrix_valid = false;
+                        continue;
+                    }
+                    const auto position = static_cast<std::size_t>(
+                        local - stmt.schedule.input_dims.begin());
+                    if (position >= schedule.space_dims.size()) {
+                        schedule.matrix_valid = false;
+                        continue;
+                    }
+                    schedule.matrix[row][position] += coefficient;
+                }
+            }
+        }
+    }
+
+    static bool same_array_element(const yir::ArrayLoadOp &load,
+                                   const yir::ArrayStoreOp &store) {
+        if (load.array() != store.array()) {
+            return false;
+        }
+        const auto load_indices = load.indices();
+        const auto store_indices = store.indices();
+        if (load_indices.size() != store_indices.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < load_indices.size(); ++i) {
+            if (load_indices[i] == store_indices[i]) {
+                continue;
+            }
+            auto *load_constant = dynamic_cast<const yir::ConstI32Op *>(
+                load_indices[i] == nullptr ? nullptr : load_indices[i]->defining_op());
+            auto *store_constant = dynamic_cast<const yir::ConstI32Op *>(
+                store_indices[i] == nullptr ? nullptr : store_indices[i]->defining_op());
+            if (load_constant == nullptr || store_constant == nullptr ||
+                load_constant->value() != store_constant->value()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static const yir::ArrayLoadOp *reduction_load_for_store(
+        const yir::ArrayStoreOp &store) {
+        if (store.value() == nullptr) {
+            return nullptr;
+        }
+        auto *add = dynamic_cast<const yir::AddIOp *>(store.value()->defining_op());
+        if (add == nullptr) {
+            return nullptr;
+        }
+
+        const auto *lhs_load = dynamic_cast<const yir::ArrayLoadOp *>(add->lhs()->defining_op());
+        const auto *rhs_load = dynamic_cast<const yir::ArrayLoadOp *>(add->rhs()->defining_op());
+        const yir::ArrayLoadOp *load = nullptr;
+        if (lhs_load != nullptr && same_array_element(*lhs_load, store)) {
+            load = lhs_load;
+        } else if (rhs_load != nullptr && same_array_element(*rhs_load, store)) {
+            load = rhs_load;
+        }
+        return load;
+    }
+
+    static std::vector<bool> reduction_dimensions(const PolyStmt &store_stmt) {
+        std::vector<bool> dims(store_stmt.schedule_dims.size(), true);
+        for (std::size_t depth = 0; depth < store_stmt.schedule_dims.size(); ++depth) {
+            const auto *dim = store_stmt.schedule_dims[depth];
+            for (const auto &access : store_stmt.writes) {
+                for (const auto &index : access.indices) {
+                    if (!index.is_linear()) {
+                        dims[depth] = false;
+                        continue;
+                    }
+                    const bool used = std::any_of(
+                        index.terms.begin(), index.terms.end(), [dim](const auto &term) {
+                            return term.first == dim && term.second != 0;
+                        });
+                    if (used) {
+                        dims[depth] = false;
+                    }
+                }
+            }
+        }
+        return dims;
+    }
+
+    static std::size_t count_value_uses(const yir::Region &region,
+                                        const yir::Value *value) {
+        std::size_t uses = 0;
+        for (const auto &op : region.operations()) {
+            uses += static_cast<std::size_t>(
+                std::count(op->operands().begin(), op->operands().end(), value));
+            if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+                uses += count_value_uses(if_op->then_region(), value);
+                if (if_op->has_else()) {
+                    uses += count_value_uses(if_op->else_region(), value);
+                }
+            } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+                uses += count_value_uses(for_op->body_region(), value);
+            }
+        }
+        return uses;
+    }
+
+    static void annotate_reductions(PolyScop &scop, const yir::Region &root) {
+        for (auto &store_stmt : scop.statements) {
+            auto *store = dynamic_cast<const yir::ArrayStoreOp *>(store_stmt.op);
+            if (store == nullptr) {
+                continue;
+            }
+            const auto *load = reduction_load_for_store(*store);
+            if (load == nullptr || load->result() == nullptr ||
+                store->value() == nullptr ||
+                count_value_uses(root, load->result()) != 1 ||
+                count_value_uses(root, store->value()) != 1) {
+                continue;
+            }
+
+            const auto dims = reduction_dimensions(store_stmt);
+            store_stmt.reduction_kind = PolyStmt::ReductionKind::Add;
+            store_stmt.reduction_memory = store->array();
+            store_stmt.reduction_group_id = store_stmt.id;
+            store_stmt.reduction_dims = dims;
+
+            for (auto &load_stmt : scop.statements) {
+                if (load_stmt.op != load) {
+                    continue;
+                }
+                load_stmt.reduction_kind = PolyStmt::ReductionKind::Add;
+                load_stmt.reduction_memory = load->array();
+                load_stmt.reduction_group_id = store_stmt.id;
+                load_stmt.reduction_dims = dims;
+                break;
+            }
+        }
+    }
+
+    static bool const_i32_value(const yir::Value *value, std::int64_t &out) {
+        auto *constant = value == nullptr
+                             ? nullptr
+                             : dynamic_cast<const yir::ConstI32Op *>(value->defining_op());
+        if (constant == nullptr) {
+            return false;
+        }
+        out = constant->value();
+        return true;
+    }
+
+    static std::unordered_set<const yir::Value *> collect_known_nonnegative_ivs(
+        const std::vector<const yir::ForOp *> &loops) {
+        std::unordered_set<const yir::Value *> values;
+        for (const auto *loop : loops) {
+            std::int64_t lower = 0;
+            std::int64_t step = 0;
+            if (loop != nullptr && const_i32_value(loop->lower_bound(), lower) && lower >= 0 &&
+                const_i32_value(loop->step(), step) && step > 0) {
+                values.insert(loop->induction_var());
+            }
+        }
+        return values;
+    }
+
     static PolyPredicate invert_predicate(PolyPredicate predicate) {
         switch (predicate) {
         case PolyPredicate::Eq: return PolyPredicate::Ne;
@@ -237,18 +527,20 @@ private:
 
     void extract_condition(const yir::Value *condition, bool negated,
                            std::vector<PolyDomainConstraint> &constraints,
-                           bool &valid) const {
+                           bool &valid,
+                           const std::unordered_set<const yir::Value *> &known_nonnegative) const {
         if (condition == nullptr) {
             valid = false;
             return;
         }
         auto *def = condition->defining_op();
         if (auto *not_op = dynamic_cast<const yir::NotOp *>(def)) {
-            extract_condition(not_op->operands().front(), !negated, constraints, valid);
+            extract_condition(not_op->operands().front(), !negated, constraints, valid,
+                              known_nonnegative);
             return;
         }
 
-        AffineExtractor extractor;
+        AffineExtractor extractor(&known_nonnegative);
         PolyDomainConstraint constraint;
         if (auto *cmp = dynamic_cast<const yir::ICmpOp *>(def)) {
             constraint.lhs = extractor.extract(cmp->lhs());
@@ -267,7 +559,11 @@ private:
             constraint.predicate = PolyPredicate::Ne;
         }
         if (negated) constraint.predicate = invert_predicate(constraint.predicate);
-        if (!constraint.lhs.valid || !constraint.rhs.valid) valid = false;
+        // A pure non-affine predicate is represented by the unconstrained
+        // over-approximation of its surrounding loop domain. This keeps the
+        // memory statements available to dependence analysis while retaining
+        // a marker on PolyStmt for conservative transform policy.
+        if (!constraint.lhs.valid || !constraint.rhs.valid) return;
         constraints.push_back(std::move(constraint));
     }
 
@@ -275,8 +571,9 @@ private:
         PolyStmt& poly_stmt, const yir::Region *scop_region,
         const std::vector<const yir::ForOp*>& enclosing_loops,
         const std::vector<YIRSCoPStatement::PathCondition> &path_conditions,
-        std::size_t schedule_depth) {
-        AffineExtractor extractor;
+        std::size_t schedule_depth,
+        const std::unordered_set<const yir::Value *> &known_nonnegative) {
+        AffineExtractor extractor(&known_nonnegative);
         for (const auto* for_op : enclosing_loops) {
             poly_stmt.dims.push_back(for_op->induction_var());
             poly_stmt.schedule_dims.push_back(for_op->induction_var());
@@ -299,7 +596,8 @@ private:
 
         for (const auto &path_condition : path_conditions) {
             extract_condition(path_condition.condition, path_condition.negated,
-                              poly_stmt.domain.constraints, poly_stmt.domain.valid);
+                              poly_stmt.domain.constraints, poly_stmt.domain.valid,
+                              known_nonnegative);
         }
 
         std::size_t root_rank = 0;
@@ -337,6 +635,15 @@ private:
         poly_stmt.schedule.lexical_order = poly_stmt.lexical_id;
         poly_stmt.schedule.output_dims.push_back(
             constant_expr(static_cast<std::int64_t>(poly_stmt.lexical_id)));
+        for (std::size_t dim = 0; dim < schedule_depth; ++dim) {
+            PolyAffineSchedule::Band band;
+            band.output_offset = 1 + dim * 2;
+            band.dimension_count = 1;
+            band.permutable = false;
+            band.coincident.push_back(false);
+            band.reduction.push_back(false);
+            poly_stmt.schedule.bands.push_back(std::move(band));
+        }
     }
 
     static void append_domain_params(PolyStmt &stmt,
@@ -344,17 +651,25 @@ private:
                                      std::vector<const yir::Value *> &scop_params) {
         std::unordered_set<const yir::Value *> dims(stmt.domain.dims.begin(),
                                                     stmt.domain.dims.end());
-        const auto visit_expr = [&](const PolyAffineExpr &expr) {
+        const auto visit_expr = [&](const PolyAffineExpr &expr, const auto &self) -> void {
             for (const auto &[value, coefficient] : expr.terms) {
                 if (coefficient == 0 || dims.count(value) != 0 || !params.insert(value).second) {
                     continue;
                 }
                 scop_params.push_back(value);
             }
+            if (expr.operand != nullptr) {
+                self(*expr.operand, self);
+            }
+            for (const auto &operand : expr.operands) {
+                if (operand != nullptr) {
+                    self(*operand, self);
+                }
+            }
         };
         for (const auto &constraint : stmt.domain.constraints) {
-            visit_expr(constraint.lhs);
-            visit_expr(constraint.rhs);
+            visit_expr(constraint.lhs, visit_expr);
+            visit_expr(constraint.rhs, visit_expr);
         }
     }
 
@@ -365,6 +680,7 @@ private:
     // recover `A[i*N + j]` as `A[i][j]`.
     static bool try_delinearize_1d(const yir::Value* index,
                                    const std::unordered_set<const yir::Value*>& params,
+                                   const std::unordered_set<const yir::Value*>& known_nonnegative,
                                    std::vector<PolyAffineExpr>& out_dims) {
         if (index == nullptr || index->defining_op() == nullptr) {
             return false;
@@ -393,7 +709,7 @@ private:
                 return false;
             }
 
-            AffineExtractor extractor;
+            AffineExtractor extractor(&known_nonnegative);
             auto high_expr = extractor.extract(high_side);
             auto low_expr = extractor.extract(low_side);
             if (!high_expr.valid || !low_expr.valid) {
@@ -412,13 +728,15 @@ private:
 
     void extract_accesses(const yir::Operation& op,
                           const std::unordered_set<const yir::Value*>& params,
+                          const std::unordered_set<const yir::Value*>& known_nonnegative,
                           std::vector<PolyAccess>& reads, std::vector<PolyAccess>& writes) {
-        AffineExtractor extractor;
+        AffineExtractor extractor(&known_nonnegative);
         const auto fill_indices = [&](const std::vector<yir::Value*>& index_values,
                                       std::vector<PolyAffineExpr>& dest) {
             if (index_values.size() == 1) {
                 std::vector<PolyAffineExpr> delinearized;
-                if (try_delinearize_1d(index_values.front(), params, delinearized)) {
+                if (try_delinearize_1d(index_values.front(), params, known_nonnegative,
+                                       delinearized)) {
                     dest = std::move(delinearized);
                     return;
                 }

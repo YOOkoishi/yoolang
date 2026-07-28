@@ -1,0 +1,20 @@
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s
+
+int a[64][64];
+
+int main() {
+  int i = 0;
+  while (i < 64) {
+    int j = 0;
+    while (j < 64) {
+      a[i][j] = a[j][i] + 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return a[0][0];
+}
+
+// CHECK: "transform": "LoopTiling"
+// CHECK-NEXT: "pass": "YIRPolyhedralTransformPass"
+// CHECK: "summary": "polyhedral dependence legality; Presburger tiled schedule legality; backend rectangular tiling tile=16"

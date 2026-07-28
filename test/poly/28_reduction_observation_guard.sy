@@ -1,0 +1,25 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+
+int a[64];
+int snapshots[64];
+int sum[1];
+
+int main() {
+  int i;
+  int n;
+
+  n = getint();
+  sum[0] = 0;
+  i = 0;
+  while (i < n) {
+    snapshots[i] = sum[0];
+    sum[0] = sum[0] + a[i];
+    i = i + 1;
+  }
+  return snapshots[n - 1];
+}
+
+// The intermediate value is observable, so the band is a reduction band but
+// cannot be permuted despite the associative update itself.
+// POLY: schedule-bands: [offset=1 count=1 permutable=false coincident=false reduction=true] optimized=true
+// POLY: memory=@sum dependent=true distance=unknown relation={{.*}} reduction=false

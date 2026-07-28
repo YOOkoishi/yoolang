@@ -27,9 +27,13 @@ struct PolyDependence {
         std::vector<const yir::Value *> source_dims;
         std::vector<const yir::Value *> target_dims;
         std::vector<const yir::Value *> params;
+        // Local div variables introduced while linearizing floor/ceil/mod
+        // expressions in the relation pieces.
+        std::size_t local_vars = 0;
         yir::presburger::PresburgerRelation constraints;
         bool exact = false;
     } relation;
+    bool is_reduction = false;
     // For affine/GCD test, we can store whether it's conservatively dependent
     bool is_dependent = true;
 };

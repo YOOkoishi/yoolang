@@ -1,0 +1,21 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+
+int a[64];
+int sum[1];
+
+int main() {
+  int i;
+  int n;
+
+  n = getint();
+  sum[0] = 0;
+  i = 0;
+  while (i < n) {
+    sum[0] = sum[0] - a[i];
+    i = i + 1;
+  }
+  return sum[0];
+}
+
+// POLY: schedule-bands: [offset=1 count=1 permutable=false coincident=false reduction=false] optimized=true
+// POLY: dependence RAW stmt #{{[0-9]+}} -> stmt #{{[0-9]+}} memory=@sum dependent=true distance=unknown relation={{.*}} reduction=false

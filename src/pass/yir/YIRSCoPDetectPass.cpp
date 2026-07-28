@@ -43,10 +43,78 @@ private:
         return for_op != nullptr && poly_loops_.find(for_op) != poly_loops_.end();
     }
 
-    // A SCoP is only useful if every control predicate and subscript can be
-    // represented in the affine model. Values defined outside the candidate
-    // region are treated as parameters; values defined inside must be built
-    // from constants, loop IVs, and affine integer arithmetic.
+    bool is_known_nonnegative_affine(
+        const yir::Value *value,
+        const std::unordered_set<const yir::Region *> &regions,
+        const std::unordered_set<const yir::Value *> &active_ivs,
+        std::unordered_set<const yir::Value *> &visiting) const {
+        if (value == nullptr || !visiting.insert(value).second) {
+            return false;
+        }
+        const auto finish = [&](bool result) {
+            visiting.erase(value);
+            return result;
+        };
+        if (auto *constant = dynamic_cast<const yir::ConstI32Op *>(value->defining_op())) {
+            return finish(constant->value() >= 0);
+        }
+        if (active_ivs.count(value) != 0) {
+            for (const auto *loop : poly_loops_) {
+                if (loop == nullptr || loop->induction_var() != value) {
+                    continue;
+                }
+                auto *lower = dynamic_cast<const yir::ConstI32Op *>(
+                    loop->lower_bound()->defining_op());
+                auto *step = dynamic_cast<const yir::ConstI32Op *>(
+                    loop->step()->defining_op());
+                return finish(lower != nullptr && lower->value() >= 0 &&
+                              step != nullptr && step->value() > 0);
+            }
+            return finish(false);
+        }
+
+        auto *def = value->defining_op();
+        if (def == nullptr || regions.find(def->parent()) == regions.end()) {
+            return finish(false);
+        }
+        if (auto *add = dynamic_cast<const yir::AddIOp *>(def)) {
+            return finish(is_known_nonnegative_affine(add->lhs(), regions, active_ivs,
+                                                      visiting) &&
+                          is_known_nonnegative_affine(add->rhs(), regions, active_ivs,
+                                                      visiting));
+        }
+        if (auto *mul = dynamic_cast<const yir::MulIOp *>(def)) {
+            const auto prove_scaled = [&](const yir::Value *constant_value,
+                                          const yir::Value *operand) {
+                auto *constant = dynamic_cast<const yir::ConstI32Op *>(
+                    constant_value == nullptr ? nullptr : constant_value->defining_op());
+                return constant != nullptr && constant->value() >= 0 &&
+                       is_known_nonnegative_affine(operand, regions, active_ivs, visiting);
+            };
+            return finish(prove_scaled(mul->lhs(), mul->rhs()) ||
+                          prove_scaled(mul->rhs(), mul->lhs()));
+        }
+        if (auto *div = dynamic_cast<const yir::DivSIOp *>(def)) {
+            auto *divisor = dynamic_cast<const yir::ConstI32Op *>(
+                div->rhs() == nullptr ? nullptr : div->rhs()->defining_op());
+            return finish(divisor != nullptr && divisor->value() > 0 &&
+                          is_known_nonnegative_affine(div->lhs(), regions, active_ivs,
+                                                      visiting));
+        }
+        if (auto *rem = dynamic_cast<const yir::RemSIOp *>(def)) {
+            auto *divisor = dynamic_cast<const yir::ConstI32Op *>(
+                rem->rhs() == nullptr ? nullptr : rem->rhs()->defining_op());
+            return finish(divisor != nullptr && divisor->value() > 0 &&
+                          is_known_nonnegative_affine(rem->lhs(), regions, active_ivs,
+                                                      visiting));
+        }
+        return finish(false);
+    }
+
+    // Values defined outside the candidate region are treated as parameters;
+    // values defined inside must be built from constants, loop IVs, and affine
+    // integer arithmetic. Pure non-affine guards are handled separately as
+    // conservative, unconstrained predicates.
     bool is_affine_value(const yir::Value* value,
                          const std::unordered_set<const yir::Region*>& regions,
                          const std::unordered_set<const yir::Value*>& active_ivs,
@@ -97,6 +165,22 @@ private:
             const auto *invariant_def = invariant->defining_op();
             return finish(invariant_def == nullptr || regions.find(invariant_def->parent()) == regions.end());
         }
+        if (auto *div = dynamic_cast<const yir::DivSIOp *>(def)) {
+            const auto *constant = dynamic_cast<const yir::ConstI32Op *>(div->rhs()->defining_op());
+            std::unordered_set<const yir::Value *> nonnegative_visiting;
+            return finish(constant != nullptr && constant->value() > 0 &&
+                          is_known_nonnegative_affine(div->lhs(), regions, active_ivs,
+                                                      nonnegative_visiting) &&
+                          is_affine_value(div->lhs(), regions, active_ivs, visiting));
+        }
+        if (auto *rem = dynamic_cast<const yir::RemSIOp *>(def)) {
+            const auto *constant = dynamic_cast<const yir::ConstI32Op *>(rem->rhs()->defining_op());
+            std::unordered_set<const yir::Value *> nonnegative_visiting;
+            return finish(constant != nullptr && constant->value() > 0 &&
+                          is_known_nonnegative_affine(rem->lhs(), regions, active_ivs,
+                                                      nonnegative_visiting) &&
+                          is_affine_value(rem->lhs(), regions, active_ivs, visiting));
+        }
         return finish(false);
     }
 
@@ -126,6 +210,56 @@ private:
         return false;
     }
 
+    bool is_safe_opaque_condition(
+        const yir::Value *value,
+        const std::unordered_set<const yir::Region *> &regions,
+        const std::unordered_set<const yir::Value *> &active_ivs,
+        std::unordered_set<const yir::Value *> &visiting) const {
+        if (value == nullptr || !visiting.insert(value).second) {
+            return false;
+        }
+        const auto finish = [&](bool result) {
+            visiting.erase(value);
+            return result;
+        };
+        const auto *def = value->defining_op();
+        if (def == nullptr || regions.find(def->parent()) == regions.end()) {
+            return finish(true);
+        }
+        if (dynamic_cast<const yir::ConstI32Op *>(def) != nullptr ||
+            dynamic_cast<const yir::ConstBoolOp *>(def) != nullptr) {
+            return finish(true);
+        }
+        if (auto *binary = dynamic_cast<const yir::BinaryOpBase *>(def)) {
+            return finish(is_safe_opaque_condition(binary->lhs(), regions, active_ivs,
+                                                    visiting) &&
+                          is_safe_opaque_condition(binary->rhs(), regions, active_ivs,
+                                                    visiting));
+        }
+        if (auto *cmp = dynamic_cast<const yir::ICmpOp *>(def)) {
+            return finish(is_safe_opaque_condition(cmp->lhs(), regions, active_ivs, visiting) &&
+                          is_safe_opaque_condition(cmp->rhs(), regions, active_ivs, visiting));
+        }
+        if (auto *not_op = dynamic_cast<const yir::NotOp *>(def)) {
+            return finish(is_safe_opaque_condition(not_op->operands().front(), regions,
+                                                    active_ivs, visiting));
+        }
+        if (auto *to_bool = dynamic_cast<const yir::ToBoolOp *>(def)) {
+            return finish(is_safe_opaque_condition(to_bool->operands().front(), regions,
+                                                    active_ivs, visiting));
+        }
+        if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(def)) {
+            for (const auto *index : load->indices()) {
+                std::unordered_set<const yir::Value *> affine_visiting;
+                if (!is_affine_value(index, regions, active_ivs, affine_visiting)) {
+                    return finish(false);
+                }
+            }
+            return finish(true);
+        }
+        return finish(false);
+    }
+
     void collect_regions(const yir::Region& region,
                          std::unordered_set<const yir::Region*>& regions) const {
         if (!regions.insert(&region).second) {
@@ -142,7 +276,8 @@ private:
     }
 
     bool validate_loop(const yir::ForOp& for_op,
-                       const std::unordered_set<const yir::Value*>& enclosing_ivs = {}) const {
+                       const std::unordered_set<const yir::Value*>& enclosing_ivs,
+                       bool &has_opaque_conditions) const {
         std::unordered_set<const yir::Region*> regions;
         collect_regions(for_op.body_region(), regions);
         std::unordered_set<const yir::Value*> visiting;
@@ -157,7 +292,8 @@ private:
         }
         auto active_ivs = enclosing_ivs;
         active_ivs.insert(for_op.induction_var());
-        if (!validate_region(for_op.body_region(), regions, active_ivs, visiting)) {
+        if (!validate_region(for_op.body_region(), regions, active_ivs, visiting,
+                             has_opaque_conditions)) {
             return false;
         }
         return true;
@@ -166,7 +302,8 @@ private:
     bool validate_region(const yir::Region& region,
                          const std::unordered_set<const yir::Region*>& regions,
                          const std::unordered_set<const yir::Value*>& active_ivs,
-                         std::unordered_set<const yir::Value*>& visiting) const {
+                         std::unordered_set<const yir::Value*>& visiting,
+                         bool &has_opaque_conditions) const {
         for (const auto& op : region.operations()) {
             if (dynamic_cast<const yir::CallOp*>(op.get()) != nullptr ||
                 dynamic_cast<const yir::LoadOp*>(op.get()) != nullptr ||
@@ -183,16 +320,26 @@ private:
                 return false;
             }
             if (auto* if_op = dynamic_cast<const yir::IfOp*>(op.get())) {
-                if (!is_affine_condition(if_op->condition(), regions, active_ivs, visiting) ||
-                    !validate_region(if_op->then_region(), regions, active_ivs, visiting) ||
+                if (!is_affine_condition(if_op->condition(), regions, active_ivs, visiting)) {
+                    std::unordered_set<const yir::Value *> opaque_visiting;
+                    if (!is_safe_opaque_condition(if_op->condition(), regions, active_ivs,
+                                                  opaque_visiting)) {
+                        return false;
+                    }
+                    has_opaque_conditions = true;
+                }
+                if (!validate_region(if_op->then_region(), regions, active_ivs, visiting,
+                                     has_opaque_conditions) ||
                     (if_op->has_else() &&
-                     !validate_region(if_op->else_region(), regions, active_ivs, visiting))) {
+                     !validate_region(if_op->else_region(), regions, active_ivs, visiting,
+                                      has_opaque_conditions))) {
                     return false;
                 }
                 continue;
             }
             if (auto* nested = dynamic_cast<const yir::ForOp*>(op.get())) {
-                if (!is_poly_loop(nested) || !validate_loop(*nested, active_ivs)) return false;
+                if (!is_poly_loop(nested) ||
+                    !validate_loop(*nested, active_ivs, has_opaque_conditions)) return false;
                 continue;
             }
             if (auto* load = dynamic_cast<const yir::ArrayLoadOp*>(op.get())) {
@@ -240,13 +387,15 @@ private:
                     if (!is_poly_loop(for_op)) {
                         break;
                     }
-                    if (!validate_loop(*for_op)) {
+                    bool has_opaque_conditions = false;
+                    if (!validate_loop(*for_op, {}, has_opaque_conditions)) {
                         complete = false;
                         scan_region_for_scops(for_op->body_region(), loop_stack, info);
                         // Do not retry the same rejected loop forever.
                         ++i;
                         break;
                     }
+                    scop.has_opaque_conditions = has_opaque_conditions;
                     complete = collect_poly_loop(*for_op, loop_stack, condition_stack, scop) && complete;
                     ++i;
                     if (!complete) {
@@ -312,6 +461,7 @@ private:
                 stmt.op_name = op->op_name();
                 stmt.enclosing_loops = loop_stack;
                 stmt.path_conditions = condition_stack;
+                stmt.has_opaque_conditions = scop.has_opaque_conditions;
                 scop.statements.push_back(std::move(stmt));
             }
 

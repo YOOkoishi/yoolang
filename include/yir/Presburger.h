@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <optional>
 #include <vector>
 
@@ -11,6 +12,12 @@ enum class VarKind {
     Range,
     Symbol,
     Local,
+};
+
+enum class IntegerFeasibility {
+    Empty,
+    NonEmpty,
+    Unknown,
 };
 
 // MLIR FlatLinearValueConstraints/IntegerRelation inspired storage.
@@ -60,6 +67,7 @@ class IntegerRelation {
 
     bool contains(const std::vector<std::int64_t> &point) const;
     bool is_integer_empty() const;
+    IntegerFeasibility check_integer_feasibility(std::size_t max_search_nodes) const;
     std::optional<std::vector<std::int64_t>> find_integer_sample() const;
     std::optional<std::vector<std::int64_t>> find_lexicographic_maximum() const;
 
@@ -100,7 +108,7 @@ class Simplex {
   public:
     explicit Simplex(const IntegerRelation &relation) : relation_(relation) {}
 
-    // TODO(polyhedral): replace the bounded fallback in the .cpp with a real tableau simplex.
+    // TODO(polyhedral): replace the constraint-derived bounded fallback with a real tableau.
     bool is_rational_empty() const;
     std::optional<std::vector<std::int64_t>> find_integer_sample() const;
 

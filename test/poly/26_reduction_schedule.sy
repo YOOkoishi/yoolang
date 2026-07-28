@@ -1,0 +1,35 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int a[64][64];
+int sum[1];
+
+int main() {
+  int i;
+  int j;
+  int n;
+
+  n = getint();
+  sum[0] = 0;
+  i = 0;
+  j = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      sum[0] = sum[0] + a[i][j];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return sum[0];
+}
+
+// POLY: schedule-bands: [offset=1 count=1 permutable=true coincident=false reduction=true, offset=3 count=1 permutable=true coincident=false reduction=true] optimized=true
+// POLY: dependence RAW stmt #{{[0-9]+}} -> stmt #{{[0-9]+}} memory=@sum dependent=true distance=unknown relation={{.*}} reduction=true
+
+// COST: "transform": "LoopTiling"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-tile"
+// COST-NEXT: "scope": "0"
+// COST-NEXT: "action": "Reject"
+// COST: "summary": "polyhedral legality with associative integer reduction; backend rectangular tiling tile=16"

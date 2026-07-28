@@ -1,0 +1,47 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int src[64][64][64];
+int dst[64][64][64];
+
+int copy_3d(int n) {
+  int i = 0;
+  int j = 0;
+  int k = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      k = 0;
+      while (k < n) {
+        dst[i][j][k] = src[i][0][k] + src[0][j][k];
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return dst[0][0][0];
+}
+
+int main() {
+  return copy_3d(64);
+}
+
+// CHECK-LABEL: yir.func @copy_3d
+// CHECK: %poly.tile.step{{[0-9]+}} = yir.const.i32 16
+// CHECK: yir.for %poly.tile.outer
+// CHECK: yir.for %poly.tile.inner
+// CHECK: yir.for %i =
+// CHECK: yir.for %j =
+// CHECK: yir.for %k =
+
+// COST: "transform": "LoopTiling"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-tile"
+// COST-NEXT: "scope": "0"
+// COST-NEXT: "action": "Accept"
+// COST: "transform": "LoopTiling"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-tile"
+// COST-NEXT: "scope": "0"
+// COST-NEXT: "action": "Accept"

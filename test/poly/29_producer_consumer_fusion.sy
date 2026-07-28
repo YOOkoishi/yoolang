@@ -1,0 +1,37 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int input[128];
+int temporary[128];
+int output[128];
+
+int producer_consumer(int n) {
+  int i = 0;
+  int j = 0;
+  while (i < n) {
+    temporary[i] = input[i] + 1;
+    i = i + 1;
+  }
+  while (j < n) {
+    output[j] = temporary[j] + 2;
+    j = j + 1;
+  }
+  return output[0];
+}
+
+int main() {
+  return producer_consumer(128);
+}
+
+// CHECK-LABEL: yir.func @producer_consumer
+// CHECK: yir.for %i =
+// CHECK: yir.array_store {{.*}}, @temporary
+// CHECK: yir.array_store {{.*}}, @output, [%i]
+// CHECK-NOT: yir.for %j =
+
+// COST: "transform": "LoopFusion"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-fusion"
+// COST-NEXT: "scope": "0:1"
+// COST-NEXT: "action": "Accept"
+// COST: "summary": "equal domains and same-iteration producer-consumer dependence"

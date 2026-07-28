@@ -1,0 +1,18 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+
+int a[4][4];
+
+int main() {
+  int i = 0;
+  while (i < 4) {
+    int j = 0;
+    while (j < 4) {
+      a[i][j] = a[j][i] + 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return a[0][0];
+}
+
+// POLY: dependence WAR stmt #0 -> stmt #1 memory=@a dependent=true distance=unknown relation={source=[%i, %j], target=[%i, %j], params=[], disjuncts=6, exact=true}

@@ -1,0 +1,32 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int input[128];
+int temporary[128];
+int output[128];
+
+int producer_consumer(int n) {
+  int i = 0;
+  int j = 0;
+  while (i < n) {
+    temporary[i + 1] = input[i] + 1;
+    i = i + 1;
+  }
+  while (j < n) {
+    output[j] = temporary[j] + 2;
+    j = j + 1;
+  }
+  return output[0];
+}
+
+int main() {
+  return producer_consumer(128);
+}
+
+// CHECK-LABEL: yir.func @producer_consumer
+// CHECK: yir.for %i =
+// CHECK: yir.array_store {{.*}}, @temporary
+// CHECK: yir.for %j =
+// CHECK: yir.array_load @temporary, [%j]
+
+// COST-NOT: "transform": "LoopFusion"

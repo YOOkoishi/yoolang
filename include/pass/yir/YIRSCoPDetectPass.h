@@ -26,6 +26,9 @@ struct YIRSCoPStatement {
     std::string op_name;
     std::vector<const yir::ForOp *> enclosing_loops;
     std::vector<PathCondition> path_conditions;
+    // The statement is guarded by a condition that is pure but not affine.
+    // Such predicates are conservatively omitted from the integer domain.
+    bool has_opaque_conditions = false;
 };
 
 struct YIRSCoP {
@@ -33,6 +36,7 @@ struct YIRSCoP {
     const yir::Region *region;
     std::vector<YIRSCoPStatement> statements;
     std::unordered_set<const yir::Value *> symbols;
+    bool has_opaque_conditions = false;
 };
 
 struct YIRSCoPInfo {

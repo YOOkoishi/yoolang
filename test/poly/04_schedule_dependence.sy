@@ -29,6 +29,7 @@ int main() {
 // POLY: stmt #0 op=yir.array_load
 // POLY: schedule: [%i]
 // POLY: domain: %i in [0, %N - 1)
+// POLY: schedule-bands: [offset=1 count=1 permutable=false coincident=false reduction=false] optimized=true
 // POLY: read @a[%i]
 // POLY: stmt #1 op=yir.array_store
 // POLY: schedule: [%i]

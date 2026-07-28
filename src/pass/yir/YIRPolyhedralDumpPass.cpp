@@ -52,6 +52,21 @@ std::string affine_expr(const PolyAffineExpr &expr) {
     if (!expr.valid) {
         return "<non-affine>";
     }
+    if (expr.is_composite_affine()) {
+        const char *op = expr.kind == PolyAffineExprKind::Add
+                             ? "add"
+                             : expr.kind == PolyAffineExprKind::Sub ? "sub" : "mul";
+        return std::string(op) + "(" + affine_expr(*expr.operands[0]) + ", " +
+               affine_expr(*expr.operands[1]) + ")";
+    }
+    if (!expr.is_linear()) {
+        const char *op = expr.kind == PolyAffineExprKind::FloorDiv
+                             ? "floordiv"
+                             : expr.kind == PolyAffineExprKind::CeilDiv ? "ceildiv" : "mod";
+        return std::string(op) + "(" +
+               (expr.operand == nullptr ? std::string("<null>") : affine_expr(*expr.operand)) +
+               ", " + std::to_string(expr.divisor) + ")";
+    }
 
     std::ostringstream out;
     bool wrote = false;
@@ -148,6 +163,78 @@ std::string schedule_map_string(const PolyStmt &stmt) {
     return out.str();
 }
 
+std::string schedule_matrix_string(const PolyStmt &stmt) {
+    std::ostringstream out;
+    out << '[';
+    for (std::size_t row = 0; row < stmt.schedule.matrix.size(); ++row) {
+        if (row != 0) out << ", ";
+        out << '[';
+        for (std::size_t col = 0; col < stmt.schedule.matrix[row].size(); ++col) {
+            if (col != 0) out << ", ";
+            out << stmt.schedule.matrix[row][col];
+        }
+        out << ']';
+    }
+    out << "] constants=[";
+    for (std::size_t i = 0; i < stmt.schedule.matrix_constants.size(); ++i) {
+        if (i != 0) out << ", ";
+        out << stmt.schedule.matrix_constants[i];
+    }
+    out << "] valid=" << (stmt.schedule.matrix_valid ? "true" : "false");
+    return out.str();
+}
+
+std::string schedule_bands_string(const PolyStmt &stmt) {
+    std::ostringstream out;
+    out << '[';
+    for (std::size_t i = 0; i < stmt.schedule.bands.size(); ++i) {
+        if (i != 0) {
+            out << ", ";
+        }
+        const auto &band = stmt.schedule.bands[i];
+        const bool coincident = !band.coincident.empty() &&
+                                std::all_of(band.coincident.begin(), band.coincident.end(),
+                                            [](bool value) { return value; });
+        const bool reduction = !band.reduction.empty() &&
+                               std::all_of(band.reduction.begin(), band.reduction.end(),
+                                           [](bool value) { return value; });
+        out << "offset=" << band.output_offset << " count=" << band.dimension_count
+            << " permutable=" << (band.permutable ? "true" : "false")
+            << " coincident=" << (coincident ? "true" : "false")
+            << " reduction=" << (reduction ? "true" : "false");
+    }
+    out << ']';
+    return out.str();
+}
+
+std::string schedule_tiles_string(const PolyStmt &stmt) {
+    std::ostringstream out;
+    bool first = true;
+    for (std::size_t depth = 0; depth < stmt.schedule.bands.size(); ++depth) {
+        const auto &band = stmt.schedule.bands[depth];
+        if (!band.tiled) {
+            continue;
+        }
+        if (first) {
+            out << '[';
+            first = false;
+        } else {
+            out << ", ";
+        }
+        out << "depth=" << depth << " size=" << band.tile_size;
+        if (band.tile_expr != nullptr) {
+            out << " map=" << affine_expr(*band.tile_expr);
+        }
+        if (band.point_order_preserving) {
+            out << " point-order-preserving=true";
+        }
+    }
+    if (!first) {
+        out << ']';
+    }
+    return out.str();
+}
+
 std::string access_kind(const PolyAccess &access) {
     return access.kind == PolyAccess::Kind::Read ? "read" : "write";
 }
@@ -218,6 +305,8 @@ void dump_scops(std::ostream &out, const YIRSCoPInfo &scop_info) {
     for (const auto &scop : scop_info.scops) {
         out << "  scop #" << scop.id << " {\n";
         out << "    symbols: " << value_list(sorted_values_from_set(scop.symbols)) << '\n';
+        out << "    opaque-conditions: "
+            << (scop.has_opaque_conditions ? "true" : "false") << '\n';
         out << "    statements: " << scop.statements.size() << '\n';
         for (const auto &stmt : scop.statements) {
             out << "    stmt #" << stmt.id << " op=" << stmt.op_name;
@@ -237,12 +326,23 @@ void dump_models(std::ostream &out, const PolyModelInfo &model_info) {
     for (const auto &model : model_info.models) {
         out << "  model #" << model.id << " {\n";
         out << "    params: " << value_list(sorted_values(model.params)) << '\n';
+        out << "    schedule-space: " << value_list(model.schedule_space_dims) << '\n';
         out << "    statements: " << model.statements.size() << '\n';
         for (const auto &stmt : model.statements) {
             out << "    stmt #" << stmt.id << " op=" << stmt.op_name << '\n';
+            if (stmt.has_opaque_conditions) {
+                out << "      opaque-condition=true\n";
+            }
             out << "      schedule: " << value_list(stmt.schedule_dims) << '\n';
             out << "      domain: " << domain_string(stmt) << '\n';
             out << "      schedule-map: " << schedule_map_string(stmt) << '\n';
+            out << "      schedule-matrix: " << schedule_matrix_string(stmt) << '\n';
+            out << "      schedule-bands: " << schedule_bands_string(stmt)
+                << " optimized=" << (stmt.schedule.optimized ? "true" : "false") << '\n';
+            const auto tiles = schedule_tiles_string(stmt);
+            if (!tiles.empty()) {
+                out << "      schedule-tiles: " << tiles << '\n';
+            }
             out << "      domain-set: " << explicit_domain_string(stmt) << '\n';
             for (const auto &read : stmt.reads) {
                 out << "      " << access_string(read) << '\n';
@@ -280,7 +380,12 @@ void dump_dependences(std::ostream &out, const PolyDependenceInfo &dep_info) {
             << ", target=" << value_list(dep.relation.target_dims)
             << ", params=" << value_list(sorted_values(dep.relation.params))
             << ", disjuncts=" << dep.relation.constraints.disjuncts().size()
-            << ", exact=" << (dep.relation.exact ? "true" : "false") << "}" << '\n';
+            << ", exact=" << (dep.relation.exact ? "true" : "false");
+        if (dep.relation.local_vars != 0) {
+            out << ", locals=" << dep.relation.local_vars;
+        }
+        out << "}"
+            << " reduction=" << (dep.is_reduction ? "true" : "false") << '\n';
     }
 }
 

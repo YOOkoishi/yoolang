@@ -1,0 +1,37 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int a[128];
+int b[128];
+int c[128];
+int d[128];
+
+int fused_copy(int n) {
+  int i = 0;
+  int j = 0;
+  while (i < n) {
+    b[i] = a[i] + 1;
+    i = i + 1;
+  }
+  while (j < n) {
+    d[j] = c[j] + 2;
+    j = j + 1;
+  }
+  return b[0] + d[0];
+}
+
+int main() {
+  return fused_copy(128);
+}
+
+// CHECK-LABEL: yir.func @fused_copy
+// CHECK: yir.for %i =
+// CHECK: yir.array_store {{.*}}, @b
+// CHECK: yir.array_store {{.*}}, @d
+// CHECK-NOT: yir.for %j =
+
+// COST: "transform": "LoopFusion"
+// COST-NEXT: "pass": "YIRPolyhedralTransformPass"
+// COST-NEXT: "candidate_id": "band-fusion"
+// COST-NEXT: "scope": "0:1"
+// COST-NEXT: "action": "Accept"

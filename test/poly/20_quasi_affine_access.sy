@@ -1,0 +1,24 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s
+
+int A[64];
+
+int rejected_negative_dividend() {
+  int i = -16;
+  while (i < 16) {
+    A[i / 4 + 16] = i;
+    i = i + 1;
+  }
+  return A[12];
+}
+
+int main() {
+  int i = 0;
+  while (i < 64) {
+    A[i / 4] = i;
+    i = i + 1;
+  }
+  return A[0];
+}
+
+// CHECK: models: 1
+// CHECK: write @A[floordiv(%i, 4)]

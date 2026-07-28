@@ -18,6 +18,7 @@ SOURCE = r"""
 #include "oir/OIR.h"
 #include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
+#include "yir/Presburger.h"
 
 #include <exception>
 #include <iostream>
@@ -292,6 +293,80 @@ void test_memory_ssa_uses_phi_at_cfg_join() {
     REQUIRE(memory_ssa.clobbering_access(*load_g) == phi);
 }
 
+void test_presburger_uses_explicit_bounds_outside_fallback_window() {
+    yir::presburger::IntegerRelation relation(1);
+    relation.add_inequality({1}, -100);
+    relation.add_inequality({-1}, 128);
+
+    auto sample = relation.find_integer_sample();
+    REQUIRE(sample.has_value());
+    REQUIRE(sample->size() == 1);
+    REQUIRE((*sample)[0] >= 100);
+    REQUIRE((*sample)[0] <= 128);
+
+    auto lexmax = relation.find_lexicographic_maximum();
+    REQUIRE(lexmax.has_value());
+    REQUIRE((*lexmax)[0] == 128);
+
+    yir::presburger::IntegerRelation empty(1);
+    empty.add_inequality({1}, -100);
+    empty.add_inequality({-1}, 99);
+    REQUIRE(empty.is_integer_empty());
+}
+
+void test_presburger_prunes_infeasible_multivariable_box() {
+    constexpr unsigned kVariables = 8;
+    yir::presburger::IntegerRelation relation(kVariables);
+    for (unsigned variable = 0; variable < kVariables; ++variable) {
+        std::vector<std::int64_t> lower(kVariables, 0);
+        std::vector<std::int64_t> upper(kVariables, 0);
+        lower[variable] = 1;
+        upper[variable] = -1;
+        relation.add_inequality(std::move(lower), 0);
+        relation.add_inequality(std::move(upper), 32);
+    }
+    std::vector<std::int64_t> sum(kVariables, 1);
+    relation.add_equality(std::move(sum), -1000);
+    REQUIRE(relation.is_integer_empty());
+}
+
+void test_presburger_local_floor_div_constraints() {
+    yir::presburger::IntegerRelation relation(1);
+    relation.add_vars(yir::presburger::VarKind::Local, 1);
+    relation.add_equality({1, 0}, -9);
+    relation.add_inequality({1, -4}, 0);
+    relation.add_inequality({-1, 4}, 3);
+    auto sample = relation.find_integer_sample();
+    REQUIRE(sample.has_value());
+    REQUIRE(sample->size() == 2);
+    REQUIRE((*sample)[0] == 9);
+    REQUIRE((*sample)[1] == 2);
+}
+
+void test_presburger_budgeted_feasibility_is_tristate() {
+    yir::presburger::IntegerRelation empty(2);
+    empty.add_inequality({1, 0}, 0);
+    empty.add_inequality({-1, 0}, 4);
+    empty.add_inequality({0, 1}, 0);
+    empty.add_inequality({0, -1}, 4);
+    empty.add_equality({1, 1}, -20);
+    REQUIRE(empty.check_integer_feasibility(1000) ==
+            yir::presburger::IntegerFeasibility::Empty);
+
+    yir::presburger::IntegerRelation sample(1);
+    sample.add_inequality({1}, 0);
+    sample.add_inequality({-1}, 4);
+    REQUIRE(sample.check_integer_feasibility(1000) ==
+            yir::presburger::IntegerFeasibility::NonEmpty);
+    REQUIRE(sample.check_integer_feasibility(1) ==
+            yir::presburger::IntegerFeasibility::Unknown);
+
+    yir::presburger::IntegerRelation unbounded(1);
+    unbounded.add_inequality({1}, 0);
+    REQUIRE(unbounded.check_integer_feasibility(1000) ==
+            yir::presburger::IntegerFeasibility::Unknown);
+}
+
 } // namespace
 
 int main() {
@@ -306,6 +381,14 @@ int main() {
          test_verifier_catches_stale_constant_use_list},
         {"memory_ssa_skips_noalias_defs", test_memory_ssa_skips_noalias_defs},
         {"memory_ssa_uses_phi_at_cfg_join", test_memory_ssa_uses_phi_at_cfg_join},
+        {"presburger_uses_explicit_bounds_outside_fallback_window",
+         test_presburger_uses_explicit_bounds_outside_fallback_window},
+        {"presburger_prunes_infeasible_multivariable_box",
+         test_presburger_prunes_infeasible_multivariable_box},
+        {"presburger_local_floor_div_constraints",
+         test_presburger_local_floor_div_constraints},
+        {"presburger_budgeted_feasibility_is_tristate",
+         test_presburger_budgeted_feasibility_is_tristate},
     };
 
     for (const auto &[name, test] : tests) {
@@ -356,6 +439,7 @@ def main() -> int:
             str(ROOT / "src/oir/OIR.cpp"),
             str(ROOT / "src/oir/OIRAnalysis.cpp"),
             str(ROOT / "src/oir/OIRCFGUtils.cpp"),
+            str(ROOT / "src/yir/Presburger.cpp"),
             "-o",
             str(binary),
         ]
