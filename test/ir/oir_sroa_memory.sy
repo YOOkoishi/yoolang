@@ -184,16 +184,25 @@ int main() {
 
 // OIR-LABEL: define i32 @guarded_zero_init
 // OIR: br i1
-// OIR: ret i32 7
 // OIR-NOT: store [4 x i32] zero
-// OIR: store [4 x i32] zero
+// OIR: if.then.{{[0-9]+}}:
+// OIR-NEXT: ret i32 7
+// OIR-NOT: store [4 x i32] zero
+// OIR: if.end.{{[0-9]+}}:
+// OIR-NEXT: store [4 x i32] zero
 
 // OIR-LABEL: define i32 @double_guard_zero_init
-// OIR: ret i32 11
 // OIR-NOT: store [4 x i32] zero
-// OIR: ret i32 13
+// OIR: if.then.{{[0-9]+}}:
+// OIR-NEXT: ret i32 11
 // OIR-NOT: store [4 x i32] zero
-// OIR: store [4 x i32] zero
+// OIR: if.end.{{[0-9]+}}:
+// OIR-NOT: store [4 x i32] zero
+// OIR: if.then.{{[0-9]+}}:
+// OIR-NEXT: ret i32 13
+// OIR-NOT: store [4 x i32] zero
+// OIR: if.end.{{[0-9]+}}:
+// OIR-NEXT: store [4 x i32] zero
 
 // OIR-LABEL: define i32 @full_overwrite_zero_init
 // OIR-NOT: store [4 x i32] zero
