@@ -586,6 +586,9 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         <option value="lose-clang">只看 yoolang 输给 Clang++</option>
         <option value="improvement">只看相对 baseline 变快</option>
         <option value="regression">只看相对 baseline 变慢</option>
+        <option value="no-code-change">只看 NO_CODE_CHANGE</option>
+        <option value="no-dynamic-change">只看 NO_DYNAMIC_CHANGE</option>
+        <option value="inconclusive">只看 INCONCLUSIVE</option>
         <option value="failed">只看失败 case</option>
       </select>
     </section>
@@ -609,6 +612,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
             <th data-key="yoolang_vs_clang_speedup">Yoolang vs Clang++ <span class="sort"></span></th>
             <th data-key="baseline_sec">Baseline 时间 <span class="sort"></span></th>
             <th data-key="delta_pct">相对 baseline <span class="sort"></span></th>
+            <th data-key="baseline_status">基线判定 <span class="sort"></span></th>
             <th data-key="status">状态 <span class="sort"></span></th>
             <th data-key="reason">失败原因 <span class="sort"></span></th>
           </tr>
@@ -1003,6 +1007,9 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         if (filter === 'lose-any' && !losesGcc(row) && !losesClang(row)) return false;
         if (filter === 'improvement' && !(isNumber(row.delta_pct) && row.delta_pct > 0)) return false;
         if (filter === 'regression' && !(isNumber(row.delta_pct) && row.delta_pct < 0)) return false;
+        if (filter === 'no-code-change' && row.baseline_status !== 'NO_CODE_CHANGE') return false;
+        if (filter === 'no-dynamic-change' && row.baseline_status !== 'NO_DYNAMIC_CHANGE') return false;
+        if (filter === 'inconclusive' && row.baseline_status !== 'INCONCLUSIVE') return false;
         if (filter === 'failed' && row.status === 'OK') return false;
         return true;
       }}).sort(compareRows);
@@ -1060,6 +1067,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
           <td class="num ${{compareTimeClass(row.yoolang_sec, row.clang_sec)}}">${{fmtSpeedup(row.yoolang_vs_clang_speedup)}}</td>
           <td class="num">${{row.baseline_sec != null ? fmtSec(row.baseline_sec) : (row.baseline_status !== 'OK' && row.baseline_status !== 'MISSING' ? row.baseline_status : 'N/A')}}</td>
           <td class="num ${{baselineClass(row.delta_pct)}}">${{fmtPct(row.delta_pct)}}</td>
+          <td class="reason" title="${{escapeHtml(row.baseline_evidence || '')}}">${{escapeHtml(row.baseline_status || 'N/A')}}</td>
           <td class="${{row.status === 'OK' ? 'ok' : 'fail'}}">${{escapeHtml(row.status || '')}}</td>
           <td class="reason">${{escapeHtml(row.reason || '')}}</td>
         </tr>

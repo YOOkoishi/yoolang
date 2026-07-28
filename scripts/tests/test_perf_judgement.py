@@ -75,6 +75,18 @@ class ChangeClassificationTests(unittest.TestCase):
         status, _ = baseline_compare.classify_change(current, baseline, 0.20, 0.10)
         self.assertEqual(status, "REGRESSION")
 
+    def test_three_percent_delta_is_measurable(self) -> None:
+        current = perf_row(1.03, asm_hash="current")
+        baseline = perf_row(1.00, asm_hash="baseline")
+        status, _ = baseline_compare.classify_change(current, baseline, 1.03, 1.00)
+        self.assertEqual(status, "REGRESSION")
+
+    def test_delta_below_three_percent_is_inconclusive(self) -> None:
+        current = perf_row(1.029, asm_hash="current")
+        baseline = perf_row(1.00, asm_hash="baseline")
+        status, _ = baseline_compare.classify_change(current, baseline, 1.029, 1.00)
+        self.assertEqual(status, "INCONCLUSIVE")
+
 
 class BaselineAggregationTests(unittest.TestCase):
     def test_no_code_change_is_neutral_in_aggregate(self) -> None:
@@ -122,6 +134,33 @@ class BaselineAggregationTests(unittest.TestCase):
         payload = generate_perf_report.build_payload(perf, delta, {})
         self.assertEqual(payload["summary"]["baseline_improvements"], 1)
         self.assertEqual(payload["summary"]["baseline_regressions"], 0)
+
+
+class PerformanceReportHtmlTests(unittest.TestCase):
+    def test_baseline_evidence_statuses_are_visible_and_filterable(self) -> None:
+        payload = {
+            "rows": [
+                {
+                    "case": "test/performance/example.sy",
+                    "baseline_status": "NO_CODE_CHANGE",
+                    "baseline_evidence": "executed ELF SHA-256 is identical",
+                    "status": "OK",
+                }
+            ],
+            "summary": {},
+            "meta": {},
+            "baseline": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out_html = Path(tmp) / "index.html"
+            generate_perf_report.write_html(payload, out_html)
+            html = out_html.read_text()
+
+        self.assertIn("基线判定", html)
+        self.assertIn("NO_CODE_CHANGE", html)
+        self.assertIn('value="no-code-change"', html)
+        self.assertIn('value="no-dynamic-change"', html)
+        self.assertIn('value="inconclusive"', html)
 
 
 class PerformanceRegressionGateTests(unittest.TestCase):
