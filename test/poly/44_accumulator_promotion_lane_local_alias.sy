@@ -1,0 +1,27 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+
+int a[64][64];
+
+int lane_local(int n) {
+  int j = 0;
+  while (j < n) {
+    int k = 0;
+    int sum = 0;
+    while (k < 64) {
+      sum = sum + a[k][j];
+      k = k + 1;
+    }
+    a[0][j] = sum;
+    j = j + 1;
+  }
+  return a[0][0];
+}
+
+int main() {
+  return lane_local(getint());
+}
+
+// CHECK-LABEL: yir.func @lane_local
+// CHECK: %poly.reduction.output_pairs{{[0-9]+}} = yir.divsi %n,
+// CHECK-COUNT-2: %poly.reduction.acc{{[0-9]+}} = yir.var : i32 =
+// CHECK-COUNT-2: yir.array_store %poly.reduction.acc{{[0-9]+}}, @a

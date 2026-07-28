@@ -1,0 +1,37 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int a[64][64];
+int b[64][64];
+int c[64][64];
+
+int main() {
+  int i = 0;
+  while (i < 64) {
+    int j = 0;
+    while (j < 64) {
+      int k = 0;
+      int sum = 0;
+      while (k < 64) {
+        sum = sum + a[i][k] * b[k][j];
+        k = k + 1;
+      }
+      c[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return c[0][0];
+}
+
+// CHECK-LABEL: yir.func @main
+// CHECK: %[[JSTEP:[^ ]+]] = yir.const.i32 2
+// CHECK: yir.for %j = {{.*}} step %[[JSTEP]]
+// CHECK-COUNT-2: %poly.reduction.acc{{[0-9]+}} = yir.var : i32 =
+// CHECK: yir.for %poly.reduction.iv{{[0-9]+}} = {{.*}} step %poly.c{{[0-9]+}}
+// CHECK-COUNT-2: yir.assign %poly.reduction.acc
+// CHECK-COUNT-2: yir.array_store %poly.reduction.acc
+
+// COST: "transform": "LoopUnroll"
+// COST: "candidate_id": "output-accumulator-promotion-factor-2"
+// COST: "action": "Accept"

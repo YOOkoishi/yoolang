@@ -245,7 +245,7 @@ public:
                 poly_stmt.has_opaque_conditions = stmt.has_opaque_conditions;
 
                 const auto known_nonnegative =
-                    collect_known_nonnegative_ivs(stmt.enclosing_loops);
+                    collect_known_nonnegative_values(stmt.enclosing_loops);
                 extract_domain(poly_stmt, scop.region, stmt.enclosing_loops,
                                stmt.path_conditions, schedule_depth, known_nonnegative);
                 append_domain_params(poly_stmt, params, poly_scop.params);
@@ -420,7 +420,7 @@ private:
             const auto dims = reduction_dimensions(store_stmt);
             store_stmt.reduction_kind = PolyStmt::ReductionKind::Add;
             store_stmt.reduction_memory = store->array();
-            store_stmt.reduction_group_id = store_stmt.id;
+            store_stmt.reduction_group_id = store_stmt.id + 1;
             store_stmt.reduction_dims = dims;
 
             for (auto &load_stmt : scop.statements) {
@@ -429,7 +429,7 @@ private:
                 }
                 load_stmt.reduction_kind = PolyStmt::ReductionKind::Add;
                 load_stmt.reduction_memory = load->array();
-                load_stmt.reduction_group_id = store_stmt.id;
+                load_stmt.reduction_group_id = store_stmt.id + 1;
                 load_stmt.reduction_dims = dims;
                 break;
             }
@@ -447,7 +447,7 @@ private:
         return true;
     }
 
-    static std::unordered_set<const yir::Value *> collect_known_nonnegative_ivs(
+    static std::unordered_set<const yir::Value *> collect_known_nonnegative_values(
         const std::vector<const yir::ForOp *> &loops) {
         std::unordered_set<const yir::Value *> values;
         for (const auto *loop : loops) {
@@ -456,6 +456,9 @@ private:
             if (loop != nullptr && const_i32_value(loop->lower_bound(), lower) && lower >= 0 &&
                 const_i32_value(loop->step(), step) && step > 0) {
                 values.insert(loop->induction_var());
+                // A statement in this loop only executes when
+                // lower <= iv < upper, hence upper is positive here.
+                values.insert(loop->upper_bound());
             }
         }
         return values;

@@ -12,6 +12,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import compare_perf_baseline as baseline_compare  # noqa: E402
+import check_perf_regression  # noqa: E402
 import generate_perf_report  # noqa: E402
 
 
@@ -121,6 +122,48 @@ class BaselineAggregationTests(unittest.TestCase):
         payload = generate_perf_report.build_payload(perf, delta, {})
         self.assertEqual(payload["summary"]["baseline_improvements"], 1)
         self.assertEqual(payload["summary"]["baseline_regressions"], 0)
+
+
+class PerformanceRegressionGateTests(unittest.TestCase):
+    def test_non_blocking_statuses_pass(self) -> None:
+        for status in check_perf_regression.NON_BLOCKING_STATUSES:
+            with self.subTest(status=status):
+                self.assertEqual(
+                    check_perf_regression.regression_reasons(
+                        {"status": status, "regressions": []}
+                    ),
+                    [],
+                )
+
+    def test_overall_regression_fails(self) -> None:
+        reasons = check_perf_regression.regression_reasons(
+            {"status": "REGRESSION", "total_delta_pct": -12.5, "regressions": []}
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("-12.50%", reasons[0])
+
+    def test_important_case_regression_fails_even_when_total_is_ok(self) -> None:
+        reasons = check_perf_regression.regression_reasons(
+            {
+                "status": "OK",
+                "regressions": [
+                    {
+                        "case": "test/performance/example.sy",
+                        "observed_delta_pct": -25.0,
+                        "observed_delta_sec": 0.08,
+                    }
+                ],
+            }
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("test/performance/example.sy", reasons[0])
+
+    def test_unrecognized_status_fails_closed(self) -> None:
+        reasons = check_perf_regression.regression_reasons(
+            {"status": "UNKNOWN", "regressions": []}
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("unrecognized", reasons[0])
 
 
 if __name__ == "__main__":

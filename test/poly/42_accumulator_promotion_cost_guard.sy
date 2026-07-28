@@ -1,0 +1,37 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int a[64][64];
+int b[64][64];
+int c[64][64];
+
+int main() {
+  int i = 0;
+  while (i < 64) {
+    int j = 0;
+    while (j < 64) {
+      int k = 0;
+      int sum = 0;
+      while (k < 64) {
+        if (a[i][k] * b[k][j] % 2 == 0) {
+          sum = sum + b[i][k] * a[k][j];
+        }
+        k = k + 1;
+      }
+      c[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return c[0][0];
+}
+
+// CHECK-LABEL: yir.func @main
+// CHECK-NOT: poly.reduction.output_step
+// CHECK: yir.for %j =
+// CHECK: yir.for %k =
+
+// COST: "transform": "LoopUnroll"
+// COST: "candidate_id": "output-accumulator-promotion"
+// COST: "action": "Reject"
+// COST: "reject_reason": "RegisterPressureTooHigh"

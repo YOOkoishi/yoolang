@@ -1,0 +1,26 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+
+int a[64];
+
+int cross_lane(int n) {
+  int j = 0;
+  while (j < n) {
+    int k = 0;
+    int sum = 0;
+    while (k < 64) {
+      sum = sum + a[k];
+      k = k + 1;
+    }
+    a[j] = sum;
+    j = j + 1;
+  }
+  return a[0];
+}
+
+int main() {
+  return cross_lane(getint());
+}
+
+// CHECK-LABEL: yir.func @cross_lane
+// CHECK-NOT: poly.reduction.output_step
+// CHECK: yir.for %j =

@@ -1,0 +1,44 @@
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+
+int src[128];
+int dst[128];
+
+int partition(int n) {
+  int i = 0;
+  while (i < n) {
+    if (i % 2 == 0) {
+      dst[i / 2] = src[i];
+    } else {
+      dst[n / 2 + i / 2] = src[i];
+    }
+    i = i + 1;
+  }
+  return dst[0];
+}
+
+int main() {
+  return partition(128);
+}
+
+// POLY: scops: 1
+// POLY: opaque-conditions: false
+// POLY: statements: 4
+// POLY: models: 1
+// POLY: domain-set: dims=[%i] params=[%n] { 0 <= %i and %i < %n and mod(%i, 2) == 0 }
+// POLY: read @src[%i]
+// POLY: write @dst[floordiv(%i, 2)]
+// POLY: domain-set: dims=[%i] params=[%n] { 0 <= %i and %i < %n and mod(%i, 2) != 0 }
+// POLY: write @dst[add(floordiv(%i, 2), floordiv(%n, 2))]
+
+// YIR-LABEL: yir.func @partition
+// YIR: %[[COUNT:[^ ]+]] = yir.divsi %n,
+// YIR: yir.for %[[Q:[^ ]+]] = {{.*}} to %[[COUNT]] step
+// YIR: %[[EVEN:[^ ]+]] = yir.muli %[[Q]],
+// YIR: yir.array_store {{.*}}, @dst, [%[[Q]]]
+// YIR: %[[ODD:[^ ]+]] = yir.addi %[[EVEN]],
+// YIR: %[[ODD_DST:[^ ]+]] = yir.addi %[[Q]], %[[COUNT]]
+// YIR: yir.array_store {{.*}}, @dst, [%[[ODD_DST]]]
+// YIR: %[[TAIL:[^ ]+]] = yir.muli %[[COUNT]],
+// YIR: %[[HAS_TAIL:[^ ]+]] = yir.icmp lt %[[TAIL]], %n
+// YIR: yir.if %[[HAS_TAIL]]

@@ -1,0 +1,37 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+// RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+
+int a[64][64];
+int c[64];
+
+int reduce_rows(int n) {
+  int j = 0;
+  while (j < n) {
+    int k = 0;
+    int sum = 0;
+    while (k < 64) {
+      sum = sum + a[j][k];
+      k = k + 1;
+    }
+    c[j] = sum;
+    j = j + 1;
+  }
+  return c[0];
+}
+
+int main() {
+  return reduce_rows(getint());
+}
+
+// CHECK-LABEL: yir.func @reduce_rows
+// CHECK: %[[PAIRS:[^ ]+]] = yir.divsi %n,
+// CHECK: %[[ALIGNED:[^ ]+]] = yir.muli %[[PAIRS]],
+// CHECK: %[[TAIL:[^ ]+]] = yir.icmp lt %[[ALIGNED]], %n
+// CHECK: yir.for %j = {{.*}} to %[[ALIGNED]] step %poly.reduction.output_step{{[0-9]+}}
+// CHECK-COUNT-2: %poly.reduction.acc{{[0-9]+}} = yir.var : i32 =
+// CHECK: yir.if %[[TAIL]]
+// CHECK: yir.for %{{[^ ]+}} =
+// CHECK: yir.array_store {{.*}}, @c, [%[[ALIGNED]]]
+
+// COST: "candidate_id": "output-accumulator-promotion-factor-2"
+// COST: "action": "Accept"

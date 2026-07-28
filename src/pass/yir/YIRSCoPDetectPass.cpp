@@ -73,6 +73,27 @@ private:
             return finish(false);
         }
 
+        // Inside a loop with a nonnegative lower bound and positive step, the
+        // loop domain itself proves its upper bound positive whenever a
+        // statement executes: lower <= iv < upper. Keep this fact local to
+        // the active loop nest so signed div/rem can be modeled as floor/mod
+        // without assuming the parameter is nonnegative outside the SCoP.
+        for (const auto *loop : poly_loops_) {
+            if (loop == nullptr || loop->upper_bound() != value ||
+                active_ivs.count(loop->induction_var()) == 0) {
+                continue;
+            }
+            auto *lower = dynamic_cast<const yir::ConstI32Op *>(
+                loop->lower_bound() == nullptr ? nullptr
+                                               : loop->lower_bound()->defining_op());
+            auto *step = dynamic_cast<const yir::ConstI32Op *>(
+                loop->step() == nullptr ? nullptr : loop->step()->defining_op());
+            if (lower != nullptr && lower->value() >= 0 && step != nullptr &&
+                step->value() > 0) {
+                return finish(true);
+            }
+        }
+
         auto *def = value->defining_op();
         if (def == nullptr || regions.find(def->parent()) == regions.end()) {
             return finish(false);

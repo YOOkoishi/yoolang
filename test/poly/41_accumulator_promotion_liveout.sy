@@ -1,0 +1,25 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+
+int a[64][64];
+int c[64];
+
+int main() {
+  int j = 0;
+  while (j < 64) {
+    int k = 0;
+    int sum = 0;
+    while (k < 64) {
+      sum = sum + a[j][k];
+      k = k + 1;
+    }
+    c[j] = sum;
+    j = j + 1;
+  }
+  putint(j);
+  return 0;
+}
+
+// CHECK-LABEL: yir.func @main
+// CHECK-NOT: poly.reduction.output_step
+// CHECK: yir.for %j =
+// CHECK: yir.call @putint(%j)

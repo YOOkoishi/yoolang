@@ -66,6 +66,16 @@ bool const_i32_value(const yir::Value *value, std::int64_t &out) {
     return true;
 }
 
+bool same_value_or_i32_constant(const yir::Value *lhs, const yir::Value *rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+    std::int64_t lhs_value = 0;
+    std::int64_t rhs_value = 0;
+    return const_i32_value(lhs, lhs_value) && const_i32_value(rhs, rhs_value) &&
+           lhs_value == rhs_value;
+}
+
 void add_term(NormalizedAddExpr &expr, const yir::Value *value, std::int64_t coefficient) {
     if (coefficient == 0) {
         return;
@@ -164,6 +174,39 @@ bool clone_wave_unroll_region_into(const yir::Region &source, yir::Region &dest,
         dest.operations().push_back(std::move(clone));
     }
     out_map = std::move(map);
+    return true;
+}
+
+bool clone_affine_partition_region_into(
+    const yir::Region &source, yir::Region &dest, ValueMap map,
+    const yir::Value *source_iv, yir::Value *partition_quotient,
+    const yir::Value *source_upper, yir::Value *upper_quotient,
+    std::int64_t divisor) {
+    for (const auto &op : source.operations()) {
+        if (auto *div = dynamic_cast<const yir::DivSIOp *>(op.get())) {
+            std::int64_t rhs = 0;
+            if (div->lhs() == source_iv && const_i32_value(div->rhs(), rhs) &&
+                rhs == divisor) {
+                map[div->result()] = partition_quotient;
+                continue;
+            }
+            if (div->lhs() == source_upper && const_i32_value(div->rhs(), rhs) &&
+                rhs == divisor) {
+                map[div->result()] = upper_quotient;
+                continue;
+            }
+        }
+
+        auto clone = clone_wave_unroll_op(*op, map);
+        if (clone == nullptr) {
+            return false;
+        }
+        clone->set_parent(&dest);
+        if (op->result() != nullptr && clone->result() != nullptr) {
+            map[op->result()] = clone->result();
+        }
+        dest.operations().push_back(std::move(clone));
+    }
     return true;
 }
 
@@ -364,6 +407,27 @@ std::size_t wave_unroll_operation_count(const yir::Region &region) {
         }
     }
     return count;
+}
+
+std::size_t array_load_count(const yir::Region &region) {
+    std::size_t count = 0;
+    for (const auto &op : region.operations()) {
+        count += dynamic_cast<const yir::ArrayLoadOp *>(op.get()) != nullptr ? 1 : 0;
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            count += array_load_count(if_op->then_region());
+            if (if_op->has_else()) {
+                count += array_load_count(if_op->else_region());
+            }
+        }
+    }
+    return count;
+}
+
+bool region_contains_if(const yir::Region &region) {
+    return std::any_of(region.operations().begin(), region.operations().end(),
+                       [](const auto &op) {
+                           return dynamic_cast<const yir::IfOp *>(op.get()) != nullptr;
+                       });
 }
 
 bool clone_wave_unroll_prefix_into(const yir::Region &source, yir::Region &dest,
@@ -909,6 +973,24 @@ bool region_uses_value(const yir::Region &region, const yir::Value *value) {
                        [value](const auto &op) { return operation_uses_value(*op, value); });
 }
 
+bool region_assigns_value(const yir::Region &region, const yir::Value *value) {
+    for (const auto &op : region.operations()) {
+        if (auto *assign = dynamic_cast<const yir::AssignOp *>(op.get())) {
+            if (assign->target() == value) {
+                return true;
+            }
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            if (region_assigns_value(if_op->then_region(), value) ||
+                (if_op->has_else() &&
+                 region_assigns_value(if_op->else_region(), value))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool module_uses_value(const yir::Module &module, const yir::Value *value) {
     for (const auto &function : module.functions()) {
         if (region_uses_value(function->body(), value)) {
@@ -1445,6 +1527,14 @@ std::string tile_temp_name(const char *stem, std::size_t id) {
     return std::string("poly.tile.") + stem + std::to_string(id);
 }
 
+std::string partition_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.partition.") + stem + std::to_string(id);
+}
+
+std::string reduction_temp_name(const char *stem, std::size_t id) {
+    return std::string("poly.reduction.") + stem + std::to_string(id);
+}
+
 std::string tile_iv_name(const yir::Value *iv, const char *stem, std::size_t id) {
     const std::string base = iv == nullptr || iv->name().empty() ? "poly.tile" : iv->name();
     std::string name = base + ".tile";
@@ -1583,7 +1673,8 @@ public:
           num_nearest_write_queries_(0), num_nearest_queries_(0), num_dead_memory_writes_(0),
           num_dead_pure_results_(0), num_unused_globals_(0),
           num_relation_legality_proofs_(0), num_relation_legality_rejections_(0),
-          num_relation_legality_unknown_(0) {}
+          num_relation_legality_unknown_(0), num_domain_partitions_(0),
+          num_reduction_privatizations_(0), num_accumulator_promotions_(0) {}
 
     bool transform() {
         bool changed = try_loop_fusion();
@@ -1622,6 +1713,13 @@ public:
                                                    future_erased_loads);
         changed |= eliminate_dead_pure_results();
         changed |= eliminate_unused_globals();
+        changed |= try_reduction_privatizations();
+        changed |= try_output_accumulator_promotions();
+        // This code regeneration consumes statement-domain information and
+        // invalidates statement operation pointers, so it intentionally runs
+        // after all model-driven transforms.
+        changed |= try_statement_domain_partitions();
+        changed |= eliminate_dead_pure_results();
         return changed;
     }
 
@@ -1642,6 +1740,13 @@ public:
     std::size_t num_dead_memory_writes() const { return num_dead_memory_writes_; }
     std::size_t num_dead_pure_results() const { return num_dead_pure_results_; }
     std::size_t num_unused_globals() const { return num_unused_globals_; }
+    std::size_t num_domain_partitions() const { return num_domain_partitions_; }
+    std::size_t num_reduction_privatizations() const {
+        return num_reduction_privatizations_;
+    }
+    std::size_t num_accumulator_promotions() const {
+        return num_accumulator_promotions_;
+    }
     std::size_t num_relation_legality_proofs() const {
         return num_relation_legality_proofs_;
     }
@@ -1653,6 +1758,922 @@ public:
     }
 
 private:
+    struct OutputAccumulatorPromotion {
+        yir::ForOp *output_loop = nullptr;
+        yir::AssignOp *reduction_reset = nullptr;
+        yir::VarOp *reduction_induction_var = nullptr;
+        yir::VarOp *accumulator = nullptr;
+        yir::ForOp *reduction_loop = nullptr;
+        yir::ArrayStoreOp *output_store = nullptr;
+        int factor = 0;
+        bool needs_runtime_tail = false;
+    };
+
+    static bool output_load_is_lane_local(
+        const yir::ArrayLoadOp &load, const yir::ArrayStoreOp &store,
+        const yir::Value *output_iv) {
+        if (load.indices().size() != store.indices().size()) {
+            return false;
+        }
+        for (std::size_t dim = 0; dim < load.indices().size(); ++dim) {
+            if (load.indices()[dim] == output_iv &&
+                store.indices()[dim] == output_iv) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool validate_accumulator_reduction_body(
+        const yir::Region &region, const yir::Value *accumulator,
+        const yir::ArrayStoreOp &output_store, const yir::Value *output_iv,
+        bool &saw_update) const {
+        for (const auto &op : region.operations()) {
+            if (dynamic_cast<const yir::CallOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ArrayStoreOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ForOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ReturnOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::BreakOp *>(op.get()) != nullptr ||
+                dynamic_cast<const yir::ContinueOp *>(op.get()) != nullptr) {
+                return false;
+            }
+            if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(op.get())) {
+                if (!is_global_memory(load->array()) ||
+                    (load->array() == output_store.array() &&
+                     !output_load_is_lane_local(*load, output_store, output_iv))) {
+                    return false;
+                }
+            }
+            if (auto *assign = dynamic_cast<const yir::AssignOp *>(op.get())) {
+                if (assign->target() != accumulator) {
+                    return false;
+                }
+                auto *add = dynamic_cast<const yir::AddIOp *>(
+                    assign->value() == nullptr ? nullptr
+                                               : assign->value()->defining_op());
+                if (add == nullptr ||
+                    ((add->lhs() == accumulator) == (add->rhs() == accumulator))) {
+                    return false;
+                }
+                saw_update = true;
+            }
+            if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+                if (!validate_accumulator_reduction_body(
+                        if_op->then_region(), accumulator, output_store,
+                        output_iv, saw_update) ||
+                    (if_op->has_else() &&
+                     !validate_accumulator_reduction_body(
+                         if_op->else_region(), accumulator, output_store,
+                         output_iv, saw_update))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void record_accumulator_promotion_rejection(
+        const yir::ForOp &output_loop, std::string summary) const {
+        if (cost_report_ == nullptr) {
+            return;
+        }
+        cost_model::TransformDecision decision;
+        decision.action = cost_model::DecisionAction::Reject;
+        decision.reject_reason = cost_model::RejectReason::RegisterPressureTooHigh;
+        decision.legal = true;
+        decision.profitable = false;
+        decision.confidence = 1.0;
+        decision.transform = std::string(
+            cost_model::to_string(cost_model::TransformKind::LoopUnroll));
+        decision.pass_name = "YIRPolyhedralTransformPass";
+        decision.candidate_id = "output-accumulator-promotion";
+        decision.scope = output_loop.induction_var() == nullptr
+                             ? "loop"
+                             : output_loop.induction_var()->name();
+        decision.reason = std::string(cost_model::to_string(decision.reject_reason));
+        decision.proof.kind = cost_model::ProofKind::Structural;
+        decision.proof.status = cost_model::ProofStatus::Proven;
+        decision.proof.summary = std::move(summary);
+        cost_report_->decisions.push_back(std::move(decision));
+    }
+
+    bool accumulator_promotion_is_profitable(
+        const yir::ForOp &output_loop, const yir::ForOp &reduction_loop,
+        int factor, std::size_t body_cost, std::size_t loads) const {
+        std::int64_t reduction_lower = 0;
+        std::int64_t reduction_upper = 0;
+        std::int64_t reduction_step = 0;
+        std::int64_t reduction_trip = 16;
+        bool exact_reduction_trip = false;
+        if (const_i32_value(reduction_loop.lower_bound(), reduction_lower) &&
+            const_i32_value(reduction_loop.upper_bound(), reduction_upper) &&
+            const_i32_value(reduction_loop.step(), reduction_step) &&
+            reduction_step > 0 && reduction_upper > reduction_lower) {
+            reduction_trip =
+                (reduction_upper - reduction_lower + reduction_step - 1) /
+                reduction_step;
+            exact_reduction_trip = true;
+        }
+
+        const auto target = active_target_profile();
+        const auto body_cycles = static_cast<std::int64_t>(body_cost) +
+                                 static_cast<std::int64_t>(loads) *
+                                     std::max(0, target.load - target.alu_i32);
+        const auto loop_control_cycles =
+            static_cast<std::int64_t>(target.branch + 2 * target.alu_i32);
+
+        cost_model::TransformCandidate model_candidate;
+        model_candidate.kind = cost_model::TransformKind::LoopUnroll;
+        model_candidate.stage = cost_model::CostIRStage::YIR;
+        model_candidate.pass_name = "YIRPolyhedralTransformPass";
+        model_candidate.candidate_id =
+            "output-accumulator-promotion-factor-" + std::to_string(factor);
+        model_candidate.scope = output_loop.induction_var() == nullptr
+                                    ? "loop"
+                                    : output_loop.induction_var()->name();
+        model_candidate.frequency.source =
+            exact_reduction_trip ? cost_model::FrequencySource::ConstantTripCount
+                                 : cost_model::FrequencySource::StructuredYIRLoop;
+        model_candidate.frequency.scale = reduction_trip;
+        model_candidate.frequency.exact_trip_count = exact_reduction_trip;
+        model_candidate.frequency.confidence = exact_reduction_trip ? 0.92 : 0.68;
+        model_candidate.proof.kind = cost_model::ProofKind::Structural;
+        model_candidate.proof.status = cost_model::ProofStatus::Proven;
+        model_candidate.proof.summary =
+            "independent output points share one side-effect-free integer reduction loop";
+
+        auto &before = model_candidate.before;
+        before.static_instrs = static_cast<std::int64_t>(body_cost) + 3;
+        before.loads = static_cast<std::int64_t>(loads);
+        before.branches = 1;
+        before.estimated_cycles =
+            static_cast<std::int64_t>(factor) * reduction_trip *
+            (body_cycles + loop_control_cycles);
+
+        auto &after = model_candidate.after;
+        after.static_instrs =
+            static_cast<std::int64_t>(factor) * static_cast<std::int64_t>(body_cost) +
+            factor * 2 + 3;
+        after.loads = static_cast<std::int64_t>(factor) *
+                      static_cast<std::int64_t>(loads);
+        after.branches = 1;
+        after.estimated_cycles =
+            reduction_trip *
+                (static_cast<std::int64_t>(factor) * body_cycles +
+                 loop_control_cycles) +
+            factor * 2;
+
+        model_candidate.risk.code_growth =
+            after.static_instrs - before.static_instrs;
+        model_candidate.risk.live_range_growth = factor - 1;
+        model_candidate.risk.register_pressure_growth =
+            static_cast<std::int64_t>(factor - 1) *
+            static_cast<std::int64_t>(loads + 1);
+        model_candidate.required_cleanup_passes = {
+            "YIRMemoryForwardingPass", "YIRLoopOptimizationPass"};
+
+        const auto decision = cost_model::decide(
+            model_candidate, active_cost_policy(), target);
+        if (cost_report_ != nullptr) {
+            cost_report_->decisions.push_back(decision);
+        }
+        return decision.profitable;
+    }
+
+    bool match_output_accumulator_promotion(
+        yir::ForOp &output_loop, OutputAccumulatorPromotion &candidate) const {
+        std::int64_t lower = 0;
+        std::int64_t upper = 0;
+        std::int64_t step = 0;
+        const bool exact_upper = const_i32_value(output_loop.upper_bound(), upper);
+        if (!const_i32_value(output_loop.lower_bound(), lower) || lower != 0 ||
+            !const_i32_value(output_loop.step(), step) || step != 1 ||
+            (exact_upper && upper <= lower)) {
+            return false;
+        }
+
+        auto &ops = output_loop.body_region().operations();
+        if (ops.size() != 4) {
+            return false;
+        }
+        auto *reset = dynamic_cast<yir::AssignOp *>(ops[0].get());
+        auto *reduction_induction_var = dynamic_cast<yir::VarOp *>(ops[0].get());
+        auto *accumulator = dynamic_cast<yir::VarOp *>(ops[1].get());
+        auto *reduction_loop = dynamic_cast<yir::ForOp *>(ops[2].get());
+        auto *store = dynamic_cast<yir::ArrayStoreOp *>(ops[3].get());
+        if (accumulator == nullptr || reduction_loop == nullptr || store == nullptr ||
+            accumulator->result() == nullptr ||
+            !accumulator->has_initializer() || store->value() != accumulator->result() ||
+            !is_global_memory(store->array()) ||
+            value_depends_on_value(reduction_loop->lower_bound(),
+                                   output_loop.induction_var()) ||
+            value_depends_on_value(reduction_loop->upper_bound(),
+                                   output_loop.induction_var()) ||
+            value_depends_on_value(reduction_loop->step(),
+                                   output_loop.induction_var())) {
+            return false;
+        }
+
+        const bool resets_external_induction =
+            reset != nullptr && reset->target() == reduction_loop->induction_var() &&
+            same_value_or_i32_constant(reset->value(),
+                                       reduction_loop->lower_bound());
+        const bool owns_induction_var =
+            reduction_induction_var != nullptr &&
+            reduction_induction_var->result() == reduction_loop->induction_var() &&
+            reduction_induction_var->has_initializer() &&
+            same_value_or_i32_constant(reduction_induction_var->initializer(),
+                                       reduction_loop->lower_bound());
+        if (!resets_external_induction && !owns_induction_var) {
+            return false;
+        }
+
+        bool output_indexed = false;
+        for (const auto *index : store->indices()) {
+            if (index == output_loop.induction_var()) {
+                output_indexed = true;
+            }
+            if (value_depends_on_value(index, reduction_loop->induction_var())) {
+                return false;
+            }
+        }
+        if (!output_indexed) {
+            return false;
+        }
+
+        bool saw_update = false;
+        if (!validate_accumulator_reduction_body(
+                reduction_loop->body_region(), accumulator->result(), *store,
+                output_loop.induction_var(), saw_update) ||
+            !saw_update || !is_wave_unroll_safe(reduction_loop->body_region())) {
+            return false;
+        }
+
+        const auto trip_count = exact_upper ? upper - lower : 0;
+        if (exact_upper && trip_count < 32) {
+            return false;
+        }
+
+        const auto body_cost = wave_unroll_operation_count(reduction_loop->body_region());
+        const auto loads = array_load_count(reduction_loop->body_region());
+        if (loads > 2 || (!exact_upper && loads > 1) ||
+            region_contains_if(reduction_loop->body_region())) {
+            record_accumulator_promotion_rejection(
+                output_loop,
+                "conditional or dynamic memory-dense reduction would exceed the accumulator register budget");
+            return false;
+        }
+        int factor = 0;
+        if (!exact_upper) {
+            factor = body_cost <= 32 ? 2 : 0;
+        } else if (body_cost <= 16 && loads <= 1 && trip_count % 4 == 0) {
+            factor = 4;
+        } else if (body_cost <= 32 && trip_count % 2 == 0) {
+            factor = 2;
+        }
+        if (factor == 0) {
+            return false;
+        }
+        if (!accumulator_promotion_is_profitable(
+                output_loop, *reduction_loop, factor, body_cost, loads)) {
+            return false;
+        }
+
+        candidate = {&output_loop, reset, reduction_induction_var, accumulator,
+                     reduction_loop, store, factor, !exact_upper};
+        return true;
+    }
+
+    bool apply_output_accumulator_promotion(
+        yir::Region &parent, std::size_t output_index,
+        const OutputAccumulatorPromotion &candidate) {
+        auto *output_loop = candidate.output_loop;
+        auto *accumulator = candidate.accumulator;
+        auto *reduction_loop = candidate.reduction_loop;
+        auto *output_store = candidate.output_store;
+        if (output_loop == nullptr || accumulator == nullptr || reduction_loop == nullptr ||
+            output_store == nullptr || candidate.factor < 2 ||
+            output_index >= parent.operations().size() ||
+            induction_value_is_live_after(parent, output_index,
+                                          output_loop->induction_var())) {
+            return false;
+        }
+
+        auto *original_upper = output_loop->upper_bound();
+        std::vector<std::unique_ptr<yir::Operation>> setup_ops;
+        yir::Value *paired_upper = original_upper;
+        std::unique_ptr<yir::IfOp> tail_if;
+        if (candidate.needs_runtime_tail) {
+            auto divisor = std::make_unique<yir::ConstI32Op>(
+                candidate.factor,
+                reduction_temp_name("output_divisor", next_reduction_temp_++));
+            auto *divisor_value = divisor->result();
+            divisor->set_parent(&parent);
+            setup_ops.push_back(std::move(divisor));
+
+            auto pair_count = std::make_unique<yir::DivSIOp>(
+                original_upper, divisor_value,
+                reduction_temp_name("output_pairs", next_reduction_temp_++));
+            auto *pair_count_value = pair_count->result();
+            pair_count->set_parent(&parent);
+            setup_ops.push_back(std::move(pair_count));
+
+            auto aligned_upper = std::make_unique<yir::MulIOp>(
+                pair_count_value, divisor_value,
+                reduction_temp_name("output_aligned", next_reduction_temp_++));
+            paired_upper = aligned_upper->result();
+            aligned_upper->set_parent(&parent);
+            setup_ops.push_back(std::move(aligned_upper));
+
+            auto tail_cmp = std::make_unique<yir::ICmpOp>(
+                yir::ICmpOp::Predicate::Lt, paired_upper, original_upper,
+                reduction_temp_name("output_has_tail", next_reduction_temp_++));
+            auto *tail_cmp_value = tail_cmp->result();
+            tail_cmp->set_parent(&parent);
+            setup_ops.push_back(std::move(tail_cmp));
+
+            tail_if = std::make_unique<yir::IfOp>(tail_cmp_value);
+            tail_if->set_parent(&parent);
+            ValueMap tail_map{{output_loop->induction_var(), paired_upper}};
+            if (!clone_wave_unroll_region_into(
+                    output_loop->body_region(), tail_if->then_region(),
+                    std::move(tail_map))) {
+                return false;
+            }
+        }
+
+        auto promoted_step = std::make_unique<yir::ConstI32Op>(
+            candidate.factor,
+            reduction_temp_name("output_step", next_reduction_temp_++));
+        auto *promoted_step_value = promoted_step->result();
+        promoted_step->set_parent(&parent);
+
+        using OpList = yir::Region::OpList;
+        OpList promoted_body;
+        auto append = [&](std::unique_ptr<yir::Operation> op) {
+            op->set_parent(&output_loop->body_region());
+            promoted_body.push_back(std::move(op));
+        };
+
+        yir::Value *promoted_reduction_iv = reduction_loop->induction_var();
+        ValueMap reduction_map;
+        if (candidate.reduction_induction_var != nullptr) {
+            auto promoted_iv = std::make_unique<yir::VarOp>(
+                candidate.reduction_induction_var->result()->type(),
+                candidate.reduction_induction_var->initializer(),
+                reduction_temp_name("iv", next_reduction_temp_++));
+            promoted_reduction_iv = promoted_iv->result();
+            reduction_map.emplace(reduction_loop->induction_var(),
+                                  promoted_reduction_iv);
+            append(std::move(promoted_iv));
+        } else {
+            append(std::make_unique<yir::AssignOp>(
+                reduction_loop->induction_var(), reduction_loop->lower_bound()));
+        }
+
+        std::vector<ValueMap> lane_maps;
+        lane_maps.reserve(static_cast<std::size_t>(candidate.factor));
+
+        for (int lane = 0; lane < candidate.factor; ++lane) {
+            yir::Value *lane_iv = output_loop->induction_var();
+            if (lane != 0) {
+                auto lane_constant = std::make_unique<yir::ConstI32Op>(
+                    lane, reduction_temp_name("lane", next_reduction_temp_++));
+                auto *lane_constant_value = lane_constant->result();
+                append(std::move(lane_constant));
+                auto lane_add = std::make_unique<yir::AddIOp>(
+                    output_loop->induction_var(), lane_constant_value,
+                    reduction_temp_name("output", next_reduction_temp_++));
+                lane_iv = lane_add->result();
+                append(std::move(lane_add));
+            }
+
+            ValueMap lane_map = reduction_map;
+            lane_map.emplace(output_loop->induction_var(), lane_iv);
+            auto lane_accumulator = std::make_unique<yir::VarOp>(
+                accumulator->result()->type(),
+                map_value(accumulator->initializer(), lane_map),
+                reduction_temp_name("acc", next_reduction_temp_++));
+            auto *lane_accumulator_value = lane_accumulator->result();
+            append(std::move(lane_accumulator));
+            lane_map.emplace(accumulator->result(), lane_accumulator_value);
+            lane_maps.push_back(std::move(lane_map));
+        }
+
+        auto promoted_reduction = std::make_unique<yir::ForOp>(
+            promoted_reduction_iv,
+            map_value(reduction_loop->lower_bound(), reduction_map),
+            map_value(reduction_loop->upper_bound(), reduction_map),
+            map_value(reduction_loop->step(), reduction_map));
+        promoted_reduction->set_parent(&output_loop->body_region());
+        for (int lane = 0; lane < candidate.factor; ++lane) {
+            if (!clone_wave_unroll_region_into(
+                    reduction_loop->body_region(), promoted_reduction->body_region(),
+                    lane_maps[static_cast<std::size_t>(lane)])) {
+                return false;
+            }
+        }
+        promoted_body.push_back(std::move(promoted_reduction));
+
+        for (int lane = 0; lane < candidate.factor; ++lane) {
+            auto cloned_store = clone_wave_unroll_op(
+                *output_store, lane_maps[static_cast<std::size_t>(lane)]);
+            if (cloned_store == nullptr) {
+                return false;
+            }
+            append(std::move(cloned_store));
+        }
+
+        output_loop->body_region().operations() = std::move(promoted_body);
+        output_loop->operands()[2] = paired_upper;
+        output_loop->operands()[3] = promoted_step_value;
+        setup_ops.push_back(std::move(promoted_step));
+        auto &parent_ops = parent.operations();
+        parent_ops.insert(
+            parent_ops.begin() + static_cast<std::ptrdiff_t>(output_index),
+            std::make_move_iterator(setup_ops.begin()),
+            std::make_move_iterator(setup_ops.end()));
+        if (tail_if != nullptr) {
+            parent_ops.insert(
+                parent_ops.begin() + static_cast<std::ptrdiff_t>(
+                                         output_index + setup_ops.size() + 1),
+                std::move(tail_if));
+        }
+        ++num_accumulator_promotions_;
+        return true;
+    }
+
+    bool try_output_accumulator_promotions(yir::Region &region) {
+        bool changed = false;
+        auto &ops = region.operations();
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            if (auto *loop = dynamic_cast<yir::ForOp *>(ops[i].get())) {
+                OutputAccumulatorPromotion candidate;
+                if (match_output_accumulator_promotion(*loop, candidate) &&
+                    apply_output_accumulator_promotion(region, i, candidate)) {
+                    changed = true;
+                    ++i;
+                    continue;
+                }
+                changed = try_output_accumulator_promotions(loop->body_region()) || changed;
+                continue;
+            }
+            if (auto *if_op = dynamic_cast<yir::IfOp *>(ops[i].get())) {
+                changed = try_output_accumulator_promotions(if_op->then_region()) || changed;
+                if (if_op->has_else()) {
+                    changed = try_output_accumulator_promotions(if_op->else_region()) || changed;
+                }
+            }
+        }
+        return changed;
+    }
+
+    bool try_output_accumulator_promotions() {
+        bool changed = false;
+        for (auto &function : module_.functions()) {
+            changed = try_output_accumulator_promotions(function->body()) || changed;
+        }
+        return changed;
+    }
+
+    struct ReductionPrivatization {
+        yir::ArrayLoadOp *load = nullptr;
+        yir::ArrayStoreOp *store = nullptr;
+        yir::ForOp *scope_loop = nullptr;
+    };
+
+    bool is_global_memory(const yir::Value *memory) const {
+        return std::any_of(module_.globals().begin(), module_.globals().end(),
+                           [memory](const auto &global) {
+                               return global != nullptr && global->address() == memory;
+                           });
+    }
+
+    static bool region_only_has_reduction_memory_accesses(
+        const yir::Region &region, const yir::Value *memory,
+        const yir::ArrayLoadOp *reduction_load,
+        const yir::ArrayStoreOp *reduction_store) {
+        for (const auto &op : region.operations()) {
+            if (auto *load = dynamic_cast<const yir::ArrayLoadOp *>(op.get())) {
+                if (load->array() == memory && load != reduction_load) {
+                    return false;
+                }
+            } else if (auto *store = dynamic_cast<const yir::ArrayStoreOp *>(op.get())) {
+                if (store->array() == memory && store != reduction_store) {
+                    return false;
+                }
+            }
+
+            if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+                if (!region_only_has_reduction_memory_accesses(
+                        if_op->then_region(), memory, reduction_load, reduction_store) ||
+                    (if_op->has_else() &&
+                     !region_only_has_reduction_memory_accesses(
+                         if_op->else_region(), memory, reduction_load,
+                         reduction_store))) {
+                    return false;
+                }
+            } else if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
+                if (!region_only_has_reduction_memory_accesses(
+                        for_op->body_region(), memory, reduction_load, reduction_store)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    std::vector<ReductionPrivatization> find_reduction_privatizations() {
+        struct ReductionGroup {
+            const PolyStmt *store_stmt = nullptr;
+            yir::ArrayStoreOp *store = nullptr;
+            yir::ArrayLoadOp *load = nullptr;
+        };
+
+        std::unordered_map<std::size_t, ReductionGroup> groups;
+        for (const auto &scop : model_info_.models) {
+            for (const auto &stmt : scop.statements) {
+                if (stmt.reduction_kind != PolyStmt::ReductionKind::Add ||
+                    stmt.reduction_group_id == 0) {
+                    continue;
+                }
+                auto &group = groups[stmt.reduction_group_id];
+                if (auto *store = dynamic_cast<yir::ArrayStoreOp *>(
+                        const_cast<yir::Operation *>(stmt.op))) {
+                    group.store_stmt = &stmt;
+                    group.store = store;
+                } else if (auto *load = dynamic_cast<yir::ArrayLoadOp *>(
+                               const_cast<yir::Operation *>(stmt.op))) {
+                    group.load = load;
+                }
+            }
+        }
+
+        auto owners = collect_enclosing_for_region_owners(module_);
+        std::vector<ReductionPrivatization> candidates;
+        for (const auto &[_, group] : groups) {
+            if (group.store_stmt == nullptr || group.store == nullptr || group.load == nullptr ||
+                group.store->parent() == nullptr || group.load->parent() == nullptr ||
+                group.store->array() != group.load->array() ||
+                !is_global_memory(group.store->array())) {
+                continue;
+            }
+
+            const auto &reduction_dims = group.store_stmt->reduction_dims;
+            if (reduction_dims.empty()) {
+                continue;
+            }
+            const auto first_reduction =
+                std::find(reduction_dims.begin(), reduction_dims.end(), true);
+            if (first_reduction == reduction_dims.end() ||
+                !std::all_of(first_reduction, reduction_dims.end(),
+                             [](bool reduction) { return reduction; })) {
+                continue;
+            }
+            const std::size_t reduction_depth = static_cast<std::size_t>(
+                first_reduction - reduction_dims.begin());
+            auto loops = collect_enclosing_loop_nest(group.store->parent(), owners);
+            if (!loop_nest_matches_stmt(loops, *group.store_stmt) ||
+                reduction_depth >= loops.outer_to_inner.size()) {
+                continue;
+            }
+            auto *scope_loop = loops.outer_to_inner[reduction_depth];
+            if (scope_loop == nullptr || scope_loop->parent() == nullptr ||
+                !region_only_has_reduction_memory_accesses(
+                    scope_loop->body_region(), group.store->array(), group.load,
+                    group.store)) {
+                continue;
+            }
+            const auto store_indices = group.store->indices();
+            const bool indices_available =
+                std::all_of(store_indices.begin(), store_indices.end(),
+                            [scope_loop](const yir::Value *index) {
+                                return !value_defined_inside_region(
+                                    index, scope_loop->body_region());
+                            });
+            if (!indices_available) {
+                continue;
+            }
+            candidates.push_back({group.load, group.store, scope_loop});
+        }
+        return candidates;
+    }
+
+    bool apply_reduction_privatization(const ReductionPrivatization &candidate) {
+        auto *load = candidate.load;
+        auto *store = candidate.store;
+        auto *scope_loop = candidate.scope_loop;
+        if (load == nullptr || store == nullptr || scope_loop == nullptr ||
+            load->parent() == nullptr || store->parent() == nullptr ||
+            scope_loop->parent() == nullptr || load->result() == nullptr ||
+            store->value() == nullptr) {
+            return false;
+        }
+
+        auto *scope_parent = scope_loop->parent();
+        std::size_t scope_index = 0;
+        std::size_t load_index = 0;
+        std::size_t store_index = 0;
+        if (!find_operation_index(*scope_parent, *scope_loop, scope_index) ||
+            !find_operation_index(*load->parent(), *load, load_index) ||
+            !find_operation_index(*store->parent(), *store, store_index)) {
+            return false;
+        }
+
+        auto indices = store->indices();
+        auto *memory = store->array();
+        auto initial_load = std::make_unique<yir::ArrayLoadOp>(
+            memory, indices, load->result()->type(),
+            reduction_temp_name("initial", next_reduction_temp_++));
+        auto *initial_value = initial_load->result();
+        initial_load->set_parent(scope_parent);
+        auto accumulator = std::make_unique<yir::VarOp>(
+            load->result()->type(), initial_value,
+            reduction_temp_name("acc", next_reduction_temp_++));
+        auto *accumulator_value = accumulator->result();
+        accumulator->set_parent(scope_parent);
+
+        replace_value_in_region(scope_loop->body_region(), load->result(),
+                                accumulator_value);
+        auto *load_parent = load->parent();
+        load_parent->operations().erase(
+            load_parent->operations().begin() + static_cast<std::ptrdiff_t>(load_index));
+
+        // The load erase may shift the store when both are in the same region.
+        auto *store_parent = store->parent();
+        if (!find_operation_index(*store_parent, *store, store_index)) {
+            return false;
+        }
+        auto assign = std::make_unique<yir::AssignOp>(accumulator_value, store->value());
+        assign->set_parent(store_parent);
+        store_parent->operations()[store_index] = std::move(assign);
+
+        auto final_store = std::make_unique<yir::ArrayStoreOp>(
+            accumulator_value, memory, std::move(indices));
+        final_store->set_parent(scope_parent);
+        auto &parent_ops = scope_parent->operations();
+        parent_ops.insert(parent_ops.begin() + static_cast<std::ptrdiff_t>(scope_index),
+                          std::move(initial_load));
+        parent_ops.insert(parent_ops.begin() + static_cast<std::ptrdiff_t>(scope_index + 1),
+                          std::move(accumulator));
+        parent_ops.insert(parent_ops.begin() + static_cast<std::ptrdiff_t>(scope_index + 3),
+                          std::move(final_store));
+        ++num_reduction_privatizations_;
+        return true;
+    }
+
+    bool try_reduction_privatizations() {
+        bool changed = false;
+        const auto candidates = find_reduction_privatizations();
+        for (const auto &candidate : candidates) {
+            changed = apply_reduction_privatization(candidate) || changed;
+        }
+        return changed;
+    }
+
+    static bool is_zero_affine_expr(const PolyAffineExpr &expr) {
+        return expr.is_linear() && expr.constant == 0 && expr.terms.empty();
+    }
+
+    static bool is_mod_two_of_dim(const PolyAffineExpr &expr,
+                                  const yir::Value *dim) {
+        return expr.kind == PolyAffineExprKind::Mod && expr.divisor == 2 &&
+               expr.operand != nullptr && expr.operand->is_linear() &&
+               expr.operand->constant == 0 && expr.operand->terms.size() == 1 &&
+               expr.operand->terms.front().first == dim &&
+               expr.operand->terms.front().second == 1;
+    }
+
+    bool model_has_parity_partition(const yir::Value *iv) const {
+        bool has_even = false;
+        bool has_odd = false;
+        for (const auto &scop : model_info_.models) {
+            for (const auto &stmt : scop.statements) {
+                if (std::find(stmt.schedule_dims.begin(), stmt.schedule_dims.end(), iv) ==
+                    stmt.schedule_dims.end()) {
+                    continue;
+                }
+                for (const auto &constraint : stmt.domain.constraints) {
+                    const bool matches =
+                        (is_mod_two_of_dim(constraint.lhs, iv) &&
+                         is_zero_affine_expr(constraint.rhs)) ||
+                        (is_mod_two_of_dim(constraint.rhs, iv) &&
+                         is_zero_affine_expr(constraint.lhs));
+                    if (!matches) {
+                        continue;
+                    }
+                    has_even = has_even || constraint.predicate == PolyPredicate::Eq;
+                    has_odd = has_odd || constraint.predicate == PolyPredicate::Ne;
+                }
+            }
+        }
+        return has_even && has_odd;
+    }
+
+    static bool induction_value_is_live_after(const yir::Region &parent,
+                                              std::size_t loop_index,
+                                              const yir::Value *iv) {
+        const auto &ops = parent.operations();
+        for (std::size_t i = loop_index + 1; i < ops.size(); ++i) {
+            if (auto *assign = dynamic_cast<const yir::AssignOp *>(ops[i].get())) {
+                if (assign->target() == iv) {
+                    return assign->value() == iv;
+                }
+            }
+            if (operation_uses_value(*ops[i], iv)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    struct ParityBranch {
+        yir::ForOp *loop = nullptr;
+        yir::IfOp *branch = nullptr;
+        yir::Value *divisor_value = nullptr;
+        bool then_is_even = true;
+    };
+
+    bool match_parity_branch(yir::ForOp &loop, yir::Region &parent,
+                             std::size_t loop_index, ParityBranch &candidate) const {
+        std::int64_t lower = 0;
+        std::int64_t step = 0;
+        if (!const_i32_value(loop.lower_bound(), lower) || lower != 0 ||
+            !const_i32_value(loop.step(), step) || step != 1 ||
+            !model_has_parity_partition(loop.induction_var()) ||
+            induction_value_is_live_after(parent, loop_index, loop.induction_var())) {
+            return false;
+        }
+
+        auto &body_ops = loop.body_region().operations();
+        if (body_ops.size() != 3) {
+            return false;
+        }
+        auto *rem = dynamic_cast<yir::RemSIOp *>(body_ops[0].get());
+        auto *cmp = dynamic_cast<yir::ICmpOp *>(body_ops[1].get());
+        auto *branch = dynamic_cast<yir::IfOp *>(body_ops[2].get());
+        if (rem == nullptr || cmp == nullptr || branch == nullptr || !branch->has_else() ||
+            branch->condition() != cmp->result() || rem->lhs() != loop.induction_var() ||
+            !is_wave_unroll_safe(branch->then_region()) ||
+            !is_wave_unroll_safe(branch->else_region()) ||
+            region_assigns_value(branch->then_region(), loop.induction_var()) ||
+            region_assigns_value(branch->else_region(), loop.induction_var())) {
+            return false;
+        }
+
+        std::int64_t divisor = 0;
+        if (!const_i32_value(rem->rhs(), divisor) || divisor != 2) {
+            return false;
+        }
+        const yir::Value *other = nullptr;
+        if (cmp->lhs() == rem->result()) {
+            other = cmp->rhs();
+        } else if (cmp->rhs() == rem->result()) {
+            other = cmp->lhs();
+        } else {
+            return false;
+        }
+        std::int64_t residue = 0;
+        if (!const_i32_value(other, residue) || residue != 0 ||
+            (cmp->predicate() != yir::ICmpOp::Predicate::Eq &&
+             cmp->predicate() != yir::ICmpOp::Predicate::Ne)) {
+            return false;
+        }
+
+        candidate.loop = &loop;
+        candidate.branch = branch;
+        candidate.divisor_value = rem->rhs();
+        candidate.then_is_even = cmp->predicate() == yir::ICmpOp::Predicate::Eq;
+        return true;
+    }
+
+    bool apply_parity_partition(yir::Region &parent, std::size_t loop_index,
+                                const ParityBranch &candidate) {
+        auto *loop = candidate.loop;
+        auto *branch = candidate.branch;
+        if (loop == nullptr || branch == nullptr || loop_index >= parent.operations().size()) {
+            return false;
+        }
+
+        auto pair_count = std::make_unique<yir::DivSIOp>(
+            loop->upper_bound(), candidate.divisor_value,
+            partition_temp_name("count", next_partition_temp_++));
+        auto *pair_count_value = pair_count->result();
+        pair_count->set_parent(&parent);
+
+        auto quotient = std::make_unique<yir::VarOp>(
+            yir::Type::get_i32(), loop->lower_bound(),
+            partition_temp_name("q", next_partition_temp_++));
+        auto *quotient_value = quotient->result();
+        quotient->set_parent(&parent);
+
+        auto paired_loop = std::make_unique<yir::ForOp>(
+            quotient_value, loop->lower_bound(), pair_count_value, loop->step());
+        paired_loop->set_parent(&parent);
+        auto *paired_loop_raw = paired_loop.get();
+
+        auto even_iv = std::make_unique<yir::MulIOp>(
+            quotient_value, candidate.divisor_value,
+            partition_temp_name("even", next_partition_temp_++));
+        auto *even_iv_value = even_iv->result();
+        even_iv->set_parent(&paired_loop_raw->body_region());
+        paired_loop_raw->body_region().operations().push_back(std::move(even_iv));
+
+        const auto &even_region = candidate.then_is_even ? branch->then_region()
+                                                         : branch->else_region();
+        const auto &odd_region = candidate.then_is_even ? branch->else_region()
+                                                        : branch->then_region();
+        ValueMap even_map{{loop->induction_var(), even_iv_value}};
+        if (!clone_affine_partition_region_into(
+                even_region, paired_loop_raw->body_region(), std::move(even_map),
+                loop->induction_var(), quotient_value, loop->upper_bound(),
+                pair_count_value, 2)) {
+            return false;
+        }
+
+        auto odd_iv = std::make_unique<yir::AddIOp>(
+            even_iv_value, loop->step(),
+            partition_temp_name("odd", next_partition_temp_++));
+        auto *odd_iv_value = odd_iv->result();
+        odd_iv->set_parent(&paired_loop_raw->body_region());
+        paired_loop_raw->body_region().operations().push_back(std::move(odd_iv));
+        ValueMap odd_map{{loop->induction_var(), odd_iv_value}};
+        if (!clone_affine_partition_region_into(
+                odd_region, paired_loop_raw->body_region(), std::move(odd_map),
+                loop->induction_var(), quotient_value, loop->upper_bound(),
+                pair_count_value, 2)) {
+            return false;
+        }
+
+        auto tail_iv = std::make_unique<yir::MulIOp>(
+            pair_count_value, candidate.divisor_value,
+            partition_temp_name("tail", next_partition_temp_++));
+        auto *tail_iv_value = tail_iv->result();
+        tail_iv->set_parent(&parent);
+        auto tail_cmp = std::make_unique<yir::ICmpOp>(
+            yir::ICmpOp::Predicate::Lt, tail_iv_value, loop->upper_bound(),
+            partition_temp_name("has_tail", next_partition_temp_++));
+        auto *tail_cmp_value = tail_cmp->result();
+        tail_cmp->set_parent(&parent);
+        auto tail_if = std::make_unique<yir::IfOp>(tail_cmp_value);
+        tail_if->set_parent(&parent);
+        ValueMap tail_map{{loop->induction_var(), tail_iv_value}};
+        if (!clone_affine_partition_region_into(
+                even_region, tail_if->then_region(), std::move(tail_map),
+                loop->induction_var(), pair_count_value, loop->upper_bound(),
+                pair_count_value, 2)) {
+            return false;
+        }
+
+        std::vector<std::unique_ptr<yir::Operation>> replacement;
+        replacement.push_back(std::move(pair_count));
+        replacement.push_back(std::move(quotient));
+        replacement.push_back(std::move(paired_loop));
+        replacement.push_back(std::move(tail_iv));
+        replacement.push_back(std::move(tail_cmp));
+        replacement.push_back(std::move(tail_if));
+        auto &ops = parent.operations();
+        auto insertion = ops.erase(ops.begin() + static_cast<std::ptrdiff_t>(loop_index));
+        ops.insert(insertion, std::make_move_iterator(replacement.begin()),
+                   std::make_move_iterator(replacement.end()));
+        ++num_domain_partitions_;
+        return true;
+    }
+
+    bool try_statement_domain_partitions(yir::Region &region) {
+        bool changed = false;
+        auto &ops = region.operations();
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            if (auto *loop = dynamic_cast<yir::ForOp *>(ops[i].get())) {
+                ParityBranch candidate;
+                if (match_parity_branch(*loop, region, i, candidate) &&
+                    apply_parity_partition(region, i, candidate)) {
+                    changed = true;
+                    i += 5;
+                    continue;
+                }
+                changed = try_statement_domain_partitions(loop->body_region()) || changed;
+                continue;
+            }
+            if (auto *if_op = dynamic_cast<yir::IfOp *>(ops[i].get())) {
+                changed = try_statement_domain_partitions(if_op->then_region()) || changed;
+                if (if_op->has_else()) {
+                    changed = try_statement_domain_partitions(if_op->else_region()) || changed;
+                }
+            }
+        }
+        return changed;
+    }
+
+    bool try_statement_domain_partitions() {
+        bool changed = false;
+        for (auto &function : module_.functions()) {
+            changed = try_statement_domain_partitions(function->body()) || changed;
+        }
+        return changed;
+    }
+
     cost_model::CostModelPolicy active_cost_policy() const {
         return cost_model::policy_for_kind(
             cost_report_ != nullptr ? cost_report_->policy
@@ -6405,12 +7426,17 @@ private:
     mutable std::size_t num_relation_legality_proofs_;
     mutable std::size_t num_relation_legality_rejections_;
     mutable std::size_t num_relation_legality_unknown_;
+    std::size_t num_domain_partitions_;
+    std::size_t num_reduction_privatizations_;
+    std::size_t num_accumulator_promotions_;
     std::unordered_set<std::size_t> fused_scope_ids_;
     std::size_t next_stencil_temp_ = 0;
     std::size_t next_future_temp_ = 0;
     std::size_t next_init_temp_ = 0;
     std::size_t next_wave_temp_ = 0;
     std::size_t next_tile_temp_ = 0;
+    std::size_t next_partition_temp_ = 0;
+    std::size_t next_reduction_temp_ = 0;
 };
 
 } // namespace
@@ -6484,7 +7510,11 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", unused_globals=" << transformer.num_unused_globals()
         << ", relation_legality_proofs=" << transformer.num_relation_legality_proofs()
         << ", relation_legality_rejections=" << transformer.num_relation_legality_rejections()
-        << ", relation_legality_unknown=" << transformer.num_relation_legality_unknown();
+        << ", relation_legality_unknown=" << transformer.num_relation_legality_unknown()
+        << ", domain_partitions=" << transformer.num_domain_partitions()
+        << ", reduction_privatizations="
+        << transformer.num_reduction_privatizations()
+        << ", accumulator_promotions=" << transformer.num_accumulator_promotions();
 
     return PassResult::ok(changed, oss.str());
 }

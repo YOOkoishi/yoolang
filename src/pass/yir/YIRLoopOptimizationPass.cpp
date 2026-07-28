@@ -1027,6 +1027,29 @@ std::size_t count_assignments_to_value(const yir::Region &region, const yir::Val
     return count;
 }
 
+void collect_scalar_assignment_targets(
+    const yir::Region &region,
+    std::unordered_set<const yir::Value *> &targets) {
+    for (const auto &op : region.operations()) {
+        if (auto *assign = dynamic_cast<const yir::AssignOp *>(op.get())) {
+            targets.insert(assign->target());
+            continue;
+        }
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            collect_scalar_assignment_targets(if_op->then_region(), targets);
+            if (if_op->has_else()) {
+                collect_scalar_assignment_targets(if_op->else_region(), targets);
+            }
+        }
+    }
+}
+
+std::size_t distinct_scalar_assignment_targets(const yir::Region &region) {
+    std::unordered_set<const yir::Value *> targets;
+    collect_scalar_assignment_targets(region, targets);
+    return targets.size();
+}
+
 const yir::CondOp *terminating_cond(const yir::Region &region) {
     if (region.operations().empty()) {
         return nullptr;
@@ -1875,7 +1898,8 @@ class Optimizer final {
                                   const yir::LoopAnalysis &analysis) {
         if (!region_is_straight_line_cloneable(for_op.body_region()) ||
             !scalar_assignments_are_vectorizable(for_op.body_region(),
-                                                 for_op.induction_var(), true)) {
+                                                 for_op.induction_var(), true) ||
+            distinct_scalar_assignment_targets(for_op.body_region()) > 1) {
             return false;
         }
 

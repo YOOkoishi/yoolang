@@ -312,6 +312,14 @@ jobs:
             --baseline-commit-title "$baseline_commit_title" \
             --baseline-commit-author "$baseline_commit_author" || true
 
+      - name: Evaluate performance regression gate
+        id: perf_regression_gate
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 scripts/check_perf_regression.py \
+            --delta build/perf-ci/perf-delta.json
+
       - name: Configure GitHub Pages
         if: always()
         continue-on-error: true
@@ -431,6 +439,11 @@ jobs:
             exit 0
           fi
 
+          if [ "${{ steps.perf_regression_gate.outcome }}" != "success" ]; then
+            echo "Performance regression gate failed; skip saving local main baseline."
+            exit 0
+          fi
+
           mkdir -p "$baseline_dir"
           cp "$current_json" "$baseline_dir/perf-report.json"
 
@@ -476,6 +489,7 @@ jobs:
         env:
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
+          PERF_REGRESSION_OUTCOME: ${{ steps.perf_regression_gate.outcome }}
         run: |
           python3 - <<'PY'
           import json
@@ -564,7 +578,12 @@ jobs:
               perf_status = "PASS" if os.environ["PERF_OUTCOME"] == "success" else "FAIL"
           else:
               perf_status = str(perf_payload.get("status", os.environ["PERF_OUTCOME"].upper()))
-          overall_status = "PASS" if functional_status == "PASS" and perf_status == "PASS" else "FAIL"
+          regression_status = "PASS" if os.environ["PERF_REGRESSION_OUTCOME"] == "success" else "FAIL"
+          overall_status = (
+              "PASS"
+              if functional_status == "PASS" and perf_status == "PASS" and regression_status == "PASS"
+              else "FAIL"
+          )
 
           lines = [
               "# 🧪 CI Summary",
@@ -573,6 +592,7 @@ jobs:
               f"- Status: {'✅' if overall_status == 'PASS' else '❌'} {overall_status}",
               f"- Functional: {'✅' if functional_status == 'PASS' else '❌'} {functional_status}",
               f"- Perf: {'✅' if perf_status == 'PASS' else '❌'} {perf_status}",
+              f"- Perf regression gate: {'✅' if regression_status == 'PASS' else '❌'} {regression_status}",
               f"- Branch: `{os.environ.get('GITHUB_REF_NAME', 'unknown')}`",
               f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
               "",
@@ -762,6 +782,7 @@ jobs:
         if: always()
         env:
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
+          PERF_REGRESSION_OUTCOME: ${{ steps.perf_regression_gate.outcome }}
         run: |
           python3 - <<'PY'
           import json
@@ -803,6 +824,10 @@ jobs:
                   print(f"Reason: {reason}")
               sys.exit(1)
 
+          if os.environ.get("PERF_REGRESSION_OUTCOME") != "success":
+              print("Performance regression gate failed; see perf-delta.md for evidence.")
+              sys.exit(1)
+
           print("Performance tests passed.")
           PY
 
@@ -815,6 +840,7 @@ jobs:
           NO_PROXY: localhost,127.0.0.1,::1
           FUNCTIONAL_OUTCOME: ${{ steps.functional_tests.outcome }}
           PERF_OUTCOME: ${{ steps.perf_tests.outcome }}
+          PERF_REGRESSION_OUTCOME: ${{ steps.perf_regression_gate.outcome }}
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
           ACTOR: ${{ github.actor }}
@@ -1041,7 +1067,14 @@ jobs:
 
           functional = os.environ.get("FUNCTIONAL_OUTCOME", "unknown")
           perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
-          status = "PASS" if functional == "success" and perf_outcome == "success" else "FAIL"
+          perf_regression_outcome = os.environ.get("PERF_REGRESSION_OUTCOME", "unknown")
+          status = (
+              "PASS"
+              if functional == "success"
+              and perf_outcome == "success"
+              and perf_regression_outcome == "success"
+              else "FAIL"
+          )
           status_emoji = "✅" if status == "PASS" else "❌"
           sha = os.environ.get("SHA", "")
           commit_title = short_text(first_line(os.environ.get("HEAD_COMMIT_MESSAGE", "")))
@@ -1068,6 +1101,7 @@ jobs:
               "",
               f"🧪 功能测试: {fmt_status(functional)}",
               f"📊 性能测试: {fmt_status(perf_outcome)}",
+              f"📉 性能退化门禁: {fmt_status(perf_regression_outcome)}",
               perf_report_line(),
               "",
               "📈 基线对比:",

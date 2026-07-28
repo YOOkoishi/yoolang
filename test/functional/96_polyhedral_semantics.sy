@@ -1,0 +1,109 @@
+int parity_src[9];
+int parity_dst[9];
+int values[16];
+int reduction_sum[1];
+int a[32][32];
+int b[32][32];
+int c[32][32];
+int dynamic_c[32];
+
+int main() {
+  int dynamic_n = getint();
+  int i = 0;
+  while (i < 9) {
+    parity_src[i] = i * 3 + 1;
+    i = i + 1;
+  }
+
+  i = 0;
+  while (i < 9) {
+    if (i % 2 == 0) {
+      parity_dst[i / 2] = parity_src[i];
+    } else {
+      parity_dst[9 / 2 + i / 2] = parity_src[i];
+    }
+    i = i + 1;
+  }
+
+  i = 0;
+  int parity_checksum = 0;
+  while (i < 9) {
+    parity_checksum = parity_checksum + (i + 1) * parity_dst[i];
+    i = i + 1;
+  }
+  putint(parity_checksum);
+  putch(10);
+
+  i = 0;
+  while (i < 16) {
+    values[i] = i % 5 - 2;
+    i = i + 1;
+  }
+  reduction_sum[0] = 3;
+  i = 0;
+  while (i < 16) {
+    reduction_sum[0] = reduction_sum[0] + values[i];
+    i = i + 1;
+  }
+  putint(reduction_sum[0]);
+  putch(10);
+
+  i = 0;
+  while (i < 32) {
+    int j = 0;
+    while (j < 32) {
+      a[i][j] = (i + 2 * j + 1) % 7;
+      b[i][j] = (3 * i + j + 2) % 5;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  i = 0;
+  while (i < 32) {
+    int j = 0;
+    while (j < 32) {
+      int k = 0;
+      int sum = 0;
+      while (k < 32) {
+        sum = sum + a[i][k] * b[k][j];
+        k = k + 1;
+      }
+      c[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  int matrix_checksum = 0;
+  i = 0;
+  while (i < 32) {
+    int j = 0;
+    while (j < 32) {
+      matrix_checksum = (matrix_checksum + c[i][j]) % 100000;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  putint(c[0][0]);
+  putch(32);
+  putint(c[7][11]);
+  putch(32);
+  putint(matrix_checksum);
+  putch(10);
+
+  i = 0;
+  while (i < dynamic_n) {
+    int k = 0;
+    int sum = 0;
+    while (k < 32) {
+      sum = sum + a[i][k];
+      k = k + 1;
+    }
+    dynamic_c[i] = sum;
+    i = i + 1;
+  }
+  putint(dynamic_c[dynamic_n - 1]);
+  putch(10);
+  return 0;
+}

@@ -27,9 +27,8 @@ int main() {
 // YIR-NOT: yir.for %j.tile
 // YIR-NOT: yir.for %k.tile
 // YIR: yir.for %i =
-// YIR: %sum = yir.var : i32
-// YIR: yir.for %k =
-// YIR: yir.array_store %sum, @c, [%i, %j]
+// YIR: yir.for {{%k|%poly.reduction.iv[0-9]+}} =
+// YIR: yir.array_store {{.*}}, @c, [%i,
 
 // COST-COUNT-2: "transform": "LoopTiling"
 // COST: "action": "Reject"
