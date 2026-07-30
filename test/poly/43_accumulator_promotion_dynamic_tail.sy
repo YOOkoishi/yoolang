@@ -26,12 +26,10 @@ int main() {
 // CHECK-LABEL: yir.func @reduce_rows
 // CHECK: %[[PAIRS:[^ ]+]] = yir.divsi %n,
 // CHECK: %[[ALIGNED:[^ ]+]] = yir.muli %[[PAIRS]],
-// CHECK: %[[TAIL:[^ ]+]] = yir.icmp lt %[[ALIGNED]], %n
 // CHECK: yir.for %j = {{.*}} to %[[ALIGNED]] step %poly.reduction.output_step{{[0-9]+}}
-// CHECK-COUNT-2: %poly.reduction.acc{{[0-9]+}} = yir.var : i32 =
-// CHECK: yir.if %[[TAIL]]
-// CHECK: yir.for %{{[^ ]+}} =
-// CHECK: yir.array_store {{.*}}, @c, [%[[ALIGNED]]]
+// CHECK-COUNT-4: %poly.reduction.acc{{[0-9]+}} = yir.var : i32 =
+// CHECK: yir.for %j = %[[ALIGNED]] to %n step
+// CHECK: yir.array_store {{.*}}, @c, [%j]
 
-// COST: "candidate_id": "output-accumulator-promotion-factor-2"
+// COST: "candidate_id": "output-reduction-unroll-and-jam-factor-4"
 // COST: "action": "Accept"
