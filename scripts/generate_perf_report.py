@@ -119,6 +119,36 @@ def rows_by_case(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def compiler_artifact(row: dict[str, Any]) -> dict[str, Any]:
+    artifacts = row.get("assembly_artifacts")
+    if not isinstance(artifacts, dict):
+        return {}
+    artifact = artifacts.get("compiler")
+    return artifact if isinstance(artifact, dict) else {}
+
+
+def compiler_instruction_count(row: dict[str, Any]) -> int | None:
+    counts = row.get("instruction_counts")
+    if isinstance(counts, dict) and isinstance(counts.get("compiler"), int):
+        return counts["compiler"]
+    value = row.get("instruction_count")
+    return value if isinstance(value, int) else None
+
+
+def compiler_timing_samples(row: dict[str, Any]) -> list[float]:
+    samples_by_compiler = row.get("timing_samples_sec")
+    if not isinstance(samples_by_compiler, dict):
+        return []
+    samples = samples_by_compiler.get("compiler")
+    if not isinstance(samples, list):
+        return []
+    return [
+        float(value)
+        for value in samples
+        if isinstance(value, (int, float)) and value >= 0.0
+    ]
+
+
 def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, str], report_index_url: str = "") -> dict[str, Any]:
     delta_rows = rows_by_case(delta)
     rows: list[dict[str, Any]] = []
@@ -132,6 +162,19 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
         delta_row = delta_rows.get(case, {})
         status = str(row.get("status", "UNKNOWN"))
         detail = str(row.get("detail", "")).strip()
+        artifact = compiler_artifact(row)
+        baseline_status = str(delta_row.get("status", ""))
+        baseline_sec = (
+            delta_row.get("baseline")
+            if isinstance(delta_row.get("baseline"), (int, float))
+            else None
+        )
+        effective_baseline_current_sec = (
+            baseline_sec
+            if baseline_status
+            in {"NO_CODE_CHANGE", "NO_DYNAMIC_CHANGE", "INCONCLUSIVE"}
+            else yoolang
+        )
         rows.append(
             {
                 "case": case,
@@ -141,10 +184,11 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
                 "hy_sec": parse_seconds(row.get("hy")),
                 "yoolang_vs_gcc_speedup": speedup(gcc, yoolang),
                 "yoolang_vs_clang_speedup": speedup(clang, yoolang),
-                "baseline_sec": delta_row.get("baseline") if isinstance(delta_row.get("baseline"), (int, float)) else None,
+                "baseline_sec": baseline_sec,
+                "baseline_effective_current_sec": effective_baseline_current_sec,
                 "delta_pct": delta_row.get("delta_pct") if isinstance(delta_row.get("delta_pct"), (int, float)) else None,
                 "baseline_speedup": delta_row.get("speedup") if isinstance(delta_row.get("speedup"), (int, float)) else None,
-                "baseline_status": str(delta_row.get("status", "")),
+                "baseline_status": baseline_status,
                 "baseline_evidence": str(delta_row.get("evidence", "")),
                 "observed_delta_pct": (
                     delta_row.get("observed_delta_pct")
@@ -153,6 +197,10 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
                 ),
                 "status": status,
                 "reason": detail,
+                "current_assembly_sha256": str(artifact.get("sha256", "")),
+                "current_executable_sha256": str(artifact.get("executable_sha256", "")),
+                "current_instruction_count": compiler_instruction_count(row),
+                "current_timing_samples_sec": compiler_timing_samples(row),
             }
         )
 
@@ -187,6 +235,21 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
         row
         for row in rows
         if row["baseline_status"] == "IMPROVEMENT"
+    ]
+    no_code_changes = [
+        row
+        for row in rows
+        if row["baseline_status"] == "NO_CODE_CHANGE"
+    ]
+    no_dynamic_changes = [
+        row
+        for row in rows
+        if row["baseline_status"] == "NO_DYNAMIC_CHANGE"
+    ]
+    inconclusive_changes = [
+        row
+        for row in rows
+        if row["baseline_status"] == "INCONCLUSIVE"
     ]
     total_yoolang = sum(row["yoolang_sec"] for row in ok_rows if isinstance(row["yoolang_sec"], float))
     total_gcc = sum(row["gcc_sec"] for row in ok_rows if isinstance(row["gcc_sec"], float))
@@ -252,9 +315,9 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
             "yoolang_loses_clang": len(loses_clang),
             "baseline_improvements": len(improvements),
             "baseline_regressions": len(regressions),
-            "baseline_no_code_change": delta.get("case_no_code_change", 0),
-            "baseline_no_dynamic_change": delta.get("case_no_dynamic_change", 0),
-            "baseline_inconclusive": delta.get("case_inconclusive", 0),
+            "baseline_no_code_change": len(no_code_changes),
+            "baseline_no_dynamic_change": len(no_dynamic_changes),
+            "baseline_inconclusive": len(inconclusive_changes),
             "total_runtime_sec": perf.get("total_runtime_sec"),
             "total_yoolang_sec": total_yoolang if ok_rows else None,
             "total_gcc_sec": total_gcc if ok_rows else None,
@@ -679,6 +742,72 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
     }}
 
+    function artifactFor(row, compiler) {{
+      const artifacts = row?.assembly_artifacts;
+      const artifact = artifacts && typeof artifacts === 'object' ? artifacts[compiler] : null;
+      return artifact && typeof artifact === 'object' ? artifact : {{}};
+    }}
+
+    function instructionCountFor(row, compiler) {{
+      const counts = row?.instruction_counts;
+      if (counts && Number.isInteger(counts[compiler])) return counts[compiler];
+      return compiler === 'compiler' && Number.isInteger(row?.instruction_count)
+        ? row.instruction_count
+        : null;
+    }}
+
+    function timingSamplesFor(row, compiler) {{
+      const samples = row?.timing_samples_sec?.[compiler];
+      return Array.isArray(samples)
+        ? samples.filter((value) => isNumber(value) && value >= 0)
+        : [];
+    }}
+
+    function classifyBaselineChange(current, baseline, currentSec, baselineSec) {{
+      if (activeBaseline.kind === 'yoolang') {{
+        const baselineArtifact = artifactFor(baseline, 'compiler');
+        const currentExecutable = String(current.current_executable_sha256 || '');
+        const baselineExecutable = String(baselineArtifact.executable_sha256 || '');
+        const currentAssembly = String(current.current_assembly_sha256 || '');
+        const baselineAssembly = String(baselineArtifact.sha256 || baseline.compiler_asm_sha256 || '');
+        if (currentExecutable && baselineExecutable) {{
+          if (currentExecutable === baselineExecutable) {{
+            return ['NO_CODE_CHANGE', 'executed ELF SHA-256 is identical'];
+          }}
+        }} else if (currentAssembly && currentAssembly === baselineAssembly) {{
+          return ['NO_CODE_CHANGE', 'compiler assembly SHA-256 is identical'];
+        }}
+
+        const currentCount = current.current_instruction_count;
+        const baselineCount = instructionCountFor(baseline, 'compiler');
+        if (Number.isInteger(currentCount) && currentCount === baselineCount) {{
+          return ['NO_DYNAMIC_CHANGE', 'QEMU dynamic instruction count is identical'];
+        }}
+      }}
+
+      const deltaSec = currentSec - baselineSec;
+      const deltaPct = baselineSec === 0 ? 0 : Math.abs(deltaSec / baselineSec) * 100;
+      if (deltaPct < 3 || Math.abs(deltaSec) < 0.01) {{
+        return ['INCONCLUSIVE', 'wall-time delta is below 3%/0.010s evidence floor'];
+      }}
+
+      const currentSamples = Array.isArray(current.current_timing_samples_sec)
+        ? current.current_timing_samples_sec
+        : [];
+      const baselineCompiler = activeBaseline.kind === 'external' ? 'hy' : 'compiler';
+      const baselineSamples = timingSamplesFor(baseline, baselineCompiler);
+      if (currentSamples.length >= 2 && baselineSamples.length >= 2) {{
+        const overlap = Math.min(...currentSamples) <= Math.max(...baselineSamples)
+          && Math.min(...baselineSamples) <= Math.max(...currentSamples);
+        if (overlap) {{
+          return ['INCONCLUSIVE', 'current and baseline timing sample ranges overlap'];
+        }}
+      }}
+      return currentSec < baselineSec
+        ? ['IMPROVEMENT', 'measurable wall-time improvement']
+        : ['REGRESSION', 'measurable wall-time regression'];
+    }}
+
 	    function failureKey(row) {{
       const reason = String(row.reason || row.status || 'unknown').trim() || 'unknown';
       return reason.split('\\n')[0].slice(0, 120);
@@ -727,17 +856,38 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
 	        const baselineFailed = baselineRow && baselineRowStatus !== 'OK' && baselineRowStatus !== 'MISSING';
 	        const baselineFailedFinal = baselineFailed || baselineHyFailed;
 	        next.baseline_sec = baselineFailedFinal ? null : baselineSec;
-	        next.baseline_speedup = baselineFailedFinal ? null : speedup(baselineSec, next.yoolang_sec);
 	        if (baselineHyFailed) {{
 	          next.baseline_status = String(baselineRow.hy || 'CFAIL').trim();
 	        }} else if (baselineFailed) {{
 	          next.baseline_status = 'ERROR';
-	        }} else {{
+	        }} else if (!baselineRow || !isNumber(baselineSec) || !isNumber(next.yoolang_sec)) {{
 	          next.baseline_status = baselineRowStatus;
+	        }} else {{
+	          const [classification, evidence] = classifyBaselineChange(
+	            next, baselineRow, next.yoolang_sec, baselineSec
+	          );
+	          next.baseline_status = classification;
+	          next.baseline_evidence = evidence;
 	        }}
-	        next.delta_pct = isNumber(baselineSec) && baselineSec > 0 && isNumber(next.yoolang_sec)
-	          ? ((baselineSec - next.yoolang_sec) / baselineSec) * 100
-	          : null;
+	        next.observed_delta_pct =
+	          isNumber(baselineSec) && baselineSec > 0 && isNumber(next.yoolang_sec)
+	            ? ((baselineSec - next.yoolang_sec) / baselineSec) * 100
+	            : null;
+	        const measurable = ['IMPROVEMENT', 'REGRESSION'].includes(next.baseline_status);
+	        next.delta_pct = measurable ? next.observed_delta_pct : (
+	          ['NO_CODE_CHANGE', 'NO_DYNAMIC_CHANGE', 'INCONCLUSIVE'].includes(next.baseline_status)
+	            ? 0
+	            : null
+	        );
+	        next.baseline_effective_current_sec =
+	          measurable ? next.yoolang_sec : (
+	            ['NO_CODE_CHANGE', 'NO_DYNAMIC_CHANGE', 'INCONCLUSIVE'].includes(next.baseline_status)
+	              ? baselineSec
+	              : null
+	          );
+	        next.baseline_speedup = baselineFailedFinal
+	          ? null
+	          : speedup(baselineSec, next.baseline_effective_current_sec);
 	        return next;
 	      }});
 	      for (const key of Array.from(selectedCases)) {{
@@ -853,7 +1003,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
       const totalYoolang = sumValues(okRows, 'yoolang_sec');
       const totalGcc = sumValues(okRows, 'gcc_sec');
       const totalClang = sumValues(okRows, 'clang_sec');
-      const baselineCurrentTotal = sumValues(baselineRows, 'yoolang_sec');
+      const baselineCurrentTotal = sumValues(baselineRows, 'baseline_effective_current_sec');
       const baselineTotal = sumValues(baselineRows, 'baseline_sec');
 
       const compilerComparisons = [];
@@ -883,7 +1033,9 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         failureCounts.set(key, (failureCounts.get(key) || 0) + 1);
       }});
 
-      const baselineSpeedups = baselineRows.map((row) => speedup(row.baseline_sec, row.yoolang_sec)).filter(isNumber);
+      const baselineSpeedups = baselineRows
+        .map((row) => speedup(row.baseline_sec, row.baseline_effective_current_sec))
+        .filter(isNumber);
       const baselineTotalSpeedup = speedup(baselineTotal, baselineCurrentTotal);
       const baselineTotalDeltaPct = isNumber(baselineTotal) && baselineTotal > 0 && isNumber(baselineCurrentTotal)
         ? ((baselineTotal - baselineCurrentTotal) / baselineTotal) * 100
@@ -898,8 +1050,11 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
           yoolang_wins_clang: okRows.filter(winsClang).length,
           yoolang_loses_gcc: okRows.filter(losesGcc).length,
           yoolang_loses_clang: okRows.filter(losesClang).length,
-          baseline_improvements: rows.filter((row) => isNumber(row.delta_pct) && row.delta_pct > 0).length,
-          baseline_regressions: rows.filter((row) => isNumber(row.delta_pct) && row.delta_pct < 0).length,
+          baseline_improvements: rows.filter((row) => row.baseline_status === 'IMPROVEMENT').length,
+          baseline_regressions: rows.filter((row) => row.baseline_status === 'REGRESSION').length,
+          baseline_no_code_change: rows.filter((row) => row.baseline_status === 'NO_CODE_CHANGE').length,
+          baseline_no_dynamic_change: rows.filter((row) => row.baseline_status === 'NO_DYNAMIC_CHANGE').length,
+          baseline_inconclusive: rows.filter((row) => row.baseline_status === 'INCONCLUSIVE').length,
           total_yoolang_sec: totalYoolang,
           total_gcc_sec: totalGcc,
           total_clang_sec: totalClang,
@@ -916,8 +1071,8 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         top: {{
           compiler_faster: compilerComparisons.filter((item) => item.speedup > 1).sort((a, b) => b.speedup - a.speedup).slice(0, 10),
           compiler_slower: compilerComparisons.filter((item) => item.speedup < 1).sort((a, b) => a.speedup - b.speedup).slice(0, 10),
-          baseline_faster: rows.filter((row) => isNumber(row.delta_pct) && row.delta_pct > 0).sort((a, b) => b.delta_pct - a.delta_pct).slice(0, 10),
-          baseline_slower: rows.filter((row) => isNumber(row.delta_pct) && row.delta_pct < 0).sort((a, b) => a.delta_pct - b.delta_pct).slice(0, 10),
+          baseline_faster: rows.filter((row) => row.baseline_status === 'IMPROVEMENT').sort((a, b) => b.delta_pct - a.delta_pct).slice(0, 10),
+          baseline_slower: rows.filter((row) => row.baseline_status === 'REGRESSION').sort((a, b) => a.delta_pct - b.delta_pct).slice(0, 10),
         }},
         failureReasons: Array.from(failureCounts, ([reason, count]) => ({{reason, count}})).sort((a, b) => b.count - a.count),
       }};
@@ -952,6 +1107,9 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         ['yoolang 输给 Clang++', stats.yoolang_loses_clang],
         ['baseline 变快', stats.baseline_improvements],
         ['baseline 变慢', stats.baseline_regressions],
+        ['代码未变化', stats.baseline_no_code_change],
+        ['动态指令未变化', stats.baseline_no_dynamic_change],
+        ['证据不足', stats.baseline_inconclusive],
         ['失败 case', stats.failed_cases],
       ].map(([label, value]) => `<div class="stat"><span>${{label}}</span><strong>${{fmtInt(value)}}</strong></div>`).join('');
       const totalsTitle = selectedCases.size === allRows.length
@@ -1005,8 +1163,8 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         if (filter === 'lose-gcc' && !losesGcc(row)) return false;
         if (filter === 'lose-clang' && !losesClang(row)) return false;
         if (filter === 'lose-any' && !losesGcc(row) && !losesClang(row)) return false;
-        if (filter === 'improvement' && !(isNumber(row.delta_pct) && row.delta_pct > 0)) return false;
-        if (filter === 'regression' && !(isNumber(row.delta_pct) && row.delta_pct < 0)) return false;
+        if (filter === 'improvement' && row.baseline_status !== 'IMPROVEMENT') return false;
+        if (filter === 'regression' && row.baseline_status !== 'REGRESSION') return false;
         if (filter === 'no-code-change' && row.baseline_status !== 'NO_CODE_CHANGE') return false;
         if (filter === 'no-dynamic-change' && row.baseline_status !== 'NO_DYNAMIC_CHANGE') return false;
         if (filter === 'inconclusive' && row.baseline_status !== 'INCONCLUSIVE') return false;

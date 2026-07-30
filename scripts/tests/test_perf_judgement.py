@@ -135,6 +135,35 @@ class BaselineAggregationTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["baseline_improvements"], 1)
         self.assertEqual(payload["summary"]["baseline_regressions"], 0)
 
+    def test_report_payload_preserves_historical_baseline_evidence(self) -> None:
+        row = perf_row(
+            0.08,
+            asm_hash="assembly",
+            executable_hash="executable",
+            instructions=123,
+            samples=[0.07, 0.08, 0.09],
+        )
+        perf = {"status": "PASS", "rows": [row]}
+        delta = {
+            "rows": [
+                {
+                    "case": "test/performance/example.sy",
+                    "baseline": 0.10,
+                    "delta_pct": 0.0,
+                    "speedup": 1.0,
+                    "status": "NO_CODE_CHANGE",
+                }
+            ]
+        }
+        payload = generate_perf_report.build_payload(perf, delta, {})
+        report_row = payload["rows"][0]
+        self.assertEqual(report_row["current_assembly_sha256"], "assembly")
+        self.assertEqual(report_row["current_executable_sha256"], "executable")
+        self.assertEqual(report_row["current_instruction_count"], 123)
+        self.assertEqual(report_row["current_timing_samples_sec"], [0.07, 0.08, 0.09])
+        self.assertEqual(report_row["baseline_effective_current_sec"], 0.10)
+        self.assertEqual(payload["summary"]["baseline_no_code_change"], 1)
+
 
 class PerformanceReportHtmlTests(unittest.TestCase):
     def test_baseline_evidence_statuses_are_visible_and_filterable(self) -> None:
@@ -161,6 +190,9 @@ class PerformanceReportHtmlTests(unittest.TestCase):
         self.assertIn('value="no-code-change"', html)
         self.assertIn('value="no-dynamic-change"', html)
         self.assertIn('value="inconclusive"', html)
+        self.assertIn("classifyBaselineChange", html)
+        self.assertIn("row.baseline_status === 'NO_CODE_CHANGE'", html)
+        self.assertIn("代码未变化", html)
 
 
 class PerformanceRegressionGateTests(unittest.TestCase):
