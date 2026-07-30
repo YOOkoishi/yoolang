@@ -24,7 +24,7 @@ STATUS_EMOJI = {
     "IMPROVEMENT": "🚀",
     "OK": "✅",
     "REGRESSION": "⚠️",
-    "NO_CODE_CHANGE": "✅",
+    "CODE_NO_CHANGE": "✅",
     "NO_DYNAMIC_CHANGE": "✅",
     "INCONCLUSIVE": "ℹ️",
     "NO BASELINE": "ℹ️",
@@ -127,9 +127,9 @@ def classify_change(
     baseline_executable = executable_sha256(baseline_row)
     if current_executable is not None and baseline_executable is not None:
         if current_executable == baseline_executable:
-            return "NO_CODE_CHANGE", "executed ELF SHA-256 is identical"
+            return "CODE_NO_CHANGE", "executed ELF SHA-256 is identical"
     elif current_hash is not None and current_hash == baseline_hash:
-        return "NO_CODE_CHANGE", "compiler assembly SHA-256 is identical"
+        return "CODE_NO_CHANGE", "compiler assembly SHA-256 is identical"
 
     current_count = instruction_count(current_row)
     baseline_count = instruction_count(baseline_row)
@@ -243,7 +243,7 @@ def write_no_baseline(args: argparse.Namespace, reason: str) -> None:
         "case_wins": 0,
         "case_losses": 0,
         "case_ties": 0,
-        "case_no_code_change": 0,
+        "case_code_no_change": 0,
         "case_no_dynamic_change": 0,
         "case_inconclusive": 0,
         "rows": [],
@@ -401,7 +401,7 @@ def main() -> int:
     case_wins = 0
     case_losses = 0
     case_ties = 0
-    case_no_code_change = 0
+    case_code_no_change = 0
     case_no_dynamic_change = 0
     case_inconclusive = 0
     adjudicated_cases = 0
@@ -427,8 +427,8 @@ def main() -> int:
         elif classification == "REGRESSION":
             case_losses += 1
             adjudicated_cases += 1
-        elif classification == "NO_CODE_CHANGE":
-            case_no_code_change += 1
+        elif classification == "CODE_NO_CHANGE":
+            case_code_no_change += 1
             case_ties += 1
         elif classification == "NO_DYNAMIC_CHANGE":
             case_no_dynamic_change += 1
@@ -484,8 +484,8 @@ def main() -> int:
         total_delta_pct = 0.0 if baseline_total == 0.0 else ((baseline_total - current_total) / baseline_total) * 100.0
         total_speedup = speedup_ratio(baseline_total, current_total)
         case_speedup_geomean = geometric_mean(speedups)
-        if adjudicated_cases == 0 and case_no_code_change == len(rows):
-            status = "NO_CODE_CHANGE"
+        if adjudicated_cases == 0 and case_code_no_change == len(rows):
+            status = "CODE_NO_CHANGE"
         elif adjudicated_cases == 0 and case_inconclusive == 0:
             status = "NO_DYNAMIC_CHANGE"
         elif adjudicated_cases == 0:
@@ -514,7 +514,7 @@ def main() -> int:
         *baseline_md_lines(args),
         f"- Comparable cases: {len(rows)}",
         f"- Evidence-backed changes: {adjudicated_cases}",
-        f"- No code change: {case_no_code_change}",
+        f"- Code no change: {case_code_no_change}",
         f"- No dynamic instruction change: {case_no_dynamic_change}",
         f"- Inconclusive timing: {case_inconclusive}",
         f"- Current Yoolang runtime total: {current_total:.4f}s",
@@ -609,7 +609,7 @@ def main() -> int:
         "case_wins": case_wins,
         "case_losses": case_losses,
         "case_ties": case_ties,
-        "case_no_code_change": case_no_code_change,
+        "case_code_no_change": case_code_no_change,
         "case_no_dynamic_change": case_no_dynamic_change,
         "case_inconclusive": case_inconclusive,
         "instruction_count": insn_compare,

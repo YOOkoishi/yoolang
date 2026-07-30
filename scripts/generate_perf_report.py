@@ -172,7 +172,7 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
         effective_baseline_current_sec = (
             baseline_sec
             if baseline_status
-            in {"NO_CODE_CHANGE", "NO_DYNAMIC_CHANGE", "INCONCLUSIVE"}
+            in {"CODE_NO_CHANGE", "NO_DYNAMIC_CHANGE", "INCONCLUSIVE"}
             else yoolang
         )
         rows.append(
@@ -236,10 +236,10 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
         for row in rows
         if row["baseline_status"] == "IMPROVEMENT"
     ]
-    no_code_changes = [
+    code_no_changes = [
         row
         for row in rows
-        if row["baseline_status"] == "NO_CODE_CHANGE"
+        if row["baseline_status"] == "CODE_NO_CHANGE"
     ]
     no_dynamic_changes = [
         row
@@ -315,7 +315,7 @@ def build_payload(perf: dict[str, Any], delta: dict[str, Any], meta: dict[str, s
             "yoolang_loses_clang": len(loses_clang),
             "baseline_improvements": len(improvements),
             "baseline_regressions": len(regressions),
-            "baseline_no_code_change": len(no_code_changes),
+            "baseline_code_no_change": len(code_no_changes),
             "baseline_no_dynamic_change": len(no_dynamic_changes),
             "baseline_inconclusive": len(inconclusive_changes),
             "total_runtime_sec": perf.get("total_runtime_sec"),
@@ -649,7 +649,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         <option value="lose-clang">只看 yoolang 输给 Clang++</option>
         <option value="improvement">只看相对 baseline 变快</option>
         <option value="regression">只看相对 baseline 变慢</option>
-        <option value="no-code-change">只看 NO_CODE_CHANGE</option>
+        <option value="code-no-change">只看 CODE_NO_CHANGE</option>
         <option value="no-dynamic-change">只看 NO_DYNAMIC_CHANGE</option>
         <option value="inconclusive">只看 INCONCLUSIVE</option>
         <option value="failed">只看失败 case</option>
@@ -772,10 +772,10 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         const baselineAssembly = String(baselineArtifact.sha256 || baseline.compiler_asm_sha256 || '');
         if (currentExecutable && baselineExecutable) {{
           if (currentExecutable === baselineExecutable) {{
-            return ['NO_CODE_CHANGE', 'executed ELF SHA-256 is identical'];
+            return ['CODE_NO_CHANGE', 'executed ELF SHA-256 is identical'];
           }}
         }} else if (currentAssembly && currentAssembly === baselineAssembly) {{
-          return ['NO_CODE_CHANGE', 'compiler assembly SHA-256 is identical'];
+          return ['CODE_NO_CHANGE', 'compiler assembly SHA-256 is identical'];
         }}
 
         const currentCount = current.current_instruction_count;
@@ -875,13 +875,13 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
 	            : null;
 	        const measurable = ['IMPROVEMENT', 'REGRESSION'].includes(next.baseline_status);
 	        next.delta_pct = measurable ? next.observed_delta_pct : (
-	          ['NO_CODE_CHANGE', 'NO_DYNAMIC_CHANGE', 'INCONCLUSIVE'].includes(next.baseline_status)
+	          ['CODE_NO_CHANGE', 'NO_DYNAMIC_CHANGE', 'INCONCLUSIVE'].includes(next.baseline_status)
 	            ? 0
 	            : null
 	        );
 	        next.baseline_effective_current_sec =
 	          measurable ? next.yoolang_sec : (
-	            ['NO_CODE_CHANGE', 'NO_DYNAMIC_CHANGE', 'INCONCLUSIVE'].includes(next.baseline_status)
+	            ['CODE_NO_CHANGE', 'NO_DYNAMIC_CHANGE', 'INCONCLUSIVE'].includes(next.baseline_status)
 	              ? baselineSec
 	              : null
 	          );
@@ -1052,7 +1052,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
           yoolang_loses_clang: okRows.filter(losesClang).length,
           baseline_improvements: rows.filter((row) => row.baseline_status === 'IMPROVEMENT').length,
           baseline_regressions: rows.filter((row) => row.baseline_status === 'REGRESSION').length,
-          baseline_no_code_change: rows.filter((row) => row.baseline_status === 'NO_CODE_CHANGE').length,
+          baseline_code_no_change: rows.filter((row) => row.baseline_status === 'CODE_NO_CHANGE').length,
           baseline_no_dynamic_change: rows.filter((row) => row.baseline_status === 'NO_DYNAMIC_CHANGE').length,
           baseline_inconclusive: rows.filter((row) => row.baseline_status === 'INCONCLUSIVE').length,
           total_yoolang_sec: totalYoolang,
@@ -1107,7 +1107,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         ['yoolang 输给 Clang++', stats.yoolang_loses_clang],
         ['baseline 变快', stats.baseline_improvements],
         ['baseline 变慢', stats.baseline_regressions],
-        ['代码未变化', stats.baseline_no_code_change],
+        ['代码未变化', stats.baseline_code_no_change],
         ['动态指令未变化', stats.baseline_no_dynamic_change],
         ['证据不足', stats.baseline_inconclusive],
         ['失败 case', stats.failed_cases],
@@ -1165,7 +1165,7 @@ def write_html(payload: dict[str, Any], out_html: Path, pages_base_url: str = ""
         if (filter === 'lose-any' && !losesGcc(row) && !losesClang(row)) return false;
         if (filter === 'improvement' && row.baseline_status !== 'IMPROVEMENT') return false;
         if (filter === 'regression' && row.baseline_status !== 'REGRESSION') return false;
-        if (filter === 'no-code-change' && row.baseline_status !== 'NO_CODE_CHANGE') return false;
+        if (filter === 'code-no-change' && row.baseline_status !== 'CODE_NO_CHANGE') return false;
         if (filter === 'no-dynamic-change' && row.baseline_status !== 'NO_DYNAMIC_CHANGE') return false;
         if (filter === 'inconclusive' && row.baseline_status !== 'INCONCLUSIVE') return false;
         if (filter === 'failed' && row.status === 'OK') return false;

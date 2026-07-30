@@ -11,7 +11,7 @@ from typing import Any
 NON_BLOCKING_STATUSES = {
     "IMPROVEMENT",
     "OK",
-    "NO_CODE_CHANGE",
+    "CODE_NO_CHANGE",
     "NO_DYNAMIC_CHANGE",
     "INCONCLUSIVE",
     "NO BASELINE",

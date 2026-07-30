@@ -49,7 +49,7 @@ class ChangeClassificationTests(unittest.TestCase):
         current = perf_row(0.20, asm_hash="same", instructions=200)
         baseline = perf_row(0.10, asm_hash="same", instructions=100)
         status, _ = baseline_compare.classify_change(current, baseline, 0.20, 0.10)
-        self.assertEqual(status, "NO_CODE_CHANGE")
+        self.assertEqual(status, "CODE_NO_CHANGE")
 
     def test_identical_dynamic_count_neutralizes_missing_hash(self) -> None:
         current = perf_row(0.20, instructions=100)
@@ -89,7 +89,7 @@ class ChangeClassificationTests(unittest.TestCase):
 
 
 class BaselineAggregationTests(unittest.TestCase):
-    def test_no_code_change_is_neutral_in_aggregate(self) -> None:
+    def test_code_no_change_is_neutral_in_aggregate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             current_path = root / "current.json"
@@ -112,7 +112,7 @@ class BaselineAggregationTests(unittest.TestCase):
                 self.assertEqual(baseline_compare.main(), 0)
 
             result = json.loads(out_json.read_text())
-            self.assertEqual(result["status"], "NO_CODE_CHANGE")
+            self.assertEqual(result["status"], "CODE_NO_CHANGE")
             self.assertEqual(result["total_delta_pct"], 0.0)
             self.assertEqual(result["raw_current_compiler_total"], 0.2)
             self.assertEqual(result["rows"][0]["observed_delta_pct"], -100.0)
@@ -151,7 +151,7 @@ class BaselineAggregationTests(unittest.TestCase):
                     "baseline": 0.10,
                     "delta_pct": 0.0,
                     "speedup": 1.0,
-                    "status": "NO_CODE_CHANGE",
+                    "status": "CODE_NO_CHANGE",
                 }
             ]
         }
@@ -162,8 +162,7 @@ class BaselineAggregationTests(unittest.TestCase):
         self.assertEqual(report_row["current_instruction_count"], 123)
         self.assertEqual(report_row["current_timing_samples_sec"], [0.07, 0.08, 0.09])
         self.assertEqual(report_row["baseline_effective_current_sec"], 0.10)
-        self.assertEqual(payload["summary"]["baseline_no_code_change"], 1)
-
+        self.assertEqual(payload["summary"]["baseline_code_no_change"], 1)
 
 class PerformanceReportHtmlTests(unittest.TestCase):
     def test_baseline_evidence_statuses_are_visible_and_filterable(self) -> None:
@@ -171,7 +170,7 @@ class PerformanceReportHtmlTests(unittest.TestCase):
             "rows": [
                 {
                     "case": "test/performance/example.sy",
-                    "baseline_status": "NO_CODE_CHANGE",
+                    "baseline_status": "CODE_NO_CHANGE",
                     "baseline_evidence": "executed ELF SHA-256 is identical",
                     "status": "OK",
                 }
@@ -186,12 +185,12 @@ class PerformanceReportHtmlTests(unittest.TestCase):
             html = out_html.read_text()
 
         self.assertIn("基线判定", html)
-        self.assertIn("NO_CODE_CHANGE", html)
-        self.assertIn('value="no-code-change"', html)
+        self.assertIn("CODE_NO_CHANGE", html)
+        self.assertIn('value="code-no-change"', html)
         self.assertIn('value="no-dynamic-change"', html)
         self.assertIn('value="inconclusive"', html)
         self.assertIn("classifyBaselineChange", html)
-        self.assertIn("row.baseline_status === 'NO_CODE_CHANGE'", html)
+        self.assertIn("row.baseline_status === 'CODE_NO_CHANGE'", html)
         self.assertIn("代码未变化", html)
 
 
