@@ -5,11 +5,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
-#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -45,6 +46,11 @@ struct GEPCandidateGroup {
     std::size_t index_pos = 0;
     std::int64_t pointer_step = 0;
     std::vector<GEPCandidate> candidates;
+};
+
+struct SharedGEPCandidateGroup {
+    std::vector<GEPCandidate> candidates;
+    std::vector<std::int64_t> offsets;
 };
 
 bool contains_block(const oir::Loop &loop, const oir::BasicBlock *block) {
@@ -484,6 +490,179 @@ collect_candidates(const oir::Loop &loop, const std::vector<InductionInfo> &indu
     return candidates;
 }
 
+struct SymbolicIndex {
+    oir::Value *base = nullptr;
+    std::int64_t offset = 0;
+};
+
+bool add_without_overflow(std::int64_t lhs, std::int64_t rhs, std::int64_t &result) {
+    if ((rhs > 0 && lhs > std::numeric_limits<std::int64_t>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<std::int64_t>::min() - rhs)) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+std::optional<SymbolicIndex> split_constant_offset(oir::Value *value) {
+    if (auto constant = constant_int(value)) {
+        return SymbolicIndex{nullptr, *constant};
+    }
+
+    auto *binary = dynamic_cast<oir::BinaryInst *>(value);
+    if (binary == nullptr) {
+        return SymbolicIndex{value, 0};
+    }
+
+    if (binary->op() == oir::Instruction::OpID::Add) {
+        if (auto rhs = constant_int(binary->rhs())) {
+            auto lhs = split_constant_offset(binary->lhs());
+            std::int64_t offset = 0;
+            if (!lhs || !add_without_overflow(lhs->offset, *rhs, offset)) {
+                return std::nullopt;
+            }
+            lhs->offset = offset;
+            return lhs;
+        }
+        if (auto lhs = constant_int(binary->lhs())) {
+            auto rhs = split_constant_offset(binary->rhs());
+            std::int64_t offset = 0;
+            if (!rhs || !add_without_overflow(rhs->offset, *lhs, offset)) {
+                return std::nullopt;
+            }
+            rhs->offset = offset;
+            return rhs;
+        }
+    }
+
+    if (binary->op() == oir::Instruction::OpID::Sub) {
+        if (auto rhs = constant_int(binary->rhs())) {
+            auto lhs = split_constant_offset(binary->lhs());
+            std::int64_t offset = 0;
+            if (!lhs || *rhs == std::numeric_limits<std::int64_t>::min() ||
+                !add_without_overflow(lhs->offset, -*rhs, offset)) {
+                return std::nullopt;
+            }
+            lhs->offset = offset;
+            return lhs;
+        }
+    }
+
+    return SymbolicIndex{value, 0};
+}
+
+std::optional<std::int64_t> constant_gep_delta(const GEPCandidate &candidate,
+                                               const GEPCandidate &base) {
+    if (candidate.gep->base_ptr() != base.gep->base_ptr() ||
+        candidate.gep->type() != base.gep->type() ||
+        candidate.induction.phi != base.induction.phi ||
+        candidate.index_pos != base.index_pos ||
+        candidate.pointer_step != base.pointer_step ||
+        candidate.pointer_step_value != base.pointer_step_value ||
+        candidate.index_scale != base.index_scale ||
+        candidate.index_scale_value != base.index_scale_value ||
+        candidate.index_offset_value != base.index_offset_value ||
+        candidate.index_offset_value_sign != base.index_offset_value_sign) {
+        return std::nullopt;
+    }
+
+    const auto candidate_indices = candidate.gep->indices();
+    const auto base_indices = base.gep->indices();
+    const auto strides = gep_index_strides(*candidate.gep);
+    const auto base_strides = gep_index_strides(*base.gep);
+    if (!strides || !base_strides || *strides != *base_strides ||
+        candidate_indices.size() != base_indices.size()) {
+        return std::nullopt;
+    }
+
+    std::int64_t byte_delta = 0;
+    for (std::size_t i = 0; i < candidate_indices.size(); ++i) {
+        auto candidate_index = split_constant_offset(candidate_indices[i]);
+        auto base_index = split_constant_offset(base_indices[i]);
+        if (!candidate_index || !base_index || candidate_index->base != base_index->base) {
+            return std::nullopt;
+        }
+
+        std::int64_t index_delta = 0;
+        if (base_index->offset == std::numeric_limits<std::int64_t>::min() ||
+            !add_without_overflow(candidate_index->offset, -base_index->offset, index_delta) ||
+            (*strides)[i] >
+                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            return std::nullopt;
+        }
+        const auto stride = static_cast<std::int64_t>((*strides)[i]);
+        if (index_delta != 0 &&
+            (index_delta > std::numeric_limits<std::int64_t>::max() / stride ||
+             index_delta < std::numeric_limits<std::int64_t>::min() / stride)) {
+            return std::nullopt;
+        }
+        std::int64_t updated_delta = 0;
+        if (!add_without_overflow(byte_delta, index_delta * stride, updated_delta)) {
+            return std::nullopt;
+        }
+        byte_delta = updated_delta;
+    }
+
+    auto *pointer_type = dynamic_cast<oir::PointerType *>(candidate.gep->type());
+    if (pointer_type == nullptr) {
+        return std::nullopt;
+    }
+    const auto raw_element_size = type_size(pointer_type->element_type());
+    if (raw_element_size == 0 ||
+        raw_element_size >
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        return std::nullopt;
+    }
+    const auto element_size = static_cast<std::int64_t>(raw_element_size);
+    if (byte_delta % element_size != 0) {
+        return std::nullopt;
+    }
+    return byte_delta / element_size;
+}
+
+std::vector<SharedGEPCandidateGroup>
+group_shared_lsr_candidates(const std::vector<GEPCandidate> &candidates) {
+    std::vector<SharedGEPCandidateGroup> groups;
+    for (const auto &candidate : candidates) {
+        bool grouped = false;
+        for (auto &group : groups) {
+            auto offset = constant_gep_delta(candidate, group.candidates.front());
+            if (!offset) {
+                continue;
+            }
+
+            auto *pointer_type = dynamic_cast<oir::PointerType *>(candidate.gep->type());
+            const auto raw_element_size =
+                pointer_type == nullptr ? 0 : type_size(pointer_type->element_type());
+            constexpr std::int64_t kMinFoldableByteOffset = -2048;
+            constexpr std::int64_t kMaxFoldableByteOffset = 2047;
+            if (raw_element_size == 0 ||
+                raw_element_size >
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max()) ||
+                static_cast<std::int64_t>(raw_element_size) >
+                    kMaxFoldableByteOffset ||
+                *offset <
+                    kMinFoldableByteOffset /
+                        static_cast<std::int64_t>(raw_element_size) ||
+                *offset >
+                    kMaxFoldableByteOffset /
+                        static_cast<std::int64_t>(raw_element_size)) {
+                continue;
+            }
+
+            group.candidates.push_back(candidate);
+            group.offsets.push_back(*offset);
+            grouped = true;
+            break;
+        }
+        if (!grouped) {
+            groups.push_back(SharedGEPCandidateGroup{{candidate}, {0}});
+        }
+    }
+    return groups;
+}
+
 bool latch_has_call_before_terminator(const oir::BasicBlock &latch) {
     for (const auto &inst : latch.instructions()) {
         if (inst->is_terminator()) {
@@ -689,15 +868,19 @@ oir::Value *materialize_pointer_step(oir::Module &module, oir::BasicBlock *prehe
 }
 
 bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preheader,
-               oir::BasicBlock *latch, const std::vector<GEPCandidate> &candidates,
+               oir::BasicBlock *latch, const std::vector<SharedGEPCandidateGroup> &groups,
                Stats &stats) {
-    if (candidates.empty()) {
+    if (groups.empty()) {
         return false;
     }
 
     ReplacementMap replacements;
     auto *header = mutable_block(loop.header);
-    for (const auto &candidate : candidates) {
+    for (const auto &group : groups) {
+        if (group.candidates.empty()) {
+            continue;
+        }
+        const auto &candidate = group.candidates.front();
         auto *gep = candidate.gep;
         auto start_indices = gep->indices();
         start_indices[candidate.index_pos] = materialize_start_index(module, preheader, candidate);
@@ -716,8 +899,23 @@ bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preh
                 lsr_name(*gep, ".next"))));
         phi->add_incoming(next, latch);
 
-        replacements[gep] = phi;
-        ++stats.lsr;
+        for (std::size_t i = 0; i < group.candidates.size(); ++i) {
+            const auto &member = group.candidates[i];
+            const auto offset = group.offsets[i];
+            if (offset == 0) {
+                replacements[member.gep] = phi;
+                continue;
+            }
+            auto *offset_ptr = insert_before_instruction(
+                member.gep->parent(), member.gep,
+                std::make_unique<oir::GetElementPtrInst>(
+                    member.gep->type(), phi,
+                    std::vector<oir::Value *>{
+                        make_int_constant(module, module.types().int32_ty(), offset)},
+                    member.gep->parent(), lsr_name(*member.gep, ".shared.off")));
+            replacements[member.gep] = offset_ptr;
+        }
+        stats.lsr += static_cast<unsigned>(group.candidates.size());
     }
 
     return apply_replacements(module, replacements) != 0;
@@ -806,7 +1004,8 @@ bool run_on_loop(oir::Module &module, const oir::Loop &loop, Stats &stats) {
         auto groups = group_stack_call_lsr_candidates(loop, latch, candidates);
         return apply_stack_call_lsr(module, preheader, latch, groups, stats);
     }
-    return apply_lsr(module, loop, preheader, latch, candidates, stats);
+    auto groups = group_shared_lsr_candidates(candidates);
+    return apply_lsr(module, loop, preheader, latch, groups, stats);
 }
 
 bool run_on_function(oir::Function &function, Stats &stats) {

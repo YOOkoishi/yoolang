@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -656,39 +657,108 @@ PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
             std::string(YIRPolyhedralFunctionSelection::kArtifactKey), std::move(selection));
     }
 
-    PassManager pm;
-    pm.add_pass<YIRPolyhedralCanonicalizePass>();
-    pm.add_pass<YIRSCoPDetectPass>();
-    pm.add_pass<YIRPolyhedralModelBuildPass>();
-    pm.add_pass<YIRPolyhedralDependenceAnalysisPass>();
-    if (run_transform_) {
-        pm.add_pass<YIRPolyhedralTransformPass>();
-    }
+    bool changed = false;
+    std::size_t execution_count = 0;
+    std::size_t analysis_rounds = 0;
+    std::size_t structural_rounds = 0;
+    bool structural_budget_exhausted = false;
 
-    auto result = pm.run(context);
-    if (!result.success) {
+    const auto run_manager = [&](PassManager &pm) -> std::optional<std::string> {
+        auto result = pm.run(context);
+        execution_count += result.executions.size();
+        changed = changed || result.changed;
+        if (result.success) {
+            return std::nullopt;
+        }
         if (result.executions.empty()) {
-            return PassResult::fail("polyhedral pipeline failed before running any pass");
+            return std::string("polyhedral pipeline failed before running any pass");
+        }
+        const auto &execution = result.executions.back();
+        std::string error = execution.name;
+        if (!execution.result.message.empty()) {
+            error += ": ";
+            error += execution.result.message;
+        }
+        return error;
+    };
+
+    const auto run_analysis = [&]() -> std::optional<std::string> {
+        PassManager analysis;
+        analysis.add_pass<YIRPolyhedralCanonicalizePass>();
+        analysis.add_pass<YIRSCoPDetectPass>();
+        analysis.add_pass<YIRPolyhedralModelBuildPass>();
+        analysis.add_pass<YIRPolyhedralDependenceAnalysisPass>();
+        ++analysis_rounds;
+        return run_manager(analysis);
+    };
+
+    if (!run_transform_) {
+        if (auto error = run_analysis()) {
+            return PassResult::fail(std::move(*error));
+        }
+    } else {
+        constexpr std::size_t kMaxStructuralRounds = 3;
+        YIRPolyhedralStructuralChange last_change =
+            YIRPolyhedralStructuralChange::None;
+        for (std::size_t round = 0; round < kMaxStructuralRounds; ++round) {
+            if (auto error = run_analysis()) {
+                return PassResult::fail(std::move(*error));
+            }
+
+            PassManager structural;
+            structural.add_pass<YIRPolyhedralTransformPass>(
+                YIRPolyhedralTransformMode::Structural);
+            ++structural_rounds;
+            if (auto error = run_manager(structural)) {
+                return PassResult::fail(std::move(*error));
+            }
+
+            const auto *summary = context.get_artifact<YIRPolyhedralTransformSummary>(
+                std::string(YIRPolyhedralTransformSummary::kArtifactKey));
+            last_change = summary == nullptr
+                              ? YIRPolyhedralStructuralChange::None
+                              : summary->structural_change;
+            if (last_change != YIRPolyhedralStructuralChange::Fusion) {
+                break;
+            }
+            if (round + 1 == kMaxStructuralRounds) {
+                structural_budget_exhausted = true;
+            }
         }
 
-        const auto &execution = result.executions.back();
-        std::string message = execution.name;
-        if (!execution.result.message.empty()) {
-            message += ": ";
-            message += execution.result.message;
+        // Any structural rewrite invalidates SCoP membership, schedule bands,
+        // dependence relations, and stored operation pointers. Rebuild once
+        // more before local model-driven rewrites. Schedule rewrites terminate
+        // the structural loop, preventing a rebuilt tiled nest from being
+        // tiled again.
+        if (last_change != YIRPolyhedralStructuralChange::None) {
+            if (auto error = run_analysis()) {
+                return PassResult::fail(std::move(*error));
+            }
         }
-        return PassResult::fail(std::move(message));
+
+        PassManager local;
+        local.add_pass<YIRPolyhedralTransformPass>(
+            YIRPolyhedralTransformMode::Local);
+        if (auto error = run_manager(local)) {
+            return PassResult::fail(std::move(*error));
+        }
     }
 
     std::ostringstream message;
-    message << "ran " << result.executions.size() << " polyhedral passes";
+    message << "ran " << execution_count << " polyhedral passes"
+            << ", analysis_rounds=" << analysis_rounds
+            << ", structural_rounds=" << structural_rounds;
+    if (structural_budget_exhausted) {
+        message << ", structural_budget_exhausted=true";
+    }
     if (mode_ == YIRPolyhedralPipelineMode::Auto) {
         const auto *selection = context.get_artifact<YIRPolyhedralFunctionSelection>(
             std::string(YIRPolyhedralFunctionSelection::kArtifactKey));
         message << ", selected_functions="
                 << (selection == nullptr ? 0 : selection->functions.size());
     }
-    return PassResult::ok(result.changed, message.str());
+    return PassResult::ok(changed, message.str());
 }
 
 } // namespace pass
