@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cstdlib>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -379,13 +380,61 @@ bool region_is_straight_line_cloneable(const yir::Region &region) {
     return true;
 }
 
-bool dependence_allows_reorder(const yir::LoopSummary *summary) {
+bool access_has_separate_dimension_for_iv(const yir::ArrayAccess &access,
+                                          const yir::Value *iv) {
+    if (iv == nullptr) {
+        return false;
+    }
+    return std::any_of(access.indices.begin(), access.indices.end(),
+                       [iv](const yir::AffineExpr &index) {
+                           if (index.unknown || index.terms.size() != 1) {
+                               return false;
+                           }
+                           const auto &term = index.terms.front();
+                           return term.value == iv &&
+                                  (term.coefficient == 1 || term.coefficient == -1);
+                       });
+}
+
+bool same_element_dependence_is_pointwise(
+    const yir::LoopSummary &summary, const yir::ArrayDependence &dependence,
+    const std::vector<const yir::Value *> &reordered_ivs) {
+    if (dependence.first >= summary.array_accesses.size() ||
+        dependence.second >= summary.array_accesses.size()) {
+        return false;
+    }
+    const auto &first = summary.array_accesses[dependence.first];
+    const auto &second = summary.array_accesses[dependence.second];
+    return std::all_of(reordered_ivs.begin(), reordered_ivs.end(),
+                       [&](const yir::Value *iv) {
+                           return access_has_separate_dimension_for_iv(first, iv) &&
+                                  access_has_separate_dimension_for_iv(second, iv);
+                       });
+}
+
+bool dependence_allows_sequential_expansion(const yir::LoopSummary *summary) {
     if (summary == nullptr) {
         return false;
     }
     for (const auto &dep : summary->dependencies) {
         if (dep.kind == yir::DependenceKind::Unknown ||
             dep.kind == yir::DependenceKind::LoopCarriedPossible) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool dependence_allows_reorder(
+    const yir::LoopSummary *summary,
+    std::initializer_list<const yir::Value *> reordered_ivs) {
+    if (!dependence_allows_sequential_expansion(summary)) {
+        return false;
+    }
+    const std::vector<const yir::Value *> ivs(reordered_ivs);
+    for (const auto &dep : summary->dependencies) {
+        if (dep.kind == yir::DependenceKind::SameElement &&
+            !same_element_dependence_is_pointwise(*summary, dep, ivs)) {
             return false;
         }
     }
@@ -1528,7 +1577,7 @@ class Optimizer final {
         }
 
         const auto *summary = analysis.summary_for(&for_op);
-        if (summary != nullptr && !dependence_allows_reorder(summary)) {
+        if (summary != nullptr && !dependence_allows_sequential_expansion(summary)) {
             return false;
         }
 
@@ -1677,7 +1726,8 @@ class Optimizer final {
         }
 
         const auto *inner_summary = analysis.summary_for(inner);
-        if (!dependence_allows_reorder(inner_summary) ||
+        if (!dependence_allows_reorder(
+                inner_summary, {outer.induction_var(), inner->induction_var()}) ||
             !has_ranked_array_access(inner_summary, 2)) {
             return false;
         }
@@ -1710,7 +1760,8 @@ class Optimizer final {
         }
 
         const auto *inner_summary = analysis.summary_for(inner);
-        if (!dependence_allows_reorder(inner_summary) ||
+        if (!dependence_allows_reorder(
+                inner_summary, {outer.induction_var(), inner->induction_var()}) ||
             !has_ranked_array_access(inner_summary, 2)) {
             return false;
         }
@@ -1839,7 +1890,8 @@ class Optimizer final {
             return false;
         }
         const auto *inner_summary = analysis.summary_for(inner);
-        if (!dependence_allows_reorder(inner_summary) ||
+        if (!dependence_allows_reorder(
+                inner_summary, {outer.induction_var(), inner->induction_var()}) ||
             !has_ranked_array_access(inner_summary, 1)) {
             return false;
         }
@@ -1904,7 +1956,8 @@ class Optimizer final {
         }
 
         const auto *summary = analysis.summary_for(&for_op);
-        if (!dependence_allows_reorder(summary) || summary->array_accesses.empty()) {
+        if (!dependence_allows_sequential_expansion(summary) ||
+            summary->array_accesses.empty()) {
             return false;
         }
 

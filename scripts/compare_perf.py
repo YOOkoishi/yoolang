@@ -865,7 +865,7 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, RunRes
     if not compiler.compile_ok or not compiler.run_ok:
         return gcc, clang, compiler, hy, False, f"compiler {compiler.detail}"
     if hy is not None and (not hy.compile_ok or not hy.run_ok):
-        return gcc, clang, compiler, hy, True, "OK"
+        return gcc, clang, compiler, hy, False, f"hy {hy.detail}"
 
     clang_stdout = _normalize_text(clang.stdout)
     compiler_stdout = _normalize_text(compiler.stdout)
@@ -887,8 +887,8 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, RunRes
                 clang,
                 compiler,
                 hy,
-                True,
-                "OK",
+                False,
+                f"hy output mismatch vs expected .out for {src.name}",
             )
         return gcc, clang, compiler, hy, True, "OK"
 
@@ -900,7 +900,7 @@ def _compile_and_run(src: Path) -> tuple[RunResult, RunResult, RunResult, RunRes
     if compiler_stdout != baseline_stdout or compiler.exit_code != baseline_exit:
         return gcc, clang, compiler, hy, False, f"compiler output mismatch vs gcc for {src.name}"
     if hy is not None and (_normalize_text(hy.stdout) != baseline_stdout or hy.exit_code != baseline_exit):
-        return gcc, clang, compiler, hy, True, "OK"
+        return gcc, clang, compiler, hy, False, f"hy output mismatch vs gcc for {src.name}"
 
     return gcc, clang, compiler, hy, True, "OK"
 
