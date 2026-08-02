@@ -5,6 +5,7 @@
 #include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
 #include "pass/oir/OIRCostModel.h"
+#include "pass/oir/OIRCountdownLoopAnalysis.h"
 
 #include <algorithm>
 #include <deque>
@@ -70,6 +71,7 @@ struct InlineContext {
     std::unordered_map<const oir::CallInst *, unsigned> recursive_call_depths;
     std::unordered_map<const oir::Function *, unsigned> recursive_growth;
     std::unordered_set<const oir::Function *> defer_recursive_expansion;
+    std::unordered_set<const oir::BasicBlock *> protected_countdown_blocks;
 };
 
 struct CallsiteEstimate {
@@ -707,7 +709,8 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
     throw std::runtime_error("unsupported instruction while cloning inline body");
 }
 
-std::unique_ptr<oir::Function> clone_function_template(oir::Function &source) {
+std::unique_ptr<oir::Function> clone_function_template(oir::Function &source,
+                                                       InlineContext &context) {
     auto out = std::make_unique<oir::Function>(source.function_type(), source.name(),
                                                source.parent(), source.is_external());
     ValueMap values;
@@ -717,7 +720,12 @@ std::unique_ptr<oir::Function> clone_function_template(oir::Function &source) {
         values[arg.get()] = out->add_argument(arg->type(), arg->name());
     }
     for (const auto &block : source.blocks()) {
-        blocks[block.get()] = out->create_block(block->name());
+        auto *cloned = out->create_block(block->name());
+        blocks[block.get()] = cloned;
+        if (context.protected_countdown_blocks.find(block.get()) !=
+            context.protected_countdown_blocks.end()) {
+            context.protected_countdown_blocks.insert(cloned);
+        }
     }
 
     auto &module = *source.parent();
@@ -1185,7 +1193,8 @@ oir::Function &recursive_template_for(InlineContext &context, oir::Function &fun
     if (found != context.recursive_templates.end()) {
         return *found->second;
     }
-    auto inserted = context.recursive_templates.emplace(&function, clone_function_template(function));
+    auto inserted =
+        context.recursive_templates.emplace(&function, clone_function_template(function, context));
     return *inserted.first->second;
 }
 
@@ -1430,7 +1439,12 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
             ? recursive_inline_prefix(caller, self_recursive_depth + 1)
             : "inl." + callee->name() + ".";
     for (const auto &callee_block : clone_source->blocks()) {
-        blocks[callee_block.get()] = caller.create_block(block_prefix + callee_block->name());
+        auto *cloned = caller.create_block(block_prefix + callee_block->name());
+        blocks[callee_block.get()] = cloned;
+        if (context.protected_countdown_blocks.find(callee_block.get()) !=
+            context.protected_countdown_blocks.end()) {
+            context.protected_countdown_blocks.insert(cloned);
+        }
     }
     auto *continuation =
         caller.create_block(block_prefix + "cont." + std::to_string(inline_index));
@@ -1483,6 +1497,10 @@ bool inline_one_call(oir::Module &module, InlineContext &context, oir::Function 
     std::vector<OrdinarySite> ordinary_sites;
     unsigned ordinal = 0;
     for (auto &block : function.blocks()) {
+        if (context.protected_countdown_blocks.find(block.get()) !=
+            context.protected_countdown_blocks.end()) {
+            continue;
+        }
         for (auto &inst : block->instructions()) {
             auto *call = dynamic_cast<oir::CallInst *>(inst.get());
             if (call == nullptr || call->callee() == &function) {
@@ -1544,6 +1562,10 @@ bool inline_one_call(oir::Module &module, InlineContext &context, oir::Function 
 
     std::vector<RecursiveSite> recursive_sites;
     for (auto &block : function.blocks()) {
+        if (context.protected_countdown_blocks.find(block.get()) !=
+            context.protected_countdown_blocks.end()) {
+            continue;
+        }
         for (auto &inst : block->instructions()) {
             auto *call = dynamic_cast<oir::CallInst *>(inst.get());
             if (call == nullptr || call->callee() != &function) {
@@ -1729,10 +1751,18 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
     return changed;
 }
 
-bool inline_functions(oir::Module &module, Stats &stats) {
+bool inline_functions(oir::Module &module, Stats &stats, InlineOptions options) {
     bool changed = false;
     unsigned inline_index = 0;
     InlineContext context;
+    if (options.preserve_guarded_countdown_dce_candidates &&
+        may_have_guarded_overwritten_countdown_inline_barrier(module)) {
+        oir::FunctionModRefAnalysis modref(module);
+        for (const auto &function : module.functions()) {
+            auto barriers = find_guarded_overwritten_countdown_inline_barriers(*function, modref);
+            context.protected_countdown_blocks.insert(barriers.begin(), barriers.end());
+        }
+    }
     const auto current_module_instrs =
         static_cast<std::int64_t>(module_instruction_count(module));
     if (stats.inline_baseline_instrs == 0) {

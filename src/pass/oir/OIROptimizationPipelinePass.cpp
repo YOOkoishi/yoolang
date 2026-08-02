@@ -110,11 +110,15 @@ bool cleanup_after_inline(oir::Module &module, oir_opt::Stats &stats) {
     return changed;
 }
 
-bool run_inline_cleanup_window(oir::Module &module, oir_opt::Stats &stats) {
+bool run_inline_cleanup_window(oir::Module &module, oir_opt::Stats &stats,
+                               bool preserve_guarded_countdown_dce_candidates = false) {
     bool changed = false;
+    oir_opt::InlineOptions inline_options;
+    inline_options.preserve_guarded_countdown_dce_candidates =
+        preserve_guarded_countdown_dce_candidates;
     constexpr unsigned kMaxRounds = 4;
     for (unsigned round = 0; round < kMaxRounds; ++round) {
-        if (!oir_opt::inline_functions(module, stats)) {
+        if (!oir_opt::inline_functions(module, stats, inline_options)) {
             break;
         }
         changed = true;
@@ -148,9 +152,9 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= run_call_specialization_window(module, stats);
     changed |= pre_inline_load_call_cse(module, stats);
     changed |= eliminate_dead_code(module, stats);
-    changed |= run_inline_cleanup_window(module, stats);
+    changed |= run_inline_cleanup_window(module, stats, true);
     changed |= run_call_specialization_window(module, stats);
-    changed |= run_inline_cleanup_window(module, stats);
+    changed |= run_inline_cleanup_window(module, stats, true);
 
     constexpr unsigned kMaxIterations = 8;
     for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {

@@ -62,6 +62,10 @@ enum class SimplifyMode {
     Algebraic,
 };
 
+struct InlineOptions {
+    bool preserve_guarded_countdown_dce_candidates = false;
+};
+
 using ReplacementMap = std::unordered_map<oir::Value *, oir::Value *>;
 
 bool is_scalar_type(oir::Type *type);
@@ -103,7 +107,7 @@ bool global_value_numbering(oir::Module &module, Stats &stats);
 bool pre_inline_load_call_cse(oir::Module &module, Stats &stats);
 bool aggressive_dead_code_elimination(oir::Module &module, Stats &stats);
 bool jump_threading(oir::Module &module, Stats &stats);
-bool inline_functions(oir::Module &module, Stats &stats);
+bool inline_functions(oir::Module &module, Stats &stats, InlineOptions options = {});
 bool specialize_constant_argument_calls(oir::Module &module, Stats &stats);
 bool eliminate_dead_arguments(oir::Module &module, Stats &stats);
 bool propagate_global_constants(oir::Module &module, Stats &stats);

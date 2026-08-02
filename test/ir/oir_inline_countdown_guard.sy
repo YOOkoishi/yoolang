@@ -1,0 +1,139 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model --cost-model-filter=ConstantArgumentSpecialization -O1 %s | FileCheck %s --check-prefix=COST
+
+int data[8];
+
+int pure_plain(int n) {
+  int i = 0;
+  int value = 0;
+  while (i < n) {
+    value = value + i;
+    i = i + 1;
+  }
+  return value;
+}
+
+int pure_const(int seed, int n) {
+  int i = 0;
+  int value = 0;
+  while (i < n) {
+    value = value + i;
+    i = i + 1;
+  }
+  return seed + value;
+}
+
+int visible_value(int n) {
+  putint(n);
+  return n;
+}
+
+int positive_plain() {
+  int n = getarray(data);
+  int result = 0;
+  while (n) {
+    result = pure_plain(n);
+    n = n - 1;
+  }
+  return result;
+}
+
+int positive_const_specialized() {
+  int n = getarray(data);
+  int result = 0;
+  while (n) {
+    result = pure_const(0, n);
+    n = n - 1;
+  }
+  return result;
+}
+
+int recurrence_case() {
+  int n = getarray(data);
+  int result = 0;
+  while (n) {
+    result = result + pure_plain(n);
+    n = n - 1;
+  }
+  return result;
+}
+
+int side_effect_case() {
+  int n = getarray(data);
+  int result = 0;
+  while (n) {
+    result = visible_value(n);
+    n = n - 1;
+  }
+  return result;
+}
+
+int external_phi_case() {
+  int n = getarray(data);
+  int result = 0;
+  while (n) {
+    result = pure_plain(n);
+    n = n - 1;
+  }
+  int selected;
+  if (getint()) {
+    selected = result;
+  } else {
+    selected = 7;
+  }
+  return selected;
+}
+
+int unknown_count_case() {
+  int n = getint();
+  int result = 0;
+  while (n) {
+    result = pure_plain(n);
+    n = n - 1;
+  }
+  return result;
+}
+
+int main() {
+  return positive_plain() + positive_const_specialized();
+}
+
+// OIR-LABEL: define i32 @positive_plain
+// OIR-NOT: %n.loop = phi
+// OIR: countdown.final.{{[0-9]+}}:
+// OIR: call i32 @pure_plain(i32 1)
+// OIR-NOT: %n.loop = phi
+
+// OIR-LABEL: define i32 @positive_const_specialized
+// OIR-NOT: %n.loop = phi
+// OIR: countdown.final.{{[0-9]+}}:
+// OIR: call i32 @__yo_constprop.pure_const.{{[0-9]+}}(i32 1)
+// OIR-NOT: %n.loop = phi
+
+// OIR-LABEL: define i32 @recurrence_case
+// OIR: %n.loop = phi
+// OIR: sub i32 %n.loop, 1
+
+// OIR-LABEL: define i32 @side_effect_case
+// OIR: call void @putint
+// OIR: sub i32
+
+// OIR-LABEL: define i32 @external_phi_case
+// OIR: %n.loop = phi
+// OIR: sub i32 %n.loop, 1
+
+// OIR-LABEL: define i32 @unknown_count_case
+// OIR: %n.loop = phi
+// OIR: sub i32 %n.loop, 1
+
+// The caller clone must be rediscovered in later inline rounds after its result use moves
+// beyond the immediate loop exit.
+// OIR-LABEL: define i32 @main
+// OIR-NOT: %inl.positive_plain.{{.*}}n.loop = phi
+// OIR-NOT: inl.pure_plain.while
+// OIR: call i32 @pure_plain(i32 1)
+// OIR-NOT: %inl.positive_const_specialized.{{.*}}n.loop = phi
+// OIR-NOT: inl.__yo_constprop.pure_const
+// OIR: call i32 @__yo_constprop.pure_const.{{[0-9]+}}(i32 1)
+
+// COST: OIRInlinePass Accept transform=ConstantArgumentSpecialization
