@@ -1,12 +1,12 @@
 #include "pass/yir/YIRPolyhedralDependenceAnalysisPass.h"
 #include "pass/yir/YIRPolyhedralModelBuildPass.h"
+#include "yir/YIR.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <numeric>
 #include <sstream>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -430,7 +430,50 @@ public:
     }
 
 private:
-    using MemoryAccessMap = std::unordered_map<const yir::Value*, std::vector<MemoryStmtAccesses>>;
+    static const yir::Value *canonical_memory_object(const yir::Value *value) {
+        while (value != nullptr) {
+            const auto *def = value->defining_op();
+            if (const auto *elem_addr = dynamic_cast<const yir::ElemAddrOp *>(def)) {
+                value = elem_addr->base();
+                continue;
+            }
+            if (const auto *decay = dynamic_cast<const yir::DecayOp *>(def)) {
+                value = decay->array_address();
+                continue;
+            }
+            break;
+        }
+        return value;
+    }
+
+    static bool is_local_unique_object(const yir::Value *value) {
+        value = canonical_memory_object(value);
+        const auto *def = value == nullptr ? nullptr : value->defining_op();
+        return dynamic_cast<const yir::ArrayVarOp *>(def) != nullptr ||
+               dynamic_cast<const yir::AllocaOp *>(def) != nullptr;
+    }
+
+    static bool is_global_object(const yir::Value *value) {
+        value = canonical_memory_object(value);
+        return value != nullptr && value->defining_op() == nullptr &&
+               !value->name().empty() && value->name().front() == '@';
+    }
+
+    static bool different_bases_noalias(const yir::Value *lhs, const yir::Value *rhs) {
+        lhs = canonical_memory_object(lhs);
+        rhs = canonical_memory_object(rhs);
+        if (lhs == rhs) {
+            return false;
+        }
+        if (is_local_unique_object(lhs) || is_local_unique_object(rhs)) {
+            return true;
+        }
+        return is_global_object(lhs) && is_global_object(rhs);
+    }
+
+    static bool may_alias_memory(const yir::Value *lhs, const yir::Value *rhs) {
+        return lhs == rhs || !different_bases_noalias(lhs, rhs);
+    }
 
     static bool same_reduction_group(const PolyStmt &source, const PolyStmt &target,
                                      const yir::Value *memory) {
@@ -441,35 +484,26 @@ private:
     }
 
     void analyze_scop(const PolyScop& scop, std::vector<PolyDependence>& deps) {
-        MemoryAccessMap accesses_by_memory;
+        // Keep all accesses in one statement-ordered group. Distinct formal
+        // array parameters may name the same (or overlapping) storage, so
+        // grouping solely by Value identity would incorrectly erase their
+        // dependences and make loop interchange/unroll-and-jam unsound.
+        std::vector<MemoryStmtAccesses> accesses;
         for (const auto& stmt : scop.statements) {
-            for (const auto& access : stmt.reads) {
-                add_access(accesses_by_memory, stmt, access, true);
-            }
-            for (const auto& access : stmt.writes) {
-                add_access(accesses_by_memory, stmt, access, false);
-            }
-        }
-
-        for (const auto& entry : accesses_by_memory) {
-            analyze_memory_group(scop, entry.second, deps);
-        }
-    }
-
-    void add_access(MemoryAccessMap& accesses_by_memory, const PolyStmt& stmt,
-                    const PolyAccess& access, bool is_read) {
-        auto& accesses = accesses_by_memory[access.memory];
-        if (accesses.empty() || accesses.back().stmt != &stmt) {
             MemoryStmtAccesses stmt_accesses;
             stmt_accesses.stmt = &stmt;
-            accesses.push_back(std::move(stmt_accesses));
+            for (const auto& access : stmt.reads) {
+                stmt_accesses.reads.push_back(&access);
+            }
+            for (const auto& access : stmt.writes) {
+                stmt_accesses.writes.push_back(&access);
+            }
+            if (!stmt_accesses.reads.empty() || !stmt_accesses.writes.empty()) {
+                accesses.push_back(std::move(stmt_accesses));
+            }
         }
 
-        if (is_read) {
-            accesses.back().reads.push_back(&access);
-        } else {
-            accesses.back().writes.push_back(&access);
-        }
+        analyze_memory_group(scop, accesses, deps);
     }
 
     void analyze_memory_group(const PolyScop &scop,
@@ -499,7 +533,18 @@ private:
                         std::vector<PolyDependence>& deps) {
         for (const auto* src_acc : source_accesses) {
             for (const auto* tgt_acc : target_accesses) {
+                if (!may_alias_memory(src_acc->memory, tgt_acc->memory)) {
+                    continue;
+                }
                 if (src_acc->memory != tgt_acc->memory) {
+                    // Different parameters may also be offset views into the
+                    // same allocation. Their logical subscripts therefore do
+                    // not provide a sound equality relation. Record an
+                    // unknown dependence instead of applying the GCD test.
+                    PolyDependence dep = make_dependence(
+                        scop, source, target, *src_acc, *tgt_acc, kind);
+                    dep.relation.exact = false;
+                    append_dependence(deps, std::move(dep));
                     continue;
                 }
                 if (can_prove_empty_dependence(source, target, *src_acc, *tgt_acc)) {

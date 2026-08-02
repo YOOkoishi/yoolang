@@ -1,0 +1,31 @@
+// RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
+
+int a[64][64];
+int c[64];
+
+int side_effect_rows() {
+  int j = 0;
+  while (j < 64) {
+    int k = 0;
+    int sum = 0;
+    while (k < 64) {
+      if (getint() != 0) {
+        sum = sum + a[j][k];
+      }
+      k = k + 1;
+    }
+    c[j] = sum;
+    j = j + 1;
+  }
+  return c[0];
+}
+
+int main() {
+  return side_effect_rows();
+}
+
+// CHECK-LABEL: yir.func @side_effect_rows
+// CHECK-NOT: poly.reduction.output_step
+// CHECK: yir.for %j =
+// CHECK: yir.for %k =
+// CHECK: yir.call @getint

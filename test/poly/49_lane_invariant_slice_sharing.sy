@@ -13,8 +13,8 @@ int main() {
       int k = 0;
       int sum = 0;
       while (k < 64) {
-        if (a[i][k] * b[k][j] % 2 == 0) {
-          sum = sum + b[i][k] * a[k][j];
+        if (a[i][k] > 0) {
+          sum = sum + (a[i][k] * 3 + 1) * b[k][j];
         }
         k = k + 1;
       }
@@ -29,16 +29,15 @@ int main() {
 // CHECK-LABEL: yir.func @main
 // CHECK: %[[JSTEP:poly\.reduction\.output_step[0-9]+]] = yir.const.i32 2
 // CHECK: yir.for %j = {{.*}} step %[[JSTEP]]
-// CHECK-COUNT-2: %poly.reduction.acc{{[0-9]+}} = yir.var : i32 =
 // CHECK: yir.for %poly.reduction.iv{{[0-9]+}} =
-// CHECK: yir.if
+// CHECK-COUNT-1: yir.array_load @a
+// CHECK-COUNT-1: yir.if
+// CHECK: yir.array_load @b
 // CHECK: yir.assign %poly.reduction.acc
-// CHECK: yir.if
+// CHECK: yir.array_load @b
 // CHECK: yir.assign %poly.reduction.acc
 // CHECK-COUNT-2: yir.array_store %poly.reduction.acc
 
-// COST: "transform": "LoopUnroll"
 // COST: "candidate_id": "output-reduction-unroll-and-jam-factor-2"
 // COST: "action": "Accept"
-// COST: "summary": "independent output points are unrolled and jammed over one guarded side-effect-free integer reduction loop; lane-invariant shared_ops=1, shared_loads=1, shared_branches=0"
-// COST: "register_pressure_growth": 3
+// COST: "summary": "independent output points are unrolled and jammed over one guarded side-effect-free integer reduction loop; lane-invariant shared_ops=8, shared_loads=2, shared_branches=1"

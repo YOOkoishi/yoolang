@@ -1,4 +1,5 @@
 // RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-poly -O1 --polyhedral %s | FileCheck %s --check-prefix=POLY
 
 int big_a[200][200];
 int big_b[200][200];
@@ -6,6 +7,8 @@ int mid_a[32][32];
 int mid_b[32][32];
 int flat_a[64];
 int flat_b[64];
+int recurrence_state[1][1];
+int recurrence_sink[32][32];
 
 int tiled_copy() {
   int i = 0;
@@ -33,6 +36,36 @@ int interchange_copy() {
     i = i + 1;
   }
   return mid_b[0][0];
+}
+
+int aliasing_params_keep_order(int lhs[][32], int rhs[][32]) {
+  int i = 0;
+  int j = 0;
+  while (i < 32) {
+    j = 0;
+    while (j < 32) {
+      lhs[i][j] = rhs[j][i] + rhs[j][i] + rhs[j][i];
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return lhs[1][0] + lhs[0][1];
+}
+
+int keep_loop_carried_order() {
+  int i = 0;
+  int j = 0;
+  recurrence_state[0][0] = 1;
+  while (i < 32) {
+    j = 0;
+    while (j < 32) {
+      recurrence_state[0][0] = recurrence_state[0][0] * 2 + i;
+      recurrence_sink[j][i] = i + j;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return recurrence_state[0][0];
 }
 
 int unroll_jam_copy() {
@@ -87,7 +120,7 @@ int repeat_keeps_live_iv(int n) {
 
 int main() {
   return tiled_copy() + interchange_copy() + unroll_jam_copy() + lane_copy_sum() +
-         repeat_invariant_sum(3) + repeat_keeps_live_iv(3);
+         repeat_invariant_sum(3) + repeat_keeps_live_iv(3) + keep_loop_carried_order();
 }
 
 // YIR-LABEL: yir.func @tiled_copy
@@ -99,6 +132,18 @@ int main() {
 // YIR-LABEL: yir.func @interchange_copy
 // YIR: yir.for %j =
 // YIR: yir.for %i =
+
+// YIR-LABEL: yir.func @aliasing_params_keep_order
+// YIR-NOT: .jam.
+// YIR: yir.for %i =
+// YIR: yir.for %j =
+
+// POLY: dependence WAR stmt #{{[0-9]+}} -> stmt #{{[0-9]+}} memory=%rhs.arg dependent=true distance=unknown relation={{.*}}exact=false
+
+// YIR-LABEL: yir.func @keep_loop_carried_order
+// YIR: yir.for %i =
+// YIR: yir.for %j =
+// YIR: yir.array_store {{.*}}, @recurrence_state
 
 // YIR-LABEL: yir.func @unroll_jam_copy
 // YIR: .jam.step = yir.const.i32 2

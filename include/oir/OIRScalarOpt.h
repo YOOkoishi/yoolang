@@ -40,6 +40,8 @@ struct Stats {
     unsigned loop_bound_tighten = 0;
     unsigned specialized = 0;
     unsigned cost_model_candidates = 0;
+    std::int64_t inline_code_growth = 0;
+    std::int64_t inline_baseline_instrs = 0;
 
     // Recursive inlining is deliberately a single, bounded phase per function.  The
     // aggressive pipeline may revisit ordinary inlining after cleanup, but restarting

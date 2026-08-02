@@ -30,13 +30,13 @@ int main() {
 // POLY: statements: 4
 // POLY: stmt #0 op=yir.array_store
 // POLY: schedule-map: [%i] -> [{{[0-9]+}}, %i, {{[0-9]+}}, 0, 0, 0]
-// POLY: schedule-matrix: [[0, 0], [1, 0], [0, 0], [0, 0], [0, 0], [0, 0]] constants=[{{[0-9]+}}, 0, 0, 0, 0, 0] valid=true
+// POLY: schedule-matrix: {{\[\[0, 0\], \[1, 0\], \[0, 0\], \[0, 0\], \[0, 0\], \[0, 0\]\]}} constants=[{{[0-9]+}}, 0, 0, 0, 0, 0] valid=true
 // POLY: stmt #1 op=yir.array_load
 // POLY: schedule-map: [%i, %j] -> [{{[0-9]+}}, %i, {{[0-9]+}}, %j, {{[0-9]+}}, 1]
-// POLY: schedule-matrix: [[0, 0], [1, 0], [0, 0], [0, 1], [0, 0], [0, 0]] constants=[{{[0-9]+}}, 0, {{[0-9]+}}, 0, 0, 1] valid=true
+// POLY: schedule-matrix: {{\[\[0, 0\], \[1, 0\], \[0, 0\], \[0, 1\], \[0, 0\], \[0, 0\]\]}} constants=[{{[0-9]+}}, 0, {{[0-9]+}}, 0, 0, 1] valid=true
 // POLY: stmt #2 op=yir.array_store
 // POLY: schedule-map: [%i, %j] -> [{{[0-9]+}}, %i, {{[0-9]+}}, %j, {{[0-9]+}}, 2]
 // POLY: stmt #3 op=yir.array_store
 // POLY: schedule-map: [%i] -> [{{[0-9]+}}, %i, {{[0-9]+}}, 0, 0, 3]
-// POLY: schedule-matrix: [[0, 0], [1, 0], [0, 0], [0, 0], [0, 0], [0, 0]] constants=[{{[0-9]+}}, 0, {{[0-9]+}}, 0, 0, 3] valid=true
+// POLY: schedule-matrix: {{\[\[0, 0\], \[1, 0\], \[0, 0\], \[0, 0\], \[0, 0\], \[0, 0\]\]}} constants=[{{[0-9]+}}, 0, {{[0-9]+}}, 0, 0, 3] valid=true
 // POLY: dependence RAW stmt #0 -> stmt #1 memory=@a dependent=true distance=unknown relation={source=[%i], target=[%i, %j], params=[%n], disjuncts={{[1-9][0-9]*}}, exact=true}

@@ -61,6 +61,16 @@ int stack_call_latch_dynamic_offset(int n, int base) {
   return acc;
 }
 
+int shared_constant_offset_lsr(int n, int a[], int b[]) {
+  int i = 0;
+  int acc = 0;
+  while (i < n) {
+    acc = acc + a[i] + a[i + 1] + b[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
 // OIR-LABEL: define i32 @dynamic_stride_lsr
 // OIR-NOT: mul i32 %j.loop
 // OIR: %a.addr.ptr = phi
@@ -89,3 +99,8 @@ int stack_call_latch_dynamic_offset(int n, int base) {
 // OIR-NOT: .stack.ptr
 // OIR: call void @putint
 // OIR-NOT: .stack.ptr
+
+// OIR-LABEL: define i32 @shared_constant_offset_lsr
+// OIR-COUNT-2: .ptr = phi
+// OIR-NOT: .ptr = phi
+// OIR: .shared.off = gep i32* %{{.*}}.ptr, i32

@@ -18,7 +18,6 @@
 #include "pass/yir/YIRMemoryForwardingPass.h"
 #include "pass/yir/YIRPolyhedralDumpPass.h"
 #include "pass/yir/YIRPolyhedralPipelinePass.h"
-#include "pass/yir/YIRPolyhedralTransformPass.h"
 #include "pass/yir/YIRToOIRPass.h"
 #include "pass/yir/YIRViewPass.h"
 
@@ -82,7 +81,8 @@ void add_ast_pipeline(pass::PassManager &pm, const CliOptions &options, std::ost
                         pass::YIRPolyhedralPipelineMode::Force, false);
                     pm.add_pass<pass::YIRPolyhedralDumpPass>(out);
                     if (needs_post_poly_yir_pipeline(options)) {
-                        pm.add_pass<pass::YIRPolyhedralTransformPass>();
+                        pm.add_pass<pass::YIRPolyhedralPipelinePass>(
+                            pass::YIRPolyhedralPipelineMode::Force);
                     }
                 } else {
                     pm.add_pass<pass::YIRPolyhedralPipelinePass>(

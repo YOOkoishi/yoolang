@@ -33,6 +33,47 @@ bool const_i32_value(const Value *value, std::int64_t &out) {
     return false;
 }
 
+const Value *canonical_memory_object(const Value *value) {
+    while (value != nullptr) {
+        const auto *def = value->defining_op();
+        if (const auto *elem_addr = dynamic_cast<const ElemAddrOp *>(def)) {
+            value = elem_addr->base();
+            continue;
+        }
+        if (const auto *decay = dynamic_cast<const DecayOp *>(def)) {
+            value = decay->array_address();
+            continue;
+        }
+        break;
+    }
+    return value;
+}
+
+bool is_local_unique_object(const Value *value) {
+    value = canonical_memory_object(value);
+    auto *def = value == nullptr ? nullptr : value->defining_op();
+    return dynamic_cast<const ArrayVarOp *>(def) != nullptr ||
+           dynamic_cast<const AllocaOp *>(def) != nullptr;
+}
+
+bool is_global_object(const Value *value) {
+    value = canonical_memory_object(value);
+    return value != nullptr && value->defining_op() == nullptr &&
+           !value->name().empty() && value->name().front() == '@';
+}
+
+bool different_bases_noalias(const Value *lhs, const Value *rhs) {
+    lhs = canonical_memory_object(lhs);
+    rhs = canonical_memory_object(rhs);
+    if (lhs == rhs) {
+        return false;
+    }
+    if (is_local_unique_object(lhs) || is_local_unique_object(rhs)) {
+        return true;
+    }
+    return is_global_object(lhs) && is_global_object(rhs);
+}
+
 const ICmpOp *while_condition_compare(const WhileOp &op) {
     auto *cond = terminating_cond(op.cond_region());
     if (cond == nullptr || cond->condition() == nullptr) {
@@ -376,8 +417,13 @@ class Analyzer final {
                     continue;
                 }
                 if (lhs.array != rhs.array) {
-                    summary.dependencies.push_back({i, j, DependenceKind::Independent,
-                                                    "different base arrays"});
+                    const bool noalias = different_bases_noalias(lhs.array, rhs.array);
+                    summary.dependencies.push_back(
+                        {i, j,
+                         noalias ? DependenceKind::Independent
+                                 : DependenceKind::Unknown,
+                         noalias ? "different unique base arrays"
+                                 : "different bases may alias"});
                     continue;
                 }
                 summary.dependencies.push_back({i, j, classify_access_pair(lhs, rhs),

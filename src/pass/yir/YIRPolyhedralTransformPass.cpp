@@ -409,25 +409,44 @@ std::size_t wave_unroll_operation_count(const yir::Region &region) {
     return count;
 }
 
-std::size_t array_load_count(const yir::Region &region) {
-    std::size_t count = 0;
+struct ReductionBodyMetrics {
+    std::size_t total_loads = 0;
+    std::size_t peak_region_loads = 0;
+    std::size_t branches = 0;
+    bool guarded = false;
+};
+
+ReductionBodyMetrics reduction_body_metrics(const yir::Region &region) {
+    ReductionBodyMetrics metrics;
+    std::size_t direct_loads = 0;
     for (const auto &op : region.operations()) {
-        count += dynamic_cast<const yir::ArrayLoadOp *>(op.get()) != nullptr ? 1 : 0;
-        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
-            count += array_load_count(if_op->then_region());
-            if (if_op->has_else()) {
-                count += array_load_count(if_op->else_region());
-            }
+        if (dynamic_cast<const yir::ArrayLoadOp *>(op.get()) != nullptr) {
+            ++direct_loads;
+            ++metrics.total_loads;
+            continue;
+        }
+        auto *if_op = dynamic_cast<const yir::IfOp *>(op.get());
+        if (if_op == nullptr) {
+            continue;
+        }
+
+        metrics.guarded = true;
+        ++metrics.branches;
+        const auto merge_child = [&](const yir::Region &child) {
+            const auto child_metrics = reduction_body_metrics(child);
+            metrics.total_loads += child_metrics.total_loads;
+            metrics.peak_region_loads =
+                std::max(metrics.peak_region_loads, child_metrics.peak_region_loads);
+            metrics.branches += child_metrics.branches;
+            metrics.guarded = metrics.guarded || child_metrics.guarded;
+        };
+        merge_child(if_op->then_region());
+        if (if_op->has_else()) {
+            merge_child(if_op->else_region());
         }
     }
-    return count;
-}
-
-bool region_contains_if(const yir::Region &region) {
-    return std::any_of(region.operations().begin(), region.operations().end(),
-                       [](const auto &op) {
-                           return dynamic_cast<const yir::IfOp *>(op.get()) != nullptr;
-                       });
+    metrics.peak_region_loads = std::max(metrics.peak_region_loads, direct_loads);
+    return metrics;
 }
 
 bool clone_wave_unroll_prefix_into(const yir::Region &source, yir::Region &dest,
@@ -966,6 +985,266 @@ bool value_depends_on_value(const yir::Value *value, const yir::Value *needle,
 bool value_depends_on_value(const yir::Value *value, const yir::Value *needle) {
     std::unordered_set<const yir::Value *> visiting;
     return value_depends_on_value(value, needle, visiting);
+}
+
+struct LaneInvariantSliceMetrics {
+    std::size_t operations = 0;
+    std::size_t loads = 0;
+    std::size_t branches = 0;
+    std::size_t live_values = 0;
+};
+
+struct LaneInvariantSliceInfo {
+    std::unordered_set<const yir::Value *> values;
+    std::unordered_set<const yir::IfOp *> controls;
+    LaneInvariantSliceMetrics metrics;
+};
+
+bool is_lane_shareable_pure_operation(const yir::Operation &op) {
+    return dynamic_cast<const yir::ConstI32Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::ConstF32Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::ConstBoolOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ZeroOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ArrayLoadOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::BinaryOpBase *>(&op) != nullptr ||
+           dynamic_cast<const yir::ZExtI1ToI32Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::TruncI32ToI1Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::SIToFPOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::FPToSIOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ToBoolOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::NotOp *>(&op) != nullptr;
+}
+
+bool lane_shared_value_needs_register(const yir::Operation &op) {
+    return dynamic_cast<const yir::ConstI32Op *>(&op) == nullptr &&
+           dynamic_cast<const yir::ConstF32Op *>(&op) == nullptr &&
+           dynamic_cast<const yir::ConstBoolOp *>(&op) == nullptr &&
+           dynamic_cast<const yir::ZeroOp *>(&op) == nullptr;
+}
+
+void collect_region_operations(
+    const yir::Region &region,
+    std::unordered_set<const yir::Operation *> &operations) {
+    for (const auto &op : region.operations()) {
+        operations.insert(op.get());
+        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+            collect_region_operations(if_op->then_region(), operations);
+            if (if_op->has_else()) {
+                collect_region_operations(if_op->else_region(), operations);
+            }
+        }
+    }
+}
+
+bool is_lane_invariant_slice_value(
+    const yir::Value *value, const yir::Value *output_iv,
+    const yir::Value *accumulator,
+    const std::unordered_set<const yir::Operation *> &region_operations,
+    std::unordered_map<const yir::Value *, bool> &memo,
+    std::unordered_set<const yir::Value *> &visiting) {
+    if (value == nullptr || value == output_iv || value == accumulator) {
+        return false;
+    }
+    if (auto found = memo.find(value); found != memo.end()) {
+        return found->second;
+    }
+    if (!visiting.insert(value).second) {
+        return false;
+    }
+
+    auto *def = value->defining_op();
+    if (def == nullptr || region_operations.count(def) == 0) {
+        const bool invariant =
+            !value_depends_on_value(value, output_iv) &&
+            !value_depends_on_value(value, accumulator);
+        visiting.erase(value);
+        memo.emplace(value, invariant);
+        return invariant;
+    }
+    if (!is_lane_shareable_pure_operation(*def)) {
+        visiting.erase(value);
+        memo.emplace(value, false);
+        return false;
+    }
+
+    const bool invariant = std::all_of(
+        def->operands().begin(), def->operands().end(),
+        [&](const yir::Value *operand) {
+            return is_lane_invariant_slice_value(
+                operand, output_iv, accumulator, region_operations, memo,
+                visiting);
+        });
+    visiting.erase(value);
+    memo.emplace(value, invariant);
+    return invariant;
+}
+
+void collect_lane_invariant_slices(
+    const yir::Region &region, const yir::Value *output_iv,
+    const yir::Value *accumulator,
+    const std::unordered_set<const yir::Operation *> &region_operations,
+    std::unordered_map<const yir::Value *, bool> &memo,
+    LaneInvariantSliceInfo &info) {
+    for (const auto &op : region.operations()) {
+        if (op->result() != nullptr) {
+            std::unordered_set<const yir::Value *> visiting;
+            if (is_lane_invariant_slice_value(
+                    op->result(), output_iv, accumulator, region_operations,
+                    memo, visiting)) {
+                info.values.insert(op->result());
+                ++info.metrics.operations;
+                if (dynamic_cast<const yir::ArrayLoadOp *>(op.get()) != nullptr) {
+                    ++info.metrics.loads;
+                }
+                if (lane_shared_value_needs_register(*op)) {
+                    ++info.metrics.live_values;
+                }
+            }
+        }
+
+        auto *if_op = dynamic_cast<const yir::IfOp *>(op.get());
+        if (if_op == nullptr) {
+            continue;
+        }
+        std::unordered_set<const yir::Value *> visiting;
+        if (!is_lane_invariant_slice_value(
+                if_op->condition(), output_iv, accumulator, region_operations,
+                memo, visiting)) {
+            continue;
+        }
+        info.controls.insert(if_op);
+        ++info.metrics.operations;
+        ++info.metrics.branches;
+        collect_lane_invariant_slices(
+            if_op->then_region(), output_iv, accumulator, region_operations,
+            memo, info);
+        if (if_op->has_else()) {
+            collect_lane_invariant_slices(
+                if_op->else_region(), output_iv, accumulator,
+                region_operations, memo, info);
+        }
+    }
+}
+
+LaneInvariantSliceInfo analyze_lane_invariant_slices(
+    const yir::Region &region, const yir::Value *output_iv,
+    const yir::Value *accumulator) {
+    std::unordered_set<const yir::Operation *> region_operations;
+    collect_region_operations(region, region_operations);
+    std::unordered_map<const yir::Value *, bool> memo;
+    LaneInvariantSliceInfo info;
+    collect_lane_invariant_slices(
+        region, output_iv, accumulator, region_operations, memo, info);
+    return info;
+}
+
+bool mapped_value_is_common(const yir::Value *value,
+                            const std::vector<ValueMap> &lane_maps) {
+    if (lane_maps.empty()) {
+        return false;
+    }
+    auto *common = map_value(const_cast<yir::Value *>(value), lane_maps.front());
+    return std::all_of(
+        lane_maps.begin() + 1, lane_maps.end(),
+        [&](const ValueMap &map) {
+            return map_value(const_cast<yir::Value *>(value), map) == common;
+        });
+}
+
+bool mapped_operands_are_common(const yir::Operation &op,
+                                const std::vector<ValueMap> &lane_maps) {
+    return std::all_of(
+        op.operands().begin(), op.operands().end(),
+        [&](const yir::Value *operand) {
+            return mapped_value_is_common(operand, lane_maps);
+        });
+}
+
+bool clone_unroll_jammed_region_into(
+    const yir::Region &source, yir::Region &dest,
+    std::vector<ValueMap> &lane_maps,
+    const LaneInvariantSliceInfo &shared_slices) {
+    if (lane_maps.empty()) {
+        return false;
+    }
+
+    // Preserve each lane's local value chain until a shared or effectful
+    // boundary, so lane predicates do not all stay live at once.
+    std::vector<const yir::Operation *> lane_variant_batch;
+    const auto flush_lane_variant_batch = [&]() {
+        for (auto &map : lane_maps) {
+            for (const auto *source_op : lane_variant_batch) {
+                auto clone = clone_wave_unroll_op(*source_op, map);
+                if (clone == nullptr) {
+                    return false;
+                }
+                clone->set_parent(&dest);
+                if (source_op->result() != nullptr && clone->result() != nullptr) {
+                    map[source_op->result()] = clone->result();
+                }
+                dest.operations().push_back(std::move(clone));
+            }
+        }
+        lane_variant_batch.clear();
+        return true;
+    };
+
+    for (const auto &op : source.operations()) {
+        if (op->result() != nullptr &&
+            shared_slices.values.count(op->result()) != 0 &&
+            mapped_operands_are_common(*op, lane_maps)) {
+            if (!flush_lane_variant_batch()) {
+                return false;
+            }
+            auto clone = clone_wave_unroll_op(*op, lane_maps.front());
+            if (clone == nullptr || clone->result() == nullptr) {
+                return false;
+            }
+            clone->set_parent(&dest);
+            auto *shared_result = clone->result();
+            for (auto &map : lane_maps) {
+                map[op->result()] = shared_result;
+            }
+            dest.operations().push_back(std::move(clone));
+            continue;
+        }
+
+        auto *if_op = dynamic_cast<const yir::IfOp *>(op.get());
+        if (if_op != nullptr &&
+            shared_slices.controls.count(if_op) != 0 &&
+            mapped_value_is_common(if_op->condition(), lane_maps)) {
+            if (!flush_lane_variant_batch()) {
+                return false;
+            }
+            auto clone = std::make_unique<yir::IfOp>(
+                map_value(if_op->condition(), lane_maps.front()));
+            clone->set_parent(&dest);
+
+            auto then_maps = lane_maps;
+            if (!clone_unroll_jammed_region_into(
+                    if_op->then_region(), clone->then_region(), then_maps,
+                    shared_slices)) {
+                return false;
+            }
+            if (if_op->has_else()) {
+                clone->set_has_else(true);
+                auto else_maps = lane_maps;
+                if (!clone_unroll_jammed_region_into(
+                        if_op->else_region(), clone->else_region(), else_maps,
+                        shared_slices)) {
+                    return false;
+                }
+            }
+            dest.operations().push_back(std::move(clone));
+            continue;
+        }
+
+        lane_variant_batch.push_back(op.get());
+        if (op->result() == nullptr && !flush_lane_variant_batch()) {
+            return false;
+        }
+    }
+    return flush_lane_variant_batch();
 }
 
 bool region_uses_value(const yir::Region &region, const yir::Value *value) {
@@ -1674,16 +1953,34 @@ public:
           num_dead_pure_results_(0), num_unused_globals_(0),
           num_relation_legality_proofs_(0), num_relation_legality_rejections_(0),
           num_relation_legality_unknown_(0), num_domain_partitions_(0),
-          num_reduction_privatizations_(0), num_accumulator_promotions_(0) {}
+          num_reduction_privatizations_(0), num_output_reduction_unroll_jams_(0),
+          num_lane_invariant_ops_shared_(0) {}
 
-    bool transform() {
-        bool changed = try_loop_fusion();
-
-        for (auto& scop : model_info_.models) {
-            if (fused_scope_ids_.count(scop.id) != 0) {
-                continue;
+    bool transform(YIRPolyhedralTransformMode mode) {
+        bool changed = false;
+        if (mode != YIRPolyhedralTransformMode::Local) {
+            changed = try_loop_fusion();
+            if (changed) {
+                structural_change_ = YIRPolyhedralStructuralChange::Fusion;
+                // Fusion changes SCoP ownership and invalidates statement
+                // operation pointers. The pipeline rebuilds all polyhedral
+                // analyses before considering another structural transform.
+                return true;
             }
-            changed |= try_interchange_or_tile(scop);
+
+            for (auto& scop : model_info_.models) {
+                changed |= try_interchange_or_tile(scop);
+            }
+            if (changed) {
+                structural_change_ = YIRPolyhedralStructuralChange::Schedule;
+                if (mode == YIRPolyhedralTransformMode::Structural) {
+                    return true;
+                }
+            }
+        }
+
+        if (mode == YIRPolyhedralTransformMode::Structural) {
+            return changed;
         }
 
         auto for_body_owners = collect_for_body_owners(module_);
@@ -1714,7 +2011,7 @@ public:
         changed |= eliminate_dead_pure_results();
         changed |= eliminate_unused_globals();
         changed |= try_reduction_privatizations();
-        changed |= try_output_accumulator_promotions();
+        changed |= try_output_reduction_unroll_jams();
         // This code regeneration consumes statement-domain information and
         // invalidates statement operation pointers, so it intentionally runs
         // after all model-driven transforms.
@@ -1744,8 +2041,11 @@ public:
     std::size_t num_reduction_privatizations() const {
         return num_reduction_privatizations_;
     }
-    std::size_t num_accumulator_promotions() const {
-        return num_accumulator_promotions_;
+    std::size_t num_output_reduction_unroll_jams() const {
+        return num_output_reduction_unroll_jams_;
+    }
+    std::size_t num_lane_invariant_ops_shared() const {
+        return num_lane_invariant_ops_shared_;
     }
     std::size_t num_relation_legality_proofs() const {
         return num_relation_legality_proofs_;
@@ -1756,9 +2056,20 @@ public:
     std::size_t num_relation_legality_unknown() const {
         return num_relation_legality_unknown_;
     }
+    YIRPolyhedralStructuralChange structural_change() const {
+        return structural_change_;
+    }
 
 private:
-    struct OutputAccumulatorPromotion {
+    struct OutputReductionUnrollJam {
+        enum class LaneLowering {
+            Scalar,
+            // TODO(rvv): select this lowering when vector semantics and target
+            // feature plumbing are available. Legality remains shared with the
+            // scalar register-blocked form.
+            RVV,
+        };
+
         yir::ForOp *output_loop = nullptr;
         yir::AssignOp *reduction_reset = nullptr;
         yir::VarOp *reduction_induction_var = nullptr;
@@ -1767,7 +2078,19 @@ private:
         yir::ArrayStoreOp *output_store = nullptr;
         int factor = 0;
         bool needs_runtime_tail = false;
+        bool guarded = false;
+        LaneLowering lowering = LaneLowering::Scalar;
+        LaneInvariantSliceInfo shared_slices;
     };
+
+    static OutputReductionUnrollJam::LaneLowering
+    choose_reduction_lane_lowering(const ReductionBodyMetrics &metrics) {
+        (void)metrics;
+        // TODO(rvv): consult target vector features and a vector cost model.
+        // The candidate legality contract intentionally does not depend on the
+        // eventual scalar or RVV lowering.
+        return OutputReductionUnrollJam::LaneLowering::Scalar;
+    }
 
     static bool output_load_is_lane_local(
         const yir::ArrayLoadOp &load, const yir::ArrayStoreOp &store,
@@ -1833,7 +2156,7 @@ private:
         return true;
     }
 
-    void record_accumulator_promotion_rejection(
+    void record_output_reduction_unroll_jam_rejection(
         const yir::ForOp &output_loop, std::string summary) const {
         if (cost_report_ == nullptr) {
             return;
@@ -1847,7 +2170,7 @@ private:
         decision.transform = std::string(
             cost_model::to_string(cost_model::TransformKind::LoopUnroll));
         decision.pass_name = "YIRPolyhedralTransformPass";
-        decision.candidate_id = "output-accumulator-promotion";
+        decision.candidate_id = "output-reduction-unroll-and-jam";
         decision.scope = output_loop.induction_var() == nullptr
                              ? "loop"
                              : output_loop.induction_var()->name();
@@ -1858,9 +2181,11 @@ private:
         cost_report_->decisions.push_back(std::move(decision));
     }
 
-    bool accumulator_promotion_is_profitable(
+    bool output_reduction_unroll_jam_is_profitable(
         const yir::ForOp &output_loop, const yir::ForOp &reduction_loop,
-        int factor, std::size_t body_cost, std::size_t loads) const {
+        int factor, std::size_t body_cost,
+        const ReductionBodyMetrics &body_metrics,
+        const LaneInvariantSliceMetrics &shared_metrics) const {
         std::int64_t reduction_lower = 0;
         std::int64_t reduction_upper = 0;
         std::int64_t reduction_step = 0;
@@ -1877,18 +2202,27 @@ private:
         }
 
         const auto target = active_target_profile();
-        const auto body_cycles = static_cast<std::int64_t>(body_cost) +
-                                 static_cast<std::int64_t>(loads) *
-                                     std::max(0, target.load - target.alu_i32);
+        const auto body_cycles =
+            static_cast<std::int64_t>(body_cost) +
+            static_cast<std::int64_t>(body_metrics.total_loads) *
+                std::max(0, target.load - target.alu_i32) +
+            static_cast<std::int64_t>(body_metrics.branches) *
+                std::max(0, target.unpredictable_branch - target.alu_i32);
         const auto loop_control_cycles =
             static_cast<std::int64_t>(target.branch + 2 * target.alu_i32);
+        const auto shared_cycles =
+            static_cast<std::int64_t>(shared_metrics.operations) +
+            static_cast<std::int64_t>(shared_metrics.loads) *
+                std::max(0, target.load - target.alu_i32) +
+            static_cast<std::int64_t>(shared_metrics.branches) *
+                std::max(0, target.unpredictable_branch - target.alu_i32);
 
         cost_model::TransformCandidate model_candidate;
         model_candidate.kind = cost_model::TransformKind::LoopUnroll;
         model_candidate.stage = cost_model::CostIRStage::YIR;
         model_candidate.pass_name = "YIRPolyhedralTransformPass";
         model_candidate.candidate_id =
-            "output-accumulator-promotion-factor-" + std::to_string(factor);
+            "output-reduction-unroll-and-jam-factor-" + std::to_string(factor);
         model_candidate.scope = output_loop.induction_var() == nullptr
                                     ? "loop"
                                     : output_loop.induction_var()->name();
@@ -1900,13 +2234,21 @@ private:
         model_candidate.frequency.confidence = exact_reduction_trip ? 0.92 : 0.68;
         model_candidate.proof.kind = cost_model::ProofKind::Structural;
         model_candidate.proof.status = cost_model::ProofStatus::Proven;
-        model_candidate.proof.summary =
-            "independent output points share one side-effect-free integer reduction loop";
+        std::ostringstream proof;
+        proof << "independent output points are unrolled and jammed over one "
+              << (body_metrics.guarded ? "guarded " : "")
+              << "side-effect-free integer reduction loop"
+              << "; lane-invariant shared_ops=" << shared_metrics.operations
+              << ", shared_loads=" << shared_metrics.loads
+              << ", shared_branches=" << shared_metrics.branches;
+        model_candidate.proof.summary = proof.str();
 
         auto &before = model_candidate.before;
         before.static_instrs = static_cast<std::int64_t>(body_cost) + 3;
-        before.loads = static_cast<std::int64_t>(loads);
-        before.branches = 1;
+        before.loads = static_cast<std::int64_t>(body_metrics.total_loads);
+        before.branches = 1 + static_cast<std::int64_t>(body_metrics.branches);
+        before.max_live_values =
+            static_cast<std::int64_t>(body_metrics.peak_region_loads) + 3;
         before.estimated_cycles =
             static_cast<std::int64_t>(factor) * reduction_trip *
             (body_cycles + loop_control_cycles);
@@ -1914,22 +2256,43 @@ private:
         auto &after = model_candidate.after;
         after.static_instrs =
             static_cast<std::int64_t>(factor) * static_cast<std::int64_t>(body_cost) +
-            factor * 2 + 3;
-        after.loads = static_cast<std::int64_t>(factor) *
-                      static_cast<std::int64_t>(loads);
-        after.branches = 1;
+            factor * 2 + 3 -
+            static_cast<std::int64_t>(factor - 1) *
+                static_cast<std::int64_t>(shared_metrics.operations);
+        after.loads =
+            static_cast<std::int64_t>(factor) *
+                static_cast<std::int64_t>(body_metrics.total_loads) -
+            static_cast<std::int64_t>(factor - 1) *
+                static_cast<std::int64_t>(shared_metrics.loads);
+        after.branches =
+            1 + static_cast<std::int64_t>(factor) *
+                    static_cast<std::int64_t>(body_metrics.branches) -
+            static_cast<std::int64_t>(factor - 1) *
+                static_cast<std::int64_t>(shared_metrics.branches);
+        after.max_live_values =
+            before.max_live_values +
+            2 * static_cast<std::int64_t>(factor - 1) +
+            static_cast<std::int64_t>(shared_metrics.live_values);
         after.estimated_cycles =
             reduction_trip *
-                (static_cast<std::int64_t>(factor) * body_cycles +
+                (static_cast<std::int64_t>(factor) * body_cycles -
+                 static_cast<std::int64_t>(factor - 1) * shared_cycles +
                  loop_control_cycles) +
             factor * 2;
 
         model_candidate.risk.code_growth =
             after.static_instrs - before.static_instrs;
-        model_candidate.risk.live_range_growth = factor - 1;
+        model_candidate.risk.live_range_growth =
+            2 * static_cast<std::int64_t>(factor - 1) +
+            static_cast<std::int64_t>(shared_metrics.live_values);
+        // The lanes execute sequentially inside one reduction iteration. Loads
+        // in mutually nested control regions are not simultaneously live, so
+        // total load count is a poor pressure proxy for guarded reductions.
+        // Only the additional lane accumulator and output index remain live
+        // across the shared reduction loop for each extra lane.
         model_candidate.risk.register_pressure_growth =
-            static_cast<std::int64_t>(factor - 1) *
-            static_cast<std::int64_t>(loads + 1);
+            2 * static_cast<std::int64_t>(factor - 1) +
+            static_cast<std::int64_t>(shared_metrics.live_values);
         model_candidate.required_cleanup_passes = {
             "YIRMemoryForwardingPass", "YIRLoopOptimizationPass"};
 
@@ -1941,8 +2304,8 @@ private:
         return decision.profitable;
     }
 
-    bool match_output_accumulator_promotion(
-        yir::ForOp &output_loop, OutputAccumulatorPromotion &candidate) const {
+    bool match_output_reduction_unroll_jam(
+        yir::ForOp &output_loop, OutputReductionUnrollJam &candidate) const {
         std::int64_t lower = 0;
         std::int64_t upper = 0;
         std::int64_t step = 0;
@@ -2016,44 +2379,63 @@ private:
         }
 
         const auto body_cost = wave_unroll_operation_count(reduction_loop->body_region());
-        const auto loads = array_load_count(reduction_loop->body_region());
-        if (loads > 2 || (!exact_upper && loads > 1) ||
-            region_contains_if(reduction_loop->body_region())) {
-            record_accumulator_promotion_rejection(
+        const auto body_metrics =
+            reduction_body_metrics(reduction_loop->body_region());
+        auto shared_slices = analyze_lane_invariant_slices(
+            reduction_loop->body_region(), output_loop.induction_var(),
+            accumulator->result());
+        if (body_metrics.peak_region_loads > 4 ||
+            (!exact_upper && body_metrics.peak_region_loads > 3)) {
+            record_output_reduction_unroll_jam_rejection(
                 output_loop,
-                "conditional or dynamic memory-dense reduction would exceed the accumulator register budget");
+                "reduction has too many simultaneously active loads for scalar register blocking");
             return false;
         }
+
         int factor = 0;
-        if (!exact_upper) {
-            factor = body_cost <= 32 ? 2 : 0;
-        } else if (body_cost <= 16 && loads <= 1 && trip_count % 4 == 0) {
-            factor = 4;
-        } else if (body_cost <= 32 && trip_count % 2 == 0) {
-            factor = 2;
+        std::vector<int> factors;
+        const auto variant_loads =
+            body_metrics.total_loads - shared_slices.metrics.loads;
+        if (!body_metrics.guarded && body_cost <= 16 && variant_loads <= 1) {
+            factors.push_back(4);
+        }
+        if ((body_metrics.guarded && body_cost <= 48) ||
+            (!body_metrics.guarded && body_cost <= 32)) {
+            factors.push_back(2);
+        }
+        for (const int candidate_factor : factors) {
+            if (exact_upper && trip_count % candidate_factor != 0) {
+                continue;
+            }
+            if (output_reduction_unroll_jam_is_profitable(
+                    output_loop, *reduction_loop, candidate_factor, body_cost,
+                    body_metrics, shared_slices.metrics)) {
+                factor = candidate_factor;
+                break;
+            }
         }
         if (factor == 0) {
             return false;
         }
-        if (!accumulator_promotion_is_profitable(
-                output_loop, *reduction_loop, factor, body_cost, loads)) {
-            return false;
-        }
 
         candidate = {&output_loop, reset, reduction_induction_var, accumulator,
-                     reduction_loop, store, factor, !exact_upper};
+                     reduction_loop, store, factor, !exact_upper,
+                     body_metrics.guarded,
+                     choose_reduction_lane_lowering(body_metrics),
+                     std::move(shared_slices)};
         return true;
     }
 
-    bool apply_output_accumulator_promotion(
+    bool apply_output_reduction_unroll_jam(
         yir::Region &parent, std::size_t output_index,
-        const OutputAccumulatorPromotion &candidate) {
+        const OutputReductionUnrollJam &candidate) {
         auto *output_loop = candidate.output_loop;
         auto *accumulator = candidate.accumulator;
         auto *reduction_loop = candidate.reduction_loop;
         auto *output_store = candidate.output_store;
         if (output_loop == nullptr || accumulator == nullptr || reduction_loop == nullptr ||
             output_store == nullptr || candidate.factor < 2 ||
+            candidate.lowering != OutputReductionUnrollJam::LaneLowering::Scalar ||
             output_index >= parent.operations().size() ||
             induction_value_is_live_after(parent, output_index,
                                           output_loop->induction_var())) {
@@ -2063,7 +2445,7 @@ private:
         auto *original_upper = output_loop->upper_bound();
         std::vector<std::unique_ptr<yir::Operation>> setup_ops;
         yir::Value *paired_upper = original_upper;
-        std::unique_ptr<yir::IfOp> tail_if;
+        std::unique_ptr<yir::ForOp> tail_loop;
         if (candidate.needs_runtime_tail) {
             auto divisor = std::make_unique<yir::ConstI32Op>(
                 candidate.factor,
@@ -2086,19 +2468,12 @@ private:
             aligned_upper->set_parent(&parent);
             setup_ops.push_back(std::move(aligned_upper));
 
-            auto tail_cmp = std::make_unique<yir::ICmpOp>(
-                yir::ICmpOp::Predicate::Lt, paired_upper, original_upper,
-                reduction_temp_name("output_has_tail", next_reduction_temp_++));
-            auto *tail_cmp_value = tail_cmp->result();
-            tail_cmp->set_parent(&parent);
-            setup_ops.push_back(std::move(tail_cmp));
-
-            tail_if = std::make_unique<yir::IfOp>(tail_cmp_value);
-            tail_if->set_parent(&parent);
-            ValueMap tail_map{{output_loop->induction_var(), paired_upper}};
+            tail_loop = std::make_unique<yir::ForOp>(
+                output_loop->induction_var(), paired_upper, original_upper,
+                output_loop->step());
+            tail_loop->set_parent(&parent);
             if (!clone_wave_unroll_region_into(
-                    output_loop->body_region(), tail_if->then_region(),
-                    std::move(tail_map))) {
+                    output_loop->body_region(), tail_loop->body_region(), {})) {
                 return false;
             }
         }
@@ -2167,12 +2542,11 @@ private:
             map_value(reduction_loop->upper_bound(), reduction_map),
             map_value(reduction_loop->step(), reduction_map));
         promoted_reduction->set_parent(&output_loop->body_region());
-        for (int lane = 0; lane < candidate.factor; ++lane) {
-            if (!clone_wave_unroll_region_into(
-                    reduction_loop->body_region(), promoted_reduction->body_region(),
-                    lane_maps[static_cast<std::size_t>(lane)])) {
-                return false;
-            }
+        if (!clone_unroll_jammed_region_into(
+                reduction_loop->body_region(),
+                promoted_reduction->body_region(), lane_maps,
+                candidate.shared_slices)) {
+            return false;
         }
         promoted_body.push_back(std::move(promoted_reduction));
 
@@ -2194,45 +2568,53 @@ private:
             parent_ops.begin() + static_cast<std::ptrdiff_t>(output_index),
             std::make_move_iterator(setup_ops.begin()),
             std::make_move_iterator(setup_ops.end()));
-        if (tail_if != nullptr) {
+        if (tail_loop != nullptr) {
             parent_ops.insert(
                 parent_ops.begin() + static_cast<std::ptrdiff_t>(
                                          output_index + setup_ops.size() + 1),
-                std::move(tail_if));
+                std::move(tail_loop));
         }
-        ++num_accumulator_promotions_;
+        num_lane_invariant_ops_shared_ +=
+            candidate.shared_slices.metrics.operations *
+            static_cast<std::size_t>(candidate.factor - 1);
+        ++num_output_reduction_unroll_jams_;
         return true;
     }
 
-    bool try_output_accumulator_promotions(yir::Region &region) {
+    bool try_output_reduction_unroll_jams(yir::Region &region) {
         bool changed = false;
         auto &ops = region.operations();
         for (std::size_t i = 0; i < ops.size(); ++i) {
             if (auto *loop = dynamic_cast<yir::ForOp *>(ops[i].get())) {
-                OutputAccumulatorPromotion candidate;
-                if (match_output_accumulator_promotion(*loop, candidate) &&
-                    apply_output_accumulator_promotion(region, i, candidate)) {
+                OutputReductionUnrollJam candidate;
+                if (match_output_reduction_unroll_jam(*loop, candidate) &&
+                    apply_output_reduction_unroll_jam(region, i, candidate)) {
                     changed = true;
                     ++i;
                     continue;
                 }
-                changed = try_output_accumulator_promotions(loop->body_region()) || changed;
+                changed =
+                    try_output_reduction_unroll_jams(loop->body_region()) || changed;
                 continue;
             }
             if (auto *if_op = dynamic_cast<yir::IfOp *>(ops[i].get())) {
-                changed = try_output_accumulator_promotions(if_op->then_region()) || changed;
+                changed = try_output_reduction_unroll_jams(
+                              if_op->then_region()) ||
+                          changed;
                 if (if_op->has_else()) {
-                    changed = try_output_accumulator_promotions(if_op->else_region()) || changed;
+                    changed = try_output_reduction_unroll_jams(
+                                  if_op->else_region()) ||
+                              changed;
                 }
             }
         }
         return changed;
     }
 
-    bool try_output_accumulator_promotions() {
+    bool try_output_reduction_unroll_jams() {
         bool changed = false;
         for (auto &function : module_.functions()) {
-            changed = try_output_accumulator_promotions(function->body()) || changed;
+            changed = try_output_reduction_unroll_jams(function->body()) || changed;
         }
         return changed;
     }
@@ -7428,7 +7810,8 @@ private:
     mutable std::size_t num_relation_legality_unknown_;
     std::size_t num_domain_partitions_;
     std::size_t num_reduction_privatizations_;
-    std::size_t num_accumulator_promotions_;
+    std::size_t num_output_reduction_unroll_jams_;
+    std::size_t num_lane_invariant_ops_shared_;
     std::unordered_set<std::size_t> fused_scope_ids_;
     std::size_t next_stencil_temp_ = 0;
     std::size_t next_future_temp_ = 0;
@@ -7437,6 +7820,8 @@ private:
     std::size_t next_tile_temp_ = 0;
     std::size_t next_partition_temp_ = 0;
     std::size_t next_reduction_temp_ = 0;
+    YIRPolyhedralStructuralChange structural_change_ =
+        YIRPolyhedralStructuralChange::None;
 };
 
 } // namespace
@@ -7481,7 +7866,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
 
     PolyhedralTransformer transformer(**artifact, *model_info, *dep_info, *canonical_info,
                                       cost_report);
-    bool changed = transformer.transform();
+    bool changed = transformer.transform(mode_);
 
     if (changed) {
         auto verify = yir::verify_high_level_yir(**artifact);
@@ -7514,7 +7899,19 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << ", domain_partitions=" << transformer.num_domain_partitions()
         << ", reduction_privatizations="
         << transformer.num_reduction_privatizations()
-        << ", accumulator_promotions=" << transformer.num_accumulator_promotions();
+        << ", output_reduction_unroll_jams="
+        << transformer.num_output_reduction_unroll_jams()
+        << ", lane_invariant_ops_shared="
+        << transformer.num_lane_invariant_ops_shared();
+
+    context.set_artifact<YIRPolyhedralTransformSummary>(
+        std::string(YIRPolyhedralTransformSummary::kArtifactKey),
+        YIRPolyhedralTransformSummary{
+            transformer.structural_change(),
+            transformer.num_interchanged(),
+            transformer.num_tiled(),
+            transformer.num_fused(),
+        });
 
     return PassResult::ok(changed, oss.str());
 }

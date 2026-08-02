@@ -7,6 +7,7 @@
 #include "pass/oir/OIRCostModel.h"
 
 #include <algorithm>
+#include <deque>
 #include <list>
 #include <memory>
 #include <sstream>
@@ -19,7 +20,6 @@
 namespace pass::oir_opt {
 namespace {
 
-constexpr unsigned kMaxInlineRounds = 3;
 constexpr unsigned kMaxInlineSites = 128;
 constexpr unsigned kMaxCalleeBlocks = 12;
 constexpr unsigned kMaxCalleeReturns = 4;
@@ -40,6 +40,8 @@ constexpr unsigned kMinRecursiveInlineProbabilityBasisPoints = 1000;
 // OIR counts control/phi instructions separately from GCC's inline size units;
 // 512 OIR instructions is the corresponding bounded-growth envelope.
 constexpr unsigned kMaxRecursiveInlineGrowth = 512;
+constexpr unsigned kMaxAdvisedCalleeBlocks = 96;
+constexpr unsigned kMaxAdvisedCalleeReturns = 32;
 
 using ValueMap = std::unordered_map<oir::Value *, oir::Value *>;
 using BlockMap = std::unordered_map<oir::BasicBlock *, oir::BasicBlock *>;
@@ -70,8 +72,21 @@ struct InlineContext {
     std::unordered_set<const oir::Function *> defer_recursive_expansion;
 };
 
+struct CallsiteEstimate {
+    unsigned constant_arguments = 0;
+    unsigned constant_argument_uses = 0;
+    unsigned predicted_eliminated_instrs = 0;
+    unsigned predicted_eliminated_branches = 0;
+    unsigned loop_depth = 0;
+    unsigned execution_scale = 1;
+    unsigned effective_growth = 0;
+    unsigned callee_call_sites = 0;
+    bool result_unused = false;
+};
+
 bool is_constprop_specialization(const oir::Function &function);
 bool mask_selects_argument(const SpecializationMask &mask, std::size_t index);
+bool is_specializable_constant(oir::Value *value);
 
 std::string inline_name(const oir::Function &callee, const oir::Value &value,
                         unsigned inline_index) {
@@ -136,6 +151,188 @@ CalleeInfo inspect_callee(const oir::Function &function) {
     return info;
 }
 
+unsigned module_instruction_count(const oir::Module &module) {
+    unsigned count = 0;
+    for (const auto &function : module.functions()) {
+        if (!function->is_external()) {
+            count += inspect_callee(*function).static_instrs;
+        }
+    }
+    return std::max(1U, count);
+}
+
+unsigned direct_callsite_count(const oir::Module &module, const oir::Function &callee) {
+    unsigned count = 0;
+    for (const auto &function : module.functions()) {
+        if (function->is_external()) {
+            continue;
+        }
+        for (const auto &block : function->blocks()) {
+            for (const auto &inst : block->instructions()) {
+                auto *call = dynamic_cast<const oir::CallInst *>(inst.get());
+                if (call != nullptr && call->callee() == &callee) {
+                    ++count;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+unsigned loop_depth_for_block(const oir::Function &function, const oir::BasicBlock &block) {
+    oir::DominatorTree dom_tree(function);
+    oir::LoopInfo loop_info(function, dom_tree);
+    unsigned depth = 0;
+    for (const auto &loop : loop_info.loops()) {
+        if (std::find(loop.blocks.begin(), loop.blocks.end(), &block) != loop.blocks.end()) {
+            ++depth;
+        }
+    }
+    return depth;
+}
+
+std::pair<unsigned, unsigned>
+estimate_constant_cfg_cleanup(const oir::CallInst &call, const oir::Function &callee) {
+    std::unordered_map<const oir::Value *, std::int64_t> known;
+    const auto actual_args = call.args();
+    for (std::size_t index = 0;
+         index < actual_args.size() && index < callee.args().size(); ++index) {
+        if (auto value = int_constant(actual_args[index])) {
+            known[callee.args()[index].get()] = *value;
+        }
+    }
+    if (known.empty() || callee.entry_block() == nullptr) {
+        return {0, 0};
+    }
+
+    auto known_int = [&](const oir::Value *value) -> std::optional<std::int64_t> {
+        if (auto literal = int_constant(const_cast<oir::Value *>(value))) {
+            return literal;
+        }
+        auto found = known.find(value);
+        return found == known.end() ? std::nullopt
+                                    : std::optional<std::int64_t>(found->second);
+    };
+
+    std::unordered_set<const oir::BasicBlock *> reachable{callee.entry_block()};
+    std::unordered_set<const oir::BranchInst *> decided_branches;
+    const unsigned max_rounds =
+        std::max<unsigned>(1, static_cast<unsigned>(callee.blocks().size()) * 2);
+    for (unsigned round = 0; round < max_rounds; ++round) {
+        bool changed = false;
+        for (const auto &block : callee.blocks()) {
+            if (reachable.find(block.get()) == reachable.end()) {
+                continue;
+            }
+            for (const auto &inst : block->instructions()) {
+                std::optional<std::int64_t> result;
+                if (auto *binary = dynamic_cast<const oir::BinaryInst *>(inst.get())) {
+                    const auto lhs = known_int(binary->lhs());
+                    const auto rhs = known_int(binary->rhs());
+                    if (lhs && rhs) {
+                        result = fold_int_binary(binary->op(), *lhs, *rhs);
+                    }
+                } else if (auto *cmp = dynamic_cast<const oir::CmpInst *>(inst.get())) {
+                    const auto lhs = known_int(cmp->lhs());
+                    const auto rhs = known_int(cmp->rhs());
+                    if (lhs && rhs && cmp->op() == oir::Instruction::OpID::ICmp) {
+                        result = eval_cmp(cmp->pred(), *lhs, *rhs) ? 1 : 0;
+                    }
+                } else if (auto *cast = dynamic_cast<const oir::CastInst *>(inst.get())) {
+                    if (cast->op() == oir::Instruction::OpID::ZExt) {
+                        result = known_int(cast->src());
+                    }
+                }
+                if (result && known.emplace(inst.get(), *result).second) {
+                    changed = true;
+                }
+
+                auto *branch = dynamic_cast<const oir::BranchInst *>(inst.get());
+                if (branch == nullptr) {
+                    continue;
+                }
+                if (!branch->is_conditional()) {
+                    changed |= reachable.insert(branch->target_bb()).second;
+                    continue;
+                }
+                if (auto condition = known_int(branch->cond())) {
+                    changed |= reachable
+                                   .insert(*condition != 0 ? branch->true_bb()
+                                                           : branch->false_bb())
+                                   .second;
+                    decided_branches.insert(branch);
+                } else {
+                    changed |= reachable.insert(branch->true_bb()).second;
+                    changed |= reachable.insert(branch->false_bb()).second;
+                }
+            }
+        }
+        if (!changed) {
+            break;
+        }
+    }
+
+    unsigned unreachable_instrs = 0;
+    for (const auto &block : callee.blocks()) {
+        if (reachable.find(block.get()) != reachable.end()) {
+            continue;
+        }
+        unreachable_instrs += static_cast<unsigned>(block->instructions().size());
+    }
+    return {unreachable_instrs, static_cast<unsigned>(decided_branches.size())};
+}
+
+CallsiteEstimate inspect_callsite(const oir::Module &module, const oir::Function &caller,
+                                  const oir::BasicBlock &block, const oir::CallInst &call,
+                                  const oir::Function &callee, const CalleeInfo &info) {
+    CallsiteEstimate estimate;
+    const auto args = call.args();
+    for (std::size_t index = 0; index < args.size() && index < callee.args().size(); ++index) {
+        if (!is_specializable_constant(args[index])) {
+            continue;
+        }
+        ++estimate.constant_arguments;
+        estimate.constant_argument_uses += static_cast<unsigned>(
+            std::min<std::size_t>(callee.args()[index]->use_count(), 8));
+    }
+
+    estimate.loop_depth = loop_depth_for_block(caller, block);
+    estimate.execution_scale = 1U << std::min(estimate.loop_depth, 2U);
+    estimate.callee_call_sites = direct_callsite_count(module, callee);
+    estimate.result_unused = !call.type()->is_void() && !call.has_uses();
+
+    // This is deliberately a bounded, read-only forecast. Constant argument uses are a proxy for
+    // the SCCP/algebraic cleanup enabled after cloning; no scratch IR or solver is involved.
+    estimate.predicted_eliminated_instrs =
+        std::min<unsigned>(info.static_instrs,
+                           estimate.constant_argument_uses * 2 +
+                               estimate.constant_arguments +
+                               (estimate.result_unused ? 1U : 0U));
+    estimate.predicted_eliminated_branches =
+        std::min<unsigned>(info.branches,
+                           estimate.constant_argument_uses / 2 +
+                               (estimate.constant_arguments != 0 ? 1U : 0U));
+    const auto [unreachable_instrs, decided_branches] =
+        estimate_constant_cfg_cleanup(call, callee);
+    estimate.predicted_eliminated_instrs =
+        std::max(estimate.predicted_eliminated_instrs, unreachable_instrs);
+    estimate.predicted_eliminated_branches =
+        std::max(estimate.predicted_eliminated_branches, decided_branches);
+    // OIR static instruction growth excludes terminators and phis; charge the same unit that the
+    // shared policy's inline thresholds use, plus only the merge required for multiple returns.
+    const unsigned cloned_growth = info.static_instrs + (info.returns > 1 ? 1U : 0U);
+    const unsigned cleanup_credit = estimate.predicted_eliminated_instrs;
+    estimate.effective_growth =
+        cloned_growth > cleanup_credit ? cloned_growth - cleanup_credit : 0;
+    if (estimate.callee_call_sites == 1) {
+        // A sole callsite gives later whole-program cleanup more leverage, but this pass keeps the
+        // original definition for stable diagnostics and downstream contracts. Credit only half
+        // of the predicted growth instead of assuming the definition has already disappeared.
+        estimate.effective_growth /= 2;
+    }
+    return estimate;
+}
+
 bool within_inline_resource_limit(const CalleeInfo &info,
                                   const pass::cost_model::CostModelPolicy &policy) {
     return info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost) &&
@@ -144,6 +341,7 @@ bool within_inline_resource_limit(const CalleeInfo &info,
 
 void fill_before_after_from_callee(OIRTransformCostEstimate &estimate, const CalleeInfo &info,
                                    std::int64_t before_calls, std::int64_t after_calls) {
+    estimate.has_detailed_instruction_mix = true;
     estimate.before_instrs = static_cast<std::int64_t>(info.static_instrs + before_calls);
     estimate.before_code_bytes = estimate.before_instrs * 4;
     estimate.before_int_alu = static_cast<std::int64_t>(info.int_alu);
@@ -368,7 +566,10 @@ bool is_eligible_non_recursive_call(const oir::Function &caller, const oir::Call
                info.returns != 0 &&
                info.returns <= kMaxSpecializedInlineReturns;
     }
-    return info.blocks <= kMaxCalleeBlocks && within_inline_resource_limit(info, policy);
+    const auto advised_cost_cap = static_cast<unsigned>(
+        std::max<std::int64_t>(1, policy.max_inline_callee_cost) * 4);
+    return info.blocks <= kMaxAdvisedCalleeBlocks && info.cost <= advised_cost_cap &&
+           info.returns != 0 && info.returns <= kMaxAdvisedCalleeReturns;
 }
 
 bool is_eligible_recursive_call(const oir::Function &caller, const oir::CallInst &call,
@@ -1137,18 +1338,53 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     }
 
     const auto info = inspect_callee(*clone_source);
+    const auto callsite =
+        inspect_callsite(module, caller, *block, *call, *clone_source, info);
     OIRTransformCostEstimate estimate;
     estimate.kind = pass::cost_model::TransformKind::Inline;
     estimate.pass_name = "OIRInlinePass";
-    estimate.candidate_id = "inline." + std::to_string(inline_index);
+    estimate.candidate_id =
+        "inline." + std::to_string(++stats.cost_model_candidates) + ".l" +
+        std::to_string(callsite.loop_depth) + ".c" +
+        std::to_string(callsite.constant_argument_uses) + ".g" +
+        std::to_string(callsite.effective_growth);
     estimate.scope = self_recursive
                          ? "direct-recursive-depth-" +
                                std::to_string(self_recursive_depth)
                          : "call";
     estimate.proof_kind = pass::cost_model::ProofKind::Structural;
-    estimate.proof_summary = "existing inline legality checks";
-    estimate.confidence = self_recursive ? 0.60 : 0.65;
-    fill_before_after_from_callee(estimate, info, 1, 0);
+    estimate.proof_summary =
+        "direct call, compatible signature and structurally cloneable CFG";
+    estimate.proof_rule_id = "oir.inline.direct-call.structural";
+    estimate.confidence = self_recursive
+                              ? 0.60
+                              : (callsite.constant_arguments != 0 || callsite.loop_depth != 0
+                                     ? 0.78
+                                     : (callsite.callee_call_sites == 1 ? 0.72 : 0.65));
+    if (!self_recursive && callsite.loop_depth != 0) {
+        estimate.frequency_scale = callsite.execution_scale;
+        estimate.loop_depth = static_cast<int>(callsite.loop_depth);
+        estimate.frequency_source = pass::cost_model::FrequencySource::OIRLoopAnalysis;
+    }
+    fill_before_after_from_callee(
+        estimate, info,
+        self_recursive ? 1 : static_cast<std::int64_t>(info.calls + callsite.execution_scale),
+        self_recursive ? 0 : static_cast<std::int64_t>(info.calls));
+    if (!self_recursive) {
+        const auto module_instrs = static_cast<std::int64_t>(module_instruction_count(module));
+        estimate.before_instrs = module_instrs;
+        estimate.after_instrs = module_instrs;
+        estimate.before_code_bytes = module_instrs * 4;
+        estimate.after_code_bytes = estimate.before_code_bytes;
+        const auto eliminated_instrs = static_cast<std::int64_t>(
+            callsite.predicted_eliminated_instrs);
+        const auto eliminated_branches = static_cast<std::int64_t>(
+            callsite.predicted_eliminated_branches);
+        estimate.after_int_alu =
+            std::max<std::int64_t>(0, estimate.after_int_alu - eliminated_instrs);
+        estimate.after_branches =
+            std::max<std::int64_t>(0, estimate.after_branches - eliminated_branches);
+    }
     if (info.returns <= 1 && estimate.after_branches > 0) {
         --estimate.after_branches;
     }
@@ -1159,7 +1395,16 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
         estimate.after_max_live_values +=
             recursive_pressure_growth(*call, info, self_recursive_depth);
     }
-    estimate.risk.code_growth = std::max<std::int64_t>(1, info.static_instrs);
+    const auto projected_module_growth =
+        stats.inline_code_growth + static_cast<std::int64_t>(callsite.effective_growth);
+    estimate.risk.code_growth =
+        self_recursive ? std::max<std::int64_t>(1, info.static_instrs)
+                       : static_cast<std::int64_t>(callsite.effective_growth);
+    if (!self_recursive && projected_module_growth > policy.max_function_code_growth) {
+        // Keep cumulative growth as a separate hard budget. Folding it into each site's risk
+        // would make a previously accepted call poison otherwise profitable tiny helpers.
+        estimate.risk.code_growth = policy.max_function_code_growth + 1;
+    }
     estimate.risk.register_pressure_growth =
         static_cast<std::int64_t>((info.loads + info.stores + call->args().size()) / 6);
     estimate.risk.live_range_growth =
@@ -1170,6 +1415,10 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
     estimate.risk.cleanup_dependency = 1;
     if (!cost_model_allows_transform(stats, estimate)) {
         return false;
+    }
+
+    if (!self_recursive) {
+        stats.inline_code_growth += static_cast<std::int64_t>(callsite.effective_growth);
     }
 
     ValueMap values;
@@ -1216,27 +1465,75 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
 
 bool inline_one_call(oir::Module &module, InlineContext &context, oir::Function &function,
                      unsigned inline_index, Stats &stats) {
+    struct OrdinarySite {
+        oir::BasicBlock *block = nullptr;
+        oir::CallInst *call = nullptr;
+        CallsiteEstimate estimate;
+        unsigned ordinal = 0;
+    };
     struct RecursiveSite {
         unsigned depth = 0;
         oir::BasicBlock *block = nullptr;
         oir::CallInst *call = nullptr;
     };
 
-    // Inline ordinary helpers first.  Recursive templates must be captured only after
-    // helper calls have had a chance to disappear, otherwise an obsolete template can
-    // make an otherwise supported recursive body look permanently ineligible.
+    // Rank ordinary sites from bounded read-only facts before mutating IR. Constant-rich and hot
+    // sites expose the most cleanup; smaller growth breaks ties. Recursive templates must still
+    // be captured only after helper calls have had a chance to disappear.
+    std::vector<OrdinarySite> ordinary_sites;
+    unsigned ordinal = 0;
     for (auto &block : function.blocks()) {
-        for (auto it = block->instructions().begin(); it != block->instructions().end(); ++it) {
-            auto *call = dynamic_cast<oir::CallInst *>(it->get());
+        for (auto &inst : block->instructions()) {
+            auto *call = dynamic_cast<oir::CallInst *>(inst.get());
             if (call == nullptr || call->callee() == &function) {
                 continue;
             }
-            if (inline_call(module, context, function, block.get(), it, inline_index, stats)) {
+            auto *callee = dynamic_cast<oir::Function *>(call->callee());
+            if (callee == nullptr || callee->is_external() || callee->entry_block() == nullptr) {
+                continue;
+            }
+            const auto info = inspect_callee(*callee);
+            ordinary_sites.push_back(
+                {block.get(), call,
+                 inspect_callsite(module, function, *block, *call, *callee, info), ordinal++});
+        }
+    }
+    std::stable_sort(ordinary_sites.begin(), ordinary_sites.end(),
+                     [](const OrdinarySite &lhs, const OrdinarySite &rhs) {
+                         if (lhs.estimate.loop_depth != rhs.estimate.loop_depth) {
+                             return lhs.estimate.loop_depth > rhs.estimate.loop_depth;
+                         }
+                         if ((lhs.estimate.callee_call_sites == 1) !=
+                             (rhs.estimate.callee_call_sites == 1)) {
+                             return lhs.estimate.callee_call_sites == 1;
+                         }
+                         if ((lhs.estimate.constant_arguments != 0) !=
+                             (rhs.estimate.constant_arguments != 0)) {
+                             return lhs.estimate.constant_arguments != 0;
+                         }
+                         if (lhs.estimate.constant_argument_uses !=
+                             rhs.estimate.constant_argument_uses) {
+                             return lhs.estimate.constant_argument_uses >
+                                    rhs.estimate.constant_argument_uses;
+                         }
+                         if (lhs.estimate.effective_growth != rhs.estimate.effective_growth) {
+                             return lhs.estimate.effective_growth < rhs.estimate.effective_growth;
+                         }
+                         return lhs.ordinal < rhs.ordinal;
+                     });
+    for (const auto &site : ordinary_sites) {
+        auto &instructions = site.block->instructions();
+        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
+            if (it->get() != site.call) {
+                continue;
+            }
+            if (inline_call(module, context, function, site.block, it, inline_index, stats)) {
                 // Let cleanup and tail-recursion elimination see the helper-free body
                 // before deciding whether recursive expansion is still profitable.
                 context.defer_recursive_expansion.insert(&function);
                 return true;
             }
+            break;
         }
     }
 
@@ -1436,25 +1733,40 @@ bool inline_functions(oir::Module &module, Stats &stats) {
     bool changed = false;
     unsigned inline_index = 0;
     InlineContext context;
+    const auto current_module_instrs =
+        static_cast<std::int64_t>(module_instruction_count(module));
+    if (stats.inline_baseline_instrs == 0) {
+        stats.inline_baseline_instrs = current_module_instrs;
+    }
+    stats.inline_code_growth =
+        std::max<std::int64_t>(0, current_module_instrs - stats.inline_baseline_instrs);
 
-    for (unsigned round = 0; round < kMaxInlineRounds; ++round) {
-        bool round_changed = false;
-        for (auto &function : module.functions()) {
-            if (function->is_external()) {
-                continue;
-            }
+    // Start from callers at the end of the stable module order. This prevents early helper
+    // expansion from making their callers artificially too large, while the bounded requeue
+    // revisits only functions whose IR actually changed.
+    std::deque<oir::Function *> worklist;
+    std::unordered_map<const oir::Function *, unsigned> visits;
+    for (auto it = module.functions().rbegin(); it != module.functions().rend(); ++it) {
+        if (!(*it)->is_external()) {
+            worklist.push_back(it->get());
+        }
+    }
 
-            while (inline_index < kMaxInlineSites &&
-                   inline_one_call(module, context, *function, inline_index + 1, stats)) {
-                ++inline_index;
-                ++stats.inlined;
-                changed = true;
-                round_changed = true;
-            }
+    while (!worklist.empty() && inline_index < kMaxInlineSites) {
+        auto *function = worklist.front();
+        worklist.pop_front();
+        auto &visit_count = visits[function];
+        if (visit_count >= kMaxInlineSites) {
+            continue;
         }
-        if (!round_changed || inline_index >= kMaxInlineSites) {
-            break;
+        ++visit_count;
+        if (!inline_one_call(module, context, *function, inline_index + 1, stats)) {
+            continue;
         }
+        ++inline_index;
+        ++stats.inlined;
+        changed = true;
+        worklist.push_front(function);
     }
 
     for (const auto &[function, growth] : context.recursive_growth) {

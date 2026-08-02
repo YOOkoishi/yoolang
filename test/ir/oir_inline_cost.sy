@@ -1,0 +1,55 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=COST
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=Inline -O1 %s | FileCheck %s --check-prefix=JSON
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int choose_value(int x, int mode) {
+  if (mode == 0) return x + 1;
+  if (mode == 1) return x + 2;
+  if (mode == 2) return x + 3;
+  if (mode == 3) return x + 4;
+  return x;
+}
+
+int costly_memory(int a[], int x) {
+  a[0] = x;
+  a[1] = x + 1;
+  a[2] = x + 2;
+  a[3] = x + 3;
+  a[4] = x + 4;
+  a[5] = x + 5;
+  a[6] = x + 6;
+  a[7] = x + 7;
+  a[8] = x + 8;
+  a[9] = x + 9;
+  a[10] = x + 10;
+  a[11] = x + 11;
+  a[12] = x + 12;
+  a[13] = x + 13;
+  a[14] = x + 14;
+  a[15] = x + 15;
+  return x;
+}
+
+int main() {
+  int data[16];
+  int total = 0;
+  int i = 0;
+  while (i < 8) {
+    total = total + choose_value(i, 2);
+    i = i + 1;
+  }
+  return total + costly_memory(data, getint());
+}
+
+// COST: OIRInlinePass Accept transform=Inline
+// COST: OIRInlinePass Reject transform=Inline
+
+// JSON: "transform": "Inline"
+// JSON: "kind": "Structural"
+// JSON: "status": "Proven"
+// JSON: "rule_id": "oir.inline.direct-call.structural"
+// JSON: "solver_id": ""
+
+// OIR-LABEL: define i32 @main
+// OIR-NOT: call i32 @choose_value
+// OIR: call i32 @costly_memory

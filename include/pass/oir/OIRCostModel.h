@@ -22,6 +22,11 @@ struct OIRTransformCostEstimate {
     std::int64_t proof_time_us = 0;
     std::int64_t proof_obligations = 0;
     double confidence = 0.65;
+    std::int64_t frequency_scale = 1;
+    int loop_depth = 0;
+    pass::cost_model::FrequencySource frequency_source =
+        pass::cost_model::FrequencySource::Unknown;
+    bool has_detailed_instruction_mix = false;
 
     std::int64_t before_instrs = 0;
     std::int64_t after_instrs = 0;
