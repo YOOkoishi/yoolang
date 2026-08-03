@@ -1,0 +1,127 @@
+int fixed_data[8];
+int reference_data[8];
+
+int fixed2(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 2) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int fixed3(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 3) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int fixed4(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 4) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int fixed5(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 5) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int reference(int seed, int limit, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < limit) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int run_case(int limit, int seed) {
+  int i = 0;
+  while (i < 8) {
+    fixed_data[i] = 1234567;
+    reference_data[i] = 1234567;
+    i = i + 1;
+  }
+
+  int actual = 0;
+  if (limit == 2) {
+    actual = fixed2(seed, fixed_data);
+  } else if (limit == 3) {
+    actual = fixed3(seed, fixed_data);
+  } else if (limit == 4) {
+    actual = fixed4(seed, fixed_data);
+  } else {
+    actual = fixed5(seed, fixed_data);
+  }
+  int expected = reference(seed, limit, reference_data);
+
+  int failures = 0;
+  if (actual != expected) {
+    failures = failures + 1;
+  }
+  i = 0;
+  while (i < 8) {
+    if (fixed_data[i] != reference_data[i]) {
+      failures = failures + 1;
+    }
+    i = i + 1;
+  }
+  return failures;
+}
+
+int main() {
+  int failures = 0;
+  failures = failures + run_case(2, -7);
+  failures = failures + run_case(3, 0);
+  failures = failures + run_case(4, 5);
+  failures = failures + run_case(5, -12);
+  putint(failures);
+  putch(10);
+  return 0;
+}

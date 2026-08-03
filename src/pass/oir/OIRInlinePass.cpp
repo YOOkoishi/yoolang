@@ -830,9 +830,7 @@ std::string constant_key(oir::Value *value) {
         return "i" + std::to_string(*constant);
     }
     if (auto constant = float_constant(value)) {
-        std::ostringstream oss;
-        oss << "f" << *constant;
-        return oss.str();
+        return "f" + std::to_string(float_bit_pattern(*constant));
     }
     return "*";
 }

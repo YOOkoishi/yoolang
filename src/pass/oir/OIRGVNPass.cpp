@@ -40,7 +40,7 @@ std::string value_key(const ReplacementMap &replacements, oir::Value *value) {
         return "i:" + ptr_key(value->type()) + ":" + std::to_string(*constant);
     }
     if (auto constant = float_constant(value)) {
-        return "f:" + ptr_key(value->type()) + ":" + std::to_string(*constant);
+        return "f:" + ptr_key(value->type()) + ":" + std::to_string(float_bit_pattern(*constant));
     }
     if (dynamic_cast<oir::ConstantZero *>(value) != nullptr) {
         return "z:" + ptr_key(value->type());

@@ -1,0 +1,160 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model --cost-model-filter=OIRAffineModRecurrence -O1 %s | FileCheck %s --check-prefix=COST
+// RUN: %compiler --emit-cost-model --cost-model-policy=conservative --cost-model-filter=OIRAffineModRecurrence -O1 %s | FileCheck %s --check-prefix=COST-CONSERVATIVE
+
+int closed_form_candidate(int value, int count) {
+  int index = 0;
+  while (index < count) {
+    value = (value + 3) % 17;
+    index = index + 1;
+  }
+  return value;
+}
+
+int alpha_renamed_candidate(int seed, int rounds) {
+  int cursor = 0;
+  while (cursor < rounds) {
+    seed = (11 + seed) % 29;
+    cursor = 1 + cursor;
+  }
+  return seed;
+}
+
+int dynamic_modulus(int value, int count, int modulus) {
+  int index = 0;
+  while (index < count) {
+    value = (value + 3) % modulus;
+    index = index + 1;
+  }
+  return value;
+}
+
+int negative_step(int value, int count) {
+  int index = 0;
+  while (index < count) {
+    value = (value - 3) % 17;
+    index = index + 1;
+  }
+  return value;
+}
+
+int extra_carried_state(int value, int count) {
+  int index = 0;
+  int total = 0;
+  while (index < count) {
+    value = (value + 3) % 17;
+    total = total + value;
+    index = index + 1;
+  }
+  return value + total;
+}
+
+int nonunit_induction(int value, int count) {
+  int index = 0;
+  while (index < count) {
+    value = (value + 3) % 17;
+    index = index + 2;
+  }
+  return value;
+}
+
+int side_effecting_loop(int value, int count) {
+  int index = 0;
+  while (index < count) {
+    value = (value + 3) % 17;
+    putint(value);
+    index = index + 1;
+  }
+  return value;
+}
+
+int same_remainder_twice(int value) {
+  return (value % 7) % 7;
+}
+
+int different_remainders(int value) {
+  return (value % 7) % 5;
+}
+
+int negative_constant_remainder_twice(int value) {
+  return (value % -7) % -7;
+}
+
+int dynamic_remainder_twice(int value, int modulus) {
+  return (value % modulus) % modulus;
+}
+
+int main() {
+  int value = getint();
+  int count = getint();
+  int modulus = getint();
+  return closed_form_candidate(value, count) +
+         alpha_renamed_candidate(value, count) +
+         dynamic_modulus(value, count, modulus) +
+         negative_step(value, count) +
+         extra_carried_state(value, count) +
+         nonunit_induction(value, count) +
+         side_effecting_loop(value, count) +
+         same_remainder_twice(value) + different_remainders(value) +
+         negative_constant_remainder_twice(value) +
+         dynamic_remainder_twice(value, modulus);
+}
+
+// OIR-LABEL: define i32 @closed_form_candidate
+// OIR: br i1 {{.*}}, %affine.mod.guard.trip
+// OIR: affine.mod.guard.trip
+// OIR: icmp ge i32 %count.arg, 3
+// OIR: affine.mod.guard.state
+// OIR: icmp ge i32 %value.arg, 0
+// OIR: affine.mod.guard.range
+// OIR: sdiv i32 {{.*}}, 3
+// OIR: affine.mod.fast
+// OIR: mul i32 %count.arg, 3
+// OIR: srem i32 {{.*}}, 17
+
+// OIR-LABEL: define i32 @alpha_renamed_candidate
+// OIR: affine.mod.guard.trip
+// OIR: mul i32 %rounds.arg, 11
+// OIR: srem i32 {{.*}}, 29
+
+// OIR-LABEL: define i32 @dynamic_modulus
+// OIR-NOT: affine.mod.guard
+// OIR: srem i32 {{.*}}, %modulus.arg
+
+// OIR-LABEL: define i32 @negative_step
+// OIR-NOT: affine.mod.guard
+// OIR: sub i32 {{.*}}, 3
+
+// OIR-LABEL: define i32 @extra_carried_state
+// OIR-NOT: affine.mod.guard
+// OIR: phi
+
+// OIR-LABEL: define i32 @nonunit_induction
+// OIR-NOT: affine.mod.guard
+// OIR: add i32 {{.*}}, 2
+
+// OIR-LABEL: define i32 @side_effecting_loop
+// OIR-NOT: affine.mod.guard
+// OIR: call void @putint
+
+// OIR-LABEL: define i32 @same_remainder_twice
+// OIR-COUNT-1: srem i32 {{.*}}, 7
+
+// OIR-LABEL: define i32 @different_remainders
+// OIR: srem i32 {{.*}}, 7
+// OIR: srem i32 {{.*}}, 5
+
+// OIR-LABEL: define i32 @negative_constant_remainder_twice
+// OIR-COUNT-1: srem i32 {{.*}}, -7
+
+// OIR-LABEL: define i32 @dynamic_remainder_twice
+// OIR: srem i32 {{.*}}, %modulus.arg
+// OIR: srem i32 {{.*}}, %modulus.arg
+
+// COST: [cost-model] target=rv64gc/lp64d policy=balanced filter=OIRAffineModRecurrence
+// COST: [cost-model] OIRAffineModRecurrence Accept transform=LoopIdiom
+// COST: reason=Profitable
+
+// COST-CONSERVATIVE: [cost-model] target=rv64gc/lp64d policy=conservative filter=OIRAffineModRecurrence
+// COST-CONSERVATIVE: [cost-model] OIRAffineModRecurrence Reject transform=LoopIdiom
+// COST-CONSERVATIVE: reason=CodeGrowthTooHigh

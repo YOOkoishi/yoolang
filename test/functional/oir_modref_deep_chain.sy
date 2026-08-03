@@ -1,0 +1,84 @@
+int visible_state;
+
+void stage0() { stage1(); }
+void stage1() { stage2(); }
+void stage2() { stage3(); }
+void stage3() { stage4(); }
+void stage4() { stage5(); }
+void stage5() { stage6(); }
+void stage6() { stage7(); }
+void stage7() { stage8(); }
+void stage8() { stage9(); }
+void stage9() { stage10(); }
+void stage10() { stage11(); }
+void stage11() { stage12(); }
+void stage12() { stage13(); }
+void stage13() { stage14(); }
+void stage14() { stage15(); }
+void stage15() { stage16(); }
+void stage16() { stage17(); }
+void stage17() { stage18(); }
+void stage18() { stage19(); }
+void stage19() { stage20(); }
+void stage20() { stage21(); }
+void stage21() { stage22(); }
+void stage22() { stage23(); }
+void stage23() { stage24(); }
+void stage24() { stage25(); }
+void stage25() { stage26(); }
+void stage26() { stage27(); }
+void stage27() { stage28(); }
+void stage28() { stage29(); }
+void stage29() { stage30(); }
+void stage30() { stage31(); }
+void stage31() { stage32(); }
+void stage32() { stage33(); }
+void stage33() { stage34(); }
+void stage34() { stage35(); }
+void stage35() { stage36(); }
+void stage36() { stage37(); }
+void stage37() { stage38(); }
+void stage38() { stage39(); }
+void stage39() { stage40(); }
+void stage40() { stage41(); }
+void stage41() { stage42(); }
+void stage42() { stage43(); }
+void stage43() { stage44(); }
+void stage44() { stage45(); }
+void stage45() { stage46(); }
+void stage46() { stage47(); }
+void stage47() { stage48(); }
+void stage48() { stage49(); }
+void stage49() { stage50(); }
+void stage50() { stage51(); }
+void stage51() { stage52(); }
+void stage52() { stage53(); }
+void stage53() { stage54(); }
+void stage54() { stage55(); }
+void stage55() { stage56(); }
+void stage56() { stage57(); }
+void stage57() { stage58(); }
+void stage58() { stage59(); }
+void stage59() { stage60(); }
+void stage60() { stage61(); }
+void stage61() { stage62(); }
+void stage62() { stage63(); }
+void stage63() { stage64(); }
+void stage64() { stage65(); }
+void stage65() { stage66(); }
+void stage66() { stage67(); }
+void stage67() { stage68(); }
+void stage68() { stage69(); }
+void stage69() { stage70(); }
+
+void stage70() {
+  visible_state = visible_state + 1;
+}
+
+int main() {
+  stage0();
+  stage0();
+  putint(visible_state);
+  putch(10);
+  return 0;
+}

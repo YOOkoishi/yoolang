@@ -4,6 +4,8 @@
 #include "pass/mir/MIRPeepholeCommon.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <set>
@@ -16,6 +18,7 @@ namespace {
 using Block = mir::MachineBasicBlock;
 using BlockSet = std::set<Block *>;
 using AvailableMap = std::map<std::string, mir::Register>;
+using RegisterVersions = std::map<VRegId, std::uint64_t>;
 
 enum class CSEScope {
     Local,
@@ -44,15 +47,33 @@ bool stable_operand_for_cse(const mir::MachineOperand &operand,
     return counts == nullptr || def_count(*counts, reg) == 1;
 }
 
-std::string operand_key(const mir::MachineOperand &operand) {
+std::uint64_t register_version(const RegisterVersions &versions, const mir::Register &reg) {
+    if (!reg.is_virtual()) {
+        return 0;
+    }
+    auto found = versions.find(reg.id);
+    return found == versions.end() ? 0 : found->second;
+}
+
+std::string operand_key(const mir::MachineOperand &operand, const RegisterVersions *versions) {
     switch (operand.kind()) {
     case mir::OperandKind::Reg:
-    case mir::OperandKind::FReg:
-        return reg_key(operand.reg_value());
+    case mir::OperandKind::FReg: {
+        auto key = reg_key(operand.reg_value());
+        if (versions != nullptr && operand.reg_value().is_virtual()) {
+            key += "@" + std::to_string(register_version(*versions, operand.reg_value()));
+        }
+        return key;
+    }
     case mir::OperandKind::Imm:
         return "i" + std::to_string(operand.int_value());
-    case mir::OperandKind::FloatImm:
-        return "f" + std::to_string(operand.float_value());
+    case mir::OperandKind::FloatImm: {
+        std::uint32_t bits = 0;
+        const float value = operand.float_value();
+        static_assert(sizeof(bits) == sizeof(value), "float must be 32-bit");
+        std::memcpy(&bits, &value, sizeof(bits));
+        return "f" + std::to_string(bits);
+    }
     case mir::OperandKind::Slot:
         return "s" + std::to_string(operand.slot_id());
     case mir::OperandKind::Global:
@@ -125,8 +146,8 @@ bool commutative_opcode(mir::Opcode opcode) {
 }
 
 std::optional<std::string> cse_key(const mir::MachineInstr &instr,
-                                   const std::map<VRegId, RegCounts> *counts,
-                                   CSEScope scope) {
+                                   const std::map<VRegId, RegCounts> *counts, CSEScope scope,
+                                   const RegisterVersions *versions = nullptr) {
     if (!cse_opcode(instr.opcode(), scope)) {
         return std::nullopt;
     }
@@ -144,7 +165,7 @@ std::optional<std::string> cse_key(const mir::MachineInstr &instr,
         if (ops[i].is_implicit() || !stable_operand_for_cse(ops[i], counts)) {
             return std::nullopt;
         }
-        pieces.push_back(operand_key(ops[i]));
+        pieces.push_back(operand_key(ops[i], versions));
     }
     if (commutative_opcode(instr.opcode()) && pieces.size() == 2) {
         std::sort(pieces.begin(), pieces.end());
@@ -290,32 +311,57 @@ bool local_cse_blocks(mir::MachineFunction &function, Stats &stats) {
     bool changed = false;
     for (auto &block_ptr : function.blocks()) {
         AvailableMap available;
+        RegisterVersions versions;
+        std::map<std::string, std::uint64_t> available_result_versions;
         for (auto &instr : block_ptr->instructions()) {
             if (memory_or_call_barrier(instr.opcode())) {
                 available.clear();
+                available_result_versions.clear();
             }
 
-            auto key = cse_key(instr, nullptr, CSEScope::Local);
+            auto key = cse_key(instr, nullptr, CSEScope::Local, &versions);
             const auto defs = instr.defs();
+            bool replaced = false;
             if (key && defs.size() == 1) {
                 auto found = available.find(*key);
                 if (found != available.end()) {
-                    if (!allows_cse_rewrite(stats, CSEScope::Local)) {
-                        continue;
+                    auto version_found = available_result_versions.find(*key);
+                    const bool result_still_available =
+                        version_found != available_result_versions.end() &&
+                        version_found->second == register_version(versions, found->second);
+                    if (!result_still_available) {
+                        available.erase(found);
+                        available_result_versions.erase(*key);
+                    } else if (allows_cse_rewrite(stats, CSEScope::Local)) {
+                        instr = make_move_like(defs[0], found->second);
+                        ++stats.cse;
+                        changed = true;
+                        replaced = true;
                     }
-                    instr = make_move_like(defs[0], found->second);
-                    ++stats.cse;
-                    changed = true;
-                    continue;
                 }
-                available[*key] = defs[0];
             }
 
+            bool physical_def = false;
             for (const auto &def : defs) {
                 if (def.is_physical() && !is_zero_reg(def)) {
-                    available.clear();
-                    break;
+                    physical_def = true;
+                } else if (def.is_virtual()) {
+                    ++versions[def.id];
                 }
+            }
+            if (physical_def) {
+                available.clear();
+                available_result_versions.clear();
+                continue;
+            }
+
+            // Record a newly computed expression only after advancing its
+            // destination version.  A CSE replacement keeps the older leader;
+            // if that leader is also redefined here, the lazy version check will
+            // invalidate it before the next lookup.
+            if (key && defs.size() == 1 && !replaced) {
+                available[*key] = defs[0];
+                available_result_versions[*key] = register_version(versions, defs[0]);
             }
         }
     }

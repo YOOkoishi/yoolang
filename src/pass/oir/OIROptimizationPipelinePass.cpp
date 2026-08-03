@@ -36,6 +36,7 @@ bool run_aggressive_iteration(oir::Module &module, oir_opt::Stats &stats) {
     changed |= oir_opt::cleanup_cfg(module, stats);
     changed |= oir_opt::unswitch_loops(module, stats);
     changed |= oir_opt::rotate_loops(module, stats);
+    changed |= oir_opt::fold_guarded_affine_mod_recurrences(module, stats);
     if (oir_opt::unroll_small_constant_loops(module, stats)) {
         changed = true;
         if (oir_opt::eliminate_tail_recursion(module, stats)) {
@@ -152,9 +153,17 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= run_call_specialization_window(module, stats);
     changed |= pre_inline_load_call_cse(module, stats);
     changed |= eliminate_dead_code(module, stats);
+    // Recognize exact signed div/rem-by-two digit reconstruction while the
+    // callee loop is still structurally intact; inlining then propagates the
+    // closed form to every call site without any symbol-based dispatch.
+    changed |= fold_signed_bit_digit_reconstruction_loops(module, stats);
     changed |= run_inline_cleanup_window(module, stats, true);
     changed |= run_call_specialization_window(module, stats);
     changed |= run_inline_cleanup_window(module, stats, true);
+    // Guarded call reuse creates a fast/slow CFG with a merge phi.  Run it after
+    // the inlining windows so recursive inlining cannot subsequently split the
+    // guard's leader block and invalidate the merge-edge dominance relation.
+    changed |= guard_duplicate_readonly_calls(module, stats);
 
     constexpr unsigned kMaxIterations = 8;
     for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
@@ -172,6 +181,7 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= tighten_monotonic_guarded_loop_bounds(module, stats);
     changed |= simplify_branches(module, stats);
     changed |= cleanup_cfg(module, stats);
+    changed |= fold_guarded_affine_mod_recurrences(module, stats);
     if (unroll_small_constant_loops(module, stats)) {
         changed = true;
         if (eliminate_tail_recursion(module, stats)) {

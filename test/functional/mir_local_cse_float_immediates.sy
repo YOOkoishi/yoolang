@@ -1,0 +1,12 @@
+int distinguish_small_float_constants(float value) {
+  float first = value + 1e-7;
+  float second = value + 2e-7;
+  return first < second;
+}
+
+int main() {
+  float value = getfloat();
+  putint(distinguish_small_float_constants(value));
+  putch(10);
+  return 0;
+}

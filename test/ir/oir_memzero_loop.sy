@@ -54,9 +54,20 @@ int static_fill_nonbyte() {
   return buf[15];
 }
 
+float static_fill_negative_zero() {
+  float buf[1000];
+  int i = 0;
+  while (i < 1000) {
+    buf[i] = (-1.0) * 0.0;
+    i = i + 1;
+  }
+  return 1.0 / buf[999];
+}
+
 int main() {
   return static_clear() + dynamic_clear(3) + static_fill_minus_one() +
-         dynamic_fill_minus_one(3) + static_fill_nonbyte();
+         dynamic_fill_minus_one(3) + static_fill_nonbyte() +
+         (static_fill_negative_zero() < 0.0);
 }
 
 // OIR-LABEL: define i32 @static_clear
@@ -76,6 +87,12 @@ int main() {
 // OIR-LABEL: define i32 @static_fill_nonbyte
 // OIR-NOT: memset
 // OIR-NOT: memzero
+
+// OIR-LABEL: define float @static_fill_negative_zero
+// OIR-NOT: memset
+// OIR-NOT: memzero
+// OIR: store float -0.000000
+// OIR: fdiv float 1.000000
 
 // OIR-LABEL: define i32 @main
 

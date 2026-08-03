@@ -48,6 +48,11 @@ struct Stats {
     // recursive expansion from depth zero would defeat its growth/frequency budget.
     std::unordered_set<const oir::Function *> recursively_inlined_functions;
 
+    // A rejected versioning candidate remains structurally identical across the
+    // bounded aggressive iterations.  Remember it so diagnostics and compile time
+    // do not scale with the pipeline's cleanup iteration count.
+    std::unordered_set<const oir::BasicBlock *> affine_mod_recurrence_candidates;
+
     pass::cost_model::CostModelReport *cost_model_report = nullptr;
     pass::cost_model::CostModelPolicyKind cost_model_policy =
         pass::cost_model::CostModelPolicyKind::Balanced;
@@ -71,6 +76,7 @@ using ReplacementMap = std::unordered_map<oir::Value *, oir::Value *>;
 bool is_scalar_type(oir::Type *type);
 std::optional<std::int64_t> int_constant(oir::Value *value);
 std::optional<float> float_constant(oir::Value *value);
+std::uint32_t float_bit_pattern(float value);
 bool is_int_value(oir::Value *value, std::int64_t expected);
 oir::ConstantInt *make_int_constant(oir::Module &module, oir::Type *type, std::int64_t value);
 oir::Value *make_zero_constant(oir::Module &module, oir::Type *type);
@@ -99,12 +105,15 @@ bool eliminate_dead_loads(oir::Module &module, Stats &stats);
 bool loop_invariant_code_motion(oir::Module &module, Stats &stats);
 bool rotate_loops(oir::Module &module, Stats &stats);
 bool unswitch_loops(oir::Module &module, Stats &stats);
+bool fold_guarded_affine_mod_recurrences(oir::Module &module, Stats &stats);
 bool unroll_small_constant_loops(oir::Module &module, Stats &stats);
 bool tighten_monotonic_guarded_loop_bounds(oir::Module &module, Stats &stats);
 bool lower_counted_zero_store_loops_to_memzero(oir::Module &module, Stats &stats);
 bool eliminate_overwritten_countdown_loops(oir::Module &module, Stats &stats);
 bool global_value_numbering(oir::Module &module, Stats &stats);
 bool pre_inline_load_call_cse(oir::Module &module, Stats &stats);
+bool fold_signed_bit_digit_reconstruction_loops(oir::Module &module, Stats &stats);
+bool guard_duplicate_readonly_calls(oir::Module &module, Stats &stats);
 bool aggressive_dead_code_elimination(oir::Module &module, Stats &stats);
 bool jump_threading(oir::Module &module, Stats &stats);
 bool inline_functions(oir::Module &module, Stats &stats, InlineOptions options = {});

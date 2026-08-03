@@ -295,32 +295,26 @@ bool non_phi_header_values_used_outside_header(const oir::Function &function,
     return false;
 }
 
-bool header_phi_used_by_external_phi(const oir::Function &function, const oir::Loop &loop,
-                                     const oir::BasicBlock &header) {
-    std::unordered_set<const oir::Value *> header_phis;
+bool header_phi_has_unrepairable_external_phi_use(const oir::Loop &loop,
+                                                  const oir::BasicBlock &header,
+                                                  const oir::BasicBlock &exit) {
     for (const auto &inst : header.instructions()) {
-        auto *phi = dynamic_cast<const oir::PhiInst *>(inst.get());
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
         if (phi == nullptr) {
             break;
         }
-        header_phis.insert(phi);
-    }
-    if (header_phis.empty()) {
-        return false;
-    }
-
-    for (const auto &block : function.blocks()) {
-        if (contains_block(loop, block.get())) {
-            continue;
-        }
-        for (const auto &inst : block->instructions()) {
-            if (dynamic_cast<const oir::PhiInst *>(inst.get()) == nullptr) {
-                break;
+        for (const auto &use : phi->uses()) {
+            auto *user_phi = dynamic_cast<oir::PhiInst *>(use.user);
+            if (user_phi == nullptr || contains_block(loop, user_phi->parent())) {
+                continue;
             }
-            for (auto *operand : inst->operands()) {
-                if (header_phis.find(operand) != header_phis.end()) {
-                    return true;
-                }
+            if (user_phi->parent() != &exit || (use.operand_index & 1U) != 0) {
+                return true;
+            }
+            const std::size_t incoming_index = use.operand_index / 2;
+            if (incoming_index >= user_phi->incoming().size() ||
+                user_phi->incoming()[incoming_index].second != &header) {
+                return true;
             }
         }
     }
@@ -387,19 +381,139 @@ bool collect_header_phi_incoming(const oir::BasicBlock &header, oir::BasicBlock 
             break;
         }
         HeaderPhiIncoming values;
+        bool saw_outside = false;
+        bool saw_latch = false;
         for (const auto &item : phi->incoming()) {
             if (item.second == preheader) {
+                if (saw_outside) {
+                    return false;
+                }
+                saw_outside = true;
                 values.outside = item.first;
             } else if (item.second == latch) {
+                if (saw_latch) {
+                    return false;
+                }
+                saw_latch = true;
                 values.latch = item.first;
             } else {
                 return false;
             }
         }
-        if (values.outside == nullptr || values.latch == nullptr) {
+        if (!saw_outside || !saw_latch || phi->incoming().size() != 2 ||
+            values.outside == nullptr || values.latch == nullptr) {
             return false;
         }
         incoming[phi] = values;
+    }
+    return true;
+}
+
+bool value_dominates_phi_edge(oir::Value *value, oir::BasicBlock *pred,
+                              const oir::DominatorTree &dom_tree) {
+    if (value == nullptr || pred == nullptr || !dom_tree.is_reachable(pred)) {
+        return false;
+    }
+    auto *definition = dynamic_cast<oir::Instruction *>(value);
+    return definition == nullptr || definition->parent() == pred ||
+           dom_tree.dominates(definition->parent(), pred);
+}
+
+bool phis_have_complete_dominating_incomings(const oir::BasicBlock &block,
+                                             const oir::DominatorTree &dom_tree) {
+    std::unordered_set<oir::BasicBlock *> predecessors;
+    for (auto *pred : block.predecessors()) {
+        if (pred == nullptr || !predecessors.insert(pred).second) {
+            return false;
+        }
+    }
+
+    for (const auto &inst : block.instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        if (phi->incoming().size() != predecessors.size()) {
+            return false;
+        }
+        std::unordered_set<oir::BasicBlock *> incoming_blocks;
+        for (const auto &[value, pred] : phi->incoming()) {
+            if (predecessors.find(pred) == predecessors.end() ||
+                !incoming_blocks.insert(pred).second ||
+                !value_dominates_phi_edge(value, pred, dom_tree)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool phi_use_is_incoming_from(const oir::PhiInst &phi, const oir::Value::Use &use,
+                              const oir::BasicBlock *pred) {
+    if ((use.operand_index & 1U) != 0) {
+        return false;
+    }
+    const std::size_t incoming_index = use.operand_index / 2;
+    return incoming_index < phi.incoming().size() && phi.incoming()[incoming_index].second == pred;
+}
+
+bool latch_phis_are_rotation_safe(const oir::Loop &loop, const oir::BasicBlock &header,
+                                  const oir::BasicBlock &latch,
+                                  const oir::DominatorTree &dom_tree) {
+    for (auto *pred : latch.predecessors()) {
+        if (!contains_block(loop, pred)) {
+            return false;
+        }
+    }
+    if (!phis_have_complete_dominating_incomings(latch, dom_tree)) {
+        return false;
+    }
+
+    for (const auto &inst : latch.instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        for (const auto &use : phi->uses()) {
+            auto *user = dynamic_cast<oir::Instruction *>(use.user);
+            if (user == nullptr) {
+                return false;
+            }
+            if (auto *user_phi = dynamic_cast<oir::PhiInst *>(user)) {
+                if (user_phi->parent() != &header ||
+                    !phi_use_is_incoming_from(*user_phi, use, &latch)) {
+                    return false;
+                }
+                continue;
+            }
+            if (user->parent() != &latch) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool header_phi_liveouts_are_rotation_safe(const oir::BasicBlock &header, const oir::Loop &loop,
+                                           const oir::BasicBlock &exit,
+                                           const oir::DominatorTree &dom_tree) {
+    for (const auto &inst : header.instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
+        if (phi == nullptr) {
+            break;
+        }
+        for (const auto &use : phi->uses()) {
+            auto *user = dynamic_cast<oir::Instruction *>(use.user);
+            if (user == nullptr || contains_block(loop, user->parent())) {
+                continue;
+            }
+            if (dynamic_cast<oir::PhiInst *>(user) != nullptr) {
+                continue;
+            }
+            if (!dom_tree.dominates(&exit, user->parent())) {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -586,7 +700,7 @@ bool rotate_loop(oir::Function &function, const oir::Loop &loop, const oir::Scal
     auto *preheader = find_preheader(loop);
     auto *latch = single_latch(loop);
     if (preheader == nullptr || latch == nullptr || !preheader->has_terminator() ||
-        !latch->has_terminator() || block_starts_with_phi(*latch)) {
+        !latch->has_terminator()) {
         return false;
     }
 
@@ -619,10 +733,21 @@ bool rotate_loop(oir::Function &function, const oir::Loop &loop, const oir::Scal
     if (body->predecessors().size() != 1 || body->predecessors().front() != header ||
         block_starts_with_phi(*body) ||
         non_phi_header_values_used_outside_header(function, *header) ||
-        header_phi_used_by_external_phi(function, loop, *header) ||
-        header_condition_has_div_or_rem(*header) ||
-        loop_has_non_condition_side_exit(loop, exit)) {
+        header_phi_has_unrepairable_external_phi_use(loop, *header, *exit) ||
+        header_condition_has_div_or_rem(*header) || loop_has_non_condition_side_exit(loop, exit)) {
         return false;
+    }
+
+    oir::DominatorTree dom_tree(function);
+    if (!phis_have_complete_dominating_incomings(*header, dom_tree) ||
+        !latch_phis_are_rotation_safe(loop, *header, *latch, dom_tree) ||
+        !header_phi_liveouts_are_rotation_safe(*header, loop, *exit, dom_tree)) {
+        return false;
+    }
+    for (auto *block : loop.blocks) {
+        if (block != header && !dom_tree.dominates(body, block)) {
+            return false;
+        }
     }
 
     std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> header_phi_values;
@@ -773,6 +898,62 @@ bool direct_loop_value_uses_are_repairable(const std::vector<oir::BasicBlock *> 
         }
     }
     return true;
+}
+
+bool all_external_loop_uses_are_repairable(const std::vector<oir::BasicBlock *> &blocks,
+                                           const oir::Loop &loop, oir::BasicBlock *latch,
+                                           oir::BasicBlock *exit) {
+    for (auto *block : blocks) {
+        for (const auto &inst : block->instructions()) {
+            for (const auto &use : inst->uses()) {
+                auto *user = dynamic_cast<oir::Instruction *>(use.user);
+                if (user == nullptr) {
+                    return false;
+                }
+                if (contains_block(loop, user->parent())) {
+                    continue;
+                }
+                if (auto *phi = dynamic_cast<oir::PhiInst *>(user)) {
+                    const bool direct_exit_phi =
+                        phi->parent() == exit && phi_use_is_incoming_from(*phi, use, latch);
+                    const bool successor_phi =
+                        std::find(exit->successors().begin(), exit->successors().end(),
+                                  phi->parent()) != exit->successors().end() &&
+                        phi_use_is_incoming_from(*phi, use, exit);
+                    if (!direct_exit_phi && !successor_phi) {
+                        return false;
+                    }
+                    continue;
+                }
+                if (user->parent() != exit) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void replace_remaining_external_loop_uses(const std::vector<oir::BasicBlock *> &blocks,
+                                          const oir::Loop &loop, const ValueMap &final_map) {
+    for (auto *block : blocks) {
+        for (const auto &inst : block->instructions()) {
+            auto *old_value = inst.get();
+            auto *new_value = map_value(old_value, final_map);
+            if (new_value == old_value) {
+                continue;
+            }
+            auto uses = old_value->uses();
+            for (const auto &use : uses) {
+                auto *user = dynamic_cast<oir::Instruction *>(use.user);
+                if (user != nullptr && !contains_block(loop, user->parent()) &&
+                    use.operand_index < user->operand_count() &&
+                    user->operand(use.operand_index) == old_value) {
+                    user->set_operand(use.operand_index, new_value);
+                }
+            }
+        }
+    }
 }
 
 void replace_non_phi_uses_in_block(oir::BasicBlock *block, oir::Value *old_value,
@@ -933,6 +1114,9 @@ std::optional<std::int64_t> latch_update_step(const oir::PhiInst *phi,
     if (binary->op() == oir::Instruction::OpID::Sub && binary->lhs() != nullptr) {
         if (binary->lhs() == phi) {
             if (auto step = int_constant(binary->rhs())) {
+                if (*step == std::numeric_limits<std::int64_t>::min()) {
+                    return std::nullopt;
+                }
                 return -*step;
             }
         }
@@ -957,8 +1141,38 @@ oir::CmpPred swap_unroll_cmp_operands(oir::CmpPred pred) {
     return pred;
 }
 
-std::optional<std::int64_t> continuing_trip_count_for(std::int64_t start, std::int64_t bound,
-                                                       std::int64_t step, oir::CmpPred pred) {
+oir::CmpPred invert_unroll_cmp(oir::CmpPred pred) {
+    switch (pred) {
+    case oir::CmpPred::LT:
+        return oir::CmpPred::GE;
+    case oir::CmpPred::LE:
+        return oir::CmpPred::GT;
+    case oir::CmpPred::GT:
+        return oir::CmpPred::LE;
+    case oir::CmpPred::GE:
+        return oir::CmpPred::LT;
+    case oir::CmpPred::EQ:
+        return oir::CmpPred::NE;
+    case oir::CmpPred::NE:
+        return oir::CmpPred::EQ;
+    }
+    return pred;
+}
+
+using WideInt = __int128_t;
+
+bool fits_signed_i32(WideInt value) {
+    return value >= static_cast<WideInt>(std::numeric_limits<std::int32_t>::min()) &&
+           value <= static_cast<WideInt>(std::numeric_limits<std::int32_t>::max());
+}
+
+bool is_i32_value(const oir::Value *value) {
+    auto *type = value == nullptr ? nullptr : dynamic_cast<oir::IntegerType *>(value->type());
+    return type != nullptr && type->bit_width() == 32;
+}
+
+std::optional<WideInt> continuing_trip_count_for(WideInt start, WideInt bound, WideInt step,
+                                                 oir::CmpPred pred) {
     if (step == 0) {
         return std::nullopt;
     }
@@ -967,7 +1181,7 @@ std::optional<std::int64_t> continuing_trip_count_for(std::int64_t start, std::i
         if (step <= 0) {
             return std::nullopt;
         }
-        const std::int64_t distance = bound - start;
+        const WideInt distance = bound - start;
         if (distance <= 0) {
             return 0;
         }
@@ -977,7 +1191,7 @@ std::optional<std::int64_t> continuing_trip_count_for(std::int64_t start, std::i
         if (step <= 0) {
             return std::nullopt;
         }
-        const std::int64_t distance = bound - start;
+        const WideInt distance = bound - start;
         if (distance < 0) {
             return 0;
         }
@@ -987,8 +1201,8 @@ std::optional<std::int64_t> continuing_trip_count_for(std::int64_t start, std::i
         if (step >= 0) {
             return std::nullopt;
         }
-        const std::int64_t step_abs = -step;
-        const std::int64_t distance = start - bound;
+        const WideInt step_abs = -step;
+        const WideInt distance = start - bound;
         if (distance <= 0) {
             return 0;
         }
@@ -998,8 +1212,8 @@ std::optional<std::int64_t> continuing_trip_count_for(std::int64_t start, std::i
         if (step >= 0) {
             return std::nullopt;
         }
-        const std::int64_t step_abs = -step;
-        const std::int64_t distance = start - bound;
+        const WideInt step_abs = -step;
+        const WideInt distance = start - bound;
         if (distance < 0) {
             return 0;
         }
@@ -1012,24 +1226,33 @@ std::optional<std::int64_t> continuing_trip_count_for(std::int64_t start, std::i
     return std::nullopt;
 }
 
-std::optional<std::int64_t> constant_latch_trip_count(
-    oir::BasicBlock *header, oir::BasicBlock *preheader, oir::BasicBlock *latch,
-    const oir::BranchInst &branch) {
+enum class ConstantLatchTripState { NoMatch, Proven, Rejected };
+
+struct ConstantLatchTripResult {
+    ConstantLatchTripState state = ConstantLatchTripState::NoMatch;
+    std::int64_t count = 0;
+};
+
+ConstantLatchTripResult constant_latch_trip_count(oir::BasicBlock *header,
+                                                  oir::BasicBlock *preheader,
+                                                  oir::BasicBlock *latch,
+                                                  const oir::BranchInst &branch,
+                                                  bool backedge_is_true) {
     auto *cmp = dynamic_cast<oir::CmpInst *>(branch.cond());
     if (cmp == nullptr || cmp->op() != oir::Instruction::OpID::ICmp) {
-        return std::nullopt;
+        return {};
     }
 
     std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> incoming;
     if (!collect_header_phi_incoming(*header, preheader, latch, incoming)) {
-        return std::nullopt;
+        return {ConstantLatchTripState::Rejected, 0};
     }
 
     auto count_from_latch = [&](oir::Value *candidate, oir::Value *bound,
-                                oir::CmpPred pred) -> std::optional<std::int64_t> {
+                                oir::CmpPred pred) -> ConstantLatchTripResult {
         auto limit = int_constant(bound);
         if (!limit.has_value()) {
-            return std::nullopt;
+            return {};
         }
         for (const auto &[phi, values] : incoming) {
             if (candidate != values.latch) {
@@ -1037,23 +1260,75 @@ std::optional<std::int64_t> constant_latch_trip_count(
             }
             auto start = int_constant(values.outside);
             auto step = latch_update_step(phi, values);
+            // Multiple header phis may legally share an incoming SSA value.  A
+            // non-recurrence match is not evidence that a later phi cannot be
+            // the induction recurrence, so keep searching deterministically.
             if (!start.has_value() || !step.has_value()) {
-                return std::nullopt;
+                continue;
             }
-            auto first_latch_value = static_cast<std::int32_t>(*start + *step);
-            auto continuing = continuing_trip_count_for(first_latch_value, *limit, *step, pred);
+            if (!is_i32_value(phi) || !is_i32_value(candidate) || !is_i32_value(bound) ||
+                !fits_signed_i32(static_cast<WideInt>(*start)) ||
+                !fits_signed_i32(static_cast<WideInt>(*limit)) ||
+                !fits_signed_i32(static_cast<WideInt>(*step))) {
+                return {ConstantLatchTripState::Rejected, 0};
+            }
+
+            const WideInt wide_start = static_cast<WideInt>(*start);
+            const WideInt wide_limit = static_cast<WideInt>(*limit);
+            const WideInt wide_step = static_cast<WideInt>(*step);
+            const WideInt first_latch_value = wide_start + wide_step;
+            if (!fits_signed_i32(first_latch_value)) {
+                return {ConstantLatchTripState::Rejected, 0};
+            }
+            auto continuing =
+                continuing_trip_count_for(first_latch_value, wide_limit, wide_step, pred);
             if (!continuing.has_value()) {
-                return std::nullopt;
+                return {ConstantLatchTripState::Rejected, 0};
             }
-            return *continuing + 1;
+            const WideInt total = *continuing + 1;
+            constexpr std::int64_t kMaxFiniteVerifiedTripCount = 16;
+            if (total <= 0 || total > kMaxFiniteVerifiedTripCount) {
+                return {ConstantLatchTripState::Rejected, 0};
+            }
+
+            auto evaluate = [pred](WideInt lhs, WideInt rhs) {
+                switch (pred) {
+                case oir::CmpPred::EQ:
+                    return lhs == rhs;
+                case oir::CmpPred::NE:
+                    return lhs != rhs;
+                case oir::CmpPred::LT:
+                    return lhs < rhs;
+                case oir::CmpPred::LE:
+                    return lhs <= rhs;
+                case oir::CmpPred::GT:
+                    return lhs > rhs;
+                case oir::CmpPred::GE:
+                    return lhs >= rhs;
+                }
+                return false;
+            };
+
+            WideInt current = wide_start;
+            for (std::int64_t iteration = 1; iteration <= static_cast<std::int64_t>(total);
+                 ++iteration) {
+                const WideInt next = current + wide_step;
+                if (!fits_signed_i32(next) || evaluate(next, wide_limit) != (iteration < total)) {
+                    return {ConstantLatchTripState::Rejected, 0};
+                }
+                current = next;
+            }
+            return {ConstantLatchTripState::Proven, static_cast<std::int64_t>(total)};
         }
-        return std::nullopt;
+        return {};
     };
 
-    if (auto count = count_from_latch(cmp->lhs(), cmp->rhs(), cmp->pred())) {
+    const auto continuation_pred = backedge_is_true ? cmp->pred() : invert_unroll_cmp(cmp->pred());
+    auto count = count_from_latch(cmp->lhs(), cmp->rhs(), continuation_pred);
+    if (count.state != ConstantLatchTripState::NoMatch) {
         return count;
     }
-    return count_from_latch(cmp->rhs(), cmp->lhs(), swap_unroll_cmp_operands(cmp->pred()));
+    return count_from_latch(cmp->rhs(), cmp->lhs(), swap_unroll_cmp_operands(continuation_pred));
 }
 
 std::optional<bool> evaluate_integer_cmp(std::int64_t lhs, std::int64_t rhs,
@@ -1400,6 +1675,7 @@ bool first_peel_has_coupled_stack_lsr_shape(
 
 std::optional<SingleBlockUnrollMatch> match_single_block_unroll_loop(
     const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+    (void)scev;
     if (loop.header == nullptr || loop.blocks.size() != 1 || loop.blocks.front() != loop.header) {
         return std::nullopt;
     }
@@ -1434,12 +1710,14 @@ std::optional<SingleBlockUnrollMatch> match_single_block_unroll_loop(
         return std::nullopt;
     }
 
-    auto trip_count = constant_latch_trip_count(header, preheader, header, *branch);
-    if (!trip_count.has_value()) {
-        trip_count = scev.constant_trip_count(loop);
+    auto exact_trip =
+        constant_latch_trip_count(header, preheader, header, *branch, backedge_is_true);
+    if (exact_trip.state != ConstantLatchTripState::Proven) {
+        return std::nullopt;
     }
+    const std::int64_t trip_count = exact_trip.count;
     constexpr std::int64_t kMaxUnrollTripCount = 16;
-    if (!trip_count.has_value() || *trip_count <= 1 || *trip_count > kMaxUnrollTripCount) {
+    if (trip_count <= 1 || trip_count > kMaxUnrollTripCount) {
         return std::nullopt;
     }
 
@@ -1458,7 +1736,7 @@ std::optional<SingleBlockUnrollMatch> match_single_block_unroll_loop(
         }
     }
 
-    return SingleBlockUnrollMatch{header, preheader, exit, backedge_is_true, *trip_count};
+    return SingleBlockUnrollMatch{header, preheader, exit, backedge_is_true, trip_count};
 }
 
 bool loop_body_is_acyclic_except_latch(const oir::Loop &loop, oir::BasicBlock *latch) {
@@ -1491,6 +1769,7 @@ bool loop_body_is_acyclic_except_latch(const oir::Loop &loop, oir::BasicBlock *l
 
 std::optional<MultiBlockUnrollMatch> match_multi_block_unroll_loop(
     const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+    (void)scev;
     if (loop.header == nullptr || loop.blocks.size() <= 1) {
         return std::nullopt;
     }
@@ -1515,11 +1794,14 @@ std::optional<MultiBlockUnrollMatch> match_multi_block_unroll_loop(
     }
 
     oir::BasicBlock *exit = nullptr;
+    bool backedge_is_true = false;
     if (latch_branch->true_bb() == header && !contains_block(loop, latch_branch->false_bb())) {
         exit = latch_branch->false_bb();
+        backedge_is_true = true;
     } else if (latch_branch->false_bb() == header &&
                !contains_block(loop, latch_branch->true_bb())) {
         exit = latch_branch->true_bb();
+        backedge_is_true = false;
     } else {
         return std::nullopt;
     }
@@ -1551,12 +1833,14 @@ std::optional<MultiBlockUnrollMatch> match_multi_block_unroll_loop(
         return std::nullopt;
     }
 
-    auto trip_count = constant_latch_trip_count(header, preheader, latch, *latch_branch);
-    if (!trip_count.has_value()) {
-        trip_count = scev.constant_trip_count(loop);
+    auto exact_trip =
+        constant_latch_trip_count(header, preheader, latch, *latch_branch, backedge_is_true);
+    if (exact_trip.state != ConstantLatchTripState::Proven) {
+        return std::nullopt;
     }
+    const std::int64_t trip_count = exact_trip.count;
     constexpr std::int64_t kMaxUnrollTripCount = 16;
-    if (!trip_count.has_value() || *trip_count <= 1 || *trip_count > kMaxUnrollTripCount) {
+    if (trip_count <= 1 || trip_count > kMaxUnrollTripCount) {
         return std::nullopt;
     }
 
@@ -1576,8 +1860,8 @@ std::optional<MultiBlockUnrollMatch> match_multi_block_unroll_loop(
         }
     }
 
-    return MultiBlockUnrollMatch{header, preheader, latch, exit, std::move(blocks), *trip_count,
-                                 has_call};
+    return MultiBlockUnrollMatch{header,     preheader, latch, exit, std::move(blocks),
+                                 trip_count, has_call};
 }
 
 bool collect_single_block_phi_incoming(
@@ -1614,7 +1898,8 @@ bool unroll_single_block_loop(oir::Function &function, const oir::Loop &loop,
     }
 
     std::vector<oir::BasicBlock *> blocks = {match->header};
-    if (!direct_loop_value_uses_are_repairable(blocks, loop)) {
+    if (!direct_loop_value_uses_are_repairable(blocks, loop) ||
+        !all_external_loop_uses_are_repairable(blocks, loop, match->header, match->exit)) {
         return false;
     }
     auto direct_exit_values = loop_values_used_on_exit_edge(match->exit, loop);
@@ -1691,6 +1976,7 @@ bool unroll_single_block_loop(oir::Function &function, const oir::Loop &loop,
             replace_phi_uses_on_successor_edges(match->exit, value, mapped);
         }
     }
+    replace_remaining_external_loop_uses(blocks, loop, final_map);
     oir::cfg::remove_edge_no_phi_update(match->header, match->exit);
     oir::cfg::remove_edge_no_phi_update(match->header, match->header);
     function.erase_block(match->header);
@@ -1854,6 +2140,14 @@ void remove_original_loop_cfg_edges(const std::vector<oir::BasicBlock *> &blocks
             oir::cfg::remove_edge_no_phi_update(block, succ);
         }
     }
+    // A PHI-bearing merge latch can refer to definitions in another loop block.  Disconnect every
+    // instruction while all defining values are still alive; erasing blocks one by one would
+    // otherwise make a later User::drop_all_operands() touch an already-destroyed definition.
+    for (auto *block : blocks) {
+        for (auto &inst : block->instructions()) {
+            inst->drop_all_operands();
+        }
+    }
 }
 
 bool unroll_multi_block_loop(oir::Function &function, const oir::Loop &loop,
@@ -1866,7 +2160,8 @@ bool unroll_multi_block_loop(oir::Function &function, const oir::Loop &loop,
         return false;
     }
 
-    if (!direct_loop_value_uses_are_repairable(match->blocks, loop)) {
+    if (!direct_loop_value_uses_are_repairable(match->blocks, loop) ||
+        !all_external_loop_uses_are_repairable(match->blocks, loop, match->latch, match->exit)) {
         return false;
     }
     auto direct_exit_values = loop_values_used_on_exit_edge(match->exit, loop);
@@ -1928,6 +2223,7 @@ bool unroll_multi_block_loop(oir::Function &function, const oir::Loop &loop,
             replace_phi_uses_on_successor_edges(match->exit, value, mapped);
         }
     }
+    replace_remaining_external_loop_uses(match->blocks, loop, final_map);
 
     remove_original_loop_cfg_edges(match->blocks);
     for (auto *block : match->blocks) {
@@ -2552,7 +2848,7 @@ std::optional<std::uint8_t> repeated_byte_store_value(oir::Value *value) {
     }
     auto float_zero = float_constant(value);
     if (float_zero.has_value()) {
-        return *float_zero == 0.0F ? std::optional<std::uint8_t>(0) : std::nullopt;
+        return float_bit_pattern(*float_zero) == 0U ? std::optional<std::uint8_t>(0) : std::nullopt;
     }
     if (dynamic_cast<oir::ConstantZero *>(value) != nullptr) {
         return 0;

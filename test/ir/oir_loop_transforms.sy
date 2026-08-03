@@ -50,6 +50,149 @@ int unroll_multiblock_if4(int x) {
   return sum;
 }
 
+int unroll_phi_latch2(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 2) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int unroll_phi_latch3(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 3) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int unroll_phi_latch4(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 4) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int unroll_phi_latch5(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 5) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int unroll_phi_latch_alpha3(int token, int slots[]) {
+  int cursor = 0;
+  int total = token;
+  while (cursor < 3) {
+    if (0 != (token + cursor) % 2) {
+      slots[cursor] = total + 1;
+      total = total - cursor - 1;
+    } else {
+      slots[cursor] = total;
+      total = total + cursor + 1;
+    }
+    cursor = cursor + 1;
+  }
+  return total;
+}
+
+int no_unroll_phi_latch_call(int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 4) {
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      putint(acc);
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int no_unroll_phi_latch_side_exit(int stop, int seed, int data[]) {
+  int i = 0;
+  int acc = seed;
+  while (i < 4) {
+    if (i == stop) {
+      return acc;
+    }
+    if ((seed + i) % 2 == 0) {
+      data[i] = acc;
+      acc = acc + i + 1;
+    } else {
+      data[i] = acc + 1;
+      acc = acc - i - 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+int no_unroll_i32_wrap(int seed) {
+  int i = 2147483646;
+  int acc = seed;
+  while (i < 2147483647) {
+    if ((acc + i) % 2 == 0) {
+      acc = acc + i;
+    } else {
+      acc = acc - i;
+    }
+    i = i + 2147483647;
+  }
+  return acc;
+}
+
+int no_unroll_i32_underflow(int seed) {
+  int i = -2147483647;
+  int acc = seed;
+  while (i > -2147483647 - 1) {
+    if ((acc + i) % 2 == 0) {
+      acc = acc + i;
+    } else {
+      acc = acc - i;
+    }
+    i = i - 2147483647;
+  }
+  return acc;
+}
+
 int no_unroll_side_exit(int n) {
   int i = 0;
   int sum = 0;
@@ -186,6 +329,75 @@ int main() {
 // OIR-LABEL: define i32 @unroll_multiblock_if4
 // OIR: .unr
 // OIR-NOT: %i.loop = phi
+
+// OIR-LABEL: define i32 @unroll_phi_latch2
+// OIR: .unr0
+// OIR: .unr1
+// OIR-NOT: .unr2
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @unroll_phi_latch3
+// OIR: .unr0
+// OIR: .unr1
+// OIR: .unr2
+// OIR-NOT: .unr3
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @unroll_phi_latch4
+// OIR: .unr0
+// OIR: .unr1
+// OIR: .unr2
+// OIR: .unr3
+// OIR-NOT: .unr4
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @unroll_phi_latch5
+// OIR: .unr0
+// OIR: .unr1
+// OIR: .unr2
+// OIR: .unr3
+// OIR: .unr4
+// OIR-NOT: .unr5
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @unroll_phi_latch_alpha3
+// OIR: .unr0
+// OIR: .unr1
+// OIR: .unr2
+// OIR-NOT: .unr3
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @no_unroll_phi_latch_call
+// OIR-NOT: .unr
+// OIR: %acc.loop = phi
+// OIR: call void @putint
+// OIR: %acc.phi = phi
+// OIR: .rot = icmp lt i32
+// OIR-NOT: .unr
+
+// OIR-LABEL: define i32 @no_unroll_phi_latch_side_exit
+// OIR-NOT: .unr
+// OIR-NOT: .rot
+// OIR: %acc.loop = phi
+// OIR: ret i32 %acc.loop
+// OIR: ret i32 %acc.loop
+// OIR: %acc.phi = phi
+// OIR-NOT: .unr
+// OIR-NOT: .rot
+
+// OIR-LABEL: define i32 @no_unroll_i32_wrap
+// OIR-NOT: .unr
+// OIR: %i.loop = phi [2147483646,
+// OIR: add i32 %i.loop, 2147483647
+// OIR: .rot = icmp lt i32
+// OIR-NOT: .unr
+
+// OIR-LABEL: define i32 @no_unroll_i32_underflow
+// OIR-NOT: .unr
+// OIR: %i.loop = phi [-2147483647,
+// OIR: sub i32 %i.loop, 2147483647
+// OIR: .rot = icmp gt i32
+// OIR-NOT: .unr
 
 // OIR-LABEL: define i32 @no_unroll_side_exit
 // OIR-NOT: .unr

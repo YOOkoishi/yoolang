@@ -1,0 +1,90 @@
+int digit_and(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 && bit_b == 1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int digit_or(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 || bit_b == 1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int digit_xor(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a != bit_b) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+// The expected checksum was generated independently from the exact signed
+// quotient/remainder recurrence.  The correctness matrix runs this file both
+// without optimization (the original 32-step loops) and with -O1 (the closed
+// forms), covering 867 results over mixed signs and both i32 endpoints.
+int main() {
+  int values[17];
+  values[0] = -2147483647 - 1;
+  values[1] = -2147483647;
+  values[2] = -1073741824;
+  values[3] = -65537;
+  values[4] = -255;
+  values[5] = -5;
+  values[6] = -3;
+  values[7] = -2;
+  values[8] = -1;
+  values[9] = 0;
+  values[10] = 1;
+  values[11] = 2;
+  values[12] = 3;
+  values[13] = 5;
+  values[14] = 255;
+  values[15] = 1073741824;
+  values[16] = 2147483647;
+
+  int checksum = 0;
+  int i = 0;
+  while (i < 17) {
+    int j = 0;
+    while (j < 17) {
+      int a = values[i];
+      int b = values[j];
+      checksum = checksum * 31 + digit_and(a, b);
+      checksum = checksum * 31 + digit_or(a, b);
+      checksum = checksum * 31 + digit_xor(a, b);
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  putint(checksum);
+  putch(10);
+  return 0;
+}

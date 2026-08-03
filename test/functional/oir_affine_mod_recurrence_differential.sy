@@ -1,0 +1,41 @@
+int ascending_recurrence(int value, int count) {
+  int index = 0;
+  while (index < count) {
+    value = (value + 3) % 5;
+    index = index + 1;
+  }
+  return value;
+}
+
+int countdown_reference(int value, int count) {
+  int remaining = count;
+  while (remaining > 0) {
+    value = (value + 3) % 5;
+    remaining = remaining - 1;
+  }
+  return value;
+}
+
+int differs(int value, int count) {
+  return ascending_recurrence(value, count) != countdown_reference(value, count);
+}
+
+int main() {
+  int errors = 0;
+  int value = -200;
+  while (value <= 200) {
+    int count = -3;
+    while (count <= 40) {
+      errors = errors + differs(value, count);
+      count = count + 1;
+    }
+    value = value + 17;
+  }
+
+  errors = errors + differs(2147483646, 3);
+  errors = errors + differs(2147483642, 3);
+  errors = errors + differs(-2147483647, 3);
+  putint(errors);
+  putch(10);
+  return 0;
+}

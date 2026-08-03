@@ -1,0 +1,19 @@
+float values[16];
+
+int main() {
+  int i = 0;
+  while (i < 16) {
+    // The frontend lowers unary float negation as +0.0 - value, which does
+    // not preserve the sign of a literal zero.  Multiplication constructs an
+    // IEEE-754 negative zero before the store-loop transform runs.
+    values[i] = (-1.0) * 0.0;
+    i = i + 1;
+  }
+
+  // IEEE-754 distinguishes -0.0 from +0.0 through division.  A byte-zero
+  // lowering of the store loop would silently change the sign here.
+  float reciprocal = 1.0 / values[7];
+  putint(reciprocal < 0.0);
+  putch(10);
+  return 0;
+}

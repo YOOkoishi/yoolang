@@ -658,6 +658,12 @@ oir::Value *simplify_instruction(oir::Module &module, oir::BasicBlock &block, St
             if (is_int_value(binary->rhs(), 1)) {
                 return make_zero_constant(module, inst.type());
             }
+            if (auto divisor = int_constant(binary->rhs()); divisor.has_value() && *divisor != 0) {
+                auto *inner = as_binary_op(binary->lhs(), oir::Instruction::OpID::SRem);
+                if (inner != nullptr && same_constant_value(inner->rhs(), binary->rhs())) {
+                    return inner;
+                }
+            }
             break;
         default:
             break;

@@ -1,5 +1,6 @@
 #include "oir/OIRScalarOpt.h"
 
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <unordered_set>
@@ -59,6 +60,13 @@ std::optional<float> float_constant(oir::Value *value) {
     return std::nullopt;
 }
 
+std::uint32_t float_bit_pattern(float value) {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "float must be 32-bit");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 bool is_int_value(oir::Value *value, std::int64_t expected) {
     auto constant = int_constant(value);
     return constant.has_value() && *constant == expected;
@@ -97,7 +105,7 @@ bool same_constant_value(oir::Value *lhs, oir::Value *rhs) {
     auto lhs_float = float_constant(lhs);
     auto rhs_float = float_constant(rhs);
     if (lhs_float.has_value() && rhs_float.has_value()) {
-        return *lhs_float == *rhs_float;
+        return float_bit_pattern(*lhs_float) == float_bit_pattern(*rhs_float);
     }
     return dynamic_cast<oir::ConstantZero *>(lhs) != nullptr &&
            dynamic_cast<oir::ConstantZero *>(rhs) != nullptr;

@@ -1,0 +1,239 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-cost-model --cost-model-filter=OIRBitDigitIdiom -O1 %s | FileCheck %s --check-prefix=COST
+
+int digit_and(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 && bit_b == 1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int digit_or(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 || bit_b == 1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int digit_xor(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a != bit_b) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_trip_31(int a, int b) {
+  int len = 31;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 && bit_b == 1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_trip_33(int a, int b) {
+  int len = 33;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 && bit_b == 1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_divisor_negative_2(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % -2;
+    int bit_b = b % -2;
+    a = a / -2;
+    b = b / -2;
+    if (bit_a != bit_b) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_divisor_3(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 3;
+    int bit_b = b % 3;
+    a = a / 3;
+    b = b / 3;
+    if (bit_a == 1 || bit_b == 1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_negative_digit(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == -1 && bit_b == -1) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_side_effect(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    putint(bit_a);
+    if (bit_a != bit_b) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_power_2(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 2;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a != bit_b) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+
+int reject_extra_liveout(int a, int b) {
+  int len = 32;
+  int result = 0;
+  int power = 1;
+  while (len) {
+    int bit_a = a % 2;
+    int bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a != bit_b) result = result + power;
+    power = power * 2;
+    len = len - 1;
+  }
+  return result + a;
+}
+
+int main() {
+  int a = getint();
+  int b = getint();
+  return digit_and(a, b) + digit_or(a, b) + digit_xor(a, b) +
+         reject_trip_31(a, b) + reject_divisor_3(a, b) +
+         reject_trip_33(a, b) + reject_divisor_negative_2(a, b) +
+         reject_negative_digit(a, b) + reject_side_effect(a, b) +
+         reject_power_2(a, b) + reject_extra_liveout(a, b);
+}
+
+// OIR-LABEL: define i32 @digit_and
+// OIR-NOT: sdiv
+// OIR: bitdigit.and
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @digit_or
+// OIR-NOT: sdiv
+// OIR: bitdigit.or.value
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @digit_xor
+// OIR-NOT: sdiv
+// OIR: bitdigit.xor
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @reject_trip_31
+// OIR-NOT: bitdigit
+// OIR: sdiv i32
+
+// OIR-LABEL: define i32 @reject_trip_33
+// OIR-NOT: bitdigit
+// OIR: sdiv i32
+
+// OIR-LABEL: define i32 @reject_divisor_negative_2
+// OIR-NOT: bitdigit
+// OIR: sdiv i32 {{.*}}, -2
+
+// OIR-LABEL: define i32 @reject_divisor_3
+// OIR-NOT: bitdigit
+// OIR: sdiv i32 {{.*}}, 3
+
+// OIR-LABEL: define i32 @reject_negative_digit
+// OIR-NOT: bitdigit
+// OIR: sdiv i32
+
+// OIR-LABEL: define i32 @reject_side_effect
+// OIR-NOT: bitdigit
+// OIR: call void @putint
+
+// OIR-LABEL: define i32 @reject_power_2
+// OIR-NOT: bitdigit
+// OIR: sdiv i32
+
+// OIR-LABEL: define i32 @reject_extra_liveout
+// OIR-NOT: bitdigit
+// OIR: sdiv i32
+
+// COST: [cost-model] target=rv64gc/lp64d policy=balanced filter=OIRBitDigitIdiom
+// COST-COUNT-3: [cost-model] OIRBitDigitIdiom Accept transform=LoopIdiom {{.*}} reason=Profitable

@@ -1,0 +1,174 @@
+// RUN: %compiler --emit-cost-model --cost-model-filter=OIRGuardedCallCSE -O1 %s | FileCheck %s --check-prefix=COST
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int read_state;
+int written_state;
+
+int light_leaf(int value) {
+  return value + 1;
+}
+
+int marginal_scalar(int value, int p1, int p2, int p3, int p4,
+                    int p5, int p6, int p7, int p8, int p9, int p10,
+                    int p11, int p12, int p13, int p14, int p15, int p16) {
+  return light_leaf(value) + value;
+}
+
+int rejected_profit_order(int lhs, int rhs, int p1, int p2, int p3, int p4,
+                          int p5, int p6, int p7, int p8, int p9, int p10,
+                          int p11, int p12, int p13, int p14, int p15, int p16) {
+  int first = marginal_scalar(lhs, p1, p2, p3, p4, p5, p6, p7, p8,
+                              p9, p10, p11, p12, p13, p14, p15, p16);
+  int second = marginal_scalar(rhs, p1, p2, p3, p4, p5, p6, p7, p8,
+                               p9, p10, p11, p12, p13, p14, p15, p16);
+  return first + second;
+}
+
+int recursive_value(int depth, int value, int delta) {
+  if (depth <= 0) {
+    return value + read_state;
+  }
+  int first = recursive_value(depth - 1, value, delta);
+  int second = recursive_value(depth - 1, value - delta, delta);
+  return first + second;
+}
+
+int costly_scalar(int value, int p1, int p2, int p3, int p4,
+                  int p5, int p6, int p7, int p8, int p9, int p10,
+                  int p11, int p12, int p13, int p14, int p15, int p16) {
+  value = value / 3;
+  value = value / 5;
+  value = value / 7;
+  value = value / 11;
+  return value;
+}
+
+int costly_pair(int lhs, int rhs, int p1, int p2, int p3, int p4,
+                int p5, int p6, int p7, int p8, int p9, int p10,
+                int p11, int p12, int p13, int p14, int p15, int p16) {
+  int first = costly_scalar(lhs, p1, p2, p3, p4, p5, p6, p7, p8,
+                            p9, p10, p11, p12, p13, p14, p15, p16);
+  int second = costly_scalar(rhs, p1, p2, p3, p4, p5, p6, p7, p8,
+                             p9, p10, p11, p12, p13, p14, p15, p16);
+  return first + second;
+}
+
+int readonly_array(int values[], int count) {
+  int total = 0;
+  int i = 0;
+  while (i < count) {
+    total = total + values[i];
+    i = i + 1;
+  }
+  return total;
+}
+
+int reject_pointer(int lhs[], int rhs[], int count) {
+  int first = readonly_array(lhs, count);
+  int second = readonly_array(rhs, count);
+  return first + second;
+}
+
+int costly_float(float value) {
+  value = value / 3.0;
+  value = value / 5.0;
+  value = value / 7.0;
+  value = value / 11.0;
+  return value;
+}
+
+int reject_float(float lhs, float rhs) {
+  int first = costly_float(lhs);
+  int second = costly_float(rhs);
+  return first + second;
+}
+
+int write_value(int value) {
+  written_state = value;
+  return value;
+}
+
+int reject_write(int lhs, int rhs) {
+  int first = write_value(lhs);
+  int second = write_value(rhs);
+  return first + second;
+}
+
+int read_value(int value) {
+  value = value / 3;
+  value = value / 5;
+  value = value / 7;
+  return value + read_state;
+}
+
+int reject_changed_snapshot(int lhs, int rhs) {
+  int first = read_value(lhs);
+  read_state = read_state + 1;
+  int second = read_value(rhs);
+  return first + second;
+}
+
+int print_value(int value) {
+  putint(value);
+  return value;
+}
+
+int reject_side_effect(int lhs, int rhs) {
+  int first = print_value(lhs);
+  int second = print_value(rhs);
+  return first + second;
+}
+
+int main() {
+  int lhs[2] = {1, 2};
+  int rhs[2] = {3, 4};
+  return rejected_profit_order(11, 12, 1, 2, 3, 4, 5, 6, 7, 8,
+                               9, 10, 11, 12, 13, 14, 15, 16) +
+         recursive_value(2, 9, 0) +
+         costly_pair(1000, 1001, 1, 2, 3, 4, 5, 6, 7, 8,
+                     9, 10, 11, 12, 13, 14, 15, 16) +
+         reject_pointer(lhs, rhs, 2) + reject_float(1.0, 2.0) +
+         reject_write(3, 4) + reject_changed_snapshot(90, 91) +
+         reject_side_effect(5, 6);
+}
+
+// Recursive and non-recursive candidates both remain after the inlining window
+// and are assessed by the same target-aware guarded-reuse cost model.
+// COST: [cost-model] OIRGuardedCallCSE Accept transform=GlobalCSE scope=same-block-recursive-call
+// COST: [cost-model] OIRGuardedCallCSE Accept transform=GlobalCSE scope=same-block-readonly-call
+
+// OIR-LABEL: define i32 @recursive_value
+// OIR-DAG: %[[REQ:guard.call.eq]] = icmp eq
+// OIR-DAG: br i1 %[[REQ]], %[[RCONT:guard\.call\.cont\.[0-9.]+]], %{{[-A-Za-z0-9_.]+}}
+// OIR-DAG: [[RCONT]]:
+// OIR-DAG: phi
+// OIR: call i32 @recursive_value
+
+// OIR-LABEL: define i32 @costly_pair
+// OIR: %[[CEQ:guard.call.eq]] = icmp eq
+// OIR-NEXT: br i1 %[[CEQ]], %[[CCONT:guard\.call\.cont\.[0-9.]+]], %[[CSLOW:[-A-Za-z0-9_.]+]]
+// OIR: [[CSLOW]]:
+// OIR: call i32 @costly_scalar
+// OIR: br %[[CCONT]]
+// OIR: [[CCONT]]:
+// OIR: phi
+
+// OIR-LABEL: define i32 @reject_pointer
+// OIR-NOT: guard.call
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @reject_float
+// OIR-NOT: guard.call
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @reject_write
+// OIR-NOT: guard.call
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @reject_changed_snapshot
+// OIR-NOT: guard.call
+// OIR: ret i32
+
+// OIR-LABEL: define i32 @reject_side_effect
+// OIR-NOT: guard.call
+// OIR: ret i32

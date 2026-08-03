@@ -1,0 +1,19 @@
+int bias = 1;
+
+int pair_tree(int depth, int value, int delta) {
+  if (depth == 0) {
+    return value + bias;
+  }
+
+  int first = pair_tree(depth - 1, value, delta);
+  int second = pair_tree(depth - 1, value - delta, delta);
+  return first + second;
+}
+
+int main() {
+  int equal_args = pair_tree(4, 7, 0);
+  int unequal_args = pair_tree(4, 10, 3);
+  putint(equal_args + unequal_args);
+  putch(10);
+  return 0;
+}

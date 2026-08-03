@@ -1303,24 +1303,54 @@ bool FunctionMemorySummary::may_write_memory() const {
 }
 
 FunctionModRefAnalysis::FunctionModRefAnalysis(const Module &module) : module_(&module) {
+    std::unordered_map<const Function *, std::unordered_set<const Function *>> callers;
+    std::deque<const Function *> worklist;
+    std::unordered_set<const Function *> queued;
+
+    // Internal summaries start at the lattice bottom.  Revisit only reverse callers when a
+    // direct callee grows; indirect and unresolved calls remain conservative in call_summary().
     for (const auto &function : module.functions()) {
         if (function->is_external()) {
             summaries_[function.get()] = external_summary(*function);
         } else {
             summaries_[function.get()] = {};
+            worklist.push_back(function.get());
+            queued.insert(function.get());
+
+            for (const auto &block : function->blocks()) {
+                for (const auto &inst : block->instructions()) {
+                    auto *call = dynamic_cast<const CallInst *>(inst.get());
+                    if (call == nullptr) {
+                        continue;
+                    }
+                    auto *callee = dynamic_cast<const Function *>(call->callee());
+                    if (callee != nullptr) {
+                        callers[callee].insert(function.get());
+                    }
+                }
+            }
         }
     }
 
-    bool changed = true;
-    for (unsigned iteration = 0; changed && iteration < 64; ++iteration) {
-        changed = false;
-        for (const auto &function : module.functions()) {
-            FunctionMemorySummary next =
-                function->is_external() ? external_summary(*function) : scan_function(*function);
-            auto &current = summaries_[function.get()];
-            if (current != next) {
-                current = std::move(next);
-                changed = true;
+    while (!worklist.empty()) {
+        const auto *function = worklist.front();
+        worklist.pop_front();
+        queued.erase(function);
+
+        FunctionMemorySummary next = scan_function(*function);
+        auto &current = summaries_[function];
+        if (current == next) {
+            continue;
+        }
+        current = std::move(next);
+
+        auto found = callers.find(function);
+        if (found == callers.end()) {
+            continue;
+        }
+        for (const auto *caller : found->second) {
+            if (queued.insert(caller).second) {
+                worklist.push_back(caller);
             }
         }
     }

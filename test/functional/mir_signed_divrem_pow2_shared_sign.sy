@@ -1,0 +1,45 @@
+int results[8];
+
+void probe_signed_divrem(int value) {
+  int rem2 = value % 2;
+  int div2 = value / 2;
+  int rem4 = value % 4;
+  int div4 = value / 4;
+  int rem8 = value % 8;
+  int div8 = value / 8;
+  int rem_neg2 = value % -2;
+  int div_neg2 = value / -2;
+
+  // Keep every result live while all div/rem operations remain adjacent.  This
+  // exercises the pre-RA local-CSE interaction with power-of-two lowering.
+  results[0] = rem2;
+  results[1] = div2;
+  results[2] = rem4;
+  results[3] = div4;
+  results[4] = rem8;
+  results[5] = div8;
+  results[6] = rem_neg2;
+  results[7] = div_neg2;
+}
+
+int main() {
+  int seed = getint();
+  int inputs[4];
+  inputs[0] = seed;
+  inputs[1] = seed - 2;
+  inputs[2] = seed + -2147483644;
+  inputs[3] = inputs[2] - 1;
+
+  int i = 0;
+  while (i < 4) {
+    probe_signed_divrem(inputs[i]);
+    int j = 0;
+    while (j < 8) {
+      putint(results[j]);
+      putch(10);
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}

@@ -1042,14 +1042,15 @@ class VRegLowerer final {
         emit(mir::Opcode::SraIW,
              {mir::MachineOperand::reg_def(sign), mir::MachineOperand::reg_use(value),
               mir::MachineOperand::imm(31)});
+        auto bias = create_vreg(mir::ValueType::I32);
         emit(mir::Opcode::SrliW,
-             {mir::MachineOperand::reg_def(sign), mir::MachineOperand::reg_use(sign),
+             {mir::MachineOperand::reg_def(bias), mir::MachineOperand::reg_use(sign),
               mir::MachineOperand::imm(32 - shift)});
 
         auto adjusted = create_vreg(mir::ValueType::I32);
         emit(mir::Opcode::AddW,
              {mir::MachineOperand::reg_def(adjusted), mir::MachineOperand::reg_use(value),
-              mir::MachineOperand::reg_use(sign)});
+              mir::MachineOperand::reg_use(bias)});
 
         auto quotient = negate_result ? create_vreg(mir::ValueType::I32) : dst;
         emit(mir::Opcode::SraIW,
@@ -1269,12 +1270,13 @@ class VRegLowerer final {
         if (is_power_of_two(magnitude)) {
             auto shift = log2_u64(magnitude);
             if (shift > 0 && shift < 31) {
-                auto bias = create_vreg(mir::ValueType::I32);
+                auto sign = create_vreg(mir::ValueType::I32);
                 emit(mir::Opcode::SraIW,
-                     {mir::MachineOperand::reg_def(bias), mir::MachineOperand::reg_use(value),
+                     {mir::MachineOperand::reg_def(sign), mir::MachineOperand::reg_use(value),
                       mir::MachineOperand::imm(31)});
+                auto bias = create_vreg(mir::ValueType::I32);
                 emit(mir::Opcode::SrliW,
-                     {mir::MachineOperand::reg_def(bias), mir::MachineOperand::reg_use(bias),
+                     {mir::MachineOperand::reg_def(bias), mir::MachineOperand::reg_use(sign),
                       mir::MachineOperand::imm(32 - shift)});
 
                 auto adjusted = create_vreg(mir::ValueType::I32);
