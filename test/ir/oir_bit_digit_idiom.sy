@@ -190,19 +190,52 @@ int main() {
 }
 
 // OIR-LABEL: define i32 @digit_and
-// OIR-NOT: sdiv
-// OIR: bitdigit.and
-// OIR: ret i32
+// OIR: %[[AND_LHS_NONNEG:[A-Za-z0-9_.]+]] = icmp ge i32 %a.arg, 0
+// OIR-NEXT: %[[AND_RHS_NONNEG:[A-Za-z0-9_.]+]] = icmp ge i32 %b.arg, 0
+// OIR-NEXT: %[[AND_GUARD:[A-Za-z0-9_.]+]] = and i1 %[[AND_LHS_NONNEG]], %[[AND_RHS_NONNEG]]
+// OIR-NEXT: br i1 %[[AND_GUARD]], %[[AND_FAST:[A-Za-z0-9_.]+]], %[[AND_SLOW:[A-Za-z0-9_.]+]]
+// OIR: [[AND_SLOW]]:
+// OIR: sdiv i32
+// OIR-NEXT: {{.*}}sdiv i32
+// OIR: [[AND_EXIT:[A-Za-z0-9_.]+]]:
+// OIR-NEXT: %[[AND_RESULT:[A-Za-z0-9_.]+]] = phi [%[[AND_VALUE:[A-Za-z0-9_.]+]], %[[AND_FAST]]], [{{.*}}, %[[AND_SLOW]]]
+// OIR-NEXT: ret i32 %[[AND_RESULT]]
+// OIR: [[AND_FAST]]:
+// OIR-NEXT: %[[AND_VALUE]] = and i32 %a.arg, %b.arg
+// OIR-NEXT: br %[[AND_EXIT]]
 
 // OIR-LABEL: define i32 @digit_or
-// OIR-NOT: sdiv
-// OIR: bitdigit.or.value
-// OIR: ret i32
+// OIR: %[[OR_LHS_NONNEG:[A-Za-z0-9_.]+]] = icmp ge i32 %a.arg, 0
+// OIR-NEXT: %[[OR_RHS_NONNEG:[A-Za-z0-9_.]+]] = icmp ge i32 %b.arg, 0
+// OIR-NEXT: %[[OR_GUARD:[A-Za-z0-9_.]+]] = and i1 %[[OR_LHS_NONNEG]], %[[OR_RHS_NONNEG]]
+// OIR-NEXT: br i1 %[[OR_GUARD]], %[[OR_FAST:[A-Za-z0-9_.]+]], %[[OR_SLOW:[A-Za-z0-9_.]+]]
+// OIR: [[OR_SLOW]]:
+// OIR: sdiv i32
+// OIR-NEXT: {{.*}}sdiv i32
+// OIR: [[OR_EXIT:[A-Za-z0-9_.]+]]:
+// OIR-NEXT: %[[OR_RESULT:[A-Za-z0-9_.]+]] = phi [%[[OR_VALUE:[A-Za-z0-9_.]+]], %[[OR_FAST]]], [{{.*}}, %[[OR_SLOW]]]
+// OIR-NEXT: ret i32 %[[OR_RESULT]]
+// OIR: [[OR_FAST]]:
+// OIR-NEXT: %[[OR_DIFFERENT:[A-Za-z0-9_.]+]] = xor i32 %a.arg, %b.arg
+// OIR-NEXT: %[[OR_BOTH:[A-Za-z0-9_.]+]] = and i32 %a.arg, %b.arg
+// OIR-NEXT: %[[OR_VALUE]] = xor i32 %[[OR_DIFFERENT]], %[[OR_BOTH]]
+// OIR-NEXT: br %[[OR_EXIT]]
 
 // OIR-LABEL: define i32 @digit_xor
-// OIR-NOT: sdiv
-// OIR: bitdigit.xor
-// OIR: ret i32
+// OIR: %[[XOR_LHS_NONNEG:[A-Za-z0-9_.]+]] = icmp ge i32 %a.arg, 0
+// OIR-NEXT: %[[XOR_RHS_NONNEG:[A-Za-z0-9_.]+]] = icmp ge i32 %b.arg, 0
+// OIR-NEXT: %[[XOR_GUARD:[A-Za-z0-9_.]+]] = and i1 %[[XOR_LHS_NONNEG]], %[[XOR_RHS_NONNEG]]
+// OIR-NEXT: br i1 %[[XOR_GUARD]], %[[XOR_FAST:[A-Za-z0-9_.]+]], %[[XOR_SLOW:[A-Za-z0-9_.]+]]
+// OIR: [[XOR_SLOW]]:
+// OIR: srem i32
+// OIR: sdiv i32
+// OIR-NEXT: {{.*}}sdiv i32
+// OIR: [[XOR_EXIT:[A-Za-z0-9_.]+]]:
+// OIR-NEXT: %[[XOR_RESULT:[A-Za-z0-9_.]+]] = phi [%[[XOR_VALUE:[A-Za-z0-9_.]+]], %[[XOR_FAST]]], [{{.*}}, %[[XOR_SLOW]]]
+// OIR-NEXT: ret i32 %[[XOR_RESULT]]
+// OIR: [[XOR_FAST]]:
+// OIR-NEXT: %[[XOR_VALUE]] = xor i32 %a.arg, %b.arg
+// OIR-NEXT: br %[[XOR_EXIT]]
 
 // OIR-LABEL: define i32 @reject_trip_31
 // OIR-NOT: bitdigit
@@ -237,11 +270,11 @@ int main() {
 // OIR: sdiv i32
 
 // COST: [cost-model] target=rv64gc/lp64d policy=balanced filter=OIRBitDigitIdiom
-// COST-COUNT-3: [cost-model] OIRBitDigitIdiom Accept transform=LoopIdiom {{.*}} reason=Profitable
+// COST-COUNT-3: [cost-model] OIRBitDigitIdiom Accept transform=LoopIdiom scope=guarded_loop {{.*}} reason=Profitable
 
-// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and modulo-2^32 power/result wrap"
-// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.full_width"
-// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and modulo-2^32 power/result wrap"
-// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.full_width"
-// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and modulo-2^32 power/result wrap"
-// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.full_width"
+// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; nonnegative runtime guard selects the direct bitwise form and either-negative inputs retain the original loop"
+// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.guarded_nonnegative"
+// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; nonnegative runtime guard selects the direct bitwise form and either-negative inputs retain the original loop"
+// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.guarded_nonnegative"
+// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; nonnegative runtime guard selects the direct bitwise form and either-negative inputs retain the original loop"
+// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.guarded_nonnegative"

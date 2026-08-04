@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -25,20 +24,16 @@ namespace {
 //   r(0)  = 0, r(k + 1)  = r(k) + (c(k) ? p(k) : 0)
 //
 // for exactly W iterations, where W is the matched fixed-width integer type's
-// bit width.  c(k) is one of the three boolean forms matched below.  Signed
-// division truncates toward zero, so the kth remainder is the kth magnitude bit
-// with value +1 for non-negative inputs and -1 for negative inputs.
-// Consequently, for every matched bit pattern (including the signed minimum):
+// bit width.  c(k) is one of the three boolean forms matched below.  When both
+// inputs are non-negative, signed division/remainder by two exposes ordinary
+// 0/1 binary digits and the recurrence is exactly the corresponding direct
+// AND/OR/XOR operation.
 //
-//   eq1(rx) && eq1(ry) = (x >= 0 && y >= 0) ? (x & y) : 0
-//   eq1(rx) || eq1(ry) = nonneg(x) | nonneg(y)
-//   rx != ry           = same_sign(x,y) ? (abs(x) ^ abs(y))
-//                                      : (abs(x) | abs(y))
-//
-// Here abs is two's-complement magnitude modulo 2^W.  The reconstruction sum
-// is also modulo 2^W, including the sign-bit weight p(W - 1), so the closed
-// forms preserve the original wrap behavior instead of relying on a
-// non-negative-input assumption.
+// Negative odd signed remainders are -1 rather than +1, so the direct bitwise
+// form is not selected for those inputs.  The rewrite emits a runtime
+// `x >= 0 && y >= 0` guard and keeps the original loop as the fallback whenever
+// either input is negative.  This makes the fast-path proof independent of any
+// closed-form derivation for negative values, including the signed minimum.
 
 enum class DigitBooleanKind {
     AndPositiveBits,
@@ -338,7 +333,10 @@ std::optional<BitDigitLoopMatch> match_bit_digit_loop(const oir::Loop &loop) {
     }
     auto *body = header_branch->true_bb();
     auto *exit = header_branch->false_bb();
-    if (!has_no_exit_phis(exit)) {
+    // The guarded rewrite adds one fast predecessor and one two-input result
+    // phi to this exit.  Reject a shared exit rather than synthesizing phi
+    // values for unrelated predecessors.
+    if (!has_no_exit_phis(exit) || !has_only_block(exit->predecessors(), header)) {
         return std::nullopt;
     }
     recognized.insert(header_cmp);
@@ -553,23 +551,6 @@ oir::Instruction *insert_icmp(oir::Module &module, oir::BasicBlock *block, oir::
         module.types().int1_ty(), oir::Instruction::OpID::ICmp, pred, lhs, rhs, block, name));
 }
 
-oir::Instruction *insert_zext(oir::Module &module, oir::BasicBlock *block, oir::Value *source,
-                              const std::string &name) {
-    return block->insert_before_terminator(std::make_unique<oir::CastInst>(
-        module.types().int32_ty(), oir::Instruction::OpID::ZExt, source, block, name));
-}
-
-oir::Value *insert_nonnegative_value(oir::Module &module, oir::BasicBlock *block, oir::Value *value,
-                                     const std::string &prefix) {
-    auto *nonnegative = insert_icmp(module, block, oir::CmpPred::GE, value, module.create_i32(0),
-                                    prefix + ".nonnegative");
-    auto *bit = insert_zext(module, block, nonnegative, prefix + ".nonnegative.bit");
-    auto *mask = insert_binary(block, oir::Instruction::OpID::Sub, module.create_i32(0), bit,
-                               prefix + ".nonnegative.mask");
-    return insert_binary(block, oir::Instruction::OpID::And, value, mask,
-                         prefix + ".nonnegative.value");
-}
-
 oir::Value *insert_bit_or(oir::BasicBlock *block, oir::Value *lhs, oir::Value *rhs,
                           const std::string &prefix) {
     auto *different =
@@ -578,35 +559,16 @@ oir::Value *insert_bit_or(oir::BasicBlock *block, oir::Value *lhs, oir::Value *r
     return insert_binary(block, oir::Instruction::OpID::Xor, different, both, prefix + ".value");
 }
 
-struct MagnitudeValue {
-    oir::Value *negative_bit = nullptr;
-    oir::Value *magnitude = nullptr;
-};
-
-MagnitudeValue insert_magnitude(oir::Module &module, oir::BasicBlock *block, oir::Value *value,
-                                const std::string &prefix) {
-    auto *negative = insert_icmp(module, block, oir::CmpPred::LT, value, module.create_i32(0),
-                                 prefix + ".negative");
-    auto *negative_bit = insert_zext(module, block, negative, prefix + ".negative.bit");
-    auto *mask = insert_binary(block, oir::Instruction::OpID::Sub, module.create_i32(0),
-                               negative_bit, prefix + ".negative.mask");
-    auto *flipped =
-        insert_binary(block, oir::Instruction::OpID::Xor, value, mask, prefix + ".flipped");
-    auto *magnitude =
-        insert_binary(block, oir::Instruction::OpID::Sub, flipped, mask, prefix + ".magnitude");
-    return {negative_bit, magnitude};
-}
-
-std::int64_t closed_instruction_count(DigitBooleanKind kind) {
+std::int64_t fast_path_instruction_count(DigitBooleanKind kind) {
     switch (kind) {
     case DigitBooleanKind::AndPositiveBits:
-        return 9;
+        return 7;
     case DigitBooleanKind::OrPositiveBits:
-        return 11;
+        return 9;
     case DigitBooleanKind::XorSignedRemainders:
-        return 16;
+        return 7;
     }
-    return 16;
+    return 9;
 }
 
 bool cost_model_allows(const BitDigitLoopMatch &match, Stats &stats) {
@@ -621,22 +583,22 @@ bool cost_model_allows(const BitDigitLoopMatch &match, Stats &stats) {
             ? "signed-digit.and"
             : (match.kind == DigitBooleanKind::OrPositiveBits ? "signed-digit.or"
                                                               : "signed-digit.xor");
-    estimate.scope = "loop";
-    estimate.proof_kind = pass::cost_model::ProofKind::Structural;
+    estimate.scope = "guarded_loop";
+    estimate.proof_kind = pass::cost_model::ProofKind::Composite;
     estimate.proof_status = pass::cost_model::ProofStatus::Proven;
-    estimate.proof_rule_id =
-        "oir.signed_digit_reconstruction.i" + std::to_string(match.bit_width) + ".full_width";
+    estimate.proof_rule_id = "oir.signed_digit_reconstruction.i" + std::to_string(match.bit_width) +
+                             ".guarded_nonnegative";
     estimate.proof_summary =
         "exact full-width (" + std::to_string(match.bit_width) +
-        "-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and "
-        "modulo-2^" +
-        std::to_string(match.bit_width) + " power/result wrap";
+        "-bit) signed-div/rem-by-2 recurrence; nonnegative runtime guard selects the direct "
+        "bitwise form and either-negative inputs retain the original loop";
+    estimate.proof_obligations = 3;
     estimate.confidence = 0.99;
     estimate.frequency_scale = match.bit_width;
     estimate.frequency_source = pass::cost_model::FrequencySource::ConstantTripCount;
     estimate.has_detailed_instruction_mix = true;
     estimate.before_instrs = static_cast<std::int64_t>(match.recognized.size());
-    estimate.after_instrs = closed_instruction_count(match.kind);
+    estimate.after_instrs = fast_path_instruction_count(match.kind);
     const auto div_rem_per_iteration =
         std::count_if(match.recognized.begin(), match.recognized.end(), [](const auto *inst) {
             return inst->op() == oir::Instruction::OpID::SDiv ||
@@ -646,84 +608,115 @@ bool cost_model_allows(const BitDigitLoopMatch &match, Stats &stats) {
         static_cast<std::int64_t>(div_rem_per_iteration) * match.bit_width;
     estimate.before_int_alu =
         (match.kind == DigitBooleanKind::XorSignedRemainders ? 7 : 8) * match.bit_width;
-    estimate.after_int_alu = estimate.after_instrs;
+    estimate.after_int_alu = match.kind == DigitBooleanKind::OrPositiveBits ? 6 : 4;
     estimate.before_branches =
         (match.kind == DigitBooleanKind::XorSignedRemainders ? 3 : 4) * match.bit_width;
-    estimate.after_branches = 0;
-    estimate.risk.code_growth =
-        std::max<std::int64_t>(0, estimate.after_instrs - estimate.before_instrs);
-    estimate.risk.register_pressure_growth =
-        match.kind == DigitBooleanKind::XorSignedRemainders ? 2 : 1;
+    estimate.after_branches = 2;
+    estimate.after_phis = 1;
+    // The original loop remains as a cold fallback; the fast path and merge are
+    // therefore real static growth even though they replace the 32-iteration
+    // dynamic cost on every admitted execution.
+    estimate.risk.code_growth = estimate.after_instrs;
+    estimate.risk.register_pressure_growth = 1;
+    estimate.risk.cleanup_dependency = 1;
     return cost_model_allows_transform(stats, estimate);
 }
 
-oir::Value *materialize_closed_form(oir::Module &module, const BitDigitLoopMatch &match) {
-    auto *block = match.preheader;
+oir::Value *materialize_nonnegative_closed_form(oir::BasicBlock *block,
+                                                const BitDigitLoopMatch &match) {
     switch (match.kind) {
-    case DigitBooleanKind::AndPositiveBits: {
-        auto *lhs = insert_nonnegative_value(module, block, match.lhs_initial, "bitdigit.lhs");
-        auto *rhs = insert_nonnegative_value(module, block, match.rhs_initial, "bitdigit.rhs");
-        return insert_binary(block, oir::Instruction::OpID::And, lhs, rhs, "bitdigit.and");
-    }
-    case DigitBooleanKind::OrPositiveBits: {
-        auto *lhs = insert_nonnegative_value(module, block, match.lhs_initial, "bitdigit.lhs");
-        auto *rhs = insert_nonnegative_value(module, block, match.rhs_initial, "bitdigit.rhs");
-        return insert_bit_or(block, lhs, rhs, "bitdigit.or");
-    }
-    case DigitBooleanKind::XorSignedRemainders: {
-        auto lhs = insert_magnitude(module, block, match.lhs_initial, "bitdigit.lhs");
-        auto rhs = insert_magnitude(module, block, match.rhs_initial, "bitdigit.rhs");
-        auto *different = insert_binary(block, oir::Instruction::OpID::Xor, lhs.magnitude,
-                                        rhs.magnitude, "bitdigit.xor.different");
-        auto *both = insert_binary(block, oir::Instruction::OpID::And, lhs.magnitude, rhs.magnitude,
-                                   "bitdigit.xor.both");
-        auto *sign_different = insert_binary(block, oir::Instruction::OpID::Xor, lhs.negative_bit,
-                                             rhs.negative_bit, "bitdigit.xor.sign.different");
-        auto *sign_mask = insert_binary(block, oir::Instruction::OpID::Sub, module.create_i32(0),
-                                        sign_different, "bitdigit.xor.sign.mask");
-        auto *extra = insert_binary(block, oir::Instruction::OpID::And, both, sign_mask,
-                                    "bitdigit.xor.extra");
-        return insert_binary(block, oir::Instruction::OpID::Xor, different, extra, "bitdigit.xor");
-    }
+    case DigitBooleanKind::AndPositiveBits:
+        return insert_binary(block, oir::Instruction::OpID::And, match.lhs_initial,
+                             match.rhs_initial, "bitdigit.and.fast");
+    case DigitBooleanKind::OrPositiveBits:
+        return insert_bit_or(block, match.lhs_initial, match.rhs_initial, "bitdigit.or.fast");
+    case DigitBooleanKind::XorSignedRemainders:
+        return insert_binary(block, oir::Instruction::OpID::Xor, match.lhs_initial,
+                             match.rhs_initial, "bitdigit.xor.fast");
     }
     return nullptr;
+}
+
+bool is_matched_loop_block(const BitDigitLoopMatch &match, const oir::BasicBlock *block) {
+    return std::find(match.loop_blocks.begin(), match.loop_blocks.end(), block) !=
+           match.loop_blocks.end();
+}
+
+std::vector<oir::Value::Use> external_result_uses(const BitDigitLoopMatch &match) {
+    std::vector<oir::Value::Use> uses;
+    for (const auto &use : match.result_phi->uses()) {
+        auto *instruction = dynamic_cast<oir::Instruction *>(use.user);
+        if (instruction != nullptr && instruction->parent() != nullptr &&
+            !is_matched_loop_block(match, instruction->parent())) {
+            uses.push_back(use);
+        }
+    }
+    return uses;
+}
+
+void replace_uses(const std::vector<oir::Value::Use> &uses, oir::Value *old_value,
+                  oir::Value *new_value) {
+    for (const auto &use : uses) {
+        if (use.user != nullptr && use.operand_index < use.user->operand_count() &&
+            use.user->operand(use.operand_index) == old_value) {
+            use.user->set_operand(use.operand_index, new_value);
+        }
+    }
 }
 
 bool rewrite_bit_digit_loop(oir::Module &module, const BitDigitLoopMatch &match, Stats &stats) {
     if (!cost_model_allows(match, stats)) {
         return false;
     }
-    // The matched preheader has one unconditional edge to the header.  Commit
-    // that guaranteed CFG edit first, so an unexpected stale candidate cannot
-    // leave a partially materialized closed form behind.
-    if (!oir::cfg::replace_successor(match.preheader, match.header, match.exit)) {
+    auto *preheader_branch = dynamic_cast<oir::BranchInst *>(
+        match.preheader == nullptr ? nullptr : match.preheader->terminator());
+    auto *function = match.header == nullptr ? nullptr : match.header->parent();
+    if (preheader_branch == nullptr || preheader_branch->is_conditional() ||
+        preheader_branch->target_bb() != match.header || function == nullptr) {
         return false;
     }
-    auto *closed = materialize_closed_form(module, match);
-    if (closed == nullptr) {
-        // DigitBooleanKind is exhaustive; this is defensive against a future
-        // enum extension that forgets to add a closed form.
-        throw std::runtime_error("missing signed bit-digit closed form");
-    }
-    match.result_phi->replace_all_uses_with(closed);
 
-    // The matcher proved that only result_phi escapes and replaced all its
-    // uses.  Remove the now-unreachable pure loop immediately so inlining and
-    // its size model see the closed form rather than dead CFG.
-    for (auto *block : match.loop_blocks) {
-        auto successors = block->successors();
-        for (auto *successor : successors) {
-            oir::cfg::remove_edge(block, successor);
-        }
+    const auto escaping_uses = external_result_uses(match);
+    auto *guard = function->create_block("bitdigit.guard");
+    auto *fast = function->create_block("bitdigit.fast");
+    auto *lhs_nonnegative = insert_icmp(module, guard, oir::CmpPred::GE, match.lhs_initial,
+                                        module.create_i32(0), "bitdigit.lhs.nonnegative");
+    auto *rhs_nonnegative = insert_icmp(module, guard, oir::CmpPred::GE, match.rhs_initial,
+                                        module.create_i32(0), "bitdigit.rhs.nonnegative");
+    auto *both_nonnegative = insert_binary(guard, oir::Instruction::OpID::And, lhs_nonnegative,
+                                           rhs_nonnegative, "bitdigit.inputs.nonnegative");
+    auto *closed = materialize_nonnegative_closed_form(fast, match);
+    if (closed == nullptr) {
+        function->erase_block(fast);
+        function->erase_block(guard);
+        return false;
     }
-    for (auto *block : match.loop_blocks) {
-        oir::cfg::drop_all_references(*block);
+
+    // Commit the single fallible CFG edit before wiring either new block into
+    // predecessor/successor lists.  On failure both blocks are still detached.
+    if (!oir::cfg::replace_branch_target(*preheader_branch, match.header, guard)) {
+        function->erase_block(fast);
+        function->erase_block(guard);
+        return false;
     }
-    auto *function = match.header->parent();
-    for (auto *block : match.loop_blocks) {
-        function->erase_block(block);
-    }
+
+    oir::cfg::remove_edge_no_phi_update(match.preheader, match.header);
+    oir::cfg::add_edge(match.preheader, guard);
+    oir::cfg::replace_phi_incoming_block(match.header, match.preheader, guard);
+    oir::cfg::append_conditional_branch(module, guard, both_nonnegative, fast, match.header);
+    oir::cfg::append_unconditional_branch(module, fast, match.exit);
+
+    auto merged_owner =
+        std::make_unique<oir::PhiInst>(match.result_phi->type(), match.exit, "bitdigit.result");
+    auto *merged = merged_owner.get();
+    merged->add_incoming(match.result_phi, match.header);
+    merged->add_incoming(closed, fast);
+    match.exit->instructions().push_front(std::move(merged_owner));
+    merged->set_parent(match.exit);
+    replace_uses(escaping_uses, match.result_phi, merged);
+
     ++stats.folded;
+    stats.cfg += 2;
     return true;
 }
 

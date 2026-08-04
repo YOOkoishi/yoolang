@@ -48,8 +48,9 @@ int digit_xor(int a, int b) {
 
 // The expected checksum was generated independently from the exact signed
 // quotient/remainder recurrence.  The correctness matrix runs this file both
-// without optimization (the original 32-step loops) and with -O1 (the closed
-// forms), covering 867 results over mixed signs and both i32 endpoints.
+// without optimization (the original 32-step loops) and with -O1 (guarded
+// direct-bitwise fast paths plus the original-loop fallbacks), covering 867
+// results over mixed signs and both i32 endpoints.
 int main() {
   int values[17];
   values[0] = -2147483647 - 1;

@@ -24,6 +24,67 @@ the preserved pre-fix `cd047e6` compiler classifies all 60 cases as `CODE_NO_CHA
 compiler emits the same target-code fingerprints for the complete performance corpus while no
 longer reusing pointer-parameter reads without a reachable-memory proof.
 
+Those performance figures predate the guarded bit-digit follow-up below.  The follow-up has full
+correctness coverage but no fresh same-machine A/B run, so the earlier figures must not be cited as
+post-follow-up performance evidence.
+
+## Guarded Bit-Digit Follow-up
+
+Follow-up base: `f7e5ac0` on `task/general-performance-optimizations`; the working tree was clean at
+task start.
+
+### Correctness Invariant
+
+For the matched full-width digit reconstruction, direct AND/OR/XOR is selected only by the runtime
+guard `lhs >= 0 && rhs >= 0`, where signed division and remainder expose ordinary `0/1` binary
+digits.  If either input is negative, control must enter the unchanged original `/2`, `%2`,
+power-doubling loop.  Both paths merge the reconstructed result in the original loop exit.
+
+### Context Budget And Ledger
+
+This follow-up reuses the existing task and limits new anchors to the production pass, focused IR
+test, existing signed differential/e2e tests, OIR CFG helpers, and the live OIR pipeline.
+
+| File | Lines / query | Why | Keep? |
+| --- | --- | --- | --- |
+| `src/pass/oir/OIRBitDigitIdiomPass.cpp` | matcher, cost model, rewrite | Add the nonnegative fast path and preserve the loop fallback | yes |
+| `test/ir/oir_bit_digit_idiom.sy` | accepted transforms and cost checks | Lock down guard, fast operation, slow division, and merge | yes |
+| `test/easy/oir_bit_digit_idiom.*` | full | Preserve mixed-sign and endpoint executable behavior | yes |
+| `test/functional/oir_bit_digit_idiom_differential.*` | full | Preserve the 17x17 all-sign differential matrix | yes |
+| `src/oir/OIRCFGUtils.cpp` | edge and PHI update helpers | Reuse established CFG bookkeeping | no |
+| `src/pass/oir/OIRAffineModRecurrencePass.cpp` | guarded fast/fallback rewrite | Follow the repository's transactional guarded-loop pattern | no |
+| `src/pass/oir/OIROptimizationPipelinePass.cpp` | bit-digit placement | Confirm downstream cleanup and verification order | no |
+
+### Patch Queue
+
+| Patch | Intent | Files | Verifier/Test | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| BD-G1 | Retain the matched loop behind a negative-input fallback and emit direct nonnegative bitwise fast paths | `src/pass/oir/OIRBitDigitIdiomPass.cpp` | build, OIR verifier | complete | AND/OR/XOR share the same guard invariant; shared exits fail closed |
+| BD-G2 | Assert guard/fast/slow/merge IR and retain signed semantic coverage | `test/ir/oir_bit_digit_idiom.sy`, functional comment | FileCheck, stage, e2e | complete | Existing outputs cover mixed signs and `INT_MIN`; no expected output changed |
+| BD-G3 | Record final gates and handoff | this file, `docs/tasks/README.md`, `docs/AI_USAGE.md` | `git diff --check` | complete | Performance remains explicitly unmeasured for this follow-up |
+
+### Guarded Follow-up Verification Matrix
+
+| Gate | Command | Required? | Result | Notes |
+| --- | --- | --- | --- | --- |
+| Build | `xmake` | yes | PASS | Release compiler rebuilt successfully |
+| Focused FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter test/ir/oir_bit_digit_idiom.sy --jobs 1` | yes | PASS | 1/1; all three guards, fast operations, original divisions, exit PHIs, and guarded cost proofs checked |
+| Easy OIR/MIR/ASM + e2e | `python3 scripts/run_tests.py --suite stage --stage oir --stage mir --stage asm --suite e2e --filter test/easy/oir_bit_digit_idiom.sy --jobs 1 --o1` | yes | PASS | 4/4; includes positive, one-negative, two-negative, and `INT_MIN` inputs |
+| Differential OIR/MIR/ASM + e2e | `python3 scripts/run_tests.py --suite stage --stage oir --stage mir --stage asm --suite e2e --filter test/functional/oir_bit_digit_idiom_differential.sy --jobs 1 --o1` | yes | PASS | 4/4; 17x17 all-sign and endpoint matrix |
+| Unoptimized reference e2e | `python3 scripts/run_tests.py --suite e2e --filter oir_bit_digit_idiom --jobs 1` | yes | PASS | 2/2 original-loop executions match the same expected outputs |
+| Full optimized suite | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | yes | PASS | 1579 passed, 0 failed, 1 existing `shuffle1` skip |
+| Focused performance A/B | same-machine pre/post compiler comparison | no | NOT_RUN | Correctness-focused request; prior performance reports predate this guarded CFG and are not reused |
+| Diff integrity | `git diff --check` | yes | PASS | No whitespace errors |
+
+### Guarded Follow-up Result
+
+The final OIR has a single `lhs >= 0 && rhs >= 0` branch.  Its true edge computes the direct
+bitwise result from the original inputs; its false edge enters the untouched matched loop.  A new
+exit PHI merges those values.  The matcher additionally requires the original exit to have only
+the loop header as predecessor, so it rejects shared-exit CFGs rather than inventing incomplete
+PHI inputs.  Three independent read-only reviews found no remaining CFG, SSA, or test-coverage
+issue.
+
 ## Dynamic GEP Alias Soundness Follow-up
 
 Fix base: `5f97e68` on `task/general-performance-optimizations`; the working tree was clean at
@@ -202,16 +263,17 @@ unbounded pointer-parameter read footprint.
 | Affine signed-remainder recurrence | Replace a proven `x = (x + c) % m` unit-trip loop with `(x0 + n*c) % m` | Runtime guards require `n >= 3`, nonnegative initial state, positive constants, and no signed overflow; otherwise execute the original loop |
 | Exact small-loop unroll | Extend constant-trip unrolling to repair PHI-latch/multi-block loops and both true/false backedges | Exact i128 trip proof, i32 wrap rejection, side-exit/call/live-out validation, and profitability gates |
 | Nested remainder simplification | Fold `(x % d) % d` to `x % d` for the same nonzero signed divisor | Exact signed-remainder identity only |
-| Signed bit-digit reconstruction | Recognize an exact full-width `/2`, `%2`, power-of-two reconstruction of AND/OR/XOR and emit constant-time bitwise closed forms | Trip count is derived from the matched integer type (currently i32); proven for negative values and `INT_MIN`, with modulo wrap preserved; strict structural matcher only |
+| Signed bit-digit reconstruction | Recognize an exact full-width `/2`, `%2`, power-of-two reconstruction of AND/OR/XOR and emit guarded direct-bitwise fast paths | `lhs >= 0 && rhs >= 0` selects the fast form; either-negative inputs execute the unchanged original loop; strict structural matcher and dedicated exit only |
 | Guarded readonly-call reuse | Reuse an earlier direct call when exact integer argument equality holds | Same direct internal nonwriting callee with no pointer/unknown reads, identical MemorySSA clobber for tracked globals, bounded equality guards, slow call path retained, cost-model gate |
 | MIR expression CSE | Version virtual-register operands/results so a redefinition cannot leave a stale available expression | Physical definitions and call/memory barriers invalidate state; global CSE retains its single-def restriction |
 | Signed power-of-two div/rem lowering | Use distinct `sign` and `bias` virtual registers | Prevents Local CSE from observing an overwritten temporary and preserves negative i32 semantics |
 | Exact float identities | Key MIR immediates, OIR GVN, inline specialization, and constant equivalence by IEEE-754 f32 bits | Distinguishes `+0/-0`, adjacent f32 values, and NaN payloads; memzero accepts only all-zero `+0` bits |
 
-The accepted closed forms are the theoretical optimum for their matched semantic idioms: a
-linear recurrence becomes one multiply/add/remainder, a full-width digit reconstruction becomes a
-bounded set of comparisons and bitwise instructions, and duplicate readonly work becomes one call
-plus a guard.  The original computation remains available whenever a proof obligation fails.
+The affine closed form remains the theoretical optimum for its matched semantic idiom.  A
+full-width digit reconstruction now becomes a bounded guard plus direct bitwise instructions only
+for nonnegative inputs, while negative inputs retain the original loop; duplicate readonly work
+becomes one call plus a guard.  The original computation remains available whenever a proof or
+runtime guard does not admit the fast path.
 
 ## Pipeline Placement
 
@@ -325,12 +387,15 @@ itself now handles a real `-0.0` constant correctly, and the regression construc
   `CODE_NO_CHANGE` against the frozen `5f97e68` compiler; recorded optional unrun diagnostics.
 - 2026-08-04: completed independent code/test/documentation review and moved the task back to
   `ready_for_review`; human competition sign-off remains intentionally pending.
+- 2026-08-04: reopened at `f7e5ac0` and changed all matched bit-digit AND/OR/XOR rewrites to a
+  nonnegative direct-bitwise fast path with an unchanged either-negative loop fallback; passed the
+  1579-item optimized suite and recorded performance A/B as not rerun.
 
 ## Handoff
 
 The implementation is ready for team review on `task/general-performance-optimizations`.  The
-dynamic-GEP fix makes unknown same-root locations fail closed, the new `7099/0` and existing
-`135/0` regressions pass, the full optimized suite is 1579/0/1, and all 60 performance cases are
-target-code-identical to `5f97e68`.  Before competition submission, a team member must review the
-production patch and complete the human-modification/sign-off fields in `docs/AI_USAGE.md`; that
-human attestation cannot be supplied by Codex.
+bit-digit pass now keeps its original loop behind the either-negative fallback, the 17x17 signed
+matrix passes, and the full optimized suite is 1579/0/1.  The earlier 60-case performance evidence
+predates this guarded-CFG follow-up and was not rerun.  Before competition submission, a team
+member must review the production patch and complete the human-modification/sign-off fields in
+`docs/AI_USAGE.md`; that human attestation cannot be supplied by Codex.
