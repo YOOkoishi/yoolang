@@ -69,6 +69,44 @@ int reject_pointer(int lhs[], int rhs[], int count) {
   return first + second;
 }
 
+int read_pointer_at(int values[], int index, int depth) {
+  if (depth == 0) {
+    return values[index];
+  }
+  return read_pointer_at(values, index, depth - 1) + 1;
+}
+
+int reject_intervening_pointer_store(int values[][4], int first_index,
+                                     int second_index, int depth) {
+  int first = read_pointer_at(values[0], first_index, depth);
+  values[0][1] = 99;
+  int second = read_pointer_at(values[0], second_index, depth);
+  return first + second;
+}
+
+int preserve_pointer_calls_across_sibling_store(int values[][4], int index,
+                                                int depth) {
+  int first = read_pointer_at(values[0], index, depth);
+  values[0][1] = 99;
+  int second = read_pointer_at(values[0], index, depth);
+  return first + second;
+}
+
+int write_pointer_at(int values[], int index, int value, int depth) {
+  if (depth == 0) {
+    values[index] = value;
+    return value;
+  }
+  return write_pointer_at(values, index, value, depth - 1) + 1;
+}
+
+int preserve_loads_across_pointer_write(int values[][4], int index, int depth) {
+  int first = values[0][1];
+  int written = write_pointer_at(values[0], index, 99, depth);
+  int second = values[0][1];
+  return first + written + second;
+}
+
 int costly_float(float value) {
   value = value / 3.0;
   value = value / 5.0;
@@ -122,12 +160,17 @@ int reject_side_effect(int lhs, int rhs) {
 int main() {
   int lhs[2] = {1, 2};
   int rhs[2] = {3, 4};
+  int values[1][4] = {{10, 20, 30, 40}};
   return rejected_profit_order(11, 12, 1, 2, 3, 4, 5, 6, 7, 8,
                                9, 10, 11, 12, 13, 14, 15, 16) +
          recursive_value(2, 9, 0) +
          costly_pair(1000, 1001, 1, 2, 3, 4, 5, 6, 7, 8,
                      9, 10, 11, 12, 13, 14, 15, 16) +
-         reject_pointer(lhs, rhs, 2) + reject_float(1.0, 2.0) +
+         reject_pointer(lhs, rhs, 2) +
+         reject_intervening_pointer_store(values, 1, 1, 8) +
+         preserve_pointer_calls_across_sibling_store(values, 1, 8) +
+         preserve_loads_across_pointer_write(values, 1, 8) +
+         reject_float(1.0, 2.0) +
          reject_write(3, 4) + reject_changed_snapshot(90, 91) +
          reject_side_effect(5, 6);
 }
@@ -155,6 +198,32 @@ int main() {
 
 // OIR-LABEL: define i32 @reject_pointer
 // OIR-NOT: guard.call
+// OIR: ret i32
+
+// The callee reads through its pointer parameter at a dynamic offset.  A store
+// to another GEP of the same base object may therefore change the second call.
+// OIR-LABEL: define i32 @reject_intervening_pointer_store
+// OIR-NOT: guard.call
+// OIR: ret i32
+
+// Equal call arguments require no runtime guard, but the sibling GEP store may
+// still change the location read through the pointer parameter.  Both calls
+// must survive ordinary GVN/MemorySSA processing on opposite sides of it.
+// OIR-LABEL: define i32 @preserve_pointer_calls_across_sibling_store
+// OIR: call i32 @read_pointer_at
+// OIR: store i32 99
+// OIR-NOT: ret i32
+// OIR: call i32 @read_pointer_at
+// OIR-NOT: guard.call
+// OIR: ret i32
+
+// A pointer-writing callee may reach a sibling GEP through its dynamic index.
+// The second load must therefore not be forwarded from before the call.
+// OIR-LABEL: define i32 @preserve_loads_across_pointer_write
+// OIR: load i32
+// OIR: call i32 @{{.*write_pointer_at.*}}
+// OIR-NOT: ret i32
+// OIR: load i32
 // OIR: ret i32
 
 // OIR-LABEL: define i32 @reject_float

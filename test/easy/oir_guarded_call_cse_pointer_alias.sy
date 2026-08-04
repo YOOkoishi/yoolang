@@ -1,0 +1,20 @@
+int read_at(int values[], int index, int depth) {
+  if (depth == 0) {
+    return values[index];
+  }
+  return read_at(values, index, depth - 1) + 1;
+}
+
+int probe(int values[][4], int first_index, int second_index, int depth) {
+  int first = read_at(values[0], first_index, depth);
+  values[0][1] = 99;
+  int second = read_at(values[0], second_index, depth);
+  return first + second;
+}
+
+int main() {
+  int values[1][4] = {{10, 20, 30, 40}};
+  putint(probe(values, 1, 1, 8));
+  putch(10);
+  return 0;
+}

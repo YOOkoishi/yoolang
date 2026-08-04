@@ -293,8 +293,8 @@ bool cost_model_allows_candidate(Stats &stats, const GuardedCallCandidate &candi
     estimate.proof_kind = pass::cost_model::ProofKind::Composite;
     estimate.proof_status = pass::cost_model::ProofStatus::Proven;
     estimate.proof_summary =
-        "same direct callee, side-effect-free call, identical MemorySSA snapshot, "
-        "and exact integer argument equality guard";
+        "same direct callee, nonwriting call with no pointer or unknown reads, "
+        "identical MemorySSA snapshot, and exact integer argument equality guard";
     estimate.proof_obligations = static_cast<std::int64_t>(candidate.equalities.size()) + 3;
     estimate.confidence = candidate.recursive ? 0.74 : 0.62;
     estimate.has_detailed_instruction_mix = true;
@@ -330,9 +330,19 @@ bool cost_model_allows_candidate(Stats &stats, const GuardedCallCandidate &candi
 
 bool is_candidate_call(const oir::CallInst &call, const oir::FunctionModRefAnalysis &modref) {
     auto *callee = dynamic_cast<oir::Function *>(call.callee());
-    return callee != nullptr && !callee->is_external() && call.type() != nullptr &&
-           !call.type()->is_void() && !modref.call_has_side_effect(call) &&
-           !modref.call_may_write_memory(call);
+    if (callee == nullptr || callee->is_external() || call.type() == nullptr ||
+        call.type()->is_void() || modref.call_has_side_effect(call) ||
+        modref.call_may_write_memory(call)) {
+        return false;
+    }
+
+    // MemorySSA can precisely separate explicitly named global reads.  A
+    // pointer-parameter summary currently records only the parameter index,
+    // not the callee's reachable byte range, so it is not a sufficient proof
+    // for speculative result reuse.  Fail closed until range-aware footprints
+    // are available.  This still admits memory-free and tracked-global readers.
+    const auto &summary = modref.summary(callee);
+    return !summary.reads_all && !summary.reads_unknown && summary.read_param_indices.empty();
 }
 
 std::optional<GuardedCallCandidate>

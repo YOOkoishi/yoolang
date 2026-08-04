@@ -985,31 +985,10 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
     }
 
     if (path_a.root != nullptr && path_a.root == path_b.root) {
-        if (same_index_path(path_a.indices, path_b.indices)) {
-            return AliasResult::MustAlias;
-        }
-        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
-            return AliasResult::NoAlias;
-        }
-        if (loc_a.offset && loc_b.offset && loc_a.size && loc_b.size) {
-            const auto a_begin = *loc_a.offset;
-            const auto b_begin = *loc_b.offset;
-            const auto a_end = a_begin + static_cast<std::int64_t>(*loc_a.size);
-            const auto b_end = b_begin + static_cast<std::int64_t>(*loc_b.size);
-            if (a_end <= b_begin || b_end <= a_begin) {
-                return AliasResult::NoAlias;
-            }
-        }
-        return AliasResult::MayAlias;
-    }
-
-    if (root_a == root_b && is_distinct_object(root_a)) {
-        if (same_index_path(path_a.indices, path_b.indices)) {
-            return AliasResult::MustAlias;
-        }
-        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
-            return AliasResult::NoAlias;
-        }
+        // Canonically different GEP paths can still denote the same byte
+        // range (for example, nested array indexing versus a flattened
+        // element GEP).  Prefer computed byte locations whenever both are
+        // available; syntactic index-path separation is only a fallback.
         if (loc_a.offset && loc_b.offset && loc_a.size && loc_b.size) {
             const auto a_begin = *loc_a.offset;
             const auto b_begin = *loc_b.offset;
@@ -1021,6 +1000,36 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
             if (a_begin == b_begin && *loc_a.size == *loc_b.size) {
                 return AliasResult::MustAlias;
             }
+            return AliasResult::MayAlias;
+        }
+        if (same_index_path(path_a.indices, path_b.indices)) {
+            return AliasResult::MustAlias;
+        }
+        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
+            return AliasResult::NoAlias;
+        }
+        return AliasResult::MayAlias;
+    }
+
+    if (root_a == root_b && is_distinct_object(root_a)) {
+        if (loc_a.offset && loc_b.offset && loc_a.size && loc_b.size) {
+            const auto a_begin = *loc_a.offset;
+            const auto b_begin = *loc_b.offset;
+            const auto a_end = a_begin + static_cast<std::int64_t>(*loc_a.size);
+            const auto b_end = b_begin + static_cast<std::int64_t>(*loc_b.size);
+            if (a_end <= b_begin || b_end <= a_begin) {
+                return AliasResult::NoAlias;
+            }
+            if (a_begin == b_begin && *loc_a.size == *loc_b.size) {
+                return AliasResult::MustAlias;
+            }
+            return AliasResult::MayAlias;
+        }
+        if (same_index_path(path_a.indices, path_b.indices)) {
+            return AliasResult::MustAlias;
+        }
+        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
+            return AliasResult::NoAlias;
         }
         return AliasResult::MayAlias;
     }
@@ -1461,19 +1470,20 @@ bool call_param_may_alias(const CallInst &call, const std::unordered_set<std::si
         }
         auto *arg = args[index];
         if (!is_pointer_value(arg)) {
-            continue;
+            // The callee summary says this formal parameter carries a memory
+            // effect.  A mismatched actual cannot prove separation.
+            return true;
         }
 
-        auto arg_loc = alias_analysis.memory_location(arg);
-        auto ptr_loc = alias_analysis.memory_location(ptr);
-        if (arg_loc.base != nullptr && ptr_loc.base != nullptr) {
-            if (alias_analysis.alias(arg_loc.base, ptr_loc.base) != AliasResult::NoAlias) {
-                return true;
-            }
-            continue;
-        }
-
-        if (alias_analysis.alias(arg, ptr) != AliasResult::NoAlias) {
+        // A parameter effect describes memory reachable through the pointer,
+        // not just the single element denoted by the actual argument.  Strip
+        // GEPs before querying AA so that, for example, a callee read through
+        // `arg[index]` may overlap a store to a different constant element of
+        // the same caller object.  Distinct stack/global roots still prove
+        // separation; unknown roots conservatively remain MayAlias.
+        auto *arg_root = collect_pointer_path(arg).root;
+        auto *ptr_root = collect_pointer_path(ptr).root;
+        if (alias_analysis.alias(arg_root, ptr_root) != AliasResult::NoAlias) {
             return true;
         }
     }

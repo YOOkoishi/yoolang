@@ -1,5 +1,6 @@
 // RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
 // RUN: %compiler --emit-cost-model --cost-model-filter=OIRBitDigitIdiom -O1 %s | FileCheck %s --check-prefix=COST
+// RUN: %compiler --emit-cost-model=json --cost-model-filter=OIRBitDigitIdiom -O1 %s | FileCheck %s --check-prefix=COST-JSON
 
 int digit_and(int a, int b) {
   int len = 32;
@@ -237,3 +238,10 @@ int main() {
 
 // COST: [cost-model] target=rv64gc/lp64d policy=balanced filter=OIRBitDigitIdiom
 // COST-COUNT-3: [cost-model] OIRBitDigitIdiom Accept transform=LoopIdiom {{.*}} reason=Profitable
+
+// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and modulo-2^32 power/result wrap"
+// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.full_width"
+// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and modulo-2^32 power/result wrap"
+// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.full_width"
+// COST-JSON: "summary": "exact full-width (32-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and modulo-2^32 power/result wrap"
+// COST-JSON-NEXT: "rule_id": "oir.signed_digit_reconstruction.i32.full_width"

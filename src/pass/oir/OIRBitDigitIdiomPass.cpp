@@ -21,23 +21,24 @@ namespace {
 //
 //   qx(0) = x, qx(k + 1) = sdiv(qx(k), 2)
 //   qy(0) = y, qy(k + 1) = sdiv(qy(k), 2)
-//   p(0)  = 1, p(k + 1)  = p(k) * 2             (i32 wrap)
+//   p(0)  = 1, p(k + 1)  = p(k) * 2             (W-bit wrap)
 //   r(0)  = 0, r(k + 1)  = r(k) + (c(k) ? p(k) : 0)
 //
-// for exactly 32 iterations.  c(k) is one of the three boolean forms matched
-// below.  Signed division truncates toward zero, so the kth remainder is the
-// kth magnitude bit with value +1 for non-negative inputs and -1 for negative
-// inputs.  Consequently, for every i32 bit pattern (including INT_MIN):
+// for exactly W iterations, where W is the matched fixed-width integer type's
+// bit width.  c(k) is one of the three boolean forms matched below.  Signed
+// division truncates toward zero, so the kth remainder is the kth magnitude bit
+// with value +1 for non-negative inputs and -1 for negative inputs.
+// Consequently, for every matched bit pattern (including the signed minimum):
 //
 //   eq1(rx) && eq1(ry) = (x >= 0 && y >= 0) ? (x & y) : 0
 //   eq1(rx) || eq1(ry) = nonneg(x) | nonneg(y)
 //   rx != ry           = same_sign(x,y) ? (abs(x) ^ abs(y))
 //                                      : (abs(x) | abs(y))
 //
-// Here abs is two's-complement magnitude modulo 2^32.  The reconstruction sum
-// is also modulo 2^32, including p(31) == INT_MIN, so the closed forms preserve
-// the original wrap behavior instead of relying on a non-negative-input
-// assumption.
+// Here abs is two's-complement magnitude modulo 2^W.  The reconstruction sum
+// is also modulo 2^W, including the sign-bit weight p(W - 1), so the closed
+// forms preserve the original wrap behavior instead of relying on a
+// non-negative-input assumption.
 
 enum class DigitBooleanKind {
     AndPositiveBits,
@@ -52,6 +53,7 @@ struct ParityMatch {
 
 struct BitDigitLoopMatch {
     DigitBooleanKind kind = DigitBooleanKind::AndPositiveBits;
+    std::int64_t bit_width = 0;
     oir::BasicBlock *preheader = nullptr;
     oir::BasicBlock *header = nullptr;
     oir::BasicBlock *latch = nullptr;
@@ -92,6 +94,9 @@ oir::Value *incoming_value_from(const oir::PhiInst &phi, oir::BasicBlock *predec
 }
 
 bool is_i32(const oir::Value *value) {
+    // Closed-form materialization currently uses OIR's i32 builders.  Within
+    // that supported type domain, derive the recurrence width from the type
+    // instead of treating 32 as an idiom or benchmark constant.
     if (value == nullptr) {
         return false;
     }
@@ -252,6 +257,11 @@ std::optional<BitDigitLoopMatch> match_bit_digit_loop(const oir::Loop &loop) {
     if (phis.size() != 5) {
         return std::nullopt;
     }
+    auto *matched_integer_type = dynamic_cast<oir::IntegerType *>(phis.front()->type());
+    if (matched_integer_type == nullptr || matched_integer_type->bit_width() == 0) {
+        return std::nullopt;
+    }
+    const auto bit_width = static_cast<std::int64_t>(matched_integer_type->bit_width());
 
     oir::PhiInst *len_phi = nullptr;
     oir::PhiInst *power_phi = nullptr;
@@ -263,7 +273,7 @@ std::optional<BitDigitLoopMatch> match_bit_digit_loop(const oir::Loop &loop) {
         auto *initial = incoming_value_from(*phi, preheader);
         auto *next = incoming_value_from(*phi, latch);
         auto *next_binary = dynamic_cast<oir::BinaryInst *>(next);
-        if (is_int_value(initial, 32) && next_binary != nullptr &&
+        if (is_int_value(initial, bit_width) && next_binary != nullptr &&
             next_binary->op() == oir::Instruction::OpID::Sub && next_binary->lhs() == phi &&
             is_int_value(next_binary->rhs(), 1)) {
             if (len_phi != nullptr) {
@@ -511,6 +521,7 @@ std::optional<BitDigitLoopMatch> match_bit_digit_loop(const oir::Loop &loop) {
 
     BitDigitLoopMatch match;
     match.kind = kind;
+    match.bit_width = bit_width;
     match.preheader = preheader;
     match.header = header;
     match.latch = latch;
@@ -599,6 +610,9 @@ std::int64_t closed_instruction_count(DigitBooleanKind kind) {
 }
 
 bool cost_model_allows(const BitDigitLoopMatch &match, Stats &stats) {
+    if (match.bit_width <= 0) {
+        return false;
+    }
     OIRTransformCostEstimate estimate;
     estimate.kind = pass::cost_model::TransformKind::LoopIdiom;
     estimate.pass_name = "OIRBitDigitIdiom";
@@ -610,12 +624,15 @@ bool cost_model_allows(const BitDigitLoopMatch &match, Stats &stats) {
     estimate.scope = "loop";
     estimate.proof_kind = pass::cost_model::ProofKind::Structural;
     estimate.proof_status = pass::cost_model::ProofStatus::Proven;
-    estimate.proof_rule_id = "oir.signed_digit_reconstruction.i32.exact32";
+    estimate.proof_rule_id =
+        "oir.signed_digit_reconstruction.i" + std::to_string(match.bit_width) + ".full_width";
     estimate.proof_summary =
-        "exact 32-step signed-div/rem-by-2 recurrence; closed form preserves negative "
-        "remainders and modulo-2^32 power/result wrap";
+        "exact full-width (" + std::to_string(match.bit_width) +
+        "-bit) signed-div/rem-by-2 recurrence; closed form preserves negative remainders and "
+        "modulo-2^" +
+        std::to_string(match.bit_width) + " power/result wrap";
     estimate.confidence = 0.99;
-    estimate.frequency_scale = 32;
+    estimate.frequency_scale = match.bit_width;
     estimate.frequency_source = pass::cost_model::FrequencySource::ConstantTripCount;
     estimate.has_detailed_instruction_mix = true;
     estimate.before_instrs = static_cast<std::int64_t>(match.recognized.size());
@@ -625,10 +642,13 @@ bool cost_model_allows(const BitDigitLoopMatch &match, Stats &stats) {
             return inst->op() == oir::Instruction::OpID::SDiv ||
                    inst->op() == oir::Instruction::OpID::SRem;
         });
-    estimate.before_int_div_rem = static_cast<std::int64_t>(div_rem_per_iteration) * 32;
-    estimate.before_int_alu = match.kind == DigitBooleanKind::XorSignedRemainders ? 224 : 256;
+    estimate.before_int_div_rem =
+        static_cast<std::int64_t>(div_rem_per_iteration) * match.bit_width;
+    estimate.before_int_alu =
+        (match.kind == DigitBooleanKind::XorSignedRemainders ? 7 : 8) * match.bit_width;
     estimate.after_int_alu = estimate.after_instrs;
-    estimate.before_branches = match.kind == DigitBooleanKind::XorSignedRemainders ? 96 : 128;
+    estimate.before_branches =
+        (match.kind == DigitBooleanKind::XorSignedRemainders ? 3 : 4) * match.bit_width;
     estimate.after_branches = 0;
     estimate.risk.code_growth =
         std::max<std::int64_t>(0, estimate.after_instrs - estimate.before_instrs);

@@ -75,8 +75,8 @@ int main() {
 // OIR: ret i32 6
 
 // OIR-LABEL: define i32 @negative_source_write()
-// OIR: %view = alloca [2 x i32]
-// OIR: %view.1 = load i32, i32* %view.1.addr
+// OIR-NOT: alloca [2 x i32]
+// OIR: ret i32 8
 
 // OIR-LABEL: define i32 @positive_flatten()
 // OIR-NOT: alloca [2 x [3 x i32]]
@@ -87,8 +87,8 @@ int main() {
 // MIR: LI a0, 6
 
 // MIR-LABEL: func @negative_source_write() -> i32
-// MIR: frame objects:
-// MIR: view.obj
+// MIR: frame align=16 size=0 outgoing=0
+// MIR: LI a0, 8
 
 // MIR-LABEL: func @positive_flatten() -> i32
 // MIR: frame align=16 size=0 outgoing=0
