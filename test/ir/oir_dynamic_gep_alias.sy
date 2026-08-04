@@ -1,0 +1,27 @@
+// RUN: %compiler --emit-oir -O1 %s | FileCheck %s --check-prefix=OIR
+
+int read_cell(int values[][4], int row, int col) {
+  return values[row][col];
+}
+
+int probe(int row, int col) {
+  int values[2][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+  int first = read_cell(values, row, col);
+  values[1][col] = 99;
+  int second = read_cell(values, row, col);
+  return first * 1000 + second;
+}
+
+int main() {
+  return probe(getint(), getint());
+}
+
+// The dynamic read and the constant-row store can overlap when row == 1.
+// Keep a fresh read after the store; the exact GEP spelling is deliberately
+// left unconstrained so this check does not depend on unrelated IR cleanup.
+// OIR-LABEL: define i32 @probe
+// OIR: load i32
+// OIR: store i32 99
+// OIR-NOT: ret i32
+// OIR: load i32
+// OIR: ret i32

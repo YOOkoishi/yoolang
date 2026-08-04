@@ -1,0 +1,19 @@
+int read_cell(int values[][4], int row, int col) {
+  return values[row][col];
+}
+
+int probe(int row, int col) {
+  int values[2][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+  int first = read_cell(values, row, col);
+  values[1][col] = 99;
+  int second = read_cell(values, row, col);
+  return first * 1000 + second;
+}
+
+int main() {
+  int row = getint();
+  int col = getint();
+  putint(probe(row, col));
+  putch(10);
+  return 0;
+}

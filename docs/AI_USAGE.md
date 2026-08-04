@@ -13,14 +13,19 @@
 
 ## AI 生成或修改范围
 
-`58d15c1..cd047e6` 的通用性能优化任务及其当前正确性修复由 Codex 辅助完成，范围为：
+`58d15c1..cd047e6` 的通用性能优化任务、其已提交正确性修复，以及基于 `5f97e68` 的
+OIR 动态 GEP 别名健全性修复由 Codex 辅助完成，范围为：
 
 - 编译器生产代码：`include/oir/OIRScalarOpt.h`、`src/oir/OIRAnalysis.cpp`、
   `src/pass/mir/MIRLocalCSEPass.cpp`，以及 `src/pass/oir/` 下本任务涉及的 affine
   recurrence、bit-digit idiom、GVN、guarded-call CSE、inline、local simplify、loop
   transforms、optimization pipeline、scalar-opt utilities 和 OIR-to-MIR lowering 文件。
+  本次动态 GEP 修复具体修改 `src/oir/OIRAnalysis.cpp`，使未知动态字节位置保守返回
+  `MayAlias`。
 - 测试：本任务在 `test/easy/`、`test/functional/`、`test/ir/` 中新增或修改的回归、
-  差分、IR 结构和端到端用例，包括 guarded-call 指针别名正确性用例。
+  差分、IR 结构和端到端用例，包括 guarded-call 指针别名正确性用例，以及
+  `test/easy/oir_dynamic_gep_alias.{sy,in,out}`、`test/ir/oir_dynamic_gep_alias.sy` 和
+  `scripts/oir_infra_tests.py` 中的直接别名分析回归。
 - 文档与验证：本任务记录、AI 使用声明及由测试/性能脚本生成的本地验证报告。
 
 “辅助完成”包括生成新代码、修改既有代码、提出修复方案和执行验证。Git 历史不能证明

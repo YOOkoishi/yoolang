@@ -293,6 +293,62 @@ void test_memory_ssa_uses_phi_at_cfg_join() {
     REQUIRE(memory_ssa.clobbering_access(*load_g) == phi);
 }
 
+void test_dynamic_gep_aliases_fail_closed() {
+    oir::Module module("dynamic_gep_alias");
+    auto *i32 = module.types().int32_ty();
+    auto *row_type = module.types().array_ty(i32, 4);
+    auto *matrix_type = module.types().array_ty(row_type, 2);
+    auto *function = create_function(module, "f", i32, {i32, i32});
+    auto *row = function->add_argument(i32, "row");
+    auto *col = function->add_argument(i32, "col");
+    auto *entry = function->create_block("entry");
+
+    oir::IRBuilder builder(&module);
+    builder.set_insert_point(entry);
+    auto *matrix = builder.create_alloca(matrix_type, "matrix");
+    auto *zero = builder.i32(0);
+    auto *one = builder.i32(1);
+
+    // Both paths flatten to [0, row, col] in the old PointerPath model, but
+    // the second GEP's first index has a whole-row stride.  Dynamic byte
+    // offsets are unknown, so the shared flattened sequence cannot prove
+    // MustAlias.
+    auto *direct = builder.create_gep(matrix, module.types().ptr_ty(i32), {zero, row, col},
+                                      "direct");
+    auto *row_base = builder.create_gep(matrix, module.types().ptr_ty(row_type), {zero, row},
+                                        "row_base");
+    auto *segmented = builder.create_gep(row_base, module.types().ptr_ty(row_type), {col},
+                                         "segmented");
+
+    // This is the executable regression's address shape.  The read may
+    // overlap the store when row == 1, despite the first differing flattened
+    // constant index.
+    auto *zero_row = builder.create_gep(matrix, module.types().ptr_ty(row_type), {zero, zero},
+                                        "zero_row");
+    auto *dynamic_read = builder.create_gep(
+        zero_row, module.types().ptr_ty(i32), {row, col}, "dynamic_read");
+    auto *dynamic_store = builder.create_gep(
+        matrix, module.types().ptr_ty(i32), {zero, one, col}, "dynamic_store");
+
+    // Fully known byte intervals retain precise results.
+    auto *constant_left = builder.create_gep(
+        matrix, module.types().ptr_ty(i32), {zero, zero, zero}, "constant_left");
+    auto *constant_left_again = builder.create_gep(
+        matrix, module.types().ptr_ty(i32), {zero, zero, zero}, "constant_left_again");
+    auto *constant_right = builder.create_gep(
+        matrix, module.types().ptr_ty(i32), {zero, zero, one}, "constant_right");
+    builder.create_ret(zero);
+
+    require_verify(module);
+
+    oir::OIRAliasAnalysis aa;
+    REQUIRE(aa.alias(direct, direct) == oir::AliasResult::MustAlias);
+    REQUIRE(aa.alias(direct, segmented) == oir::AliasResult::MayAlias);
+    REQUIRE(aa.alias(dynamic_read, dynamic_store) == oir::AliasResult::MayAlias);
+    REQUIRE(aa.alias(constant_left, constant_left_again) == oir::AliasResult::MustAlias);
+    REQUIRE(aa.alias(constant_left, constant_right) == oir::AliasResult::NoAlias);
+}
+
 void test_presburger_uses_explicit_bounds_outside_fallback_window() {
     yir::presburger::IntegerRelation relation(1);
     relation.add_inequality({1}, -100);
@@ -381,6 +437,7 @@ int main() {
          test_verifier_catches_stale_constant_use_list},
         {"memory_ssa_skips_noalias_defs", test_memory_ssa_skips_noalias_defs},
         {"memory_ssa_uses_phi_at_cfg_join", test_memory_ssa_uses_phi_at_cfg_join},
+        {"dynamic_gep_aliases_fail_closed", test_dynamic_gep_aliases_fail_closed},
         {"presburger_uses_explicit_bounds_outside_fallback_window",
          test_presburger_uses_explicit_bounds_outside_fallback_window},
         {"presburger_prunes_infeasible_multivariable_box",

@@ -24,24 +24,6 @@ std::optional<std::int64_t> constant_int_value(const Value *value) {
     return std::nullopt;
 }
 
-bool same_index_value(const Value *lhs, const Value *rhs) {
-    if (lhs == rhs) {
-        return true;
-    }
-
-    auto lhs_constant = constant_int_value(lhs);
-    auto rhs_constant = constant_int_value(rhs);
-    return lhs_constant.has_value() && rhs_constant.has_value() &&
-           *lhs_constant == *rhs_constant;
-}
-
-bool distinct_constant_indices(const Value *lhs, const Value *rhs) {
-    auto lhs_constant = constant_int_value(lhs);
-    auto rhs_constant = constant_int_value(rhs);
-    return lhs_constant.has_value() && rhs_constant.has_value() &&
-           *lhs_constant != *rhs_constant;
-}
-
 bool loop_contains(const Loop &loop, const BasicBlock *block) {
     return contains_value(loop.blocks, block);
 }
@@ -153,46 +135,11 @@ std::optional<std::int64_t> trip_count_for(std::int64_t start, std::int64_t boun
     return std::nullopt;
 }
 
-struct PointerPath {
-    const Value *root = nullptr;
-    std::vector<const Value *> indices;
-};
-
-PointerPath collect_pointer_path(const Value *value) {
+const Value *gep_chain_root(const Value *value) {
     if (auto *gep = dynamic_cast<const GetElementPtrInst *>(value)) {
-        auto path = collect_pointer_path(gep->base_ptr());
-        for (auto *index : gep->indices()) {
-            path.indices.push_back(index);
-        }
-        return path;
+        return gep_chain_root(gep->base_ptr());
     }
-
-    return {value, {}};
-}
-
-bool same_index_path(const std::vector<const Value *> &lhs,
-                     const std::vector<const Value *> &rhs) {
-    if (lhs.size() != rhs.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < lhs.size(); ++i) {
-        if (!same_index_value(lhs[i], rhs[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool has_disjoint_constant_index(const std::vector<const Value *> &lhs,
-                                 const std::vector<const Value *> &rhs) {
-    const auto common = std::min(lhs.size(), rhs.size());
-    for (std::size_t i = 0; i < common; ++i) {
-        if (same_index_value(lhs[i], rhs[i])) {
-            continue;
-        }
-        return distinct_constant_indices(lhs[i], rhs[i]);
-    }
-    return false;
+    return value;
 }
 
 bool is_argument_or_distinct_object(const Value *value) {
@@ -969,26 +916,28 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
 
     auto loc_a = memory_location(a);
     auto loc_b = memory_location(b);
-    auto path_a = collect_pointer_path(a);
-    auto path_b = collect_pointer_path(b);
-    auto *root_a = loc_a.base != nullptr ? loc_a.base : underlying_object(path_a.root);
-    auto *root_b = loc_b.base != nullptr ? loc_b.base : underlying_object(path_b.root);
+    auto *path_root_a = gep_chain_root(a);
+    auto *path_root_b = gep_chain_root(b);
+    auto *root_a = loc_a.base != nullptr ? loc_a.base : underlying_object(path_root_a);
+    auto *root_b = loc_b.base != nullptr ? loc_b.base : underlying_object(path_root_b);
 
     const bool a_is_stack_object = dynamic_cast<const AllocaInst *>(root_a) != nullptr;
     const bool b_is_stack_object = dynamic_cast<const AllocaInst *>(root_b) != nullptr;
-    const auto *known_root_a = root_a != nullptr ? root_a : path_a.root;
-    const auto *known_root_b = root_b != nullptr ? root_b : path_b.root;
+    const auto *known_root_a = root_a != nullptr ? root_a : path_root_a;
+    const auto *known_root_b = root_b != nullptr ? root_b : path_root_b;
     if (root_a != root_b &&
         ((a_is_stack_object && is_argument_or_distinct_object(known_root_b)) ||
          (b_is_stack_object && is_argument_or_distinct_object(known_root_a)))) {
         return AliasResult::NoAlias;
     }
 
-    if (path_a.root != nullptr && path_a.root == path_b.root) {
+    if (path_root_a != nullptr && path_root_a == path_root_b) {
         // Canonically different GEP paths can still denote the same byte
         // range (for example, nested array indexing versus a flattened
-        // element GEP).  Prefer computed byte locations whenever both are
-        // available; syntactic index-path separation is only a fallback.
+        // element GEP).  Only complete byte intervals can prove their
+        // relationship.  When a dynamic index makes either offset unknown,
+        // fail closed: GEP segment boundaries, base types, and strides cannot
+        // be recovered from a concatenated index sequence.
         if (loc_a.offset && loc_b.offset && loc_a.size && loc_b.size) {
             const auto a_begin = *loc_a.offset;
             const auto b_begin = *loc_b.offset;
@@ -1001,12 +950,6 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
                 return AliasResult::MustAlias;
             }
             return AliasResult::MayAlias;
-        }
-        if (same_index_path(path_a.indices, path_b.indices)) {
-            return AliasResult::MustAlias;
-        }
-        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
-            return AliasResult::NoAlias;
         }
         return AliasResult::MayAlias;
     }
@@ -1024,12 +967,6 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
                 return AliasResult::MustAlias;
             }
             return AliasResult::MayAlias;
-        }
-        if (same_index_path(path_a.indices, path_b.indices)) {
-            return AliasResult::MustAlias;
-        }
-        if (has_disjoint_constant_index(path_a.indices, path_b.indices)) {
-            return AliasResult::NoAlias;
         }
         return AliasResult::MayAlias;
     }
@@ -1481,8 +1418,8 @@ bool call_param_may_alias(const CallInst &call, const std::unordered_set<std::si
         // `arg[index]` may overlap a store to a different constant element of
         // the same caller object.  Distinct stack/global roots still prove
         // separation; unknown roots conservatively remain MayAlias.
-        auto *arg_root = collect_pointer_path(arg).root;
-        auto *ptr_root = collect_pointer_path(ptr).root;
+        auto *arg_root = gep_chain_root(arg);
+        auto *ptr_root = gep_chain_root(ptr);
         if (alias_analysis.alias(arg_root, ptr_root) != AliasResult::NoAlias) {
             return true;
         }

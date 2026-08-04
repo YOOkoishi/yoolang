@@ -24,6 +24,121 @@ the preserved pre-fix `cd047e6` compiler classifies all 60 cases as `CODE_NO_CHA
 compiler emits the same target-code fingerprints for the complete performance corpus while no
 longer reusing pointer-parameter reads without a reachable-memory proof.
 
+## Dynamic GEP Alias Soundness Follow-up
+
+Fix base: `5f97e68` on `task/general-performance-optimizations`; the working tree was clean at
+task start.
+
+### Confirmed Counterexample
+
+For a local `int values[2][4]`, a dynamic read through the decomposed GEP path
+`[0, 0, row, col]` and a later write through `[0, 1, col]` overlap when `row == 1`.  With input
+`1 2`, the unoptimized compiler returned `7099`, while the pre-fix `5f97e68 -O1` compiler
+returned `7007` by reusing the load from before the store.
+
+### Root Cause
+
+`collect_pointer_path` flattened every GEP segment into one index vector, discarding each
+segment's base type, boundary, and stride.  `memory_location()` correctly gave up its byte offset
+when a dynamic index was present, but both same-root branches in `OIRAliasAnalysis::alias()` then
+used `same_index_path` and `has_disjoint_constant_index` to recover `MustAlias` or `NoAlias` from
+that lossy vector.  Neither conclusion follows from the retained information.
+
+### Correctness Invariant
+
+Alias analysis may return `MustAlias` or `NoAlias` only from a representation that preserves the
+addressing semantics needed for that proof.  A concatenated sequence of indices from multiple
+GEPs does not preserve each segment's base type or stride, so an unknown dynamic byte position
+must fail closed to `MayAlias`.  Pointer identity remains `MustAlias`, and complete byte
+offset-and-size intervals may retain their proven `MustAlias`/`NoAlias` result.
+
+### Context Budget And Ledger
+
+This follow-up keeps the existing task protocol and performance-workflow references, and limits
+new source/script anchors to the alias implementation, focused regressions, test runner, task
+record, and AI disclosure.
+
+| File | Lines / query | Why | Keep? |
+| --- | --- | --- | --- |
+| `src/oir/OIRAnalysis.cpp` | `collect_pointer_path`, `alias`, `memory_location` | Remove unsound dynamic path proofs in both same-root branches | yes |
+| `include/oir/OIRAnalysis.h` | `AliasResult`, `MemoryLocation`, AA API | Confirm public API and reliable byte-location facts | yes |
+| `test/ir/oir_dynamic_gep_alias.sy` | full | Focused store/load structural regression | yes |
+| `test/easy/oir_dynamic_gep_alias.{sy,in,out}` | full | Independent executable counterexample | yes |
+| `test/ir/oir_guarded_call_cse.sy` | pointer checks | Preserve the prior pointer-alias soundness regression | yes |
+| `scripts/oir_infra_tests.py` | direct AA construction | Cover both lossy-path `MustAlias` and `NoAlias` results | yes |
+| `scripts/run_tests.py` | e2e discovery/output handling | Confirm `.out` includes stdout and exit code | no |
+| `docs/AI_USAGE.md` | modification-scope section | Disclose the follow-up without filling human fields | yes |
+
+### Patch Queue
+
+| Patch | Intent | Files | Verifier/Test | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| GEP-P1 | Add independent semantic, OIR-shape, and direct-AA regressions | `test/easy/oir_dynamic_gep_alias.*`, `test/ir/oir_dynamic_gep_alias.sy`, `scripts/oir_infra_tests.py` | infra, focused FileCheck and e2e | complete | Pre-fix O1 was `7007`; FileCheck lacked the second load; direct AA returned old `MustAlias` |
+| GEP-P2 | Delete concatenated-index fallback proofs when byte locations are unknown | `src/oir/OIRAnalysis.cpp` | OIR/MIR/ASM stages and e2e | complete | Both `same_index_path` and constant-index separation fallbacks removed; root stripping retained |
+| GEP-P3 | Record verification, performance effect, and AI-modified scope | this file, `docs/AI_USAGE.md`, `docs/tasks/README.md` | `git diff --check` | complete | Human reviewer/date fields remain untouched |
+
+### Follow-up Verification Matrix
+
+| Gate | Command | Required? | Result | Notes |
+| --- | --- | --- | --- | --- |
+| Pre-fix evidence | frozen `5f97e68` compiler | yes | PASS | unoptimized `7099/0`; O1 `7007/0`; focused FileCheck and direct-AA assertion failed as expected |
+| Direct AA infra | `python3 scripts/run_tests.py --suite infra --jobs 1` | yes | PASS | identity/constant intervals remain precise; both dynamic cases are `MayAlias` |
+| Build | `xmake` | yes | PASS | release compiler rebuilt |
+| Dynamic GEP FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter test/ir/oir_dynamic_gep_alias.sy --jobs 1` | yes | PASS | store followed by a fresh load |
+| Dynamic GEP YIR/OIR/MIR/ASM | `python3 scripts/run_tests.py --suite stage --stage yir --stage oir --stage mir --stage asm --filter test/easy/oir_dynamic_gep_alias.sy --jobs 1 --o1` | yes | PASS | 4/4 |
+| Dynamic GEP unoptimized e2e | `python3 scripts/run_tests.py --suite e2e --filter test/easy/oir_dynamic_gep_alias.sy --jobs 1` | yes | PASS | stdout `7099`, exit `0` |
+| Dynamic GEP optimized e2e | `python3 scripts/run_tests.py --suite e2e --filter test/easy/oir_dynamic_gep_alias.sy --jobs 1 --o1` | yes | PASS | stdout `7099`, exit `0` |
+| Guarded-call FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter test/ir/oir_guarded_call_cse.sy --jobs 1` | yes | PASS | 1/1 |
+| Guarded-call pointer stage/e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --filter test/easy/oir_guarded_call_cse_pointer_alias.sy --jobs 1 --o1` | yes | PASS | 5/5; stdout `135`, exit `0` |
+| Guarded-call stage/e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --filter test/easy/oir_guarded_call_cse.sy --jobs 1 --o1` | yes | PASS | 5/5 |
+| Bit-digit FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter test/ir/oir_bit_digit_idiom.sy --jobs 1` | yes | PASS | 1/1 |
+| Bit-digit easy stage/e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --filter test/easy/oir_bit_digit_idiom.sy --jobs 1 --o1` | yes | PASS | 5/5 |
+| Bit-digit differential stage/e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --filter test/functional/oir_bit_digit_idiom_differential.sy --jobs 1 --o1` | yes | PASS | 5/5 |
+| YIR view FileCheck | `python3 scripts/run_tests.py --suite filecheck --filter test/ir/yir_view.sy --jobs 1` | yes | PASS | 1/1 |
+| YIR view stage/e2e | `python3 scripts/run_tests.py --suite stage --suite e2e --filter test/easy/yir_view.sy --jobs 1 --o1` | yes | PASS | 5/5 |
+| Full optimized suite | `python3 scripts/run_tests.py --build --suite all --jobs 1 --o1` | yes | PASS | 1579 passed, 0 failed, 1 existing `shuffle1` e2e skip |
+| Diff integrity | `git diff --check` | yes | PASS | no whitespace errors |
+| Current `test/performance` run | `COMPILER_BIN=build/linux/x86_64/release/compiler SYSY_RUNTIME_LIB=runtime/libsysy_riscv.a PERF_TEST_DIRS=test/performance python3 scripts/compare_perf.py` | yes | PASS | 60/60 |
+| `test/performance` adjudication | `python3 scripts/compare_perf_baseline.py --current build/task-evidence/2026-08-04-general-opts/dynamic-gep-alias/current.json --baseline build/task-evidence/2026-08-04-general-opts/soundness-fix/fresh-ab/fixed.json --out-md build/task-evidence/2026-08-04-general-opts/dynamic-gep-alias/delta.md --out-json build/task-evidence/2026-08-04-general-opts/dynamic-gep-alias/delta.json --out-insn-json build/task-evidence/2026-08-04-general-opts/dynamic-gep-alias/instruction-count-compare.json --baseline-label 5f97e68` | yes | PASS | 60/60 `CODE_NO_CHANGE`; 0 wins, 0 losses, 60 neutral |
+| CI-parity 115-case performance timing | `COMPILER_BIN=build/linux/x86_64/release/compiler SYSY_RUNTIME_LIB=runtime/libsysy_riscv.a PERF_TEST_DIRS=test/performance,test/bsb-final PERF_EXCLUDE_CASES=test/performance/h-10-02.sy,test/performance/h-10-03.sy,test/bsb-final/2025-CPS-39.sy,test/bsb-final/2025-Z8N-28.sy python3 scripts/compare_perf.py` | no | NOT_RUN | no target-code change in the complete 60-case performance corpus; full optimized correctness covers both directories |
+| Dynamic instruction comparison | same 60-case command with `ENABLE_QEMU_INSN_COUNT=1 QEMU_RISCV64=/usr/bin/qemu-riscv64 QEMU_INSN_API_VERSION=6` on both compilers | no | NOT_RUN | baseline counting was disabled, so the matching current run also left it disabled |
+
+### Performance Impact
+
+The pre-fix compiler is frozen at `build/perf-baselines/5f97e68/compiler`, SHA-256
+`be2220b1a4e85c186434d72b1e714df11b55aa118a8776d349fceca600f31f40`.  A fresh current
+`test/performance` run passed all 60 cases.  Comparison against the preserved `5f97e68` report
+classified all 60 as `CODE_NO_CHANGE`, so the patch changes no target code in that complete
+performance scope: adjudicated delta `0.00%`, 0 wins, 0 losses, 60 neutral.  Raw QEMU totals
+(`5.2882s` current versus `5.2833s` baseline) are diagnostic noise because the binaries are
+identical.  Evidence is under
+`build/task-evidence/2026-08-04-general-opts/dynamic-gep-alias/`.
+
+- Baseline report: `build/task-evidence/2026-08-04-general-opts/soundness-fix/fresh-ab/fixed.{json,md}`.
+- Current report: `build/task-evidence/2026-08-04-general-opts/dynamic-gep-alias/current.{json,md}`.
+- Adjudicated comparison: `build/task-evidence/2026-08-04-general-opts/dynamic-gep-alias/delta.{json,md}`.
+
+### Residual Risk And Unrun Gates
+
+The conservative result may suppress alias-dependent optimization in unseen programs with
+unknown dynamic same-root GEPs; it cannot enable an illegal transformation.  Existing constant
+byte-offset arithmetic (`type_size`, GEP offset accumulation, and interval endpoint addition)
+does not have explicit overflow checks.  This patch does not add symbolic offsets or expand that
+pre-existing boundary; every newly affected dynamic case fails closed.
+
+The 115-case CI-parity performance timing scope and dynamic QEMU instruction counts were not run.
+They are not needed to adjudicate this patch's 60-case `CODE_NO_CHANGE` result, but remain explicit
+unrun performance diagnostics rather than claimed coverage.
+
+### Handoff State
+
+Current conclusion: both lossy syntactic fallbacks have been removed.  Pointer identity and
+complete constant byte intervals retain their strong results; every tested unknown dynamic
+same-root case now returns `MayAlias`.
+
+Next action: team review.  All required correctness gates and the complete 60-case target-code
+comparison pass; only the explicitly optional diagnostics above remain unrun.
+
 ## Soundness Follow-up
 
 ### Correctness Invariant
@@ -203,10 +318,19 @@ itself now handles a real `-0.0` constant correctly, and the regression construc
   pointer/unknown reads, corrected equivalent-GEP byte-range aliasing, and added regressions.
 - 2026-08-04: passed 1573 optimized checks and a fresh 60-case comparison with every case
   `CODE_NO_CHANGE`; added a truthful AI-use disclosure and left team sign-off explicit.
+- 2026-08-04: reopened at `5f97e68` to repair unsound dynamic-GEP `MustAlias`/`NoAlias`
+  fallbacks; reproduced `7007` versus `7099`, added direct AA/FileCheck/e2e regressions, and made
+  unknown dynamic same-root locations fail closed.
+- 2026-08-04: passed the 1579-item optimized suite and classified all 60 performance cases as
+  `CODE_NO_CHANGE` against the frozen `5f97e68` compiler; recorded optional unrun diagnostics.
+- 2026-08-04: completed independent code/test/documentation review and moved the task back to
+  `ready_for_review`; human competition sign-off remains intentionally pending.
 
 ## Handoff
 
-The implementation is ready for team review on `task/general-performance-optimizations`.  Technical
-correctness and performance-preservation gates pass.  Before competition submission, a team member
-must review the production patch and complete the human-modification/sign-off fields in
-`docs/AI_USAGE.md`; that human attestation cannot be supplied by Codex.
+The implementation is ready for team review on `task/general-performance-optimizations`.  The
+dynamic-GEP fix makes unknown same-root locations fail closed, the new `7099/0` and existing
+`135/0` regressions pass, the full optimized suite is 1579/0/1, and all 60 performance cases are
+target-code-identical to `5f97e68`.  Before competition submission, a team member must review the
+production patch and complete the human-modification/sign-off fields in `docs/AI_USAGE.md`; that
+human attestation cannot be supplied by Codex.
