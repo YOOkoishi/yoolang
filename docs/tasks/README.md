@@ -18,6 +18,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [Yoolang Compiler Design Documentation](2026-08-05-yoolang-compiler-design.md) | ready_for_review | `master` working tree | 2026-08-05 |
 | [General Semantics-Preserving Performance Optimizations](2026-08-04-general-performance-optimizations.md) | ready_for_review | `task/general-performance-optimizations` | 2026-08-04 |
 | [Loop Performance Audit And Optimization Integration](2026-07-31-loop-performance-integration.md) | verifying | `master` working tree | 2026-07-31 |
 | [Context-Sensitive Callsite Inlining And Transactional Residual Partial Evaluation](2026-07-17-context-inline-residual-pe.md) | scoped | `task/context-inline-residual-pe` (planned) | 2026-07-17 |

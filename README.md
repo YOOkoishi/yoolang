@@ -7,8 +7,9 @@
 本 gitlab 仓库是 github 仓库[yoolang](https://github.com/YOOkoishi/yoolang)的一个快照,如果组委会或其余参赛队需要参考git记录，请查看github仓库。
 
 本项目开发中使用了 OpenAI Codex。AI 辅助范围包括部分编译器源代码、脚本、测试和
-文档；工具、生成范围及人工复核状态详见 [AI 使用声明](docs/AI_USAGE.md)。参赛队提交
-前应据实补全其中的人工修改与复核记录。
+文档；工具、生成范围及人工复核状态详见 [AI 使用声明](docs/AI_USAGE.md)。
+
+yoolang 总体的设计文档可以参考 [yoolang-design](docs/yoolang-design.md)
 
 ## 使用方法
 
