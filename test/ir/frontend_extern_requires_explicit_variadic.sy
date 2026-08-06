@@ -1,0 +1,7 @@
+// RUN: %compiler --emit-oir %s > %t.out 2>&1; status=$?; test $status -ne 0 && FileCheck %s --check-prefix=ERR < %t.out
+
+int invalid_variadic_definition(int fixed, ...) {
+  return fixed;
+}
+
+// ERR: error[PA0002]: variadic functions require an extern declaration

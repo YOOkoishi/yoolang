@@ -1,0 +1,10 @@
+// RUN: %compiler --emit-oir %s > %t.out 2>&1; status=$?; test $status -ne 0 && FileCheck %s --check-prefix=ERR < %t.out
+
+extern int consume_i3(vector<int,3> value);
+
+int invalid_call() {
+  vector<int,4> value = {};
+  return consume_i3(value);
+}
+
+// ERR: Pass FAILED: ASTSemanticAnalysisPass: SE0008: argument 1 of 'consume_i3' cannot convert vector<int, 4> to vector<int, 3>

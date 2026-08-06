@@ -1,0 +1,7 @@
+// RUN: %compiler --emit-oir %s > %t.out 2>&1; status=$?; test $status -ne 0 && FileCheck %s --check-prefix=ERR < %t.out
+
+extern int duplicate(int value);
+int duplicate(int value) { return value; }
+int duplicate(int value) { return value + 1; }
+
+// ERR: Pass FAILED: ASTSemanticAnalysisPass: SE0004: redefinition of function 'duplicate'

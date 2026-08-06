@@ -1,0 +1,83 @@
+// RUN: %compiler --emit-ast %s | FileCheck %s --check-prefix=AST
+// RUN: %compiler --emit-yir %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-oir %s | FileCheck %s --check-prefix=OIR
+
+extern int scalar_mix(int count, float scale, int values[]);
+extern float unnamed_scalar(int, float);
+extern void external_sink(void);
+extern int external_log(int level, ...);
+extern vector<int,3> transform_i3(vector<int,3> value, mask<3> active);
+extern vector<int,3> transform_i3(vector<int,3> input, mask<3> predicate);
+extern mask<31> clean_mask31(mask<31> value);
+
+extern int declared_then_defined(int value);
+int declared_then_defined(int value) {
+  return value + 1;
+}
+
+int defined_then_declared(int value) {
+  return value - 1;
+}
+extern int defined_then_declared(int);
+
+int call_externals(int values[]) {
+  vector<int,3> value = vector<int,3>{1, 2, 3};
+  mask<3> active = mask<3>{1, 0, 1};
+  vector<int,3> changed = transform_i3(value, active);
+  mask<31> cleaned = clean_mask31(mask<31>{});
+  external_sink();
+  external_log(7, 11, 2.5);
+  return scalar_mix(3, 1.5, values) + changed[0] + cleaned[0] +
+         declared_then_defined(4) + defined_then_declared(6);
+}
+
+// AST-LABEL: FuncDecl name=scalar_mix return=int extern=true variadic=false
+// AST: Param[0] name=count type=int
+// AST: Param[1] name=scale type=float
+// AST: Param[2] name=values type=int
+// AST: Body: <external>
+// AST-LABEL: FuncDecl name=unnamed_scalar return=float extern=true variadic=false
+// AST: Param[0] name=<unnamed> type=int
+// AST: Param[1] name=<unnamed> type=float
+// AST-LABEL: FuncDecl name=external_sink return=void extern=true variadic=false
+// AST-LABEL: FuncDecl name=external_log return=int extern=true variadic=true
+// AST-LABEL: FuncDecl name=transform_i3 return=vector<int, 3> extern=true variadic=false
+// AST-LABEL: FuncDecl name=clean_mask31 return=mask<31> extern=true variadic=false
+// AST-LABEL: FuncDecl name=declared_then_defined return=int extern=true variadic=false
+// AST-LABEL: FuncDef name=declared_then_defined return=int
+// AST-LABEL: FuncDef name=defined_then_declared return=int
+// AST-LABEL: FuncDecl name=defined_then_declared return=int extern=true variadic=false
+
+// YIR-DAG: yir.declare @scalar_mix({{.*}}i32, {{.*}}f32, {{.*}}ptr<i32>) -> i32
+// YIR-DAG: yir.declare @unnamed_scalar({{.*}}i32, {{.*}}f32) -> f32
+// YIR-DAG: yir.declare @external_sink() -> void
+// YIR-DAG: yir.declare @external_log({{.*}}i32, ...) -> i32
+// YIR-DAG: yir.declare @transform_i3({{.*}}vector<3 x i32>, {{.*}}mask<3>) -> vector<3 x i32>
+// YIR-DAG: yir.declare @clean_mask31({{.*}}mask<31>) -> mask<31>
+// YIR-NOT: yir.declare @declared_then_defined
+// YIR: yir.func @declared_then_defined
+// YIR-NOT: yir.declare @defined_then_declared
+// YIR: yir.func @defined_then_declared
+// YIR: yir.func @call_externals
+// YIR: yir.call @transform_i3
+// YIR: yir.call @clean_mask31
+// YIR: yir.call @external_sink
+// YIR: yir.call @external_log
+// YIR: yir.call @scalar_mix
+
+// OIR-DAG: declare i32 @scalar_mix(i32 {{.*}}, float {{.*}}, i32* {{.*}})
+// OIR-DAG: declare float @unnamed_scalar(i32 {{.*}}, float {{.*}})
+// OIR-DAG: declare void @external_sink()
+// OIR-DAG: declare i32 @external_log(i32 {{.*}}, ...)
+// OIR-DAG: declare <3 x i32> @transform_i3(<3 x i32> {{.*}}, <3 x i1> {{.*}})
+// OIR-DAG: declare <31 x i1> @clean_mask31(<31 x i1> {{.*}})
+// OIR-NOT: declare i32 @declared_then_defined
+// OIR: define i32 @declared_then_defined
+// OIR-NOT: declare i32 @defined_then_declared
+// OIR: define i32 @defined_then_declared
+// OIR: define i32 @call_externals
+// OIR: call <3 x i32> @transform_i3
+// OIR: call <31 x i1> @clean_mask31
+// OIR: call void @external_sink
+// OIR: call i32 @external_log
+// OIR: call i32 @scalar_mix

@@ -1,0 +1,6 @@
+// RUN: %compiler --emit-oir %s > %t.out 2>&1; status=$?; test $status -ne 0 && FileCheck %s --check-prefix=ERR < %t.out
+
+extern int incompatible(int value);
+extern float incompatible(int value);
+
+// ERR: Pass FAILED: ASTSemanticAnalysisPass: SE0018: conflicting declaration of function 'incompatible'
