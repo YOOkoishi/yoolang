@@ -7,7 +7,10 @@ local srcs = {
     "src/smt/**.cpp",
     "src/yir/**.cpp",
     "src/front/**.cpp",
+    "src/builtin/**.cpp",
+    "src/sema/**.cpp",
     "src/pass/**.cpp",
+    "src/target/**.cpp",
 }
 
 target("compiler")
