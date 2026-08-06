@@ -1,12 +1,15 @@
 #include "pass/ast/ASTToYIRPass.h"
 
+#include "builtin/BuiltinRegistry.h"
+#include "pass/ast/ASTSemanticAnalysisPass.h"
+#include "sema/SemanticModel.h"
+
 #include "yir/YIR.h"
 #include "yir/YIRVerifier.h"
 
 #include <algorithm>
 #include <cctype>
-#include <iomanip>
-#include <sstream>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -14,16 +17,6 @@
 
 namespace pass {
 namespace {
-
-bool same_type(const yir::TypePtr &lhs, const yir::TypePtr &rhs) {
-    if (lhs == rhs) {
-        return true;
-    }
-    if (lhs == nullptr || rhs == nullptr) {
-        return false;
-    }
-    return lhs->str() == rhs->str();
-}
 
 std::string sanitize_name(const std::string &name) {
     std::string out;
@@ -40,13 +33,6 @@ std::string sanitize_name(const std::string &name) {
 }
 
 class Lowerer final : public ASTVisitor {
-    struct ConstantValue {
-        bool valid = false;
-        BuiltinType type = BuiltinType::Int;
-        int int_value = 0;
-        float float_value = 0.0F;
-    };
-
     struct Symbol {
         enum class Kind {
             Variable,
@@ -65,7 +51,6 @@ class Lowerer final : public ASTVisitor {
         yir::Function *function = nullptr;
         yir::TypePtr return_type;
         std::vector<yir::TypePtr> param_types;
-        ConstantValue constant;
     };
 
     class SymbolTable {
@@ -106,6 +91,9 @@ class Lowerer final : public ASTVisitor {
     };
 
   public:
+    explicit Lowerer(const sema::SemanticModel &model) : model_(model) {
+    }
+
     std::unique_ptr<yir::Module> lower(CompUnit &unit) {
         module_ = std::make_unique<yir::Module>();
         unit.accept(*this);
@@ -116,11 +104,25 @@ class Lowerer final : public ASTVisitor {
     }
 
     void visit(IntLiteral &node) override {
-        last_value_ = emit<yir::ConstI32Op>(node.value, fresh_temp());
+        const auto *constant = model_.constant(node);
+        if (!constant || !*constant ||
+            (*constant)->kind() != sema::SemanticConstant::Kind::Integer) {
+            fail("FE_SEMANTIC_MODEL_INCOMPLETE: integer literal has no checked constant");
+            last_value_ = nullptr;
+            return;
+        }
+        last_value_ =
+            emit<yir::ConstI32Op>(static_cast<int>((*constant)->integer_value()), fresh_temp());
     }
 
     void visit(FloatLiteral &node) override {
-        last_value_ = emit<yir::ConstF32Op>(node.value, fresh_temp());
+        const auto *constant = model_.constant(node);
+        if (!constant || !*constant || (*constant)->kind() != sema::SemanticConstant::Kind::Float) {
+            fail("FE_SEMANTIC_MODEL_INCOMPLETE: float literal has no checked constant");
+            last_value_ = nullptr;
+            return;
+        }
+        last_value_ = emit<yir::ConstF32Op>((*constant)->float_value(), fresh_temp());
     }
 
     void visit(LValExpr &node) override {
@@ -130,32 +132,43 @@ class Lowerer final : public ASTVisitor {
     void visit(BinaryExpr &node) override {
         if (node.op == BinaryOp::And) {
             last_value_ = lower_logical_and(*node.lhs, *node.rhs);
+            if (!has_boolean_context_conversion(node))
+                last_value_ = emit<yir::ZExtI1ToI32Op>(last_value_, fresh_temp());
             return;
         }
         if (node.op == BinaryOp::Or) {
             last_value_ = lower_logical_or(*node.lhs, *node.rhs);
+            if (!has_boolean_context_conversion(node))
+                last_value_ = emit<yir::ZExtI1ToI32Op>(last_value_, fresh_temp());
             return;
         }
 
         yir::Value *lhs = lower_expr(*node.lhs);
         yir::Value *rhs = lower_expr(*node.rhs);
+        auto *result_type = require_expr_type(node);
+        const bool float_operation =
+            result_type->is_float() ||
+            (result_type->is_fixed_vector() && result_type->element_type()->is_float());
 
         switch (node.op) {
         case BinaryOp::Add:
-            last_value_ = lower_add(lhs, rhs);
+            last_value_ = float_operation ? emit<yir::AddFOp>(lhs, rhs, fresh_temp())
+                                          : emit<yir::AddIOp>(lhs, rhs, fresh_temp());
             return;
         case BinaryOp::Sub:
-            last_value_ = lower_sub(lhs, rhs);
+            last_value_ = float_operation ? emit<yir::SubFOp>(lhs, rhs, fresh_temp())
+                                          : emit<yir::SubIOp>(lhs, rhs, fresh_temp());
             return;
         case BinaryOp::Mul:
-            last_value_ = lower_mul(lhs, rhs);
+            last_value_ = float_operation ? emit<yir::MulFOp>(lhs, rhs, fresh_temp())
+                                          : emit<yir::MulIOp>(lhs, rhs, fresh_temp());
             return;
         case BinaryOp::Div:
-            last_value_ = lower_div(lhs, rhs);
+            last_value_ = float_operation ? emit<yir::DivFOp>(lhs, rhs, fresh_temp())
+                                          : emit<yir::DivSIOp>(lhs, rhs, fresh_temp());
             return;
         case BinaryOp::Mod:
-            last_value_ = emit<yir::RemSIOp>(cast_to(lhs, yir::Type::get_i32()),
-                                             cast_to(rhs, yir::Type::get_i32()), fresh_temp());
+            last_value_ = emit<yir::RemSIOp>(lhs, rhs, fresh_temp());
             return;
         case BinaryOp::Lt:
         case BinaryOp::Le:
@@ -163,7 +176,29 @@ class Lowerer final : public ASTVisitor {
         case BinaryOp::Ge:
         case BinaryOp::Eq:
         case BinaryOp::Ne:
-            last_value_ = lower_compare(node.op, lhs, rhs);
+            last_value_ = operand_is_float(lhs)
+                              ? emit<yir::FCmpOp>(to_fcmp(node.op), lhs, rhs, fresh_temp())
+                              : emit<yir::ICmpOp>(to_icmp(node.op), lhs, rhs, fresh_temp());
+            if (result_type->is_integer() && !has_boolean_context_conversion(node))
+                last_value_ = emit<yir::ZExtI1ToI32Op>(last_value_, fresh_temp());
+            return;
+        case BinaryOp::BitAnd:
+            last_value_ =
+                result_type->is_mask()
+                    ? emit<yir::MaskBinaryOp>(yir::MaskBinaryOp::Kind::And, lhs, rhs, fresh_temp())
+                    : emit<yir::AndIOp>(lhs, rhs, fresh_temp());
+            return;
+        case BinaryOp::BitXor:
+            last_value_ =
+                result_type->is_mask()
+                    ? emit<yir::MaskBinaryOp>(yir::MaskBinaryOp::Kind::Xor, lhs, rhs, fresh_temp())
+                    : emit<yir::XorIOp>(lhs, rhs, fresh_temp());
+            return;
+        case BinaryOp::BitOr:
+            last_value_ =
+                result_type->is_mask()
+                    ? emit<yir::MaskBinaryOp>(yir::MaskBinaryOp::Kind::Or, lhs, rhs, fresh_temp())
+                    : emit<yir::OrIOp>(lhs, rhs, fresh_temp());
             return;
         case BinaryOp::And:
         case BinaryOp::Or:
@@ -173,41 +208,82 @@ class Lowerer final : public ASTVisitor {
 
     void visit(UnaryExpr &node) override {
         yir::Value *value = lower_expr(*node.operand);
+        auto *result_type = require_expr_type(node);
         switch (node.op) {
         case UnaryOp::Pos:
             last_value_ = value;
             return;
         case UnaryOp::Neg:
-            if (value->type()->is_float()) {
+            if (result_type->is_float()) {
                 auto *zero = emit<yir::ConstF32Op>(0.0F, fresh_temp());
                 last_value_ = emit<yir::SubFOp>(zero, value, fresh_temp());
+            } else if (result_type->is_fixed_vector()) {
+                auto *zero = emit<yir::ZeroOp>(type_for_semantic(result_type), fresh_temp());
+                last_value_ = result_type->element_type()->is_float()
+                                  ? emit<yir::SubFOp>(zero, value, fresh_temp())
+                                  : emit<yir::SubIOp>(zero, value, fresh_temp());
             } else {
                 auto *zero = emit<yir::ConstI32Op>(0, fresh_temp());
-                last_value_ =
-                    emit<yir::SubIOp>(zero, cast_to(value, yir::Type::get_i32()), fresh_temp());
+                last_value_ = emit<yir::SubIOp>(zero, value, fresh_temp());
             }
             return;
         case UnaryOp::Not:
             last_value_ = emit<yir::NotOp>(to_bool(value), fresh_temp());
+            if (!has_boolean_context_conversion(node))
+                last_value_ = emit<yir::ZExtI1ToI32Op>(last_value_, fresh_temp());
+            return;
+        case UnaryOp::BitNot:
+            last_value_ = result_type->is_mask() ? emit<yir::MaskNotOp>(value, fresh_temp())
+                                                 : emit<yir::BitNotOp>(value, fresh_temp());
             return;
         }
     }
 
     void visit(CallExpr &node) override {
-        Symbol *callee = lookup_function(node.func_name);
-        std::vector<yir::Value *> args;
-        args.reserve(node.args.size());
-        for (std::size_t i = 0; i < node.args.size(); ++i) {
-            yir::TypePtr expected_type;
-            if (callee != nullptr && !callee->is_variadic && i < callee->param_types.size()) {
-                expected_type = callee->param_types[i];
-            }
-            args.push_back(lower_call_arg(*node.args[i], expected_type));
+        if (const auto *binding = model_.builtin_binding(node)) {
+            lower_builtin_call(node, *binding);
+            return;
         }
 
-        yir::TypePtr result_type = callee == nullptr ? yir::Type::get_i32() : callee->return_type;
-        auto *op = emit<yir::CallOp>(node.func_name, std::move(args), result_type, fresh_temp());
+        Symbol *callee = lookup_function(node.func_name);
+        if (callee == nullptr) {
+            fail("FE_SEMANTIC_MODEL_INCONSISTENT: no user function binding for '" + node.func_name +
+                 "'");
+            last_value_ = nullptr;
+            return;
+        }
+        std::vector<yir::Value *> args;
+        args.reserve(node.args.size());
+        for (auto &argument : node.args)
+            args.push_back(lower_expr(*argument));
+
+        auto *op =
+            emit<yir::CallOp>(node.func_name, std::move(args), callee->return_type, fresh_temp());
         last_value_ = op == nullptr ? nullptr : op;
+    }
+
+    void visit(TypedVectorLiteralExpr &node) override {
+        auto *semantic_type = require_expr_type(node);
+        auto result_type = type_for_semantic(semantic_type);
+        if (node.lanes.empty()) {
+            last_value_ = emit<yir::ZeroOp>(result_type, fresh_temp());
+            return;
+        }
+        std::vector<yir::Value *> lanes;
+        lanes.reserve(node.lanes.size());
+        for (auto &lane : node.lanes) {
+            auto *value = lower_expr(*lane);
+            if (semantic_type->is_mask())
+                value = to_i1(value);
+            lanes.push_back(value);
+        }
+        last_value_ = emit<yir::VectorCreateOp>(result_type, std::move(lanes), fresh_temp());
+    }
+
+    void visit(VectorCastExpr &node) override {
+        // The constructor's authoritative conversion chain is attached to its
+        // operand by semantic analysis; lowering does not rediscover it.
+        last_value_ = lower_expr(*node.operand);
     }
 
     void visit(InitVal &) override {
@@ -233,13 +309,10 @@ class Lowerer final : public ASTVisitor {
             return;
         }
         if (node.target->indices.empty()) {
-            emit<yir::AssignOp>(target->value, cast_to(value, target->type));
+            emit<yir::AssignOp>(target->value, value);
             return;
         }
-
-        auto indices = lower_indices(node.target->indices);
-        yir::TypePtr element_type = type_after_indices(target->type, indices.size());
-        emit<yir::ArrayStoreOp>(cast_to(value, element_type), target->value, std::move(indices));
+        lower_indexed_assignment(*target, *node.target, value);
     }
 
     void visit(BlockStmt &node) override {
@@ -256,9 +329,6 @@ class Lowerer final : public ASTVisitor {
             return;
         }
         yir::Value *value = lower_expr(*node.expr);
-        if (current_return_type_ != nullptr && !current_return_type_->is_void()) {
-            value = cast_to(value, current_return_type_);
-        }
         emit<yir::ReturnOp>(value);
     }
 
@@ -308,26 +378,29 @@ class Lowerer final : public ASTVisitor {
     }
 
     void visit(VarDecl &node) override {
-        yir::TypePtr storage_type = type_for_var(node.base_type, node.dimensions);
-        ConstantValue constant = constant_value_for_decl(node);
+        auto *semantic_type = model_.declaration_type(node);
+        if (!semantic_type) {
+            fail("FE_SEMANTIC_MODEL_INCOMPLETE: missing declaration type for '" + node.name + "'");
+            return;
+        }
+        yir::TypePtr storage_type = type_for_semantic(semantic_type);
         if (storage_type->is_array()) {
             auto *array = emit<yir::ArrayVarOp>(storage_type, fresh_name(node.name));
-            define_variable(node.name, array, storage_type, node.is_const, true, false, constant);
+            define_variable(node.name, array, storage_type, node.is_const, true, false);
             if (node.init) {
-                emit_array_init(array, storage_type, *node.init);
+                emit_array_init(array, semantic_type, *node.init);
             }
             return;
         }
 
         yir::Value *initializer = nullptr;
         if (node.init) {
-            initializer = lower_scalar_init(storage_type, *node.init);
+            initializer = lower_object_initializer(semantic_type, *node.init);
         } else {
             initializer = emit<yir::ZeroOp>(storage_type, fresh_temp());
         }
-        auto *var = emit<yir::VarOp>(storage_type, cast_to(initializer, storage_type),
-                                     fresh_name(node.name));
-        define_variable(node.name, var, storage_type, node.is_const, false, false, constant);
+        auto *var = emit<yir::VarOp>(storage_type, initializer, fresh_name(node.name));
+        define_variable(node.name, var, storage_type, node.is_const, false, false);
     }
 
     void visit(DeclStmt &node) override {
@@ -344,21 +417,53 @@ class Lowerer final : public ASTVisitor {
 
         current_function_ = function_symbol->function;
         current_region_ = &current_function_->body();
-        current_return_type_ = type_for_builtin(node.return_type);
+        auto *function_type = model_.function_type(node);
+        if (!function_type || !function_type->is_function()) {
+            fail("FE_SEMANTIC_MODEL_INCOMPLETE: missing function type for '" + node.name + "'");
+            return;
+        }
+
+        if (node.is_external) {
+            name_counts_.clear();
+            for (std::size_t i = 0; i < node.params.size(); ++i) {
+                const auto &param = node.params[i];
+                auto *parameter_semantic_type = model_.parameter_type(param);
+                if (!parameter_semantic_type) {
+                    fail("FE_SEMANTIC_MODEL_INCOMPLETE: missing parameter type for external '" +
+                         node.name + "'");
+                    continue;
+                }
+                const std::string base =
+                    param.name.empty() ? "arg" + std::to_string(i) : param.name + ".arg";
+                current_function_->add_param(type_for_semantic(parameter_semantic_type),
+                                             fresh_name(base));
+            }
+            current_function_ = nullptr;
+            current_region_ = nullptr;
+            return;
+        }
+
+        current_return_type_ = type_for_semantic(function_type->return_type());
         name_counts_.clear();
         temp_counter_ = 0;
 
         enter_scope();
         for (std::size_t i = 0; i < node.params.size(); ++i) {
             const auto &param = node.params[i];
+            auto *parameter_semantic_type = model_.parameter_type(param);
+            if (!parameter_semantic_type) {
+                fail("FE_SEMANTIC_MODEL_INCOMPLETE: missing parameter type for '" + param.name +
+                     "'");
+                continue;
+            }
+            auto parameter_type = type_for_semantic(parameter_semantic_type);
             yir::Value *param_value =
-                current_function_->add_param(param_type(param), fresh_name(param.name + ".arg"));
-            if (param.dimensions.empty()) {
-                auto type = type_for_builtin(param.type);
-                auto *var = emit<yir::VarOp>(type, param_value, fresh_name(param.name));
-                define_variable(param.name, var, type, false, false, false, {});
+                current_function_->add_param(parameter_type, fresh_name(param.name + ".arg"));
+            if (!parameter_semantic_type->is_pointer()) {
+                auto *var = emit<yir::VarOp>(parameter_type, param_value, fresh_name(param.name));
+                define_variable(param.name, var, parameter_type, false, false, false);
             } else {
-                define_variable(param.name, param_value, param_type(param), false, true, false, {});
+                define_variable(param.name, param_value, parameter_type, false, true, false);
             }
         }
 
@@ -374,23 +479,44 @@ class Lowerer final : public ASTVisitor {
 
     void visit(CompUnit &node) override {
         enter_scope();
-        install_sysy_builtins();
         for (auto &decl : node.global_decls) {
             lower_global_decl(*decl);
         }
 
-        for (auto &func : node.functions) {
-            std::vector<yir::TypePtr> param_types;
-            for (const auto &param : func->params) {
-                param_types.push_back(param_type(param));
+        // Semantic analysis has already checked compatibility. Collapse a
+        // declaration family to one YIR symbol, preferring its definition.
+        std::vector<FuncDef *> canonical_functions;
+        std::unordered_map<std::string, std::size_t> function_positions;
+        for (auto &owned : node.functions) {
+            auto *func = owned.get();
+            auto [position, inserted] =
+                function_positions.emplace(func->name, canonical_functions.size());
+            if (inserted) {
+                canonical_functions.push_back(func);
+            } else if (canonical_functions[position->second]->is_external && !func->is_external) {
+                canonical_functions[position->second] = func;
             }
-            auto return_type = type_for_builtin(func->return_type);
-            auto *function = module_->add_function(func->name, return_type, param_types);
-            define_function(func->name, function, return_type, std::move(param_types), false,
-                            false);
         }
 
-        for (auto &func : node.functions) {
+        for (auto *func : canonical_functions) {
+            auto *semantic_function_type = model_.function_type(*func);
+            if (!semantic_function_type || !semantic_function_type->is_function()) {
+                fail("FE_SEMANTIC_MODEL_INCOMPLETE: missing function type for '" + func->name +
+                     "'");
+                continue;
+            }
+            std::vector<yir::TypePtr> param_types;
+            for (auto *parameter : semantic_function_type->parameter_types())
+                param_types.push_back(type_for_semantic(parameter));
+            auto return_type = type_for_semantic(semantic_function_type->return_type());
+            auto *function =
+                module_->add_function(func->name, return_type, param_types,
+                                      semantic_function_type->is_variadic(), func->is_external);
+            define_function(func->name, function, return_type, std::move(param_types), false,
+                            semantic_function_type->is_variadic());
+        }
+
+        for (auto *func : canonical_functions) {
             func->accept(*this);
         }
         leave_scope();
@@ -424,7 +550,238 @@ class Lowerer final : public ASTVisitor {
     yir::Value *lower_expr(Expr &expr) {
         last_value_ = nullptr;
         expr.accept(*this);
+        last_value_ = apply_semantic_conversions(expr, last_value_);
         return last_value_;
+    }
+
+    bool has_boolean_context_conversion(const Expr &expression) const {
+        const auto *conversions = model_.conversions(expression);
+        return conversions != nullptr &&
+               std::any_of(conversions->begin(), conversions->end(), [](const auto &conversion) {
+                   return conversion.kind == sema::ConversionKind::ScalarToBool;
+               });
+    }
+
+    sema::SemanticTypeRef require_expr_type(const Expr &expression) {
+        auto *type = model_.expr_type(expression);
+        if (!type) {
+            fail("FE_SEMANTIC_MODEL_INCOMPLETE: missing resolved expression type");
+            return model_.types().error_type();
+        }
+        return type;
+    }
+
+    yir::TypePtr type_for_semantic(sema::SemanticTypeRef type) {
+        if (!type || type->is_error()) {
+            fail("FE_SEMANTIC_MODEL_INCOMPLETE: cannot lower missing/error semantic type");
+            return yir::Type::get_i32();
+        }
+        switch (type->kind()) {
+        case sema::SemanticType::Kind::Error:
+            return yir::Type::get_i32();
+        case sema::SemanticType::Kind::Void:
+            return yir::Type::get_void();
+        case sema::SemanticType::Kind::Int:
+            return yir::Type::get_i32();
+        case sema::SemanticType::Kind::Float:
+            return yir::Type::get_f32();
+        case sema::SemanticType::Kind::FixedVector:
+            return yir::Type::get_vector(type->lane_count(),
+                                         type_for_semantic(type->element_type()));
+        case sema::SemanticType::Kind::Mask:
+            return yir::Type::get_mask(type->lane_count());
+        case sema::SemanticType::Kind::Array:
+            return yir::Type::get_array(type->array_bound(),
+                                        type_for_semantic(type->element_type()));
+        case sema::SemanticType::Kind::Pointer:
+            return yir::Type::get_ptr(type_for_semantic(type->pointee_type()));
+        case sema::SemanticType::Kind::Function: {
+            std::vector<yir::TypePtr> parameters;
+            parameters.reserve(type->parameter_types().size());
+            for (auto *parameter : type->parameter_types())
+                parameters.push_back(type_for_semantic(parameter));
+            return yir::Type::get_func(std::move(parameters),
+                                       type_for_semantic(type->return_type()), type->is_variadic());
+        }
+        }
+        return yir::Type::get_i32();
+    }
+
+    yir::Value *apply_semantic_conversions(Expr &expression, yir::Value *value) {
+        if (!value)
+            return nullptr;
+        const auto *conversions = model_.conversions(expression);
+        if (!conversions)
+            return value;
+        for (const auto &conversion : *conversions) {
+            auto target = type_for_semantic(conversion.target_type);
+            switch (conversion.kind) {
+            case sema::ConversionKind::None:
+            case sema::ConversionKind::Identity:
+            case sema::ConversionKind::LValueToRValue:
+                break;
+            case sema::ConversionKind::ArrayToPointer:
+                value = emit<yir::DecayOp>(value, target, fresh_temp());
+                break;
+            case sema::ConversionKind::IntToFloat:
+                value = emit<yir::SIToFPOp>(value, fresh_temp());
+                break;
+            case sema::ConversionKind::FloatToInt:
+                value = emit<yir::FPToSIOp>(value, fresh_temp());
+                break;
+            case sema::ConversionKind::ScalarToBool:
+                value = to_bool(value);
+                break;
+            case sema::ConversionKind::BoolToInt:
+            case sema::ConversionKind::MaskLaneToInt:
+                value = emit<yir::ZExtI1ToI32Op>(value, fresh_temp());
+                break;
+            case sema::ConversionKind::ScalarSplat:
+                value = emit<yir::SplatOp>(value, target, fresh_temp());
+                break;
+            case sema::ConversionKind::VectorElementCast:
+                value = emit<yir::VectorCastOp>(value, target, fresh_temp());
+                break;
+            }
+        }
+        return value;
+    }
+
+    void lower_builtin_call(CallExpr &call, const sema::BuiltinBinding &binding) {
+        const auto id = static_cast<builtin::BuiltinID>(binding.id);
+        const auto *descriptor = builtin::BuiltinRegistry::instance().find(id);
+        if (!descriptor) {
+            fail("FE_SEMANTIC_MODEL_INCONSISTENT: unknown builtin binding id " +
+                 std::to_string(binding.id));
+            last_value_ = nullptr;
+            return;
+        }
+        std::vector<yir::Value *> arguments;
+        arguments.reserve(call.args.size());
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            // Shuffle's third argument is a semantic-only structured constant;
+            // it is encoded in ShuffleOp and has no runtime SSA operand.
+            if (id == builtin::BuiltinID::VectorShuffle && i == 2)
+                arguments.push_back(nullptr);
+            else
+                arguments.push_back(lower_expr(*call.args[i]));
+        }
+        auto result_type = type_for_semantic(binding.result_type);
+
+        if (descriptor->lowering == builtin::LoweringKind::RuntimeCall) {
+            last_value_ = emit<yir::CallOp>(std::string(descriptor->source_name),
+                                            std::move(arguments), result_type, fresh_temp());
+            return;
+        }
+
+        switch (id) {
+        case builtin::BuiltinID::VectorSelect:
+            last_value_ =
+                emit<yir::SelectOp>(arguments[0], arguments[1], arguments[2], fresh_temp());
+            return;
+        case builtin::BuiltinID::VectorAny:
+        case builtin::BuiltinID::VectorAll:
+        case builtin::BuiltinID::VectorNone: {
+            auto kind = yir::MaskReduceOp::Kind::Any;
+            if (id == builtin::BuiltinID::VectorAll)
+                kind = yir::MaskReduceOp::Kind::All;
+            if (id == builtin::BuiltinID::VectorNone)
+                kind = yir::MaskReduceOp::Kind::None;
+            auto *predicate = emit<yir::MaskReduceOp>(kind, arguments[0], fresh_temp());
+            last_value_ = emit<yir::ZExtI1ToI32Op>(predicate, fresh_temp());
+            return;
+        }
+        case builtin::BuiltinID::VectorExtract:
+            last_value_ = emit<yir::ExtractLaneOp>(arguments[0], arguments[1], fresh_temp());
+            return;
+        case builtin::BuiltinID::VectorInsert:
+            last_value_ =
+                emit<yir::InsertLaneOp>(arguments[0], arguments[1], arguments[2], fresh_temp());
+            return;
+        case builtin::BuiltinID::VectorIota:
+            last_value_ = emit<yir::StepVectorOp>(result_type, fresh_temp());
+            return;
+        case builtin::BuiltinID::VectorReduceAdd:
+        case builtin::BuiltinID::VectorReduceMul:
+        case builtin::BuiltinID::VectorReduceMin:
+        case builtin::BuiltinID::VectorReduceMax:
+        case builtin::BuiltinID::VectorReduceAnd:
+        case builtin::BuiltinID::VectorReduceOr:
+        case builtin::BuiltinID::VectorReduceXor: {
+            auto kind = yir::VectorReduceOp::Kind::Add;
+            if (id == builtin::BuiltinID::VectorReduceMul)
+                kind = yir::VectorReduceOp::Kind::Mul;
+            else if (id == builtin::BuiltinID::VectorReduceMin)
+                kind = yir::VectorReduceOp::Kind::Min;
+            else if (id == builtin::BuiltinID::VectorReduceMax)
+                kind = yir::VectorReduceOp::Kind::Max;
+            else if (id == builtin::BuiltinID::VectorReduceAnd)
+                kind = yir::VectorReduceOp::Kind::And;
+            else if (id == builtin::BuiltinID::VectorReduceOr)
+                kind = yir::VectorReduceOp::Kind::Or;
+            else if (id == builtin::BuiltinID::VectorReduceXor)
+                kind = yir::VectorReduceOp::Kind::Xor;
+            const auto &operand_type = arguments[0]->type();
+            const bool ordered = operand_type->is_vector() && operand_type->element()->is_float();
+            last_value_ = emit<yir::VectorReduceOp>(kind, arguments[0], ordered, fresh_temp());
+            return;
+        }
+        case builtin::BuiltinID::VectorMaskedLoad:
+            last_value_ =
+                emit<yir::MaskedLoadOp>(arguments[0], arguments[1], arguments[2], 4, fresh_temp());
+            return;
+        case builtin::BuiltinID::VectorMaskedStore:
+            emit<yir::MaskedStoreOp>(arguments[2], arguments[0], arguments[1], 4);
+            last_value_ = nullptr;
+            return;
+        case builtin::BuiltinID::VectorGather:
+            last_value_ = emit<yir::GatherOp>(arguments[0], arguments[1], arguments[2],
+                                              arguments[3], 4, fresh_temp());
+            return;
+        case builtin::BuiltinID::VectorScatter:
+            emit<yir::ScatterOp>(arguments[3], arguments[0], arguments[1], arguments[2], 4);
+            last_value_ = nullptr;
+            return;
+        case builtin::BuiltinID::VectorShuffle: {
+            std::vector<std::uint64_t> indices;
+            const auto *constant = model_.constant(*call.args[2]);
+            if (!constant || !*constant) {
+                fail("FE_SEMANTIC_MODEL_INCOMPLETE: shuffle binding has no structured indices");
+                last_value_ = nullptr;
+                return;
+            }
+            if ((*constant)->kind() == sema::SemanticConstant::Kind::AggregateZero) {
+                indices.assign(static_cast<std::size_t>(binding.result_type->lane_count()), 0);
+            } else {
+                for (const auto &element : (*constant)->elements()) {
+                    const auto index = element->integer_value();
+                    indices.push_back(index == -1 ? yir::ShuffleOp::UndefLane
+                                                  : static_cast<std::uint64_t>(index));
+                }
+            }
+            last_value_ = emit<yir::ShuffleOp>(arguments[0], arguments[1], std::move(indices),
+                                               result_type, fresh_temp());
+            return;
+        }
+        case builtin::BuiltinID::Invalid:
+        case builtin::BuiltinID::GetInt:
+        case builtin::BuiltinID::GetCh:
+        case builtin::BuiltinID::GetFloat:
+        case builtin::BuiltinID::GetArray:
+        case builtin::BuiltinID::GetFloatArray:
+        case builtin::BuiltinID::PutInt:
+        case builtin::BuiltinID::PutCh:
+        case builtin::BuiltinID::PutArray:
+        case builtin::BuiltinID::PutFloat:
+        case builtin::BuiltinID::PutFloatArray:
+        case builtin::BuiltinID::PutFormat:
+        case builtin::BuiltinID::StartTime:
+        case builtin::BuiltinID::StopTime:
+        case builtin::BuiltinID::RuntimeRangesDisjoint:
+            break;
+        }
+        fail("FE_SEMANTIC_MODEL_INCONSISTENT: builtin has no YIR lowering");
+        last_value_ = nullptr;
     }
 
     yir::Value *lower_lval_value(LValExpr &lval) {
@@ -437,132 +794,86 @@ class Lowerer final : public ASTVisitor {
             return symbol->value;
         }
 
-        auto indices = lower_indices(lval.indices);
-        yir::TypePtr indexed_type = type_after_indices(symbol->type, indices.size());
-        if (indexed_type != nullptr && indexed_type->is_array()) {
-            return emit<yir::ElemAddrOp>(symbol->value, std::move(indices),
-                                         yir::Type::get_ptr(indexed_type),
-                                         fresh_name(lval.name + ".addr"));
-        }
-        return emit<yir::ArrayLoadOp>(symbol->value, std::move(indices), indexed_type,
-                                      fresh_name(lval.name));
-    }
-
-    yir::Value *lower_lval_pointer(LValExpr &lval, yir::TypePtr expected_type) {
-        Symbol *symbol = lookup_variable(lval.name);
-        if (symbol == nullptr) {
-            errors_.push_back("unknown variable: " + lval.name);
-            return emit<yir::ConstI32Op>(0, fresh_temp());
-        }
-        if (lval.indices.empty()) {
-            return expected_type == nullptr ? decay(symbol->value)
-                                            : cast_to(symbol->value, expected_type);
-        }
-
-        auto indices = lower_indices(lval.indices);
-        yir::TypePtr indexed_type = type_after_indices(symbol->type, indices.size());
-        auto *address = emit<yir::ElemAddrOp>(symbol->value, std::move(indices),
+        auto path = lower_index_path(*symbol, lval);
+        yir::Value *value = symbol->value;
+        if (!path.object_indices.empty()) {
+            auto indexed_type =
+                path.lane_index != nullptr ? path.lane_container_type : path.object_type;
+            if (indexed_type->is_array()) {
+                value = emit<yir::ElemAddrOp>(symbol->value, std::move(path.object_indices),
                                               yir::Type::get_ptr(indexed_type),
                                               fresh_name(lval.name + ".addr"));
-        return expected_type == nullptr ? decay(address) : cast_to(address, expected_type);
-    }
-
-    yir::Value *lower_call_arg(Expr &expr, yir::TypePtr expected_type) {
-        if (auto *lval = dynamic_cast<LValExpr *>(&expr)) {
-            if (expected_type != nullptr && expected_type->is_ptr()) {
-                return lower_lval_pointer(*lval, expected_type);
+            } else {
+                value = emit<yir::ArrayLoadOp>(symbol->value, std::move(path.object_indices),
+                                               indexed_type, fresh_name(lval.name));
             }
-            return expected_type == nullptr ? decay(lower_lval_value(*lval))
-                                            : cast_to(lower_lval_value(*lval), expected_type);
         }
-        return expected_type == nullptr ? lower_expr(expr)
-                                        : cast_to(lower_expr(expr), expected_type);
-    }
-
-    std::vector<yir::Value *> lower_indices(const std::vector<std::unique_ptr<Expr>> &exprs) {
-        std::vector<yir::Value *> indices;
-        indices.reserve(exprs.size());
-        for (auto &index : exprs) {
-            indices.push_back(cast_to(lower_expr(*index), yir::Type::get_i32()));
-        }
-        return indices;
-    }
-
-    yir::Value *decay(yir::Value *value) {
-        if (value == nullptr || value->type() == nullptr) {
-            return value;
-        }
-        if (value->type()->is_array()) {
-            return emit<yir::DecayOp>(value, yir::Type::get_ptr(value->type()->element()),
-                                      fresh_temp());
-        }
-        if (value->type()->is_ptr()) {
-            auto pointee = value->type()->pointee();
-            if (pointee != nullptr && pointee->is_array()) {
-                return emit<yir::DecayOp>(value, yir::Type::get_ptr(pointee->element()),
-                                          fresh_temp());
-            }
+        if (path.lane_index != nullptr) {
+            value =
+                emit<yir::ExtractLaneOp>(value, path.lane_index, fresh_name(lval.name + ".lane"));
         }
         return value;
     }
 
-    yir::TypePtr type_after_indices(yir::TypePtr base_type, std::size_t index_count) {
-        yir::TypePtr current = base_type;
-        if (current != nullptr && current->is_ptr() && index_count > 0) {
-            current = current->pointee();
-            --index_count;
-        }
-        for (std::size_t i = 0; i < index_count; ++i) {
-            if (current != nullptr && current->is_array()) {
-                current = current->element();
+    struct IndexPath {
+        std::vector<yir::Value *> object_indices;
+        yir::TypePtr object_type;
+        yir::TypePtr lane_container_type;
+        yir::Value *lane_index = nullptr;
+    };
+
+    IndexPath lower_index_path(const Symbol &symbol, LValExpr &lvalue) {
+        IndexPath path;
+        auto current = symbol.type;
+        for (auto &index_expression : lvalue.indices) {
+            auto *index = lower_expr(*index_expression);
+            if (current->is_vector() || current->is_mask()) {
+                if (path.lane_index != nullptr) {
+                    fail("FE_SEMANTIC_MODEL_INCONSISTENT: vector value has multiple lane indices");
+                }
+                path.lane_container_type = current;
+                path.lane_index = index;
+                current = current->is_mask() ? yir::Type::get_i1() : current->element();
+                continue;
             }
+            path.object_indices.push_back(index);
+            if (current->is_ptr())
+                current = current->pointee();
+            else if (current->is_array())
+                current = current->element();
+            else
+                fail("FE_SEMANTIC_MODEL_INCONSISTENT: non-indexable YIR object in lvalue");
         }
-        return current == nullptr ? yir::Type::get_i32() : current;
+        path.object_type = current;
+        return path;
     }
 
-    yir::Value *lower_add(yir::Value *lhs, yir::Value *rhs) {
-        if (lhs->type()->is_float() || rhs->type()->is_float()) {
-            return emit<yir::AddFOp>(cast_to(lhs, yir::Type::get_f32()),
-                                     cast_to(rhs, yir::Type::get_f32()), fresh_temp());
+    void lower_indexed_assignment(Symbol &target, LValExpr &lvalue, yir::Value *value) {
+        auto path = lower_index_path(target, lvalue);
+        if (path.lane_index == nullptr) {
+            emit<yir::ArrayStoreOp>(value, target.value, std::move(path.object_indices));
+            return;
         }
-        return emit<yir::AddIOp>(cast_to(lhs, yir::Type::get_i32()),
-                                 cast_to(rhs, yir::Type::get_i32()), fresh_temp());
-    }
 
-    yir::Value *lower_sub(yir::Value *lhs, yir::Value *rhs) {
-        if (lhs->type()->is_float() || rhs->type()->is_float()) {
-            return emit<yir::SubFOp>(cast_to(lhs, yir::Type::get_f32()),
-                                     cast_to(rhs, yir::Type::get_f32()), fresh_temp());
+        // Recompute the container type without consuming the final lane index.
+        yir::TypePtr vector_type = target.type;
+        std::size_t object_index = 0;
+        while (object_index < path.object_indices.size()) {
+            vector_type = vector_type->is_ptr() ? vector_type->pointee() : vector_type->element();
+            ++object_index;
         }
-        return emit<yir::SubIOp>(cast_to(lhs, yir::Type::get_i32()),
-                                 cast_to(rhs, yir::Type::get_i32()), fresh_temp());
-    }
 
-    yir::Value *lower_mul(yir::Value *lhs, yir::Value *rhs) {
-        if (lhs->type()->is_float() || rhs->type()->is_float()) {
-            return emit<yir::MulFOp>(cast_to(lhs, yir::Type::get_f32()),
-                                     cast_to(rhs, yir::Type::get_f32()), fresh_temp());
-        }
-        return emit<yir::MulIOp>(cast_to(lhs, yir::Type::get_i32()),
-                                 cast_to(rhs, yir::Type::get_i32()), fresh_temp());
-    }
-
-    yir::Value *lower_div(yir::Value *lhs, yir::Value *rhs) {
-        if (lhs->type()->is_float() || rhs->type()->is_float()) {
-            return emit<yir::DivFOp>(cast_to(lhs, yir::Type::get_f32()),
-                                     cast_to(rhs, yir::Type::get_f32()), fresh_temp());
-        }
-        return emit<yir::DivSIOp>(cast_to(lhs, yir::Type::get_i32()),
-                                  cast_to(rhs, yir::Type::get_i32()), fresh_temp());
-    }
-
-    yir::Value *lower_compare(BinaryOp op, yir::Value *lhs, yir::Value *rhs) {
-        if (lhs->type()->is_float() || rhs->type()->is_float()) {
-            return emit<yir::FCmpOp>(to_fcmp(op), cast_to(lhs, yir::Type::get_f32()),
-                                     cast_to(rhs, yir::Type::get_f32()), fresh_temp());
-        }
-        return emit<yir::ICmpOp>(to_icmp(op), cast_to(lhs, yir::Type::get_i32()),
-                                 cast_to(rhs, yir::Type::get_i32()), fresh_temp());
+        yir::Value *vector = target.value;
+        if (!path.object_indices.empty())
+            vector = emit<yir::ArrayLoadOp>(target.value, path.object_indices, vector_type,
+                                            fresh_name(lvalue.name + ".update"));
+        if (vector_type->is_mask())
+            value = to_i1(value);
+        auto *updated = emit<yir::InsertLaneOp>(vector, path.lane_index, value, fresh_temp());
+        if (path.object_indices.empty())
+            emit<yir::AssignOp>(target.value, updated);
+        else
+            emit<yir::ArrayStoreOp>(updated, target.value, std::move(path.object_indices));
     }
 
     yir::Value *lower_logical_and(Expr &lhs_expr, Expr &rhs_expr) {
@@ -597,41 +908,6 @@ class Lowerer final : public ASTVisitor {
         return result;
     }
 
-    yir::Value *cast_to(yir::Value *value, yir::TypePtr target) {
-        if (value == nullptr || target == nullptr || same_type(value->type(), target)) {
-            return value;
-        }
-        if (target->kind() == yir::Type::Kind::I1) {
-            return to_bool(value);
-        }
-        if (target->kind() == yir::Type::Kind::I32) {
-            if (value->type()->kind() == yir::Type::Kind::I1) {
-                return emit<yir::ZExtI1ToI32Op>(value, fresh_temp());
-            }
-            if (value->type()->kind() == yir::Type::Kind::F32) {
-                return emit<yir::FPToSIOp>(value, fresh_temp());
-            }
-        }
-        if (target->kind() == yir::Type::Kind::F32) {
-            if (value->type()->kind() == yir::Type::Kind::I1) {
-                value = emit<yir::ZExtI1ToI32Op>(value, fresh_temp());
-            }
-            if (value->type()->kind() == yir::Type::Kind::I32) {
-                return emit<yir::SIToFPOp>(value, fresh_temp());
-            }
-        }
-        if (target->kind() == yir::Type::Kind::Ptr) {
-            if (value->type()->is_array()) {
-                return emit<yir::DecayOp>(value, target, fresh_temp());
-            }
-            if (value->type()->is_ptr() && value->type()->pointee() != nullptr &&
-                value->type()->pointee()->is_array()) {
-                return emit<yir::DecayOp>(value, target, fresh_temp());
-            }
-        }
-        return value;
-    }
-
     yir::Value *to_bool(yir::Value *value) {
         if (value == nullptr || value->type()->kind() == yir::Type::Kind::I1) {
             return value;
@@ -639,33 +915,152 @@ class Lowerer final : public ASTVisitor {
         return emit<yir::ToBoolOp>(value, fresh_temp());
     }
 
-    yir::Value *lower_scalar_init(yir::TypePtr storage_type, InitVal &init) {
+    yir::Value *to_i1(yir::Value *value) {
+        if (!value || value->type() == yir::Type::get_i1())
+            return value;
+        return emit<yir::TruncI32ToI1Op>(value, fresh_temp());
+    }
+
+    bool operand_is_float(const yir::Value *value) const {
+        if (!value || !value->type())
+            return false;
+        return value->type()->is_float() ||
+               (value->type()->is_vector() && value->type()->element()->is_float());
+    }
+
+    void fail(std::string message) {
+        if (errors_.empty())
+            errors_.push_back(std::move(message));
+    }
+
+    yir::Value *lower_object_initializer(sema::SemanticTypeRef semantic_type, InitVal &init) {
+        auto storage_type = type_for_semantic(semantic_type);
         if (init.expr) {
             return lower_expr(*init.expr);
         }
+        if ((semantic_type->is_fixed_vector() || semantic_type->is_mask()) && !init.elems.empty()) {
+            std::vector<yir::Value *> lanes;
+            lanes.reserve(init.elems.size());
+            for (auto &lane_initializer : init.elems) {
+                if (!lane_initializer->expr) {
+                    fail("FE_SEMANTIC_MODEL_INCONSISTENT: non-scalar vector lane initializer");
+                    return nullptr;
+                }
+                auto *lane = lower_expr(*lane_initializer->expr);
+                if (semantic_type->is_mask())
+                    lane = to_i1(lane);
+                lanes.push_back(lane);
+            }
+            return emit<yir::VectorCreateOp>(storage_type, std::move(lanes), fresh_temp());
+        }
+        if (!init.elems.empty() && init.elems.size() == 1)
+            return lower_object_initializer(semantic_type, *init.elems.front());
         return emit<yir::ZeroOp>(storage_type, fresh_temp());
     }
 
-    ConstantValue constant_value_for_decl(const VarDecl &decl) {
-        ConstantValue value;
-        if (!decl.is_const || !decl.dimensions.empty() || decl.init == nullptr) {
-            return value;
+    void emit_array_init(yir::Value *array, sema::SemanticTypeRef semantic_type, InitVal &init) {
+        auto storage_type = type_for_semantic(semantic_type);
+        std::vector<yir::ArrayInitEntry> entries;
+        if (const auto *constant = model_.initializer_constant(init); constant && *constant) {
+            std::vector<std::uint64_t> coordinates;
+            flatten_constant_array(*constant, storage_type, coordinates, entries);
+        } else if (array_leaf_semantic_type(semantic_type)->is_fixed_vector() ||
+                   array_leaf_semantic_type(semantic_type)->is_mask()) {
+            std::vector<std::uint64_t> coordinates;
+            lower_vector_array_init(semantic_type, init, coordinates, entries);
+        } else {
+            entries = build_array_init_entries(storage_type, init);
         }
-        value.valid = true;
-        value.type = decl.base_type;
-        if (decl.base_type == BuiltinType::Float) {
-            value.float_value = eval_const_float(decl.init->expr.get());
-            value.int_value = static_cast<int>(value.float_value);
-            return value;
-        }
-        value.int_value = eval_const_int(decl.init->expr.get());
-        value.float_value = static_cast<float>(value.int_value);
-        return value;
+        current_region_->append<yir::ArrayInitOp>(array, storage_type, std::move(entries), true);
     }
 
-    void emit_array_init(yir::Value *array, yir::TypePtr storage_type, InitVal &init) {
-        auto entries = build_array_init_entries(storage_type, init);
-        current_region_->append<yir::ArrayInitOp>(array, storage_type, std::move(entries), true);
+    sema::SemanticTypeRef array_leaf_semantic_type(sema::SemanticTypeRef type) const {
+        while (type && type->is_array())
+            type = type->element_type();
+        return type;
+    }
+
+    yir::ConstantPtr to_yir_constant(const sema::SemanticConstantRef &constant) {
+        if (!constant)
+            return nullptr;
+        auto type = type_for_semantic(constant->type());
+        switch (constant->kind()) {
+        case sema::SemanticConstant::Kind::Integer:
+            return std::make_shared<yir::ConstantInt>(type, constant->integer_value());
+        case sema::SemanticConstant::Kind::Float:
+            return std::make_shared<yir::ConstantFloat>(constant->float_value());
+        case sema::SemanticConstant::Kind::AggregateZero:
+            return std::make_shared<yir::ConstantAggregateZero>(type);
+        case sema::SemanticConstant::Kind::Aggregate:
+            break;
+        }
+        if (constant->type()->is_mask()) {
+            std::vector<std::uint8_t> bytes(
+                static_cast<std::size_t>((constant->type()->lane_count() + 7) / 8), 0);
+            for (std::size_t lane = 0; lane < constant->elements().size(); ++lane) {
+                const auto &element = constant->elements()[lane];
+                if (element && element->kind() == sema::SemanticConstant::Kind::Integer &&
+                    element->integer_value() != 0)
+                    bytes[lane / 8] |= static_cast<std::uint8_t>(1U << (lane % 8));
+            }
+            return std::make_shared<yir::ConstantMask>(type, std::move(bytes));
+        }
+        std::vector<yir::ConstantPtr> elements;
+        elements.reserve(constant->elements().size());
+        for (const auto &element : constant->elements()) {
+            auto lowered = to_yir_constant(element);
+            if (!lowered)
+                return nullptr;
+            elements.push_back(std::move(lowered));
+        }
+        if (constant->type()->is_fixed_vector())
+            return std::make_shared<yir::ConstantVector>(type, std::move(elements));
+        if (constant->type()->is_array())
+            return std::make_shared<yir::ConstantArray>(type, std::move(elements));
+        return nullptr;
+    }
+
+    void flatten_constant_array(const sema::SemanticConstantRef &constant, const yir::TypePtr &type,
+                                std::vector<std::uint64_t> &coordinates,
+                                std::vector<yir::ArrayInitEntry> &entries) {
+        if (!constant || constant->kind() == sema::SemanticConstant::Kind::AggregateZero)
+            return;
+        if (!type->is_array()) {
+            auto value = to_yir_constant(constant);
+            if (value && !value->is_zero()) {
+                yir::ArrayInitEntry entry;
+                entry.indices = coordinates;
+                entry.constant = std::move(value);
+                entries.push_back(std::move(entry));
+            }
+            return;
+        }
+        if (constant->kind() != sema::SemanticConstant::Kind::Aggregate)
+            return;
+        for (std::size_t i = 0; i < constant->elements().size(); ++i) {
+            coordinates.push_back(static_cast<std::uint64_t>(i));
+            flatten_constant_array(constant->elements()[i], type->element(), coordinates, entries);
+            coordinates.pop_back();
+        }
+    }
+
+    void lower_vector_array_init(sema::SemanticTypeRef type, InitVal &initializer,
+                                 std::vector<std::uint64_t> &coordinates,
+                                 std::vector<yir::ArrayInitEntry> &entries) {
+        if (!type->is_array()) {
+            auto *value = lower_object_initializer(type, initializer);
+            yir::ArrayInitEntry entry;
+            entry.indices = coordinates;
+            entry.value = value;
+            entries.push_back(std::move(entry));
+            return;
+        }
+        for (std::size_t i = 0; i < initializer.elems.size(); ++i) {
+            coordinates.push_back(static_cast<std::uint64_t>(i));
+            lower_vector_array_init(type->element_type(), *initializer.elems[i], coordinates,
+                                    entries);
+            coordinates.pop_back();
+        }
     }
 
     std::vector<yir::ArrayInitEntry> build_array_init_entries(yir::TypePtr storage_type,
@@ -757,9 +1152,8 @@ class Lowerer final : public ASTVisitor {
                                  std::vector<yir::ArrayInitEntry> &entries) {
         yir::ArrayInitEntry entry;
         entry.indices = coordinates_for_index(dimensions, flat_index);
-        if (!try_const_expr_to_string(init.expr.get(), element_type, entry.literal)) {
-            entry.value = cast_to(lower_expr(*init.expr), element_type);
-        }
+        (void)element_type;
+        entry.value = lower_expr(*init.expr);
         entries.push_back(std::move(entry));
     }
 
@@ -776,269 +1170,28 @@ class Lowerer final : public ASTVisitor {
 
     void lower_global_decl(DeclStmt &decl_stmt) {
         for (auto &decl : decl_stmt.decls) {
-            yir::TypePtr storage_type = type_for_var(decl->base_type, decl->dimensions);
-            ConstantValue constant = constant_value_for_decl(*decl);
+            auto *semantic_type = model_.declaration_type(*decl);
+            if (!semantic_type) {
+                fail("FE_SEMANTIC_MODEL_INCOMPLETE: missing global declaration type for '" +
+                     decl->name + "'");
+                continue;
+            }
+            yir::TypePtr storage_type = type_for_semantic(semantic_type);
             yir::Global *global = module_->add_global(decl->name, storage_type, decl->is_const);
             if (decl->init) {
-                global->set_initializer(global_initializer(storage_type, *decl->init));
+                const auto *constant = model_.initializer_constant(*decl->init);
+                if (!constant || !*constant) {
+                    fail("FE_SEMANTIC_MODEL_INCOMPLETE: global initializer for '" + decl->name +
+                         "' has no structured constant");
+                } else {
+                    global->set_initializer(to_yir_constant(*constant));
+                }
             } else {
-                global->set_initializer("zero");
+                global->set_initializer(std::make_shared<yir::ConstantAggregateZero>(storage_type));
             }
             define_variable(decl->name, global->address(), storage_type, decl->is_const,
-                            storage_type->is_array(), true, constant);
+                            storage_type->is_array(), true);
         }
-    }
-
-    std::string global_initializer(yir::TypePtr storage_type, InitVal &init) {
-        if (!storage_type->is_array()) {
-            return init.expr ? const_expr_to_string(init.expr.get(), storage_type)
-                             : zero_literal(storage_type);
-        }
-
-        std::vector<std::uint64_t> dimensions;
-        yir::TypePtr element_type = collect_array_dimensions(storage_type, dimensions);
-        std::uint64_t total_elements = 1;
-        for (std::uint64_t dim : dimensions) {
-            total_elements *= dim;
-        }
-
-        std::vector<std::string> values(total_elements, zero_literal(element_type));
-        std::uint64_t cursor = 0;
-        flatten_global_init_list(element_type, dimensions, init, 0, cursor, total_elements, values);
-
-        std::uint64_t offset = 0;
-        return format_global_initializer(values, dimensions, 0, offset);
-    }
-
-    void flatten_global_init_list(yir::TypePtr element_type,
-                                  const std::vector<std::uint64_t> &dimensions, InitVal &init,
-                                  std::size_t level, std::uint64_t &cursor, std::uint64_t limit,
-                                  std::vector<std::string> &values) {
-        if (cursor >= limit) {
-            return;
-        }
-        if (init.expr) {
-            values[cursor++] = const_expr_to_string(init.expr.get(), element_type);
-            return;
-        }
-        for (auto &elem : init.elems) {
-            if (cursor >= limit) {
-                return;
-            }
-            if (elem->expr) {
-                values[cursor++] = const_expr_to_string(elem->expr.get(), element_type);
-                continue;
-            }
-
-            std::uint64_t sub_size = 1;
-            std::size_t sub_level =
-                braced_subobject_level(dimensions, level, cursor, limit, sub_size);
-            std::uint64_t sub_end = cursor + sub_size;
-            flatten_global_init_list(element_type, dimensions, *elem, sub_level, cursor, sub_end,
-                                     values);
-            cursor = sub_end;
-        }
-    }
-
-    std::string format_global_initializer(const std::vector<std::string> &values,
-                                          const std::vector<std::uint64_t> &dimensions,
-                                          std::size_t level, std::uint64_t &offset) {
-        if (level == dimensions.size()) {
-            return offset < values.size() ? values[offset++] : "0";
-        }
-
-        std::ostringstream oss;
-        oss << "{";
-        for (std::uint64_t i = 0; i < dimensions[level]; ++i) {
-            if (i != 0) {
-                oss << ", ";
-            }
-            oss << format_global_initializer(values, dimensions, level + 1, offset);
-        }
-        oss << "}";
-        return oss.str();
-    }
-
-    std::string const_expr_to_string(Expr *expr, yir::TypePtr type) {
-        if (type->kind() == yir::Type::Kind::F32) {
-            std::ostringstream oss;
-            oss << std::setprecision(9) << eval_const_float(expr);
-            return oss.str();
-        }
-        return std::to_string(eval_const_int(expr));
-    }
-
-    bool try_const_expr_to_string(Expr *expr, yir::TypePtr type, std::string &out) {
-        if (!is_const_expr(expr)) {
-            return false;
-        }
-        out = const_expr_to_string(expr, type);
-        return true;
-    }
-
-    bool is_const_expr(Expr *expr) {
-        if (expr == nullptr) {
-            return true;
-        }
-        if (dynamic_cast<IntLiteral *>(expr) != nullptr ||
-            dynamic_cast<FloatLiteral *>(expr) != nullptr) {
-            return true;
-        }
-        if (auto *lval = dynamic_cast<LValExpr *>(expr)) {
-            Symbol *symbol = lookup_variable(lval->name);
-            return lval->indices.empty() && symbol != nullptr && symbol->constant.valid;
-        }
-        if (auto *unary = dynamic_cast<UnaryExpr *>(expr)) {
-            return is_const_expr(unary->operand.get());
-        }
-        if (auto *binary = dynamic_cast<BinaryExpr *>(expr)) {
-            switch (binary->op) {
-            case BinaryOp::Add:
-            case BinaryOp::Sub:
-            case BinaryOp::Mul:
-            case BinaryOp::Div:
-            case BinaryOp::Mod:
-                return is_const_expr(binary->lhs.get()) && is_const_expr(binary->rhs.get());
-            default:
-                return false;
-            }
-        }
-        return false;
-    }
-
-    std::string zero_literal(yir::TypePtr type) {
-        return type->kind() == yir::Type::Kind::F32 ? "0.0" : "0";
-    }
-
-    yir::TypePtr type_for_builtin(BuiltinType type) {
-        switch (type) {
-        case BuiltinType::Void:
-            return yir::Type::get_void();
-        case BuiltinType::Int:
-            return yir::Type::get_i32();
-        case BuiltinType::Float:
-            return yir::Type::get_f32();
-        }
-        return yir::Type::get_i32();
-    }
-
-    yir::TypePtr type_for_var(BuiltinType base_type,
-                              const std::vector<std::unique_ptr<Expr>> &dims) {
-        yir::TypePtr type = type_for_builtin(base_type);
-        for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
-            type =
-                yir::Type::get_array(static_cast<std::uint64_t>(eval_const_int(it->get())), type);
-        }
-        return type;
-    }
-
-    yir::TypePtr param_type(const FuncParam &param) {
-        yir::TypePtr type = type_for_builtin(param.type);
-        if (param.dimensions.empty()) {
-            return type;
-        }
-        for (auto it = param.dimensions.rbegin(); it != param.dimensions.rend(); ++it) {
-            if (it->get() == nullptr) {
-                continue;
-            }
-            type =
-                yir::Type::get_array(static_cast<std::uint64_t>(eval_const_int(it->get())), type);
-        }
-        return yir::Type::get_ptr(type);
-    }
-
-    int eval_const_int(Expr *expr) {
-        if (expr == nullptr) {
-            return 0;
-        }
-        if (auto *int_lit = dynamic_cast<IntLiteral *>(expr)) {
-            return int_lit->value;
-        }
-        if (auto *float_lit = dynamic_cast<FloatLiteral *>(expr)) {
-            return static_cast<int>(float_lit->value);
-        }
-        if (auto *lval = dynamic_cast<LValExpr *>(expr)) {
-            Symbol *symbol = lookup_variable(lval->name);
-            if (lval->indices.empty() && symbol != nullptr && symbol->constant.valid) {
-                return symbol->constant.type == BuiltinType::Float
-                           ? static_cast<int>(symbol->constant.float_value)
-                           : symbol->constant.int_value;
-            }
-            errors_.push_back("constant expression uses non-constant variable: " + lval->name);
-            return 0;
-        }
-        if (auto *unary = dynamic_cast<UnaryExpr *>(expr)) {
-            int value = eval_const_int(unary->operand.get());
-            if (unary->op == UnaryOp::Neg) {
-                return -value;
-            }
-            return value;
-        }
-        if (auto *binary = dynamic_cast<BinaryExpr *>(expr)) {
-            int lhs = eval_const_int(binary->lhs.get());
-            int rhs = eval_const_int(binary->rhs.get());
-            switch (binary->op) {
-            case BinaryOp::Add:
-                return lhs + rhs;
-            case BinaryOp::Sub:
-                return lhs - rhs;
-            case BinaryOp::Mul:
-                return lhs * rhs;
-            case BinaryOp::Div:
-                return rhs == 0 ? 0 : lhs / rhs;
-            case BinaryOp::Mod:
-                return rhs == 0 ? 0 : lhs % rhs;
-            default:
-                return 0;
-            }
-        }
-        return 0;
-    }
-
-    float eval_const_float(Expr *expr) {
-        if (expr == nullptr) {
-            return 0.0F;
-        }
-        if (auto *float_lit = dynamic_cast<FloatLiteral *>(expr)) {
-            return float_lit->value;
-        }
-        if (auto *int_lit = dynamic_cast<IntLiteral *>(expr)) {
-            return static_cast<float>(int_lit->value);
-        }
-        if (auto *lval = dynamic_cast<LValExpr *>(expr)) {
-            Symbol *symbol = lookup_variable(lval->name);
-            if (lval->indices.empty() && symbol != nullptr && symbol->constant.valid) {
-                return symbol->constant.type == BuiltinType::Float
-                           ? symbol->constant.float_value
-                           : static_cast<float>(symbol->constant.int_value);
-            }
-            errors_.push_back("constant expression uses non-constant variable: " + lval->name);
-            return 0.0F;
-        }
-        if (auto *unary = dynamic_cast<UnaryExpr *>(expr)) {
-            float value = eval_const_float(unary->operand.get());
-            if (unary->op == UnaryOp::Neg) {
-                return -value;
-            }
-            return value;
-        }
-        if (auto *binary = dynamic_cast<BinaryExpr *>(expr)) {
-            float lhs = eval_const_float(binary->lhs.get());
-            float rhs = eval_const_float(binary->rhs.get());
-            switch (binary->op) {
-            case BinaryOp::Add:
-                return lhs + rhs;
-            case BinaryOp::Sub:
-                return lhs - rhs;
-            case BinaryOp::Mul:
-                return lhs * rhs;
-            case BinaryOp::Div:
-                return rhs == 0.0F ? 0.0F : lhs / rhs;
-            default:
-                return static_cast<float>(eval_const_int(expr));
-            }
-        }
-        return static_cast<float>(eval_const_int(expr));
     }
 
     yir::ICmpOp::Predicate to_icmp(BinaryOp op) {
@@ -1088,7 +1241,7 @@ class Lowerer final : public ASTVisitor {
     }
 
     void define_variable(const std::string &name, yir::Value *value, yir::TypePtr type,
-                         bool is_const, bool is_array, bool is_global, ConstantValue constant) {
+                         bool is_const, bool is_array, bool is_global) {
         Symbol symbol;
         symbol.kind = Symbol::Kind::Variable;
         symbol.name = name;
@@ -1097,7 +1250,6 @@ class Lowerer final : public ASTVisitor {
         symbol.is_const = is_const;
         symbol.is_array = is_array;
         symbol.is_global = is_global;
-        symbol.constant = constant;
         if (!symbols_.define(std::move(symbol))) {
             errors_.push_back("redefinition of symbol: " + name);
         }
@@ -1108,7 +1260,7 @@ class Lowerer final : public ASTVisitor {
         Symbol symbol;
         symbol.kind = Symbol::Kind::Function;
         symbol.name = name;
-        symbol.type = yir::Type::get_func(param_types, return_type);
+        symbol.type = yir::Type::get_func(param_types, return_type, is_variadic);
         symbol.function = function;
         symbol.return_type = std::move(return_type);
         symbol.param_types = std::move(param_types);
@@ -1135,29 +1287,6 @@ class Lowerer final : public ASTVisitor {
         return symbol;
     }
 
-    void install_sysy_builtins() {
-        auto i32 = yir::Type::get_i32();
-        auto f32 = yir::Type::get_f32();
-        auto void_ty = yir::Type::get_void();
-        auto i32_ptr = yir::Type::get_ptr(i32);
-        auto f32_ptr = yir::Type::get_ptr(f32);
-
-        define_function("getint", nullptr, i32, {}, true, false);
-        define_function("getch", nullptr, i32, {}, true, false);
-        define_function("getfloat", nullptr, f32, {}, true, false);
-        define_function("getarray", nullptr, i32, {i32_ptr}, true, false);
-        define_function("getfarray", nullptr, i32, {f32_ptr}, true, false);
-
-        define_function("putint", nullptr, void_ty, {i32}, true, false);
-        define_function("putch", nullptr, void_ty, {i32}, true, false);
-        define_function("putarray", nullptr, void_ty, {i32, i32_ptr}, true, false);
-        define_function("putfloat", nullptr, void_ty, {f32}, true, false);
-        define_function("putfarray", nullptr, void_ty, {i32, f32_ptr}, true, false);
-        define_function("putf", nullptr, void_ty, {}, true, true);
-        define_function("starttime", nullptr, void_ty, {}, true, false);
-        define_function("stoptime", nullptr, void_ty, {}, true, false);
-    }
-
     std::string fresh_temp() {
         return "v" + std::to_string(temp_counter_++);
     }
@@ -1172,6 +1301,7 @@ class Lowerer final : public ASTVisitor {
         return name + "." + std::to_string(count++);
     }
 
+    const sema::SemanticModel &model_;
     std::unique_ptr<yir::Module> module_;
     yir::Function *current_function_ = nullptr;
     yir::Region *current_region_ = nullptr;
@@ -1199,15 +1329,22 @@ PassResult ASTToYIRPass::run(PassContext &context) {
         return PassResult::fail("ASTToYIRPass requires AST in pass context");
     }
 
+    auto *model_artifact = context.get_artifact<std::shared_ptr<sema::SemanticModel>>(
+        ASTSemanticAnalysisPass::kArtifactKey);
+    if (model_artifact == nullptr || *model_artifact == nullptr) {
+        return PassResult::fail(
+            "FE_SEMANTIC_MODEL_REQUIRED: ASTToYIRPass requires authoritative semantic model");
+    }
     try {
-        Lowerer lowerer;
+        Lowerer lowerer(**model_artifact);
         auto module = lowerer.lower(*context.ast());
         auto verify = yir::verify_high_level_yir(*module);
         if (!verify.success) {
             return PassResult::fail(verify.errors.empty() ? "YIR verification failed"
                                                           : verify.errors.front());
         }
-        context.set_artifact<std::unique_ptr<yir::Module>>(std::string(kArtifactKey), std::move(module));
+        context.set_artifact<std::unique_ptr<yir::Module>>(std::string(kArtifactKey),
+                                                           std::move(module));
         return PassResult::ok(true);
     } catch (const std::exception &ex) {
         return PassResult::fail(ex.what());

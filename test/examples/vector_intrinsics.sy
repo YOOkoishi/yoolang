@@ -1,0 +1,40 @@
+// Every source-level vector/mask intrinsic registered by BuiltinRegistry is
+// exercised here and compiled through YIR and OIR by the documentation test.
+
+float data[64] = {};
+
+vector<float,7> memory_and_reductions(vector<float,7> lhs,
+                                      vector<float,7> rhs,
+                                      mask<7> active,
+                                      int lane) {
+  vector<int,7> indices = iota(vector<int,7>{});
+  vector<float,7> passthrough = select(active, lhs, rhs);
+
+  int predicates = any(active) + all(active) + none(active);
+  float old_lane = extract_lane(passthrough, lane);
+  passthrough = insert_lane(passthrough, lane, old_lane + predicates);
+
+  vector<float,7> loaded = masked_load(data, active, passthrough);
+  masked_store(data, active, loaded);
+  vector<float,7> gathered = gather(data, indices, active, passthrough);
+  scatter(data, indices, active, gathered);
+
+  // -1 denotes an undefined result lane.  0..6 select lhs, 7..13 rhs.
+  vector<float,7> shuffled =
+      shuffle(lhs, rhs, vector<int,7>{-1,0,6,7,8,12,13});
+  float reduced = reduce_add(shuffled) + reduce_mul(lhs) +
+                  reduce_min(rhs) + reduce_max(gathered);
+  return insert_lane(loaded, lane, reduced);
+}
+
+int integer_reductions(vector<int,3> value) {
+  return reduce_and(value) + reduce_or(value) + reduce_xor(value);
+}
+
+int main() {
+  vector<float,7> lhs = vector<float,7>{1,2,3,4,5,6,7};
+  vector<float,7> rhs = vector<float,7>{7,6,5,4,3,2,1};
+  mask<7> active = mask<7>{1,0,1,0,1,0,1};
+  vector<float,7> result = memory_and_reductions(lhs, rhs, active, 2);
+  return integer_reductions(vector<int,3>{1,2,3}) + result[0];
+}

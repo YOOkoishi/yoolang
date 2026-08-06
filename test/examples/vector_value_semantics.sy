@@ -1,0 +1,54 @@
+// This file is compiled by scripts/vector_docs_infra_tests.py through YIR and OIR.
+// It is a source example, not an assembly/psABI promise.
+
+const int LANES = 3;
+
+vector<int,1> one_lane = vector<int,1>{7};
+vector<float,LANES> rows[2] = {{1,2,3}, {4,5,6}};
+mask<LANES> mask_rows[2] = {{1,0,1}, {0,1,0}};
+mask<7> alternating = mask<7>{1,0,1,0,1,0,1};
+mask<7> no_lanes = mask<7>{};
+
+vector<float,LANES> convert_and_select(vector<int,LANES> input, int bias) {
+  // The constructor casts a same-lane numeric vector or splats a scalar.
+  vector<float,LANES> converted = vector<float,LANES>(input);
+  vector<float,LANES> explicit_splat = vector<float,LANES>(bias);
+
+  // In a vector/scalar operator, the scalar is converted to the element type
+  // and splatted.  The comparison produces mask<LANES>.
+  vector<float,LANES> sum = converted + explicit_splat + 1;
+  mask<LANES> positive = sum > 0;
+  int first_predicate = positive[0];
+  return select(positive, sum, vector<float,LANES>(first_predicate));
+}
+
+vector<int,LANES> update_lane(vector<int,LANES> values, int lane) {
+  // Constant lane indices are checked statically; dynamic indices remain legal.
+  values[0] = values[1];
+  values[lane] = values[lane] + 1;
+  return values;
+}
+
+vector<float,LANES> first_row(vector<float,LANES> values[]) {
+  // The parameter is an array of vectors.  The vector value itself never decays.
+  return values[0];
+}
+
+mask<7> invert_mask(mask<7> value) {
+  return ~value;
+}
+
+mask<LANES> first_mask(mask<LANES> values[]) {
+  return values[0];
+}
+
+int main() {
+  vector<int,31> wide_zero = vector<int,31>{};
+  vector<int,31> integer_bits = (wide_zero & ~wide_zero) |
+                                (wide_zero ^ wide_zero);
+  mask<7> mask_bits = (alternating & ~no_lanes) | alternating;
+  vector<float,LANES> selected = convert_and_select(vector<int,LANES>{1,2,3}, 2);
+  vector<int,LANES> narrowed = vector<int,LANES>(selected);
+  return reduce_or(integer_bits) + any(mask_bits) + any(first_mask(mask_rows)) +
+         narrowed[2] + one_lane[0];
+}
