@@ -23,6 +23,8 @@ class Type final {
         Void,
         Ptr,
         Array,
+        Vector,
+        Mask,
         Func,
     };
 
@@ -32,7 +34,9 @@ class Type final {
     static TypePtr get_void();
     static TypePtr get_ptr(TypePtr pointee);
     static TypePtr get_array(std::uint64_t count, TypePtr element);
-    static TypePtr get_func(std::vector<TypePtr> params, TypePtr result);
+    static TypePtr get_vector(std::uint64_t count, TypePtr element);
+    static TypePtr get_mask(std::uint64_t count);
+    static TypePtr get_func(std::vector<TypePtr> params, TypePtr result, bool is_variadic = false);
 
     Kind kind() const {
         return kind_;
@@ -52,9 +56,15 @@ class Type final {
     const TypePtr &result() const {
         return result_;
     }
+    bool is_variadic() const {
+        return is_variadic_;
+    }
 
     bool is_integer() const;
     bool is_float() const;
+    bool is_scalar() const;
+    bool is_vector() const;
+    bool is_mask() const;
     bool is_void() const;
     bool is_ptr() const;
     bool is_array() const;
@@ -63,8 +73,8 @@ class Type final {
   private:
     explicit Type(Kind kind);
     Type(Kind kind, TypePtr nested);
-    Type(std::uint64_t count, TypePtr element);
-    Type(std::vector<TypePtr> params, TypePtr result);
+    Type(Kind kind, std::uint64_t count, TypePtr element);
+    Type(std::vector<TypePtr> params, TypePtr result, bool is_variadic);
 
     Kind kind_;
     TypePtr pointee_;
@@ -72,6 +82,98 @@ class Type final {
     std::uint64_t count_ = 0;
     std::vector<TypePtr> params_;
     TypePtr result_;
+    bool is_variadic_ = false;
+};
+
+class Constant;
+using ConstantPtr = std::shared_ptr<const Constant>;
+
+class Constant {
+  public:
+    explicit Constant(TypePtr type);
+    virtual ~Constant() = default;
+
+    const TypePtr &type() const {
+        return type_;
+    }
+    virtual bool is_zero() const = 0;
+    virtual std::string str() const = 0;
+
+  private:
+    TypePtr type_;
+};
+
+class ConstantInt final : public Constant {
+  public:
+    ConstantInt(TypePtr type, std::int64_t value);
+    std::int64_t value() const {
+        return value_;
+    }
+    bool is_zero() const override;
+    std::string str() const override;
+
+  private:
+    std::int64_t value_;
+};
+
+class ConstantFloat final : public Constant {
+  public:
+    explicit ConstantFloat(float value);
+    float value() const {
+        return value_;
+    }
+    bool is_zero() const override;
+    std::string str() const override;
+
+  private:
+    float value_;
+};
+
+class ConstantAggregateZero final : public Constant {
+  public:
+    explicit ConstantAggregateZero(TypePtr type);
+    bool is_zero() const override;
+    std::string str() const override;
+};
+
+class ConstantArray final : public Constant {
+  public:
+    ConstantArray(TypePtr type, std::vector<ConstantPtr> elements);
+    const std::vector<ConstantPtr> &elements() const {
+        return elements_;
+    }
+    bool is_zero() const override;
+    std::string str() const override;
+
+  private:
+    std::vector<ConstantPtr> elements_;
+};
+
+class ConstantVector final : public Constant {
+  public:
+    ConstantVector(TypePtr type, std::vector<ConstantPtr> lanes);
+    const std::vector<ConstantPtr> &lanes() const {
+        return lanes_;
+    }
+    bool is_zero() const override;
+    std::string str() const override;
+
+  private:
+    std::vector<ConstantPtr> lanes_;
+};
+
+class ConstantMask final : public Constant {
+  public:
+    ConstantMask(TypePtr type, std::vector<std::uint8_t> packed_bytes);
+    const std::vector<std::uint8_t> &packed_bytes() const {
+        return packed_bytes_;
+    }
+    bool lane(std::uint64_t index) const;
+    bool is_zero() const override;
+    std::string str() const override;
+
+  private:
+    std::vector<std::uint8_t> packed_bytes_;
 };
 
 class Value {
@@ -109,6 +211,9 @@ class Value {
 struct ArrayInitEntry {
     std::vector<std::uint64_t> indices;
     Value *value = nullptr;
+    ConstantPtr constant;
+    // Transitional text bridge for existing scalar lowering. New producers
+    // must populate constant instead.
     std::string literal;
 };
 
@@ -192,11 +297,11 @@ class Global {
         return &address_;
     }
 
-    void set_initializer(std::string initializer) {
-        initializer_ = std::move(initializer);
+    void set_initializer(ConstantPtr initializer) {
+        typed_initializer_ = std::move(initializer);
     }
-    const std::string &initializer() const {
-        return initializer_;
+    const ConstantPtr &typed_initializer() const {
+        return typed_initializer_;
     }
 
   private:
@@ -204,12 +309,13 @@ class Global {
     TypePtr storage_type_;
     bool is_const_;
     Value address_;
-    std::string initializer_;
+    ConstantPtr typed_initializer_;
 };
 
 class Function {
   public:
-    Function(std::string name, TypePtr return_type, std::vector<TypePtr> param_types);
+    Function(std::string name, TypePtr return_type, std::vector<TypePtr> param_types,
+             bool is_variadic = false, bool is_external = false);
 
     const std::string &name() const {
         return name_;
@@ -221,7 +327,13 @@ class Function {
         return param_types_;
     }
     TypePtr function_type() const {
-        return Type::get_func(param_types_, return_type_);
+        return Type::get_func(param_types_, return_type_, is_variadic_);
+    }
+    bool is_variadic() const {
+        return is_variadic_;
+    }
+    bool is_external() const {
+        return is_external_;
     }
 
     Value *add_param(TypePtr type, std::string name);
@@ -243,6 +355,8 @@ class Function {
     std::string name_;
     TypePtr return_type_;
     std::vector<TypePtr> param_types_;
+    bool is_variadic_ = false;
+    bool is_external_ = false;
     std::vector<std::unique_ptr<Value>> params_;
     Region body_;
 };
@@ -250,7 +364,8 @@ class Function {
 class Module {
   public:
     Global *add_global(std::string name, TypePtr storage_type, bool is_const);
-    Function *add_function(std::string name, TypePtr return_type, std::vector<TypePtr> param_types);
+    Function *add_function(std::string name, TypePtr return_type, std::vector<TypePtr> param_types,
+                           bool is_variadic = false, bool is_external = false);
 
     const std::vector<std::unique_ptr<Global>> &globals() const {
         return globals_;
@@ -460,6 +575,18 @@ class RemSIOp final : public BinaryOpBase {
   public:
     RemSIOp(Value *lhs, Value *rhs, std::string result_name = "");
 };
+class AndIOp final : public BinaryOpBase {
+  public:
+    AndIOp(Value *lhs, Value *rhs, std::string result_name = "");
+};
+class OrIOp final : public BinaryOpBase {
+  public:
+    OrIOp(Value *lhs, Value *rhs, std::string result_name = "");
+};
+class XorIOp final : public BinaryOpBase {
+  public:
+    XorIOp(Value *lhs, Value *rhs, std::string result_name = "");
+};
 
 class AddFOp final : public BinaryOpBase {
   public:
@@ -530,6 +657,249 @@ class ToBoolOp final : public Operation {
 class NotOp final : public Operation {
   public:
     explicit NotOp(Value *value, std::string result_name = "");
+};
+
+class BitNotOp final : public Operation {
+  public:
+    explicit BitNotOp(Value *value, std::string result_name = "");
+    Value *value() const {
+        return operands()[0];
+    }
+};
+
+class MaskBinaryOp final : public BinaryOpBase {
+  public:
+    enum class Kind { And, Or, Xor };
+
+    MaskBinaryOp(Kind kind, Value *lhs, Value *rhs, std::string result_name = "");
+    Kind kind() const {
+        return kind_;
+    }
+
+  private:
+    Kind kind_;
+};
+
+class MaskNotOp final : public Operation {
+  public:
+    explicit MaskNotOp(Value *mask, std::string result_name = "");
+    Value *mask() const {
+        return operands()[0];
+    }
+};
+
+// Fixed source-vector construction and lane operations.  These operations are
+// deliberately distinct from array operations: vectors are SSA values and do
+// not decay to pointers.
+class VectorCreateOp final : public Operation {
+  public:
+    VectorCreateOp(TypePtr result_type, std::vector<Value *> lanes, std::string result_name = "");
+    const std::vector<Value *> &lanes() const {
+        return operands();
+    }
+};
+
+class SplatOp final : public Operation {
+  public:
+    SplatOp(Value *scalar, TypePtr result_type, std::string result_name = "");
+    Value *scalar() const {
+        return operands()[0];
+    }
+};
+
+class StepVectorOp final : public Operation {
+  public:
+    explicit StepVectorOp(TypePtr result_type, std::string result_name = "");
+};
+
+class ExtractLaneOp final : public Operation {
+  public:
+    ExtractLaneOp(Value *vector, Value *index, std::string result_name = "");
+    Value *vector() const {
+        return operands()[0];
+    }
+    Value *index() const {
+        return operands()[1];
+    }
+};
+
+class InsertLaneOp final : public Operation {
+  public:
+    InsertLaneOp(Value *vector, Value *index, Value *lane, std::string result_name = "");
+    Value *vector() const {
+        return operands()[0];
+    }
+    Value *index() const {
+        return operands()[1];
+    }
+    Value *lane() const {
+        return operands()[2];
+    }
+};
+
+class ShuffleOp final : public Operation {
+  public:
+    static constexpr std::uint64_t UndefLane = ~std::uint64_t{0};
+    ShuffleOp(Value *lhs, Value *rhs, std::vector<std::uint64_t> indices, TypePtr result_type,
+              std::string result_name = "");
+    Value *lhs() const {
+        return operands()[0];
+    }
+    Value *rhs() const {
+        return operands()[1];
+    }
+    const std::vector<std::uint64_t> &indices() const {
+        return indices_;
+    }
+
+  private:
+    std::vector<std::uint64_t> indices_;
+};
+
+class SelectOp final : public Operation {
+  public:
+    SelectOp(Value *mask, Value *true_value, Value *false_value, std::string result_name = "");
+    Value *mask() const {
+        return operands()[0];
+    }
+    Value *true_value() const {
+        return operands()[1];
+    }
+    Value *false_value() const {
+        return operands()[2];
+    }
+};
+
+class VectorCastOp final : public Operation {
+  public:
+    VectorCastOp(Value *value, TypePtr result_type, std::string result_name = "");
+    Value *value() const {
+        return operands()[0];
+    }
+};
+
+class MaskReduceOp final : public Operation {
+  public:
+    enum class Kind { Any, All, None };
+
+    MaskReduceOp(Kind kind, Value *mask, std::string result_name = "");
+    Kind kind() const {
+        return kind_;
+    }
+    Value *mask() const {
+        return operands()[0];
+    }
+
+  private:
+    Kind kind_;
+};
+
+class VectorReduceOp final : public Operation {
+  public:
+    enum class Kind { Add, Mul, Min, Max, And, Or, Xor };
+
+    VectorReduceOp(Kind kind, Value *vector, bool ordered, std::string result_name = "");
+    Kind kind() const {
+        return kind_;
+    }
+    Value *vector() const {
+        return operands()[0];
+    }
+    bool ordered() const {
+        return ordered_;
+    }
+
+  private:
+    Kind kind_;
+    bool ordered_;
+};
+
+class MaskedLoadOp final : public Operation {
+  public:
+    MaskedLoadOp(Value *address, Value *mask, Value *passthrough, std::uint64_t alignment,
+                 std::string result_name = "");
+    Value *address() const {
+        return operands()[0];
+    }
+    Value *mask() const {
+        return operands()[1];
+    }
+    Value *passthrough() const {
+        return operands()[2];
+    }
+    std::uint64_t alignment() const {
+        return alignment_;
+    }
+
+  private:
+    std::uint64_t alignment_;
+};
+
+class MaskedStoreOp final : public Operation {
+  public:
+    MaskedStoreOp(Value *value, Value *address, Value *mask, std::uint64_t alignment);
+    Value *value() const {
+        return operands()[0];
+    }
+    Value *address() const {
+        return operands()[1];
+    }
+    Value *mask() const {
+        return operands()[2];
+    }
+    std::uint64_t alignment() const {
+        return alignment_;
+    }
+
+  private:
+    std::uint64_t alignment_;
+};
+
+class GatherOp final : public Operation {
+  public:
+    GatherOp(Value *base, Value *indices, Value *mask, Value *passthrough, std::uint64_t alignment,
+             std::string result_name = "");
+    Value *base() const {
+        return operands()[0];
+    }
+    Value *indices() const {
+        return operands()[1];
+    }
+    Value *mask() const {
+        return operands()[2];
+    }
+    Value *passthrough() const {
+        return operands()[3];
+    }
+    std::uint64_t alignment() const {
+        return alignment_;
+    }
+
+  private:
+    std::uint64_t alignment_;
+};
+
+class ScatterOp final : public Operation {
+  public:
+    ScatterOp(Value *value, Value *base, Value *indices, Value *mask, std::uint64_t alignment);
+    Value *value() const {
+        return operands()[0];
+    }
+    Value *base() const {
+        return operands()[1];
+    }
+    Value *indices() const {
+        return operands()[2];
+    }
+    Value *mask() const {
+        return operands()[3];
+    }
+    std::uint64_t alignment() const {
+        return alignment_;
+    }
+
+  private:
+    std::uint64_t alignment_;
 };
 
 class CallOp final : public Operation {

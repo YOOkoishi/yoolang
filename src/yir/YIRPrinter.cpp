@@ -68,22 +68,34 @@ void YIRPrinter::print_global(const Global &global) {
     if (global.is_const()) {
         out_ << " const";
     }
-    if (!global.initializer().empty()) {
-        out_ << " = " << global.initializer();
+    if (global.typed_initializer() != nullptr) {
+        out_ << " = " << global.typed_initializer()->str();
     }
     out_ << '\n';
 }
 
 void YIRPrinter::print_function(const Function &function) {
     write_indent();
-    out_ << "yir.func @" << function.name() << '(';
+    out_ << (function.is_external() ? "yir.declare @" : "yir.func @") << function.name() << '(';
     for (std::size_t i = 0; i < function.params().size(); ++i) {
         if (i != 0) {
             out_ << ", ";
         }
-        out_ << value_name(function.params()[i].get()) << " : " << function.params()[i]->type()->str();
+        out_ << value_name(function.params()[i].get()) << " : "
+             << function.params()[i]->type()->str();
     }
-    out_ << ") -> " << function.return_type()->str() << " {\n";
+    if (function.is_variadic()) {
+        if (!function.params().empty()) {
+            out_ << ", ";
+        }
+        out_ << "...";
+    }
+    out_ << ") -> " << function.return_type()->str();
+    if (function.is_external()) {
+        out_ << '\n';
+        return;
+    }
+    out_ << " {\n";
     with_indent(1);
     print_region(function.body());
     with_indent(-1);
@@ -134,8 +146,8 @@ void YIRPrinter::print_operation(const Operation &op) {
     }
     if (const auto *assign = dynamic_cast<const AssignOp *>(&op)) {
         write_indent();
-        out_ << "yir.assign " << value_name(assign->target()) << ", "
-             << value_name(assign->value()) << '\n';
+        out_ << "yir.assign " << value_name(assign->target()) << ", " << value_name(assign->value())
+             << '\n';
         return;
     }
     if (dynamic_cast<const ArrayVarOp *>(&op) != nullptr) {
@@ -158,7 +170,13 @@ void YIRPrinter::print_operation(const Operation &op) {
                 }
                 out_ << entry.indices[i];
             }
-            out_ << "] = " << (entry.literal.empty() ? init_value(entry.value) : entry.literal) << '\n';
+            out_ << "] = ";
+            if (entry.constant != nullptr) {
+                out_ << entry.constant->str();
+            } else {
+                out_ << (entry.literal.empty() ? init_value(entry.value) : entry.literal);
+            }
+            out_ << '\n';
         }
         if (array_init->default_zero()) {
             write_indent();
@@ -241,28 +259,158 @@ void YIRPrinter::print_operation(const Operation &op) {
         write_indent();
         write_result(op);
         out_ << "yir.icmp " << icmp_predicate(icmp->predicate()) << ' ' << value_name(icmp->lhs())
-             << ", " << value_name(icmp->rhs()) << " : i1\n";
+             << ", " << value_name(icmp->rhs()) << " : " << op.result()->type()->str() << '\n';
         return;
     }
     if (const auto *fcmp = dynamic_cast<const FCmpOp *>(&op)) {
         write_indent();
         write_result(op);
         out_ << "yir.fcmp " << fcmp_predicate(fcmp->predicate()) << ' ' << value_name(fcmp->lhs())
-             << ", " << value_name(fcmp->rhs()) << " : i1\n";
+             << ", " << value_name(fcmp->rhs()) << " : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *create = dynamic_cast<const VectorCreateOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.create [";
+        for (std::size_t i = 0; i < create->lanes().size(); ++i) {
+            if (i != 0) {
+                out_ << ", ";
+            }
+            out_ << value_name(create->lanes()[i]);
+        }
+        out_ << "] : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *splat = dynamic_cast<const SplatOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.splat " << value_name(splat->scalar()) << " : "
+             << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (dynamic_cast<const StepVectorOp *>(&op) != nullptr) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.step : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *extract = dynamic_cast<const ExtractLaneOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.extract " << value_name(extract->vector()) << ", "
+             << value_name(extract->index()) << " : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *insert = dynamic_cast<const InsertLaneOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.insert " << value_name(insert->vector()) << ", "
+             << value_name(insert->index()) << ", " << value_name(insert->lane()) << " : "
+             << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *shuffle = dynamic_cast<const ShuffleOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.shuffle " << value_name(shuffle->lhs()) << ", "
+             << value_name(shuffle->rhs()) << " [";
+        for (std::size_t i = 0; i < shuffle->indices().size(); ++i) {
+            if (i != 0) {
+                out_ << ", ";
+            }
+            if (shuffle->indices()[i] == ShuffleOp::UndefLane) {
+                out_ << -1;
+            } else {
+                out_ << shuffle->indices()[i];
+            }
+        }
+        out_ << "] : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *select = dynamic_cast<const SelectOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.select " << value_name(select->mask()) << ", "
+             << value_name(select->true_value()) << ", " << value_name(select->false_value())
+             << " : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *cast = dynamic_cast<const VectorCastOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.cast " << value_name(cast->value()) << " : "
+             << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *mask_not = dynamic_cast<const MaskNotOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.mask.not " << value_name(mask_not->mask()) << " : "
+             << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *mask_reduce = dynamic_cast<const MaskReduceOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << op.op_name() << ' ' << value_name(mask_reduce->mask()) << " : i1\n";
+        return;
+    }
+    if (const auto *reduce = dynamic_cast<const VectorReduceOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << op.op_name() << ' ' << value_name(reduce->vector());
+        if (reduce->ordered()) {
+            out_ << " ordered";
+        }
+        out_ << " : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *load = dynamic_cast<const MaskedLoadOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.masked_load " << value_name(load->address()) << ", "
+             << value_name(load->mask()) << ", " << value_name(load->passthrough()) << " align "
+             << load->alignment() << " : " << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *store = dynamic_cast<const MaskedStoreOp *>(&op)) {
+        write_indent();
+        out_ << "yir.vector.masked_store " << value_name(store->value()) << ", "
+             << value_name(store->address()) << ", " << value_name(store->mask()) << " align "
+             << store->alignment() << '\n';
+        return;
+    }
+    if (const auto *gather = dynamic_cast<const GatherOp *>(&op)) {
+        write_indent();
+        write_result(op);
+        out_ << "yir.vector.gather " << value_name(gather->base()) << ", "
+             << value_name(gather->indices()) << ", " << value_name(gather->mask()) << ", "
+             << value_name(gather->passthrough()) << " align " << gather->alignment() << " : "
+             << op.result()->type()->str() << '\n';
+        return;
+    }
+    if (const auto *scatter = dynamic_cast<const ScatterOp *>(&op)) {
+        write_indent();
+        out_ << "yir.vector.scatter " << value_name(scatter->value()) << ", "
+             << value_name(scatter->base()) << ", " << value_name(scatter->indices()) << ", "
+             << value_name(scatter->mask()) << " align " << scatter->alignment() << '\n';
         return;
     }
     if (const auto *binary = dynamic_cast<const BinaryOpBase *>(&op)) {
         write_indent();
         write_result(op);
-        out_ << op.op_name() << ' ' << value_name(binary->lhs()) << ", " << value_name(binary->rhs())
-             << " : " << op.result()->type()->str() << '\n';
+        out_ << op.op_name() << ' ' << value_name(binary->lhs()) << ", "
+             << value_name(binary->rhs()) << " : " << op.result()->type()->str() << '\n';
         return;
     }
     if (dynamic_cast<const ZExtI1ToI32Op *>(&op) != nullptr ||
         dynamic_cast<const TruncI32ToI1Op *>(&op) != nullptr ||
         dynamic_cast<const SIToFPOp *>(&op) != nullptr ||
         dynamic_cast<const FPToSIOp *>(&op) != nullptr ||
-        dynamic_cast<const ToBoolOp *>(&op) != nullptr || dynamic_cast<const NotOp *>(&op) != nullptr) {
+        dynamic_cast<const ToBoolOp *>(&op) != nullptr ||
+        dynamic_cast<const NotOp *>(&op) != nullptr ||
+        dynamic_cast<const BitNotOp *>(&op) != nullptr) {
         write_indent();
         write_result(op);
         out_ << op.op_name() << ' ' << value_name(op.operands()[0]) << " : "
