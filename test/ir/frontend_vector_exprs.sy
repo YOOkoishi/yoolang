@@ -1,0 +1,140 @@
+// RUN: %compiler --emit-yir %s | FileCheck %s
+// RUN: %compiler --emit-oir %s | FileCheck %s --check-prefix=OIR
+// Source fixed-value syntax is intentionally explicit:
+//   vector<T,N>{e...} / mask<N>{0|1...}, with {} meaning aggregate zero.
+//   vector<T,N>(x) splats a scalar or casts a same-N numeric vector lane-wise.
+
+vector<int,1> global_one = vector<int,1>{1};
+mask<3> global_mask = mask<3>{1,0,1};
+mask<3> global_zero_mask = mask<3>{};
+vector<float,3> global_vectors[2] = {{1,2,3}, {4,5,6}};
+float data[64] = {};
+
+vector<int,3> round_trip(vector<float,3> input, mask<3> active, int lane) {
+  vector<int,3> a = vector<int,3>(input);
+  vector<int,3> b = vector<int,3>(2);
+  vector<int,3> sum = a + b * 3;
+  mask<3> compared = sum >= b;
+  mask<3> bits = (compared & ~active) | (compared ^ active);
+  int old = extract_lane(sum, lane);
+  sum = insert_lane(sum, lane, old + active[0]);
+  any(bits);
+  all(bits);
+  none(bits);
+  return select(bits, sum, b);
+}
+
+vector<int,3> first_vector(vector<int,3> values[]) {
+  values[0][1] = values[0][0];
+  return values[0];
+}
+
+mask<3> mask_round_trip(mask<3> values[], int index) {
+  mask<3> loaded = values[index];
+  values[index] = ~loaded;
+  return values[index];
+}
+
+mask<3> mask_select(mask<3> condition, mask<3> when_true, mask<3> when_false) {
+  return select(condition, when_true, when_false);
+}
+
+vector<float,7> memory_ops(vector<float,7> a, vector<float,7> b, mask<7> active) {
+  vector<int,7> indices = iota(vector<int,7>{});
+  vector<float,7> typed = vector<float,7>{1,2,3,4,5,6,7};
+  vector<float,7> loaded = masked_load(data, active, typed);
+  masked_store(data, active, loaded);
+  vector<float,7> gathered = gather(data, indices, active, b);
+  scatter(data, indices, active, gathered);
+  vector<float,7> shuffled =
+      shuffle(a, b, vector<int,7>{-1,0,6,7,8,12,13});
+  float ordered = reduce_add(shuffled) + reduce_mul(a) +
+                  reduce_min(a) + reduce_max(b);
+  return insert_lane(select(active, loaded, gathered), 3, ordered);
+}
+
+int main() {
+  vector<int,31> wide = vector<int,31>{};
+  vector<int,31> bitwise = (wide & ~wide) | (wide ^ wide);
+  vector<int,3> local[2] = {{1,2,3}, {4,5,6}};
+  mask<3> local_masks[2] = {{1,0,1}, {0,1,0}};
+  vector<int,3> picked = first_vector(local);
+  mask<3> picked_mask = mask_round_trip(local_masks, 0);
+  int reductions = reduce_and(bitwise) + reduce_or(bitwise) + reduce_xor(bitwise);
+  int scalar_bits = (~1 | 2 ^ 3 & 4);
+  return reductions + scalar_bits + picked[1] + picked_mask[1] + global_one[0];
+}
+
+// CHECK: yir.global @global_one : vector<1 x i32> = <i32 1>
+// CHECK: yir.global @global_mask : mask<3> = maskbits<1,0,1>
+// CHECK: yir.global @global_zero_mask : mask<3> = zero
+// CHECK: yir.global @global_vectors : array<2 x vector<3 x f32>>
+// CHECK-LABEL: yir.func @round_trip(
+// CHECK: yir.vector.cast
+// CHECK: yir.vector.splat
+// CHECK: yir.muli
+// CHECK: yir.addi
+// CHECK: yir.icmp ge
+// CHECK: yir.mask.not
+// CHECK: yir.mask.and
+// CHECK: yir.mask.xor
+// CHECK: yir.mask.or
+// CHECK: yir.vector.extract
+// CHECK: yir.vector.insert
+// CHECK: yir.mask.any
+// CHECK: yir.mask.all
+// CHECK: yir.mask.none
+// CHECK: yir.vector.select
+// CHECK-LABEL: yir.func @first_vector(
+// CHECK: yir.array_load
+// CHECK: yir.vector.insert
+// CHECK: yir.array_store
+// CHECK-LABEL: yir.func @mask_round_trip(
+// CHECK: yir.array_load {{.*}} : mask<3>
+// CHECK: yir.mask.not
+// CHECK: yir.array_store
+// CHECK-LABEL: yir.func @mask_select(
+// CHECK: yir.vector.select {{.*}} : mask<3>
+// CHECK-LABEL: yir.func @memory_ops(
+// CHECK: yir.vector.step : vector<7 x i32>
+// CHECK: yir.vector.create {{.*}} : vector<7 x f32>
+// CHECK: yir.vector.masked_load
+// CHECK: yir.vector.masked_store
+// CHECK: yir.vector.gather
+// CHECK: yir.vector.scatter
+// CHECK: yir.vector.shuffle {{.*}} [-1, 0, 6, 7, 8, 12, 13]
+// CHECK: yir.vector.reduce_add {{.*}} ordered
+// CHECK: yir.vector.reduce_mul {{.*}} ordered
+// CHECK: yir.vector.reduce_min {{.*}} ordered
+// CHECK: yir.vector.reduce_max {{.*}} ordered
+// CHECK-LABEL: yir.func @main()
+// CHECK: yir.zero : vector<31 x i32>
+// CHECK: yir.noti {{.*}} : vector<31 x i32>
+// CHECK: yir.andi {{.*}} : vector<31 x i32>
+// CHECK: yir.xori {{.*}} : vector<31 x i32>
+// CHECK: yir.ori {{.*}} : vector<31 x i32>
+// CHECK: yir.vector.reduce_and {{.*}} : i32
+// CHECK: yir.vector.reduce_or {{.*}} : i32
+// CHECK: yir.vector.reduce_xor {{.*}} : i32
+
+// OIR: @global_one = global <1 x i32> <i32 1>
+// OIR: @global_mask = global <3 x i1> <i1 1, i1 0, i1 1>
+// OIR-LABEL: define <3 x i32> @round_trip(
+// OIR: vector.fptosi
+// OIR: splat i32 2 to <3 x i32>
+// OIR: icmp ge <3 x i32>
+// OIR: select <3 x i1>
+// OIR-LABEL: define <3 x i1> @mask_select(
+// OIR: select <3 x i1>
+// OIR-LABEL: define <7 x float> @memory_ops(
+// OIR: stepvector <7 x i32>
+// OIR: masked.load
+// OIR: masked.store
+// OIR: vp.gather
+// OIR: vp.scatter
+// OIR: shufflevector {{.*}} [-1, 0, 6, 7, 8, 12, 13]
+// OIR: vp.reduce.ordered.fadd
+// OIR-LABEL: define i32 @main()
+// OIR: xor <31 x i32>
+// OIR: and <31 x i32>
+// OIR: or <31 x i32>

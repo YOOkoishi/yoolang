@@ -18,6 +18,9 @@ class ASTPrinter : public ASTVisitor {
     void visit(BinaryExpr &node) override;
     void visit(UnaryExpr &node) override;
     void visit(CallExpr &node) override;
+    void visit(TypedVectorLiteralExpr &node) override;
+    void visit(VectorCastExpr &node) override;
+    void visit(ConstExpr &node) override;
 
     void visit(InitVal &node) override;
 
@@ -44,6 +47,9 @@ class ASTPrinter : public ASTVisitor {
     void with_indent(const std::function<void()> &fn);
 
     std::string type_name(BuiltinType type) const;
+    std::string type_name(const TypeSyntaxRef &type) const;
+    std::string const_expr_name(const ConstExpr &expression) const;
+    std::string inline_expr_name(const Expr &expression) const;
     std::string binary_op_name(BinaryOp op) const;
     std::string unary_op_name(UnaryOp op) const;
 

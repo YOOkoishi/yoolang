@@ -1,0 +1,25 @@
+// RUN: %compiler --emit-yir %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-oir %s | FileCheck %s --check-prefix=OIR
+// RUN: %compiler --emit-mir-stage=lowered %s | FileCheck %s --check-prefix=MIR
+
+int bit_or(int a, int b) {
+  return a | b;
+}
+
+int main() {
+  if (bit_or(5, 2) != 7) {
+    return 1;
+  }
+  return 0;
+}
+
+// YIR-LABEL: yir.func @bit_or(
+// YIR: yir.ori
+
+// OIR-LABEL: define i32 @bit_or(
+// OIR: or i32
+
+// MIR-LABEL: func @bit_or(
+// MIR: XOR
+// MIR: AND
+// MIR: XOR

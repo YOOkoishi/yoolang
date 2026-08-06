@@ -4,6 +4,62 @@
 #include <sstream>
 #include <utility>
 
+namespace {
+
+const char *binary_op_symbol(BinaryOp op) {
+    switch (op) {
+    case BinaryOp::Add:
+        return "+";
+    case BinaryOp::Sub:
+        return "-";
+    case BinaryOp::Mul:
+        return "*";
+    case BinaryOp::Div:
+        return "/";
+    case BinaryOp::Mod:
+        return "%";
+    case BinaryOp::Lt:
+        return "<";
+    case BinaryOp::Le:
+        return "<=";
+    case BinaryOp::Gt:
+        return ">";
+    case BinaryOp::Ge:
+        return ">=";
+    case BinaryOp::Eq:
+        return "==";
+    case BinaryOp::Ne:
+        return "!=";
+    case BinaryOp::BitAnd:
+        return "&";
+    case BinaryOp::BitXor:
+        return "^";
+    case BinaryOp::BitOr:
+        return "|";
+    case BinaryOp::And:
+        return "&&";
+    case BinaryOp::Or:
+        return "||";
+    }
+    return "?";
+}
+
+const char *unary_op_symbol(UnaryOp op) {
+    switch (op) {
+    case UnaryOp::Neg:
+        return "-";
+    case UnaryOp::Not:
+        return "!";
+    case UnaryOp::Pos:
+        return "+";
+    case UnaryOp::BitNot:
+        return "~";
+    }
+    return "?";
+}
+
+} // namespace
+
 ASTPrinter::ASTPrinter(std::ostream &out) : out_(out) {
 }
 
@@ -40,6 +96,76 @@ std::string ASTPrinter::type_name(BuiltinType type) const {
     return "unknown";
 }
 
+std::string ASTPrinter::inline_expr_name(const Expr &expression) const {
+    if (auto *literal = dynamic_cast<const IntLiteral *>(&expression)) {
+        return std::to_string(literal->value);
+    }
+    if (auto *literal = dynamic_cast<const FloatLiteral *>(&expression)) {
+        std::ostringstream out;
+        out << literal->value;
+        return out.str();
+    }
+    if (auto *lval = dynamic_cast<const LValExpr *>(&expression)) {
+        std::string text = lval->name;
+        for (const auto &index : lval->indices) {
+            text += "[" + inline_expr_name(*index) + "]";
+        }
+        return text;
+    }
+    if (auto *binary = dynamic_cast<const BinaryExpr *>(&expression)) {
+        return "(" + inline_expr_name(*binary->lhs) + " " + binary_op_symbol(binary->op) + " " +
+               inline_expr_name(*binary->rhs) + ")";
+    }
+    if (auto *unary = dynamic_cast<const UnaryExpr *>(&expression)) {
+        return std::string("(") + unary_op_symbol(unary->op) + inline_expr_name(*unary->operand) +
+               ")";
+    }
+    if (auto *call = dynamic_cast<const CallExpr *>(&expression)) {
+        std::string text = call->func_name + "(";
+        for (std::size_t i = 0; i < call->args.size(); ++i) {
+            if (i != 0) {
+                text += ", ";
+            }
+            text += inline_expr_name(*call->args[i]);
+        }
+        return text + ")";
+    }
+    if (auto *literal = dynamic_cast<const TypedVectorLiteralExpr *>(&expression)) {
+        std::string text = type_name(literal->type_syntax) + "{";
+        for (std::size_t i = 0; i < literal->lanes.size(); ++i) {
+            if (i != 0) {
+                text += ", ";
+            }
+            text += inline_expr_name(*literal->lanes[i]);
+        }
+        return text + "}";
+    }
+    if (auto *cast = dynamic_cast<const VectorCastExpr *>(&expression)) {
+        return type_name(cast->target_type_syntax) + "(" + inline_expr_name(*cast->operand) + ")";
+    }
+    return "<expr>";
+}
+
+std::string ASTPrinter::const_expr_name(const ConstExpr &expression) const {
+    return inline_expr_name(expression.expression());
+}
+
+std::string ASTPrinter::type_name(const TypeSyntaxRef &type) const {
+    if (type == nullptr) {
+        return "<missing-type>";
+    }
+    switch (type->kind()) {
+    case TypeSyntax::Kind::Builtin:
+        return type_name(type->builtin_type());
+    case TypeSyntax::Kind::Vector:
+        return "vector<" + type_name(type->vector_element_type()) + ", " +
+               const_expr_name(*type->lane_expression()) + ">";
+    case TypeSyntax::Kind::Mask:
+        return "mask<" + const_expr_name(*type->lane_expression()) + ">";
+    }
+    return "<missing-type>";
+}
+
 std::string ASTPrinter::binary_op_name(BinaryOp op) const {
     switch (op) {
     case BinaryOp::Add:
@@ -64,6 +190,12 @@ std::string ASTPrinter::binary_op_name(BinaryOp op) const {
         return "Eq";
     case BinaryOp::Ne:
         return "Ne";
+    case BinaryOp::BitAnd:
+        return "BitAnd";
+    case BinaryOp::BitXor:
+        return "BitXor";
+    case BinaryOp::BitOr:
+        return "BitOr";
     case BinaryOp::And:
         return "And";
     case BinaryOp::Or:
@@ -80,6 +212,8 @@ std::string ASTPrinter::unary_op_name(UnaryOp op) const {
         return "Not";
     case UnaryOp::Pos:
         return "Pos";
+    case UnaryOp::BitNot:
+        return "BitNot";
     }
     return "Unknown";
 }
@@ -174,6 +308,32 @@ void ASTPrinter::visit(CallExpr &node) {
     });
 }
 
+void ASTPrinter::visit(TypedVectorLiteralExpr &node) {
+    write_line("TypedVectorLiteralExpr type=" + type_name(node.type_syntax));
+    with_indent([&] {
+        write_line("Lanes:");
+        with_indent([&] {
+            if (node.lanes.empty()) {
+                write_line("<zero>");
+                return;
+            }
+            for (std::size_t i = 0; i < node.lanes.size(); ++i) {
+                write_line("[" + std::to_string(i) + "]:");
+                with_indent([&] { node.lanes[i]->accept(*this); });
+            }
+        });
+    });
+}
+
+void ASTPrinter::visit(VectorCastExpr &node) {
+    write_line("VectorCastExpr type=" + type_name(node.target_type_syntax));
+    with_indent([&] { print_expr("Operand", node.operand); });
+}
+
+void ASTPrinter::visit(ConstExpr &node) {
+    write_line("ConstExpr value=" + const_expr_name(node));
+}
+
 void ASTPrinter::visit(InitVal &node) {
     if (node.expr) {
         write_line("InitVal kind=expr");
@@ -252,7 +412,7 @@ void ASTPrinter::visit(ContinueStmt &) {
 }
 
 void ASTPrinter::visit(VarDecl &node) {
-    write_line("VarDecl name=" + node.name + " type=" + type_name(node.base_type) +
+    write_line("VarDecl name=" + node.name + " type=" + type_name(node.type_syntax) +
                " const=" + (node.is_const ? "true" : "false"));
     with_indent([&] {
         print_dimensions(node.dimensions);
@@ -261,7 +421,7 @@ void ASTPrinter::visit(VarDecl &node) {
 }
 
 void ASTPrinter::visit(DeclStmt &node) {
-    write_line("DeclStmt type=" + type_name(node.base_type) +
+    write_line("DeclStmt type=" + type_name(node.type_syntax) +
                " const=" + (node.is_const ? "true" : "false"));
     with_indent([&] {
         if (node.decls.empty()) {
@@ -276,7 +436,14 @@ void ASTPrinter::visit(DeclStmt &node) {
 }
 
 void ASTPrinter::visit(FuncDef &node) {
-    write_line("FuncDef name=" + node.name + " return=" + type_name(node.return_type));
+    if (node.is_external) {
+        write_line("FuncDecl name=" + node.name + " return=" +
+                   type_name(node.return_type_syntax) + " extern=true variadic=" +
+                   (node.is_variadic ? "true" : "false"));
+    } else {
+        write_line("FuncDef name=" + node.name + " return=" +
+                   type_name(node.return_type_syntax));
+    }
     with_indent([&] {
         write_line("Params:");
         with_indent([&] {
@@ -286,8 +453,9 @@ void ASTPrinter::visit(FuncDef &node) {
             }
             for (std::size_t i = 0; i < node.params.size(); ++i) {
                 auto &param = node.params[i];
-                write_line("Param[" + std::to_string(i) + "] name=" + param.name +
-                           " type=" + type_name(param.type));
+                write_line("Param[" + std::to_string(i) + "] name=" +
+                           (param.name.empty() ? "<unnamed>" : param.name) +
+                           " type=" + type_name(param.type_syntax));
                 with_indent([&] { print_dimensions(param.dimensions); });
             }
         });
@@ -295,7 +463,7 @@ void ASTPrinter::visit(FuncDef &node) {
             write_line("Body:");
             with_indent([&] { node.body->accept(*this); });
         } else {
-            write_line("Body: <null>");
+            write_line(node.is_external ? "Body: <external>" : "Body: <null>");
         }
     });
 }

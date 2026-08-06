@@ -1,0 +1,45 @@
+// RUN: %compiler --emit-ast %s | FileCheck %s --check-prefix=AST
+
+vector<int,1> global_one;
+vector<float,3> global_triple[7];
+mask<7> global_mask;
+
+vector<int,31> passthrough(vector<int,31> value, mask<31> active) {
+  vector<float,3> local = {1.0, 2.0, 3.0};
+  vector<int,1> local_array[7];
+  return value;
+}
+
+void consume(mask<7> value) {
+  return;
+}
+
+int bitwise_precedence(int a, int b, int c) {
+  return ~a | b ^ c & 1;
+}
+
+// AST: DeclStmt type=vector<int, 1> const=false
+// AST: VarDecl name=global_one type=vector<int, 1> const=false
+// AST: DeclStmt type=vector<float, 3> const=false
+// AST: VarDecl name=global_triple type=vector<float, 3> const=false
+// AST: IntLiteral value=7
+// AST: DeclStmt type=mask<7> const=false
+// AST: VarDecl name=global_mask type=mask<7> const=false
+
+// AST-LABEL: FuncDef name=passthrough return=vector<int, 31>
+// AST: Param[0] name=value type=vector<int, 31>
+// AST: Param[1] name=active type=mask<31>
+// AST: DeclStmt type=vector<float, 3> const=false
+// AST: VarDecl name=local type=vector<float, 3> const=false
+// AST: DeclStmt type=vector<int, 1> const=false
+// AST: VarDecl name=local_array type=vector<int, 1> const=false
+// AST: IntLiteral value=7
+
+// AST-LABEL: FuncDef name=consume return=void
+// AST: Param[0] name=value type=mask<7>
+
+// AST-LABEL: FuncDef name=bitwise_precedence return=int
+// AST: BinaryExpr op=BitOr
+// AST: UnaryExpr op=BitNot
+// AST: BinaryExpr op=BitXor
+// AST: BinaryExpr op=BitAnd

@@ -1,17 +1,23 @@
 #pragma once
 
+#include "front/SourceLocation.h"
+
 #include <cassert>
 #include <memory>
 #include <string>
 #include <vector>
 
 class ASTVisitor;
+class TypeSyntax;
+using TypeSyntaxRef = std::shared_ptr<const TypeSyntax>;
 
 // ============================================================================
 // 基类
 // ============================================================================
 class ASTNode {
   public:
+    front::SourceRange source_range;
+
     virtual ~ASTNode() = default;
     virtual void accept(ASTVisitor &visitor) = 0;
 };
@@ -33,11 +39,14 @@ enum class BinaryOp {
     Ge,
     Eq,
     Ne, // 比较
+    BitAnd,
+    BitXor,
+    BitOr,
     And,
     Or // 逻辑
 };
 
-enum class UnaryOp { Neg, Not, Pos };
+enum class UnaryOp { Neg, Not, Pos, BitNot };
 
 // ============================================================================
 // 表达式
@@ -101,6 +110,108 @@ class CallExpr : public Expr {
     explicit CallExpr(const std::string &name) : func_name(name) {
     }
     void accept(ASTVisitor &visitor) override;
+};
+
+// An explicitly typed fixed-vector or mask literal.  The parsed type syntax is
+// retained verbatim so semantic analysis can resolve the lane expression once
+// and attach the canonical type to this expression.  An empty lane list is the
+// source spelling for an aggregate zero value.
+class TypedVectorLiteralExpr final : public Expr {
+  public:
+    TypeSyntaxRef type_syntax;
+    std::vector<std::unique_ptr<Expr>> lanes;
+
+    TypedVectorLiteralExpr(TypeSyntaxRef type, std::vector<std::unique_ptr<Expr>> values)
+        : type_syntax(std::move(type)), lanes(std::move(values)) {
+    }
+    void accept(ASTVisitor &visitor) override;
+};
+
+// vector<T, N>(value) is an explicit constructor: a scalar value is splatted,
+// while a same-width numeric vector is converted lane-wise.
+class VectorCastExpr final : public Expr {
+  public:
+    TypeSyntaxRef target_type_syntax;
+    std::unique_ptr<Expr> operand;
+
+    VectorCastExpr(TypeSyntaxRef target, std::unique_ptr<Expr> value)
+        : target_type_syntax(std::move(target)), operand(std::move(value)) {
+    }
+    void accept(ASTVisitor &visitor) override;
+};
+
+// A type-level constant expression owns an ordinary expression AST, but only
+// exposes it through const access. Semantic analysis decides whether the tree
+// is an integer constant expression and whether its value is a legal extent.
+class ConstExpr final : public ASTNode {
+  public:
+    explicit ConstExpr(std::unique_ptr<Expr> expression,
+                       front::SourceRange range = front::SourceRange{});
+
+    const Expr &expression() const {
+        assert(expression_ != nullptr);
+        return *expression_;
+    }
+
+    void accept(ASTVisitor &visitor) override;
+
+  private:
+    std::unique_ptr<Expr> expression_;
+};
+
+using ConstExprRef = std::shared_ptr<const ConstExpr>;
+
+// Parsed source types are immutable values shared by a declaration group and
+// its declarators. Arrays remain declarator dimensions; this node represents
+// their scalar, fixed-vector, or mask element type.
+class TypeSyntax final {
+  public:
+    enum class Kind { Builtin, Vector, Mask };
+
+    static std::shared_ptr<const TypeSyntax>
+    make_builtin(BuiltinType type, front::SourceRange range = front::SourceRange{});
+    static std::shared_ptr<const TypeSyntax>
+    make_vector(BuiltinType element_type, ConstExprRef lane_expression,
+                front::SourceRange range = front::SourceRange{});
+    static std::shared_ptr<const TypeSyntax>
+    make_mask(ConstExprRef lane_expression, front::SourceRange range = front::SourceRange{});
+
+    Kind kind() const {
+        return kind_;
+    }
+
+    BuiltinType builtin_type() const {
+        assert(kind_ == Kind::Builtin);
+        return scalar_type_;
+    }
+
+    BuiltinType vector_element_type() const {
+        assert(kind_ == Kind::Vector);
+        return scalar_type_;
+    }
+
+    const ConstExprRef &lane_expression() const {
+        assert(kind_ == Kind::Vector || kind_ == Kind::Mask);
+        return lane_expression_;
+    }
+
+    const front::SourceRange &source_range() const {
+        return source_range_;
+    }
+
+    // Compatibility projection for scalar-only passes. Vector operations are
+    // not lowered through this field; it only keeps legacy visitors buildable
+    // until they consume SemanticModel.
+    BuiltinType legacy_builtin_type() const;
+
+  private:
+    TypeSyntax(Kind kind, BuiltinType scalar_type, ConstExprRef lane_expression,
+               front::SourceRange range);
+
+    const Kind kind_;
+    const BuiltinType scalar_type_;
+    const ConstExprRef lane_expression_;
+    const front::SourceRange source_range_;
 };
 
 // ============================================================================
@@ -199,13 +310,19 @@ class ContinueStmt : public Stmt {
 class VarDecl : public ASTNode {
   public:
     bool is_const;
+    TypeSyntaxRef type_syntax;
+    // Scalar compatibility for legacy semantic/lowering passes.
     BuiltinType base_type;
     std::string name;
     std::vector<std::unique_ptr<Expr>> dimensions; // 空 = 标量
     std::unique_ptr<InitVal> init;                 // 可为 nullptr
 
     VarDecl(bool is_const, BuiltinType ty, const std::string &n)
-        : is_const(is_const), base_type(ty), name(n) {
+        : VarDecl(is_const, TypeSyntax::make_builtin(ty), n) {
+    }
+    VarDecl(bool is_const, TypeSyntaxRef type, const std::string &n)
+        : is_const(is_const), type_syntax(std::move(type)),
+          base_type(type_syntax->legacy_builtin_type()), name(n) {
     }
     void accept(ASTVisitor &visitor) override;
 };
@@ -213,10 +330,16 @@ class VarDecl : public ASTNode {
 class DeclStmt : public Stmt {
   public:
     bool is_const;
+    TypeSyntaxRef type_syntax;
+    // Scalar compatibility for legacy semantic/lowering passes.
     BuiltinType base_type;
     std::vector<std::unique_ptr<VarDecl>> decls;
 
-    DeclStmt(bool is_const, BuiltinType ty) : is_const(is_const), base_type(ty) {
+    DeclStmt(bool is_const, BuiltinType ty) : DeclStmt(is_const, TypeSyntax::make_builtin(ty)) {
+    }
+    DeclStmt(bool is_const, TypeSyntaxRef type)
+        : is_const(is_const), type_syntax(std::move(type)),
+          base_type(type_syntax->legacy_builtin_type()) {
     }
     void accept(ASTVisitor &visitor) override;
 };
@@ -225,19 +348,40 @@ class DeclStmt : public Stmt {
 // 函数
 // ============================================================================
 struct FuncParam {
-    BuiltinType type;
+    TypeSyntaxRef type_syntax = TypeSyntax::make_builtin(BuiltinType::Int);
+    // Scalar compatibility for legacy semantic/lowering passes.
+    BuiltinType type = BuiltinType::Int;
     std::string name;
     std::vector<std::unique_ptr<Expr>> dimensions; // 数组参数有维度；首维隐式为 0
+    front::SourceRange source_range;
+
+    FuncParam() = default;
+    FuncParam(TypeSyntaxRef syntax, std::string parameter_name)
+        : type_syntax(std::move(syntax)), type(type_syntax->legacy_builtin_type()),
+          name(std::move(parameter_name)) {
+    }
 };
 
 class FuncDef : public ASTNode {
   public:
+    TypeSyntaxRef return_type_syntax;
+    // Scalar compatibility for legacy semantic/lowering passes.
     BuiltinType return_type;
     std::string name;
     std::vector<FuncParam> params;
     std::unique_ptr<BlockStmt> body;
+    // An external declaration has a signature but deliberately owns no body.
+    // Variadic source functions are declaration-only; ordinary definitions
+    // remain non-variadic in the current language.
+    bool is_external = false;
+    bool is_variadic = false;
 
-    FuncDef(BuiltinType ret_ty, const std::string &n) : return_type(ret_ty), name(n) {
+    FuncDef(BuiltinType ret_ty, const std::string &n)
+        : FuncDef(TypeSyntax::make_builtin(ret_ty), n) {
+    }
+    FuncDef(TypeSyntaxRef ret_ty, const std::string &n)
+        : return_type_syntax(std::move(ret_ty)),
+          return_type(return_type_syntax->legacy_builtin_type()), name(n) {
     }
     void accept(ASTVisitor &visitor) override;
 };
@@ -266,6 +410,15 @@ class ASTVisitor {
     virtual void visit(BinaryExpr &node) = 0;
     virtual void visit(UnaryExpr &node) = 0;
     virtual void visit(CallExpr &node) = 0;
+    virtual void visit(TypedVectorLiteralExpr &) {
+    }
+    virtual void visit(VectorCastExpr &) {
+    }
+
+    // New source-type-only node. Defaulting this hook keeps scalar-only
+    // visitors source-compatible until they need to traverse type syntax.
+    virtual void visit(ConstExpr &) {
+    }
 
     // InitVal
     virtual void visit(InitVal &node) = 0;
