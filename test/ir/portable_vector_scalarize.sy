@@ -1,0 +1,36 @@
+// RUN: %compiler --emit-oir -O0 -march=rv64gc %s | FileCheck --check-prefix=OIR %s
+// RUN: %compiler --emit-mir -O0 -march=rv64gc %s | FileCheck --check-prefix=MIR %s
+// RUN: %compiler -S -O0 -march=rv64gc %s | FileCheck --check-prefix=ASM %s
+
+int main() {
+  vector<int,4> literal = vector<int,4>{1, 2, 3, 4};
+  vector<int,4> biased = literal + vector<int,4>(7);
+  mask<4> active = biased > vector<int,4>(8);
+  vector<int,4> selected = select(active, biased, literal);
+  return selected[2];
+}
+
+// OIR-LABEL: define i32 @main()
+// OIR: insertelement <4 x i32>
+// OIR: add <4 x i32>
+// OIR: icmp gt <4 x i32>
+// OIR: select <4 x i1>
+// OIR: extractelement <4 x i32>
+
+// MIR-LABEL: func @main() -> i32 {
+// MIR-NOT: :vr
+// MIR-NOT: :vmask
+// MIR-NOT: fv<
+// MIR-NOT: VSET
+// MIR-NOT: RVV
+// MIR: ADDIW
+// MIR: SLT
+// MIR: J %epilogue
+
+// ASM: .attribute arch, "rv64gc"
+// ASM-LABEL: main:
+// ASM-NOT: vset
+// ASM-NOT: vadd
+// ASM: addiw
+// ASM: slt
+// ASM: jalr zero, 0(ra)

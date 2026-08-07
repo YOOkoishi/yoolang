@@ -123,7 +123,8 @@ bool propagate_global_constants(oir::Module &module, Stats &stats);
 bool promote_global_loads(oir::Module &module, Stats &stats);
 bool eliminate_tail_recursion(oir::Module &module, Stats &stats);
 bool reduce_gep_strength(oir::Module &module, Stats &stats);
-bool optimize_oir_aggressively(oir::Module &module, Stats &stats);
+bool optimize_oir_aggressively(oir::Module &module, Stats &stats,
+                               bool preserve_function_signatures = false);
 bool verify_oir(oir::Module &module, std::string &message);
 
 template <typename Fn>
