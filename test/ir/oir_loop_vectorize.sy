@@ -1,0 +1,74 @@
+// RUN: %compiler --emit-oir -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=VLA
+// RUN: %compiler --emit-oir -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=VLA2
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-oir -O2 -fno-vectorize -march=rv64gcv %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-oir -O2 -march=rv64gc %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-vector-plan -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=PLAN
+// RUN: %compiler --emit-vector-plan -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=PLAN2
+// RUN: %compiler --emit-oir -O2 -march=rv64gcv -Rpass=loop %s 2>&1 | FileCheck %s --check-prefix=REMARK
+
+int values[4096];
+
+void add_bias(int n) {
+  int i = 0;
+  while (i < n) {
+    values[i] = values[i] + 7;
+    i = i + 1;
+  }
+}
+
+int main() {
+  int n = getarray(values);
+  add_bias(n);
+  return values[0];
+}
+
+// VLA-LABEL: define void @add_bias
+// VLA-LABEL: while.body.2:
+// VLA: %{{[^ ]+}} = phi
+// VLA: %[[VL:[^ ]+]] = setvl <vscale x {{[1-9][0-9]*}} x i32>, i32 %{{[^ ]+}}
+// VLA: vp.load <vscale x {{[1-9][0-9]*}} x i32>
+// VLA: evl i32 %[[VL]]
+// VLA: vp.add <vscale x {{[1-9][0-9]*}} x i32>
+// VLA: vp.store <vscale x {{[1-9][0-9]*}} x i32>
+// VLA: add i32 %{{[^,]+}}, %[[VL]]
+// VLA: sub i32 %{{[^,]+}}, %[[VL]]
+// VLA: icmp ne i32 %{{[^,]+}}, 0
+// VLA-NOT: load i32
+// VLA-NOT: store i32
+// VLA: br i1
+
+// VLA2-LABEL: define void @add_bias
+// VLA2-LABEL: while.body.2:
+// VLA2: %[[VL0:[^ ]+]] = setvl <vscale x {{[1-9][0-9]*}} x i32>, i32 %{{[^ ]+}}
+// VLA2: vp.load <vscale x {{[1-9][0-9]*}} x i32>
+// VLA2: evl i32 %[[VL0]]
+// VLA2: vp.store <vscale x {{[1-9][0-9]*}} x i32>
+// VLA2: evl i32 %[[VL0]]
+// VLA2: %[[REM1:[^ ]+]] = sub i32 %{{[^,]+}}, %[[VL0]]
+// VLA2: %[[VL1:[^ ]+]] = setvl <vscale x {{[1-9][0-9]*}} x i32>, i32 %[[REM1]]
+// VLA2: vp.load <vscale x {{[1-9][0-9]*}} x i32>
+// VLA2: evl i32 %[[VL1]]
+// VLA2: vp.store <vscale x {{[1-9][0-9]*}} x i32>
+// VLA2: evl i32 %[[VL1]]
+// VLA2: %[[TOTAL:[^ ]+]] = add i32 %[[VL0]], %[[VL1]]
+// VLA2: add i32 %{{[^,]+}}, %[[TOTAL]]
+// VLA2: gep i32* %{{[^,]+}}, i32 %[[TOTAL]]
+// VLA2: sub i32 %{{[^,]+}}, %[[TOTAL]]
+
+// SCALAR-NOT: setvl
+// SCALAR-NOT: vp.load
+// SCALAR-NOT: vp.store
+
+// PLAN: "code": "VECTORIZED"
+// PLAN: "scalable": true
+// PLAN: "minimum_lanes": {{[1-9][0-9]*}}
+// PLAN: "runtime_alias_check": false
+
+// PLAN2: "code": "VECTORIZED"
+// PLAN2: "function": "add_bias"
+// PLAN2: "interleave": 2
+// PLAN2: "interleave_overlap_credit": {{[1-9][0-9]*}}
+// PLAN2: "interleave_capability_gate": ""
+
+// REMARK: remark: vectorize(loop): VECTORIZED:

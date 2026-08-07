@@ -1,0 +1,223 @@
+// RUN: %compiler --emit-oir -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=VLA
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv %s | FileCheck %s --check-prefix=O1
+// RUN: %compiler --emit-oir -O2 -fno-vectorize -march=rv64gcv %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-oir -O2 -march=rv64gc %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-vector-plan -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=PLAN
+// RUN: %compiler -S -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=ASM
+
+int reduction_input[4096];
+int forward_output[4096];
+int reverse_output[4096];
+float float_input[4096];
+
+int rotated_reduce_add(int n, int seed) {
+  int i = 0;
+  int acc = seed;
+  while (i < n) {
+    acc = acc + reduction_input[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
+int rotated_reduce_mul(int n, int seed) {
+  int i = 0;
+  int acc = seed;
+  while (i < n) {
+    acc = acc * reduction_input[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
+int rotated_reduce_and(int n, int seed) {
+  int i = 0;
+  int acc = seed;
+  while (i < n) {
+    acc = acc & reduction_input[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
+int rotated_reduce_or(int n, int seed) {
+  int i = 0;
+  int acc = seed;
+  while (i < n) {
+    acc = acc | reduction_input[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
+int rotated_reduce_xor(int n, int seed) {
+  int i = 0;
+  int acc = seed;
+  while (i < n) {
+    acc = acc ^ reduction_input[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
+float rotated_reduce_strict_float(int n, float seed) {
+  int i = 0;
+  float acc = seed;
+  while (i < n) {
+    acc = acc + float_input[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
+void forward_stride_1(int n) {
+  int i = 0;
+  while (i < n) {
+    forward_output[i] = reduction_input[i] + 1;
+    i = i + 1;
+  }
+}
+
+void forward_stride_2(int n) {
+  int i = 0;
+  while (i < n) {
+    forward_output[i] = reduction_input[i] + 2;
+    i = i + 2;
+  }
+}
+
+void forward_stride_4(int n) {
+  int i = 0;
+  while (i < n) {
+    forward_output[i] = reduction_input[i] + 4;
+    i = i + 4;
+  }
+}
+
+void reverse_stride_1(int n) {
+  int i = n - 1;
+  while (i >= 0) {
+    reverse_output[i] = reduction_input[i] + 1;
+    i = i - 1;
+  }
+}
+
+void reverse_stride_2(int n) {
+  int i = n - 1;
+  while (i >= 0) {
+    reverse_output[i] = reduction_input[i] + 2;
+    i = i - 2;
+  }
+}
+
+void reverse_stride_4(int n) {
+  int i = n - 1;
+  while (i >= 0) {
+    reverse_output[i] = reduction_input[i] + 4;
+    i = i - 4;
+  }
+}
+
+int main() {
+  return 0;
+}
+
+// VLA-LABEL: define i32 @rotated_reduce_add
+// VLA: vp.reduce.add
+// VLA: .rot.exit = phi
+// VLA-LABEL: define i32 @rotated_reduce_mul
+// VLA: vp.reduce.mul
+// VLA: .rot.exit = phi
+// VLA-LABEL: define i32 @rotated_reduce_and
+// VLA: vp.reduce.and
+// VLA: .rot.exit = phi
+// VLA-LABEL: define i32 @rotated_reduce_or
+// VLA: vp.reduce.or
+// VLA: .rot.exit = phi
+// VLA-LABEL: define i32 @rotated_reduce_xor
+// VLA: vp.reduce.xor
+// VLA: .rot.exit = phi
+
+// VLA-LABEL: define float @rotated_reduce_strict_float
+// VLA-NOT: vp.reduce
+
+// VLA-LABEL: define void @forward_stride_1
+// VLA: vp.load
+// VLA: vp.store
+// VLA-LABEL: define void @forward_stride_2
+// VLA: vp.gather
+// VLA: vp.scatter
+// VLA-LABEL: define void @forward_stride_4
+// VLA: vp.gather
+// VLA: vp.scatter
+// VLA-LABEL: define void @reverse_stride_1
+// VLA: memory.chunk.low.base
+// VLA: vp.gather
+// VLA: vp.scatter
+// VLA-LABEL: define void @reverse_stride_2
+// VLA: memory.chunk.low.base
+// VLA: vp.gather
+// VLA: vp.scatter
+// VLA-LABEL: define void @reverse_stride_4
+// VLA: memory.chunk.low.base
+// VLA: vp.gather
+// VLA: vp.scatter
+
+// O1-LABEL: define i32 @rotated_reduce_add
+// O1: %{{[^ ]+}}.rot.exit = phi
+// O1-NOT: vp.reduce
+
+// SCALAR-NOT: setvl
+// SCALAR-NOT: vp.
+
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "rotated_reduce_add"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "rotated_reduce_mul"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "rotated_reduce_and"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "rotated_reduce_or"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "rotated_reduce_xor"
+// PLAN: "code": "REJECT_FP_ORDER"
+// PLAN-NEXT: "function": "rotated_reduce_strict_float"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "forward_stride_1"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "forward_stride_2"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "forward_stride_4"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "reverse_stride_1"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "reverse_stride_2"
+// PLAN: "code": "VECTORIZED"
+// PLAN-NEXT: "function": "reverse_stride_4"
+
+// ASM-LABEL: rotated_reduce_add:
+// ASM: vredsum.vs
+// ASM-LABEL: rotated_reduce_and:
+// ASM: vredand.vs
+// ASM-LABEL: rotated_reduce_or:
+// ASM: vredor.vs
+// ASM-LABEL: rotated_reduce_xor:
+// ASM: vredxor.vs
+// ASM-LABEL: reverse_stride_1:
+// ASM: addi {{[^,]+}}, zero, -4
+// ASM-NOT: vloxei32.v
+// ASM-NOT: vsoxei32.v
+// ASM: vlse32.v {{.*}}, v0.t
+// ASM: vsse32.v {{.*}}, v0.t
+// ASM-LABEL: reverse_stride_2:
+// ASM: addi {{[^,]+}}, zero, -8
+// ASM-NOT: vloxei32.v
+// ASM-NOT: vsoxei32.v
+// ASM: vlse32.v {{.*}}, v0.t
+// ASM: vsse32.v {{.*}}, v0.t
+// ASM-LABEL: reverse_stride_4:
+// ASM: addi {{[^,]+}}, zero, -16
+// ASM-NOT: vloxei32.v
+// ASM-NOT: vsoxei32.v
+// ASM: vlse32.v {{.*}}, v0.t
+// ASM: vsse32.v {{.*}}, v0.t

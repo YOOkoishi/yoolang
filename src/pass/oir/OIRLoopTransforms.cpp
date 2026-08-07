@@ -2,11 +2,13 @@
 
 #include "oir/OIRAnalysis.h"
 #include "oir/OIRCFGUtils.h"
+#include "oir/OIRDataLayout.h"
 #include "pass/oir/OIRCostModel.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -42,12 +44,9 @@ bool starts_with(const std::string &value, const char *prefix) {
 }
 
 bool cost_model_allows_loop_transform(Stats &stats, pass::cost_model::TransformKind kind,
-                                      const std::string &candidate_id,
-                                      std::int64_t before_instrs,
-                                      std::int64_t after_instrs,
-                                      std::int64_t before_branches,
-                                      std::int64_t after_branches,
-                                      std::int64_t code_growth,
+                                      const std::string &candidate_id, std::int64_t before_instrs,
+                                      std::int64_t after_instrs, std::int64_t before_branches,
+                                      std::int64_t after_branches, std::int64_t code_growth,
                                       double confidence,
                                       bool exact_first_peel_has_coupled_lsr = false) {
     OIRTransformCostEstimate estimate;
@@ -92,8 +91,7 @@ oir::Value *map_value(oir::Value *value, const ValueMap &map) {
     return found == map.end() ? value : found->second;
 }
 
-std::vector<oir::Value *> map_values(const std::vector<oir::Value *> &values,
-                                     const ValueMap &map) {
+std::vector<oir::Value *> map_values(const std::vector<oir::Value *> &values, const ValueMap &map) {
     std::vector<oir::Value *> out;
     out.reserve(values.size());
     for (auto *value : values) {
@@ -108,6 +106,7 @@ bool is_cloneable_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Or:
     case oir::Instruction::OpID::Xor:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
@@ -130,6 +129,27 @@ bool is_cloneable_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Call:
     case oir::Instruction::OpID::MemZero:
     case oir::Instruction::OpID::Phi:
+    case oir::Instruction::OpID::SetVL:
+    case oir::Instruction::OpID::Splat:
+    case oir::Instruction::OpID::StepVector:
+    case oir::Instruction::OpID::ExtractElement:
+    case oir::Instruction::OpID::InsertElement:
+    case oir::Instruction::OpID::ShuffleVector:
+    case oir::Instruction::OpID::VectorSelect:
+    case oir::Instruction::OpID::VectorCast:
+    case oir::Instruction::OpID::FixedABIExtractLane:
+    case oir::Instruction::OpID::FixedABIPack:
+    case oir::Instruction::OpID::FixedABIObjectLoadLane:
+    case oir::Instruction::OpID::FixedABIObjectStoreLane:
+    case oir::Instruction::OpID::VPBinary:
+    case oir::Instruction::OpID::VPCmp:
+    case oir::Instruction::OpID::VPLoad:
+    case oir::Instruction::OpID::VPStore:
+    case oir::Instruction::OpID::MaskedLoad:
+    case oir::Instruction::OpID::MaskedStore:
+    case oir::Instruction::OpID::VPGather:
+    case oir::Instruction::OpID::VPScatter:
+    case oir::Instruction::OpID::VPReduction:
         return false;
     }
     return false;
@@ -140,20 +160,17 @@ std::string suffixed_name(const oir::Value &value, const char *suffix) {
 }
 
 std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst,
-                                                    const ValueMap &map,
-                                                    oir::BasicBlock *parent,
+                                                    const ValueMap &map, oir::BasicBlock *parent,
                                                     const char *suffix) {
     if (auto *binary = dynamic_cast<const oir::BinaryInst *>(&inst)) {
-        return std::make_unique<oir::BinaryInst>(binary->type(), binary->op(),
-                                                 map_value(binary->lhs(), map),
-                                                 map_value(binary->rhs(), map), parent,
-                                                 suffixed_name(inst, suffix));
+        return std::make_unique<oir::BinaryInst>(
+            binary->type(), binary->op(), map_value(binary->lhs(), map),
+            map_value(binary->rhs(), map), parent, suffixed_name(inst, suffix));
     }
     if (auto *cmp = dynamic_cast<const oir::CmpInst *>(&inst)) {
-        return std::make_unique<oir::CmpInst>(cmp->type(), cmp->op(), cmp->pred(),
-                                              map_value(cmp->lhs(), map),
-                                              map_value(cmp->rhs(), map), parent,
-                                              suffixed_name(inst, suffix));
+        return std::make_unique<oir::CmpInst>(
+            cmp->type(), cmp->op(), cmp->pred(), map_value(cmp->lhs(), map),
+            map_value(cmp->rhs(), map), parent, suffixed_name(inst, suffix));
     }
     if (auto *cast = dynamic_cast<const oir::CastInst *>(&inst)) {
         return std::make_unique<oir::CastInst>(cast->type(), cast->op(),
@@ -178,10 +195,9 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
                                                 map_value(store->ptr(), map), parent);
     }
     if (auto *memzero = dynamic_cast<const oir::MemZeroInst *>(&inst)) {
-        return std::make_unique<oir::MemZeroInst>(
-            memzero->type(), map_value(memzero->ptr(), map),
-            map_value(memzero->byte_value(), map),
-            map_value(memzero->byte_count(), map), parent);
+        return std::make_unique<oir::MemZeroInst>(memzero->type(), map_value(memzero->ptr(), map),
+                                                  map_value(memzero->byte_value(), map),
+                                                  map_value(memzero->byte_count(), map), parent);
     }
     if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
         return std::make_unique<oir::CallInst>(call->type(), map_value(call->callee(), map),
@@ -189,11 +205,8 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
                                                suffixed_name(inst, suffix));
     }
     if (auto *ret = dynamic_cast<const oir::ReturnInst *>(&inst)) {
-        return std::make_unique<oir::ReturnInst>(ret->type(),
-                                                 ret->has_value()
-                                                     ? map_value(ret->value(), map)
-                                                     : nullptr,
-                                                 parent);
+        return std::make_unique<oir::ReturnInst>(
+            ret->type(), ret->has_value() ? map_value(ret->value(), map) : nullptr, parent);
     }
     if (auto *branch = dynamic_cast<const oir::BranchInst *>(&inst)) {
         if (branch->is_conditional()) {
@@ -207,8 +220,8 @@ std::unique_ptr<oir::Instruction> clone_instruction(const oir::Instruction &inst
             parent);
     }
     if (auto *phi = dynamic_cast<const oir::PhiInst *>(&inst)) {
-        auto clone = std::make_unique<oir::PhiInst>(phi->type(), parent,
-                                                    suffixed_name(inst, suffix));
+        auto clone =
+            std::make_unique<oir::PhiInst>(phi->type(), parent, suffixed_name(inst, suffix));
         for (const auto &incoming : phi->incoming()) {
             clone->add_incoming(map_value(incoming.first, map),
                                 static_cast<oir::BasicBlock *>(map_value(incoming.second, map)));
@@ -286,7 +299,8 @@ bool non_phi_header_values_used_outside_header(const oir::Function &function,
             }
             for (auto *operand : inst->operands()) {
                 auto *operand_inst = dynamic_cast<const oir::Instruction *>(operand);
-                if (operand_inst != nullptr && header_defs.find(operand_inst) != header_defs.end()) {
+                if (operand_inst != nullptr &&
+                    header_defs.find(operand_inst) != header_defs.end()) {
                     return true;
                 }
             }
@@ -355,7 +369,8 @@ bool header_condition_uses_addrec(const oir::Loop &loop, const oir::BranchInst &
     return lhs.kind() == oir::SCEVKind::AddRec || rhs.kind() == oir::SCEVKind::AddRec;
 }
 
-bool loop_has_non_condition_side_exit(const oir::Loop &loop, const oir::BasicBlock *condition_exit) {
+bool loop_has_non_condition_side_exit(const oir::Loop &loop,
+                                      const oir::BasicBlock *condition_exit) {
     for (auto *block : loop.blocks) {
         for (auto *succ : block->successors()) {
             if (contains_block(loop, succ) || succ == condition_exit) {
@@ -561,10 +576,10 @@ void move_header_phis_to_body(oir::BasicBlock *header, oir::BasicBlock *body) {
     }
 }
 
-void split_exit_phi_incoming(oir::BasicBlock *exit, oir::BasicBlock *old_header,
-                             oir::BasicBlock *preheader, oir::BasicBlock *latch,
-                             const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming>
-                                 &header_phi_values) {
+void split_exit_phi_incoming(
+    oir::BasicBlock *exit, oir::BasicBlock *old_header, oir::BasicBlock *preheader,
+    oir::BasicBlock *latch,
+    const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &header_phi_values) {
     for (auto &inst : exit->instructions()) {
         auto *phi = dynamic_cast<oir::PhiInst *>(inst.get());
         if (phi == nullptr) {
@@ -671,6 +686,7 @@ void materialize_rotated_exit_values(
     oir::BasicBlock *old_header, oir::BasicBlock *preheader, oir::BasicBlock *latch,
     const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &header_phi_values) {
     (void)function;
+    (void)old_header;
     auto reachable = normal_exit_reachable_blocks(exit, loop);
     for (const auto &[header_phi, values] : header_phi_values) {
         if (!reachable_blocks_have_direct_use(reachable, header_phi)) {
@@ -763,9 +779,9 @@ bool rotate_loop(oir::Function &function, const oir::Loop &loop, const oir::Scal
         }
     }
 
-    if (!cost_model_allows_loop_transform(
-            stats, pass::cost_model::TransformKind::LoopRotate,
-            "rotate." + std::to_string(stats.loop_rotate + 1), 4, 3, 1, 1, 0, 0.66)) {
+    if (!cost_model_allows_loop_transform(stats, pass::cost_model::TransformKind::LoopRotate,
+                                          "rotate." + std::to_string(stats.loop_rotate + 1), 4, 3,
+                                          1, 1, 0, 0.66)) {
         return false;
     }
 
@@ -1038,8 +1054,7 @@ oir::BranchInst *find_unswitch_branch(const oir::Loop &loop, const oir::ScalarEv
         if (branch == nullptr || !branch->is_conditional()) {
             continue;
         }
-        if (!contains_block(loop, branch->true_bb()) ||
-            !contains_block(loop, branch->false_bb())) {
+        if (!contains_block(loop, branch->true_bb()) || !contains_block(loop, branch->false_bb())) {
             continue;
         }
         if (scev.is_loop_invariant(branch->cond(), loop)) {
@@ -1331,8 +1346,7 @@ ConstantLatchTripResult constant_latch_trip_count(oir::BasicBlock *header,
     return count_from_latch(cmp->rhs(), cmp->lhs(), swap_unroll_cmp_operands(continuation_pred));
 }
 
-std::optional<bool> evaluate_integer_cmp(std::int64_t lhs, std::int64_t rhs,
-                                         oir::CmpPred pred) {
+std::optional<bool> evaluate_integer_cmp(std::int64_t lhs, std::int64_t rhs, oir::CmpPred pred) {
     switch (pred) {
     case oir::CmpPred::EQ:
         return lhs == rhs;
@@ -1440,8 +1454,7 @@ std::optional<FirstIterationGuardMatch> find_first_iteration_guard(
         }
         auto *branch = dynamic_cast<oir::BranchInst *>(block->terminator());
         if (branch == nullptr || !branch->is_conditional() ||
-            branch->true_bb() == branch->false_bb() ||
-            !contains_block(loop, branch->true_bb()) ||
+            branch->true_bb() == branch->false_bb() || !contains_block(loop, branch->true_bb()) ||
             !contains_block(loop, branch->false_bb())) {
             continue;
         }
@@ -1544,9 +1557,10 @@ oir::CallInst *first_call_before_terminator(oir::BasicBlock *block) {
     return nullptr;
 }
 
-std::optional<std::int64_t> affine_header_phi_offset(
-    oir::Value *value, const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &phi_incoming,
-    oir::PhiInst *&matched_phi) {
+std::optional<std::int64_t>
+affine_header_phi_offset(oir::Value *value,
+                         const std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> &phi_incoming,
+                         oir::PhiInst *&matched_phi) {
     if (auto *phi = dynamic_cast<oir::PhiInst *>(value)) {
         if (phi_incoming.find(phi) == phi_incoming.end()) {
             return std::nullopt;
@@ -1673,8 +1687,8 @@ bool first_peel_has_coupled_stack_lsr_shape(
     return groups.size() >= 2 && groups.size() <= 4;
 }
 
-std::optional<SingleBlockUnrollMatch> match_single_block_unroll_loop(
-    const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+std::optional<SingleBlockUnrollMatch>
+match_single_block_unroll_loop(const oir::Loop &loop, const oir::ScalarEvolution &scev) {
     (void)scev;
     if (loop.header == nullptr || loop.blocks.size() != 1 || loop.blocks.front() != loop.header) {
         return std::nullopt;
@@ -1767,8 +1781,8 @@ bool loop_body_is_acyclic_except_latch(const oir::Loop &loop, oir::BasicBlock *l
     return dfs(loop.header, dfs);
 }
 
-std::optional<MultiBlockUnrollMatch> match_multi_block_unroll_loop(
-    const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+std::optional<MultiBlockUnrollMatch>
+match_multi_block_unroll_loop(const oir::Loop &loop, const oir::ScalarEvolution &scev) {
     (void)scev;
     if (loop.header == nullptr || loop.blocks.size() <= 1) {
         return std::nullopt;
@@ -1993,9 +2007,10 @@ struct UnrolledIteration {
     ValueMap value_map;
 };
 
-std::optional<UnrolledIteration> clone_unroll_iteration(
-    oir::Function &function, const MultiBlockUnrollMatch &match,
-    const ValueMap &iteration_map, std::int64_t iteration) {
+std::optional<UnrolledIteration> clone_unroll_iteration(oir::Function &function,
+                                                        const MultiBlockUnrollMatch &match,
+                                                        const ValueMap &iteration_map,
+                                                        std::int64_t iteration) {
     BlockMap block_map;
     ValueMap value_map = iteration_map;
     UnrolledIteration out;
@@ -2048,9 +2063,9 @@ std::optional<UnrolledIteration> clone_unroll_iteration(
     return out;
 }
 
-std::optional<UnrolledIteration> clone_first_peel_iteration(
-    oir::Function &function, const MultiBlockUnrollMatch &match,
-    const ValueMap &iteration_map) {
+std::optional<UnrolledIteration> clone_first_peel_iteration(oir::Function &function,
+                                                            const MultiBlockUnrollMatch &match,
+                                                            const ValueMap &iteration_map) {
     BlockMap block_map;
     ValueMap value_map = iteration_map;
     UnrolledIteration out;
@@ -2269,10 +2284,9 @@ bool peel_first_iteration_loop(oir::Function &function, const oir::Loop &loop,
     }
     if (!cost_model_allows_loop_transform(
             stats, pass::cost_model::TransformKind::LoopUnroll,
-            "first-peel." + std::to_string(stats.loop_unroll + 1),
-            body_instrs * match->trip_count, body_instrs * match->trip_count + body_instrs,
-            match->trip_count, match->trip_count - 1, body_instrs, 0.76,
-            has_coupled_lsr)) {
+            "first-peel." + std::to_string(stats.loop_unroll + 1), body_instrs * match->trip_count,
+            body_instrs * match->trip_count + body_instrs, match->trip_count, match->trip_count - 1,
+            body_instrs, 0.76, has_coupled_lsr)) {
         return false;
     }
 
@@ -2328,22 +2342,24 @@ bool exit_block_is_void_return_only(const oir::BasicBlock &block) {
     return false;
 }
 
-std::optional<FinalIterationPeelMatch> match_final_iteration_peel_loop(
-    oir::Function &function, const oir::Loop &loop, const oir::ScalarEvolution &scev) {
+std::optional<FinalIterationPeelMatch>
+match_final_iteration_peel_loop(oir::Function &function, const oir::Loop &loop,
+                                const oir::ScalarEvolution &scev) {
     if (function.return_type() == nullptr || !function.return_type()->is_void()) {
         return std::nullopt;
     }
     auto base = match_multi_block_unroll_loop(loop, scev);
-    if (!base.has_value() || !base->has_call || base->trip_count <= 1 ||
-        base->trip_count > 16 || !exit_block_is_void_return_only(*base->exit) ||
+    if (!base.has_value() || !base->has_call || base->trip_count <= 1 || base->trip_count > 16 ||
+        !exit_block_is_void_return_only(*base->exit) ||
         !loop_values_used_on_exit_edge(base->exit, loop).empty()) {
         return std::nullopt;
     }
 
     auto *latch_branch = dynamic_cast<oir::BranchInst *>(base->latch->terminator());
-    auto *latch_cmp = latch_branch == nullptr ? nullptr
-                                              : dynamic_cast<oir::CmpInst *>(latch_branch->cond());
-    if (latch_branch == nullptr || latch_cmp == nullptr || latch_cmp->op() != oir::Instruction::OpID::ICmp ||
+    auto *latch_cmp =
+        latch_branch == nullptr ? nullptr : dynamic_cast<oir::CmpInst *>(latch_branch->cond());
+    if (latch_branch == nullptr || latch_cmp == nullptr ||
+        latch_cmp->op() != oir::Instruction::OpID::ICmp ||
         latch_branch->true_bb() != base->header || latch_branch->false_bb() != base->exit) {
         return std::nullopt;
     }
@@ -2356,8 +2372,8 @@ std::optional<FinalIterationPeelMatch> match_final_iteration_peel_loop(
     std::size_t bound_operand = 0;
     std::int64_t peeled_bound = 0;
     bool found_bound = false;
-    auto try_match_bound = [&](oir::Value *candidate, oir::Value *bound,
-                               oir::CmpPred pred, std::size_t operand_index) {
+    auto try_match_bound = [&](oir::Value *candidate, oir::Value *bound, oir::CmpPred pred,
+                               std::size_t operand_index) {
         if (found_bound || (pred != oir::CmpPred::LT && pred != oir::CmpPred::LE)) {
             return;
         }
@@ -2380,8 +2396,8 @@ std::optional<FinalIterationPeelMatch> match_final_iteration_peel_loop(
         }
     };
     try_match_bound(latch_cmp->lhs(), latch_cmp->rhs(), latch_cmp->pred(), 1);
-    try_match_bound(latch_cmp->rhs(), latch_cmp->lhs(),
-                    swap_unroll_cmp_operands(latch_cmp->pred()), 0);
+    try_match_bound(latch_cmp->rhs(), latch_cmp->lhs(), swap_unroll_cmp_operands(latch_cmp->pred()),
+                    0);
     if (!found_bound) {
         return std::nullopt;
     }
@@ -2414,12 +2430,12 @@ std::optional<FinalIterationPeelMatch> match_final_iteration_peel_loop(
         return std::nullopt;
     }
 
-    return FinalIterationPeelMatch{std::move(*base), call, latch_cmp, bound_operand,
-                                   peeled_bound};
+    return FinalIterationPeelMatch{std::move(*base), call, latch_cmp, bound_operand, peeled_bound};
 }
 
-std::optional<UnrolledIteration> clone_final_peel_iteration(
-    oir::Function &function, const MultiBlockUnrollMatch &match, const ValueMap &iteration_map) {
+std::optional<UnrolledIteration> clone_final_peel_iteration(oir::Function &function,
+                                                            const MultiBlockUnrollMatch &match,
+                                                            const ValueMap &iteration_map) {
     BlockMap block_map;
     ValueMap value_map = iteration_map;
     UnrolledIteration out;
@@ -2499,17 +2515,18 @@ bool peel_final_iteration_loop(oir::Function &function, const oir::Loop &loop,
     if (body_instrs > kMaxPeeledInstructions) {
         return false;
     }
-    if (!cost_model_allows_loop_transform(
-            stats, pass::cost_model::TransformKind::LoopUnroll,
-            "final-peel." + std::to_string(stats.loop_unroll + 1),
-            body_instrs * match->loop.trip_count, body_instrs * match->loop.trip_count + body_instrs,
-            match->loop.trip_count, match->loop.trip_count - 1, body_instrs, 0.72)) {
+    if (!cost_model_allows_loop_transform(stats, pass::cost_model::TransformKind::LoopUnroll,
+                                          "final-peel." + std::to_string(stats.loop_unroll + 1),
+                                          body_instrs * match->loop.trip_count,
+                                          body_instrs * match->loop.trip_count + body_instrs,
+                                          match->loop.trip_count, match->loop.trip_count - 1,
+                                          body_instrs, 0.72)) {
         return false;
     }
 
     std::unordered_map<oir::PhiInst *, HeaderPhiIncoming> phi_incoming;
-    if (!collect_header_phi_incoming(*match->loop.header, match->loop.preheader,
-                                     match->loop.latch, phi_incoming)) {
+    if (!collect_header_phi_incoming(*match->loop.header, match->loop.preheader, match->loop.latch,
+                                     phi_incoming)) {
         return false;
     }
     ValueMap final_iteration_map;
@@ -2524,7 +2541,8 @@ bool peel_final_iteration_loop(oir::Function &function, const oir::Loop &loop,
 
     match->latch_cmp->set_operand(
         match->latch_bound_operand,
-        make_int_constant(*function.parent(), match->latch_cmp->operand(match->latch_bound_operand)->type(),
+        make_int_constant(*function.parent(),
+                          match->latch_cmp->operand(match->latch_bound_operand)->type(),
                           match->peeled_bound));
 
     auto *latch_branch = static_cast<oir::BranchInst *>(match->loop.latch->terminator());
@@ -2606,12 +2624,12 @@ void fix_cloned_operands(const std::vector<oir::BasicBlock *> &clones, const Val
 void build_cloned_cfg_and_exit_phis(const oir::Loop &loop,
                                     const std::vector<oir::BasicBlock *> &original_blocks,
                                     const BlockMap &block_map, const ValueMap &value_map) {
+    (void)loop;
     for (auto *orig : original_blocks) {
         auto *clone = block_map.at(orig);
         for (auto *succ : orig->successors()) {
             auto block_found = block_map.find(succ);
-            auto *clone_succ =
-                block_found == block_map.end() ? succ : block_found->second;
+            auto *clone_succ = block_found == block_map.end() ? succ : block_found->second;
             oir::cfg::add_edge(clone, clone_succ);
 
             if (block_found != block_map.end()) {
@@ -2678,8 +2696,8 @@ void force_branch_direction(oir::BranchInst &branch, bool take_true) {
     replace_terminator_with_br(block, taken);
 }
 
-bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
-                   const oir::ScalarEvolution &scev, Stats &stats) {
+bool unswitch_loop(oir::Function &function, const oir::Loop &loop, const oir::ScalarEvolution &scev,
+                   Stats &stats) {
     auto *preheader = find_preheader(loop);
     if (preheader == nullptr || !preheader->has_terminator()) {
         return false;
@@ -2702,12 +2720,11 @@ bool unswitch_loop(oir::Function &function, const oir::Loop &loop,
         return false;
     }
 
-    const auto original_instrs =
-        static_cast<std::int64_t>(loop_instruction_count(original_blocks));
-    if (!cost_model_allows_loop_transform(
-            stats, pass::cost_model::TransformKind::LoopUnswitch,
-            "unswitch." + std::to_string(stats.loop_unswitch + 1), original_instrs + 6,
-            original_instrs, 1, 0, original_instrs / 2, 0.62)) {
+    const auto original_instrs = static_cast<std::int64_t>(loop_instruction_count(original_blocks));
+    if (!cost_model_allows_loop_transform(stats, pass::cost_model::TransformKind::LoopUnswitch,
+                                          "unswitch." + std::to_string(stats.loop_unswitch + 1),
+                                          original_instrs + 6, original_instrs, 1, 0,
+                                          original_instrs / 2, 0.62)) {
         return false;
     }
 
@@ -2810,22 +2827,14 @@ oir::CmpPred swap_predicate_operands(oir::CmpPred pred) {
 }
 
 std::uint64_t oir_type_size(oir::Type *type) {
-    if (type == nullptr || type->is_void() || type->is_label() || type->is_function()) {
+    static const oir::DataLayout layout;
+    try {
+        return layout.fixed_alloc_size(type).value_or(0);
+    } catch (const std::exception &) {
+        // Loop idiom recognition is optional and must fail closed for an
+        // unsized, scalable, or overflowing object layout.
         return 0;
     }
-    if (auto *integer = dynamic_cast<oir::IntegerType *>(type)) {
-        return (integer->bit_width() + 7) / 8;
-    }
-    if (type->is_float()) {
-        return 4;
-    }
-    if (type->is_pointer()) {
-        return 8;
-    }
-    if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
-        return oir_type_size(array->element_type()) * array->element_count();
-    }
-    return 0;
 }
 
 std::optional<std::uint8_t> repeated_byte_store_value(oir::Value *value) {
@@ -2837,10 +2846,9 @@ std::optional<std::uint8_t> repeated_byte_store_value(oir::Value *value) {
         }
         const auto word = static_cast<std::uint32_t>(*int_zero);
         const auto byte = static_cast<std::uint8_t>(word & 0xffU);
-        const auto repeated = static_cast<std::uint32_t>(byte) |
-                              (static_cast<std::uint32_t>(byte) << 8U) |
-                              (static_cast<std::uint32_t>(byte) << 16U) |
-                              (static_cast<std::uint32_t>(byte) << 24U);
+        const auto repeated =
+            static_cast<std::uint32_t>(byte) | (static_cast<std::uint32_t>(byte) << 8U) |
+            (static_cast<std::uint32_t>(byte) << 16U) | (static_cast<std::uint32_t>(byte) << 24U);
         if (word == repeated) {
             return byte;
         }
@@ -2905,8 +2913,7 @@ bool loop_defs_have_no_external_uses(const oir::Loop &loop) {
     return true;
 }
 
-oir::StoreInst *single_byte_pattern_store(const oir::BasicBlock &block,
-                                          std::uint64_t &element_size,
+oir::StoreInst *single_byte_pattern_store(const oir::BasicBlock &block, std::uint64_t &element_size,
                                           std::uint8_t &byte_value) {
     oir::StoreInst *store = nullptr;
     for (const auto &inst : block.instructions()) {
@@ -2960,7 +2967,8 @@ bool is_i32_value(oir::Value *value) {
 }
 
 oir::BasicBlock *unconditional_branch_target(oir::BasicBlock *block) {
-    auto *branch = block == nullptr ? nullptr : dynamic_cast<oir::BranchInst *>(block->terminator());
+    auto *branch =
+        block == nullptr ? nullptr : dynamic_cast<oir::BranchInst *>(block->terminator());
     if (branch == nullptr || branch->is_conditional()) {
         return nullptr;
     }
@@ -3042,9 +3050,9 @@ bool skipped_guard_path_is_empty(oir::BasicBlock *block, oir::BasicBlock *latch)
            (unconditional_branch_target(block) == latch && block_has_only_guard_progress(*block));
 }
 
-std::optional<GuardedLoopBoundMatch> match_monotonic_guarded_loop_bound(
-    const oir::Loop &loop) {
-    if (loop.header == nullptr || loop.blocks.size() > 8 || !loop_defs_have_no_external_uses(loop)) {
+std::optional<GuardedLoopBoundMatch> match_monotonic_guarded_loop_bound(const oir::Loop &loop) {
+    if (loop.header == nullptr || loop.blocks.size() > 8 ||
+        !loop_defs_have_no_external_uses(loop)) {
         return std::nullopt;
     }
 
@@ -3158,9 +3166,8 @@ bool rewrite_monotonic_guarded_loop_bound(oir::Function &function,
     builder.create_cond_br(use_tight_bound, plus_block, merge_block);
 
     builder.set_insert_point(plus_block);
-    auto *limit_next =
-        builder.create_binary(oir::Instruction::OpID::Add, match.limit, module->create_i32(1),
-                              "loop.bound.next");
+    auto *limit_next = builder.create_binary(oir::Instruction::OpID::Add, match.limit,
+                                             module->create_i32(1), "loop.bound.next");
     builder.create_br(merge_block);
 
     builder.set_insert_point(merge_block);
@@ -3337,15 +3344,16 @@ oir::Value *materialize_byte_count(oir::Module &module, oir::BasicBlock *block,
                                       "memzero.count");
     }
     if (match.element_size != 1) {
-        count = builder.create_binary(oir::Instruction::OpID::Mul, count,
-                                      module.create_i32(static_cast<std::int64_t>(match.element_size)),
-                                      "memzero.bytes");
+        count = builder.create_binary(
+            oir::Instruction::OpID::Mul, count,
+            module.create_i32(static_cast<std::int64_t>(match.element_size)), "memzero.bytes");
     }
     return count;
 }
 
 std::optional<ZeroStoreLoopMatch> match_zero_store_loop(const oir::Loop &loop) {
-    if (loop.blocks.size() != 1 || loop.header == nullptr || !loop_defs_have_no_external_uses(loop)) {
+    if (loop.blocks.size() != 1 || loop.header == nullptr ||
+        !loop_defs_have_no_external_uses(loop)) {
         return std::nullopt;
     }
 
@@ -3410,9 +3418,9 @@ bool rewrite_zero_store_loop(oir::Function &function, const ZeroStoreLoopMatch &
     if (match.byte_value == 0) {
         builder.create_memzero(match.start_ptr, byte_count);
     } else {
-        builder.create_memset(match.start_ptr,
-                              function.parent()->create_i32(static_cast<std::int64_t>(match.byte_value)),
-                              byte_count);
+        builder.create_memset(
+            match.start_ptr,
+            function.parent()->create_i32(static_cast<std::int64_t>(match.byte_value)), byte_count);
     }
     builder.create_br(match.exit);
 

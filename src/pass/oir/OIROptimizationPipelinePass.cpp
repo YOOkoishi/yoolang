@@ -136,7 +136,8 @@ bool run_inline_cleanup_window(oir::Module &module, oir_opt::Stats &stats,
 
 namespace oir_opt {
 
-bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
+bool optimize_oir_aggressively(oir::Module &module, Stats &stats,
+                               bool preserve_function_signatures) {
     bool changed = false;
     changed |= canonicalize_loops(module, stats);
     changed |= propagate_global_constants(module, stats);
@@ -206,13 +207,20 @@ bool optimize_oir_aggressively(oir::Module &module, Stats &stats) {
     changed |= eliminate_dead_code(module, stats);
     changed |= aggressive_dead_code_elimination(module, stats);
     changed |= jump_threading(module, stats);
-    changed |= eliminate_dead_arguments(module, stats);
+    if (!preserve_function_signatures) {
+        changed |= eliminate_dead_arguments(module, stats);
+    }
     changed |= propagate_global_constants(module, stats);
     changed |= eliminate_dead_code(module, stats);
     return changed;
 }
 
 } // namespace oir_opt
+
+OIROptimizationPipelinePass::OIROptimizationPipelinePass(
+    OIROptimizationPipelineOptions options)
+    : options_(options) {
+}
 
 std::string_view OIROptimizationPipelinePass::name() const {
     return "OIROptimizationPipelinePass";
@@ -223,10 +231,12 @@ PassKind OIROptimizationPipelinePass::kind() const {
 }
 
 PassResult OIROptimizationPipelinePass::run(PassContext &context) {
+    const bool preserve_function_signatures = options_.preserve_function_signatures;
     return oir_opt::run_oir_transform(
         context, "OIROptimizationPipelinePass requires OIR module in pass context",
-        [](oir::Module &module, oir_opt::Stats &stats) {
-            return oir_opt::optimize_oir_aggressively(module, stats);
+        [preserve_function_signatures](oir::Module &module, oir_opt::Stats &stats) {
+            return oir_opt::optimize_oir_aggressively(
+                module, stats, preserve_function_signatures);
         });
 }
 
