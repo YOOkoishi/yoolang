@@ -91,8 +91,8 @@ int main() {
 // OIR-LABEL: define float @static_fill_negative_zero
 // OIR-NOT: memset
 // OIR-NOT: memzero
-// OIR: store float -0.000000
-// OIR: fdiv float 1.000000
+// OIR: store float 0x80000000
+// OIR: fdiv float 0x3f800000
 
 // OIR-LABEL: define i32 @main
 
@@ -109,20 +109,28 @@ int main() {
 // MIR: MEMZERO %v{{[0-9]+}}:gpr, 255, %v{{[0-9]+}}:gpr
 
 // ASM-LABEL: static_clear:
-// ASM: call memset
+// ASM: .Lstatic_clear.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(memset)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Lstatic_clear.call.0)(ra)
 
 // ASM-LABEL: dynamic_clear:
-// ASM: bge zero,
-// ASM: li a1, 0
-// ASM: call memset
-// ASM: .Lmemzero_dynamic_done_
+// ASM: bge zero, t5, .Ldynamic_clear_memzero.done.0
+// ASM: addi a1, zero, 0
+// ASM: .Ldynamic_clear.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(memset)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Ldynamic_clear.call.0)(ra)
+// ASM: .Ldynamic_clear_memzero.done.0:
 
 // ASM-LABEL: static_fill_minus_one:
-// ASM: li a1, 255
-// ASM: call memset
+// ASM: addi a1, zero, 255
+// ASM: .Lstatic_fill_minus_one.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(memset)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Lstatic_fill_minus_one.call.0)(ra)
 
 // ASM-LABEL: dynamic_fill_minus_one:
-// ASM: bge zero,
-// ASM: li a1, 255
-// ASM: call memset
-// ASM: .Lmemzero_dynamic_done_
+// ASM: bge zero, t5, .Ldynamic_fill_minus_one_memzero.done.0
+// ASM: addi a1, zero, 255
+// ASM: .Ldynamic_fill_minus_one.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(memset)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Ldynamic_fill_minus_one.call.0)(ra)
+// ASM: .Ldynamic_fill_minus_one_memzero.done.0:

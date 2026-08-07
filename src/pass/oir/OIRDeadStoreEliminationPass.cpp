@@ -1,10 +1,12 @@
 #include "pass/oir/OIRDeadStoreEliminationPass.h"
 
 #include "oir/OIRAnalysis.h"
+#include "oir/OIRDataLayout.h"
 #include "oir/OIRScalarOpt.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,9 +43,9 @@ struct AllocaWriteOnlyState {
     std::vector<oir::Instruction *> writes;
 };
 
-void mark_pointer_operand_escapes(oir::Instruction &inst, oir::Value *operand,
-                                  std::unordered_map<oir::AllocaInst *,
-                                                     AllocaWriteOnlyState> &states) {
+void mark_pointer_operand_escapes(
+    oir::Instruction &inst, oir::Value *operand,
+    std::unordered_map<oir::AllocaInst *, AllocaWriteOnlyState> &states) {
     auto *base = alloca_base(operand);
     if (base == nullptr) {
         return;
@@ -75,8 +77,7 @@ void mark_pointer_operand_escapes(oir::Instruction &inst, oir::Value *operand,
 }
 
 void collect_write_only_alloca_state(
-    oir::Function &function,
-    std::unordered_map<oir::AllocaInst *, AllocaWriteOnlyState> &states) {
+    oir::Function &function, std::unordered_map<oir::AllocaInst *, AllocaWriteOnlyState> &states) {
     for (auto &block : function.blocks()) {
         for (auto &inst_ptr : block->instructions()) {
             auto *inst = inst_ptr.get();
@@ -120,8 +121,8 @@ void collect_write_only_alloca_state(
     }
 }
 
-bool collect_dead_write_only_alloca_stores(
-    oir::Function &function, std::unordered_set<oir::Instruction *> &dead) {
+bool collect_dead_write_only_alloca_stores(oir::Function &function,
+                                           std::unordered_set<oir::Instruction *> &dead) {
     std::unordered_map<oir::AllocaInst *, AllocaWriteOnlyState> states;
     collect_write_only_alloca_state(function, states);
 
@@ -145,26 +146,14 @@ bool is_aggregate_zero_alloca_store(const oir::StoreInst &store) {
 }
 
 std::uint64_t fixed_type_size(oir::Type *type) {
-    if (type == nullptr || type->is_void() || type->is_label() || type->is_function()) {
+    static const oir::DataLayout layout;
+    try {
+        return layout.fixed_alloc_size(type).value_or(0);
+    } catch (const std::exception &) {
+        // DSE cannot prove complete coverage without one exact, non-
+        // overflowing allocation size.
         return 0;
     }
-    if (auto *integer = dynamic_cast<oir::IntegerType *>(type)) {
-        return (integer->bit_width() + 7) / 8;
-    }
-    if (type->is_float()) {
-        return 4;
-    }
-    if (type->is_pointer()) {
-        return 8;
-    }
-    if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
-        auto element_size = fixed_type_size(array->element_type());
-        if (element_size == 0) {
-            return 0;
-        }
-        return element_size * array->element_count();
-    }
-    return 0;
 }
 
 struct CoveredSlice {
@@ -368,9 +357,10 @@ bool later_same_block_stores_cover_zeroed_alloca(const oir::StoreInst &zero_stor
     return false;
 }
 
-bool collect_fully_overwritten_aggregate_zero_stores(
-    oir::Function &function, const oir::OIRAliasAnalysis &aa,
-    const oir::FunctionModRefAnalysis &modref, std::unordered_set<oir::Instruction *> &dead) {
+bool collect_fully_overwritten_aggregate_zero_stores(oir::Function &function,
+                                                     const oir::OIRAliasAnalysis &aa,
+                                                     const oir::FunctionModRefAnalysis &modref,
+                                                     std::unordered_set<oir::Instruction *> &dead) {
     bool changed = false;
     for (auto &block : function.blocks()) {
         for (auto &inst_ptr : block->instructions()) {
@@ -570,29 +560,29 @@ bool erase_instructions(oir::Function &function,
 
 void invalidate_aliasing(std::vector<MemoryEntry> &memory, oir::Value *ptr,
                          const oir::OIRAliasAnalysis &aa) {
-    memory.erase(std::remove_if(memory.begin(), memory.end(), [&](const MemoryEntry &entry) {
-                     return aa.alias(ptr, entry.ptr) != oir::AliasResult::NoAlias;
-                 }),
+    memory.erase(std::remove_if(memory.begin(), memory.end(),
+                                [&](const MemoryEntry &entry) {
+                                    return aa.alias(ptr, entry.ptr) != oir::AliasResult::NoAlias;
+                                }),
                  memory.end());
 }
 
 void invalidate_for_call(std::vector<MemoryEntry> &memory, const oir::CallInst &call,
-                         const oir::OIRAliasAnalysis &aa,
-                         const oir::FunctionModRefAnalysis &modref,
+                         const oir::OIRAliasAnalysis &aa, const oir::FunctionModRefAnalysis &modref,
                          bool preserve_stores_read_by_call) {
-    memory.erase(std::remove_if(memory.begin(), memory.end(), [&](const MemoryEntry &entry) {
-                     if (preserve_stores_read_by_call && entry.is_store &&
-                         modref.call_may_read(call, entry.ptr, aa)) {
-                         return true;
-                     }
-                     return modref.call_may_clobber(call, entry.ptr, aa);
-                 }),
+    memory.erase(std::remove_if(memory.begin(), memory.end(),
+                                [&](const MemoryEntry &entry) {
+                                    if (preserve_stores_read_by_call && entry.is_store &&
+                                        modref.call_may_read(call, entry.ptr, aa)) {
+                                        return true;
+                                    }
+                                    return modref.call_may_clobber(call, entry.ptr, aa);
+                                }),
                  memory.end());
 }
 
 bool dse_instruction(oir::Instruction *inst, std::vector<MemoryEntry> &memory,
-                     const oir::OIRAliasAnalysis &aa,
-                     const oir::FunctionModRefAnalysis &modref,
+                     const oir::OIRAliasAnalysis &aa, const oir::FunctionModRefAnalysis &modref,
                      std::unordered_set<oir::Instruction *> &dead) {
     if (auto *store = dynamic_cast<oir::StoreInst *>(inst)) {
         bool changed = false;
@@ -676,9 +666,10 @@ bool is_redundant_loaded_value_writeback(const oir::StoreInst &store,
     return false;
 }
 
-void collect_redundant_loaded_value_writebacks(
-    oir::Function &function, const oir::OIRAliasAnalysis &aa,
-    const oir::FunctionModRefAnalysis &modref, std::unordered_set<oir::Instruction *> &dead) {
+void collect_redundant_loaded_value_writebacks(oir::Function &function,
+                                               const oir::OIRAliasAnalysis &aa,
+                                               const oir::FunctionModRefAnalysis &modref,
+                                               std::unordered_set<oir::Instruction *> &dead) {
     for (auto &block : function.blocks()) {
         for (auto &inst_ptr : block->instructions()) {
             auto *store = dynamic_cast<oir::StoreInst *>(inst_ptr.get());

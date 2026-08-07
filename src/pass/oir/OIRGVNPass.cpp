@@ -53,7 +53,8 @@ std::string value_key(const ReplacementMap &replacements, oir::Value *value) {
 
 bool is_commutative_integer_op(oir::Instruction::OpID op) {
     return op == oir::Instruction::OpID::Add || op == oir::Instruction::OpID::Mul ||
-           op == oir::Instruction::OpID::And || op == oir::Instruction::OpID::Xor;
+           op == oir::Instruction::OpID::And || op == oir::Instruction::OpID::Or ||
+           op == oir::Instruction::OpID::Xor;
 }
 
 bool is_commutative_equality(oir::CmpPred pred) {
@@ -66,6 +67,7 @@ bool is_gvn_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Or:
     case oir::Instruction::OpID::Xor:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
@@ -88,6 +90,27 @@ bool is_gvn_candidate(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Call:
     case oir::Instruction::OpID::MemZero:
     case oir::Instruction::OpID::Phi:
+    case oir::Instruction::OpID::SetVL:
+    case oir::Instruction::OpID::Splat:
+    case oir::Instruction::OpID::StepVector:
+    case oir::Instruction::OpID::ExtractElement:
+    case oir::Instruction::OpID::InsertElement:
+    case oir::Instruction::OpID::ShuffleVector:
+    case oir::Instruction::OpID::VectorSelect:
+    case oir::Instruction::OpID::VectorCast:
+    case oir::Instruction::OpID::FixedABIExtractLane:
+    case oir::Instruction::OpID::FixedABIPack:
+    case oir::Instruction::OpID::FixedABIObjectLoadLane:
+    case oir::Instruction::OpID::FixedABIObjectStoreLane:
+    case oir::Instruction::OpID::VPBinary:
+    case oir::Instruction::OpID::VPCmp:
+    case oir::Instruction::OpID::VPLoad:
+    case oir::Instruction::OpID::VPStore:
+    case oir::Instruction::OpID::MaskedLoad:
+    case oir::Instruction::OpID::MaskedStore:
+    case oir::Instruction::OpID::VPGather:
+    case oir::Instruction::OpID::VPScatter:
+    case oir::Instruction::OpID::VPReduction:
         return false;
     }
     return false;

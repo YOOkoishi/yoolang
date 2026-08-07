@@ -11,6 +11,7 @@
 #include <deque>
 #include <list>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,7 +24,6 @@ namespace {
 
 constexpr unsigned kMaxInlineSites = 128;
 constexpr unsigned kMaxCalleeBlocks = 12;
-constexpr unsigned kMaxCalleeReturns = 4;
 constexpr unsigned kMaxCalleeParams = 16;
 constexpr unsigned kMaxSpecializedInlineBlocks = 96;
 constexpr unsigned kMaxSpecializedInlineReturns = 8;
@@ -72,6 +72,7 @@ struct InlineContext {
     std::unordered_map<const oir::Function *, unsigned> recursive_growth;
     std::unordered_set<const oir::Function *> defer_recursive_expansion;
     std::unordered_set<const oir::BasicBlock *> protected_countdown_blocks;
+    std::unordered_set<const oir::CallInst *> unsupported_clone_calls;
 };
 
 struct CallsiteEstimate {
@@ -89,6 +90,123 @@ struct CallsiteEstimate {
 bool is_constprop_specialization(const oir::Function &function);
 bool mask_selects_argument(const SpecializationMask &mask, std::size_t index);
 bool is_specializable_constant(oir::Value *value);
+
+bool type_contains_vector(const oir::Type *type,
+                          std::unordered_set<const oir::Type *> &visited) {
+    if (type == nullptr || !visited.insert(type).second) {
+        return false;
+    }
+    if (type->is_vector()) {
+        return true;
+    }
+    if (const auto *pointer = dynamic_cast<const oir::PointerType *>(type)) {
+        return type_contains_vector(pointer->element_type(), visited);
+    }
+    if (const auto *array = dynamic_cast<const oir::ArrayType *>(type)) {
+        return type_contains_vector(array->element_type(), visited);
+    }
+    if (const auto *function = dynamic_cast<const oir::FunctionType *>(type)) {
+        if (type_contains_vector(function->return_type(), visited)) {
+            return true;
+        }
+        for (const auto *parameter : function->param_types()) {
+            if (type_contains_vector(parameter, visited)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool type_contains_vector(const oir::Type *type) {
+    std::unordered_set<const oir::Type *> visited;
+    return type_contains_vector(type, visited);
+}
+
+bool scalar_inline_clone_supports(oir::Instruction::OpID op) {
+    switch (op) {
+    case oir::Instruction::OpID::Ret:
+    case oir::Instruction::OpID::Br:
+    case oir::Instruction::OpID::Add:
+    case oir::Instruction::OpID::Sub:
+    case oir::Instruction::OpID::Mul:
+    case oir::Instruction::OpID::SDiv:
+    case oir::Instruction::OpID::SRem:
+    case oir::Instruction::OpID::FAdd:
+    case oir::Instruction::OpID::FSub:
+    case oir::Instruction::OpID::FMul:
+    case oir::Instruction::OpID::FDiv:
+    case oir::Instruction::OpID::ICmp:
+    case oir::Instruction::OpID::FCmp:
+    case oir::Instruction::OpID::Alloca:
+    case oir::Instruction::OpID::Load:
+    case oir::Instruction::OpID::Store:
+    case oir::Instruction::OpID::GetElementPtr:
+    case oir::Instruction::OpID::Call:
+    case oir::Instruction::OpID::MemZero:
+    case oir::Instruction::OpID::ZExt:
+    case oir::Instruction::OpID::SIToFP:
+    case oir::Instruction::OpID::FPToSI:
+    case oir::Instruction::OpID::Phi:
+    case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Or:
+    case oir::Instruction::OpID::Xor:
+        return true;
+    case oir::Instruction::OpID::FixedABIExtractLane:
+    case oir::Instruction::OpID::FixedABIPack:
+    case oir::Instruction::OpID::FixedABIObjectLoadLane:
+    case oir::Instruction::OpID::FixedABIObjectStoreLane:
+    case oir::Instruction::OpID::SetVL:
+    case oir::Instruction::OpID::Splat:
+    case oir::Instruction::OpID::StepVector:
+    case oir::Instruction::OpID::ExtractElement:
+    case oir::Instruction::OpID::InsertElement:
+    case oir::Instruction::OpID::ShuffleVector:
+    case oir::Instruction::OpID::VectorSelect:
+    case oir::Instruction::OpID::VectorCast:
+    case oir::Instruction::OpID::VPBinary:
+    case oir::Instruction::OpID::VPCmp:
+    case oir::Instruction::OpID::VPLoad:
+    case oir::Instruction::OpID::VPStore:
+    case oir::Instruction::OpID::MaskedLoad:
+    case oir::Instruction::OpID::MaskedStore:
+    case oir::Instruction::OpID::VPGather:
+    case oir::Instruction::OpID::VPScatter:
+    case oir::Instruction::OpID::VPReduction:
+        return false;
+    }
+    return false;
+}
+
+std::optional<std::string> scalar_inline_clone_rejection(const oir::Function &callee) {
+    if (type_contains_vector(callee.function_type())) {
+        return "OIRINLINE_VECTOR_SIGNATURE: scalar inline cloning does not support "
+               "vector, mask, or scalable-vector signatures";
+    }
+    for (const auto &block : callee.blocks()) {
+        for (const auto &instruction : block->instructions()) {
+            for (const auto *operand : instruction->operands()) {
+                if (const auto *constant = dynamic_cast<const oir::Constant *>(operand);
+                    constant != nullptr && type_contains_vector(constant->type())) {
+                    return "OIRINLINE_VECTOR_CONSTANT: scalar inline cloning does not "
+                           "support typed vector or mask constants";
+                }
+            }
+            if (!scalar_inline_clone_supports(instruction->op()) ||
+                type_contains_vector(instruction->type())) {
+                return "OIRINLINE_VECTOR_BODY: scalar inline cloning does not support "
+                       "vector, VP, or SetVL body operations";
+            }
+            for (const auto *operand : instruction->operands()) {
+                if (operand != nullptr && type_contains_vector(operand->type())) {
+                    return "OIRINLINE_VECTOR_BODY: scalar inline cloning does not support "
+                           "vector, VP, or SetVL body values";
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
 
 std::string inline_name(const oir::Function &callee, const oir::Value &value,
                         unsigned inline_index) {
@@ -335,12 +453,6 @@ CallsiteEstimate inspect_callsite(const oir::Module &module, const oir::Function
     return estimate;
 }
 
-bool within_inline_resource_limit(const CalleeInfo &info,
-                                  const pass::cost_model::CostModelPolicy &policy) {
-    return info.cost <= static_cast<unsigned>(policy.max_inline_callee_cost) &&
-           info.returns != 0 && info.returns <= kMaxCalleeReturns;
-}
-
 void fill_before_after_from_callee(OIRTransformCostEstimate &estimate, const CalleeInfo &info,
                                    std::int64_t before_calls, std::int64_t after_calls) {
     estimate.has_detailed_instruction_mix = true;
@@ -376,6 +488,26 @@ void fill_before_after_from_callee(OIRTransformCostEstimate &estimate, const Cal
     estimate.after_phis = estimate.before_phis;
     estimate.after_live_values = estimate.before_live_values;
     estimate.after_max_live_values = estimate.before_max_live_values;
+}
+
+void record_unsupported_clone_candidate(
+    Stats &stats, const oir::Function &callee, const std::string &reason,
+    pass::cost_model::TransformKind kind = pass::cost_model::TransformKind::Inline) {
+    const auto info = inspect_callee(callee);
+    OIRTransformCostEstimate estimate;
+    estimate.kind = kind;
+    estimate.pass_name = "OIRInlinePass";
+    estimate.candidate_id =
+        "inline." + std::to_string(++stats.cost_model_candidates) +
+        ".scalar-clone-gate";
+    estimate.scope = "call";
+    estimate.proof_kind = pass::cost_model::ProofKind::Structural;
+    estimate.proof_status = pass::cost_model::ProofStatus::Refuted;
+    estimate.proof_summary = reason;
+    estimate.proof_rule_id = "oir.inline.scalar-clone.vector-gate";
+    estimate.confidence = 1.0;
+    fill_before_after_from_callee(estimate, info, 1, 1);
+    (void)cost_model_allows_transform(stats, estimate);
 }
 
 bool contains_call_to(const oir::Function &function, const oir::Function &target) {
@@ -642,6 +774,7 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
     case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Or:
     case oir::Instruction::OpID::Xor:
     case oir::Instruction::OpID::FAdd:
     case oir::Instruction::OpID::FSub:
@@ -704,6 +837,27 @@ std::unique_ptr<oir::Instruction> clone_non_phi_instruction(oir::Module &module,
     case oir::Instruction::OpID::Phi:
     case oir::Instruction::OpID::Br:
     case oir::Instruction::OpID::Ret:
+    case oir::Instruction::OpID::SetVL:
+    case oir::Instruction::OpID::Splat:
+    case oir::Instruction::OpID::StepVector:
+    case oir::Instruction::OpID::ExtractElement:
+    case oir::Instruction::OpID::InsertElement:
+    case oir::Instruction::OpID::ShuffleVector:
+    case oir::Instruction::OpID::VectorSelect:
+    case oir::Instruction::OpID::VectorCast:
+    case oir::Instruction::OpID::FixedABIExtractLane:
+    case oir::Instruction::OpID::FixedABIPack:
+    case oir::Instruction::OpID::FixedABIObjectLoadLane:
+    case oir::Instruction::OpID::FixedABIObjectStoreLane:
+    case oir::Instruction::OpID::VPBinary:
+    case oir::Instruction::OpID::VPCmp:
+    case oir::Instruction::OpID::VPLoad:
+    case oir::Instruction::OpID::VPStore:
+    case oir::Instruction::OpID::MaskedLoad:
+    case oir::Instruction::OpID::MaskedStore:
+    case oir::Instruction::OpID::VPGather:
+    case oir::Instruction::OpID::VPScatter:
+    case oir::Instruction::OpID::VPReduction:
         break;
     }
     throw std::runtime_error("unsupported instruction while cloning inline body");
@@ -947,6 +1101,7 @@ bool argument_has_structural_use(const oir::Function &callee, std::size_t index)
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
         case oir::Instruction::OpID::And:
+        case oir::Instruction::OpID::Or:
         case oir::Instruction::OpID::Xor:
         case oir::Instruction::OpID::ICmp:
         case oir::Instruction::OpID::FCmp:
@@ -968,6 +1123,29 @@ bool argument_has_structural_use(const oir::Function &callee, std::size_t index)
         case oir::Instruction::OpID::FMul:
         case oir::Instruction::OpID::FDiv:
             break;
+        case oir::Instruction::OpID::SetVL:
+        case oir::Instruction::OpID::Splat:
+        case oir::Instruction::OpID::StepVector:
+        case oir::Instruction::OpID::ExtractElement:
+        case oir::Instruction::OpID::InsertElement:
+        case oir::Instruction::OpID::ShuffleVector:
+        case oir::Instruction::OpID::VectorSelect:
+        case oir::Instruction::OpID::VectorCast:
+        case oir::Instruction::OpID::FixedABIExtractLane:
+        case oir::Instruction::OpID::FixedABIPack:
+        case oir::Instruction::OpID::FixedABIObjectLoadLane:
+        case oir::Instruction::OpID::FixedABIObjectStoreLane:
+        case oir::Instruction::OpID::VPBinary:
+        case oir::Instruction::OpID::VPCmp:
+        case oir::Instruction::OpID::VPLoad:
+        case oir::Instruction::OpID::VPStore:
+        case oir::Instruction::OpID::MaskedLoad:
+        case oir::Instruction::OpID::MaskedStore:
+        case oir::Instruction::OpID::VPGather:
+        case oir::Instruction::OpID::VPScatter:
+        case oir::Instruction::OpID::VPReduction:
+            // Scalar specialization must not reason through unmodelled vector uses.
+            return true;
         }
     }
     return false;
@@ -1245,6 +1423,7 @@ void clone_callee_into_caller(oir::Module &module, oir::Function &caller, oir::F
                               ValueMap &values, BlockMap &blocks,
                               std::vector<std::pair<oir::BasicBlock *, oir::Value *>> &returns,
                               unsigned inline_index) {
+    (void)caller;
     auto args = call.args();
     for (std::size_t i = 0; i < callee.args().size(); ++i) {
         values[callee.args()[i].get()] = args[i];
@@ -1333,6 +1512,12 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
             stats.recursively_inlined_functions.end()) {
             return false;
         }
+        if (auto reason = scalar_inline_clone_rejection(caller)) {
+            if (context.unsupported_clone_calls.insert(call).second) {
+                record_unsupported_clone_candidate(stats, caller, *reason);
+            }
+            return false;
+        }
         clone_source = &recursive_template_for(context, caller);
         self_recursive_depth = recursive_inline_depth(context, *call);
         if (!is_eligible_recursive_call(caller, *call, *clone_source, policy,
@@ -1341,6 +1526,11 @@ bool inline_call(oir::Module &module, InlineContext &context, oir::Function &cal
             return false;
         }
     } else if (!is_eligible_non_recursive_call(caller, *call, callee, policy)) {
+        return false;
+    } else if (auto reason = scalar_inline_clone_rejection(*callee)) {
+        if (context.unsupported_clone_calls.insert(call).second) {
+            record_unsupported_clone_candidate(stats, *callee, *reason);
+        }
         return false;
     }
 
@@ -1624,6 +1814,12 @@ bool specialize_constant_argument_calls(oir::Module &module, Stats &stats) {
                 SpecializationMask mask;
                 if (!is_eligible_for_constant_specialization(*function, *call, callee, policy,
                                                              existing_for_callee, mask)) {
+                    continue;
+                }
+                if (auto reason = scalar_inline_clone_rejection(*callee)) {
+                    record_unsupported_clone_candidate(
+                        stats, *callee, *reason,
+                        pass::cost_model::TransformKind::ConstantArgumentSpecialization);
                     continue;
                 }
                 sites.push_back({function.get(), callee, call,

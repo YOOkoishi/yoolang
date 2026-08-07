@@ -1,10 +1,12 @@
 #include "pass/oir/OIRLoopStrengthReductionPass.h"
 
 #include "oir/OIRAnalysis.h"
+#include "oir/OIRDataLayout.h"
 #include "oir/OIRScalarOpt.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -156,9 +158,9 @@ std::optional<std::int64_t> constant_int(oir::Value *value) {
     return int_constant(value);
 }
 
-std::optional<std::int64_t>
-induction_step_value_impl(const oir::PhiInst &phi, oir::Value *back_value,
-                          std::unordered_set<oir::Value *> &active) {
+std::optional<std::int64_t> induction_step_value_impl(const oir::PhiInst &phi,
+                                                      oir::Value *back_value,
+                                                      std::unordered_set<oir::Value *> &active) {
     if (!active.insert(back_value).second) {
         return std::nullopt;
     }
@@ -252,57 +254,31 @@ std::vector<InductionInfo> collect_inductions(const oir::Loop &loop, oir::BasicB
 }
 
 std::uint64_t type_size(oir::Type *type) {
-    if (type == nullptr || type->is_void() || type->is_label() || type->is_function()) {
+    static const oir::DataLayout layout;
+    try {
+        return layout.fixed_alloc_size(type).value_or(0);
+    } catch (const std::exception &) {
+        // LSR is optional. Unsized, scalable, or overflowing layouts must
+        // conservatively disable the transform instead of inventing a stride.
         return 0;
     }
-    if (auto *int_ty = dynamic_cast<oir::IntegerType *>(type)) {
-        return (int_ty->bit_width() + 7) / 8;
-    }
-    if (type->is_float()) {
-        return 4;
-    }
-    if (type->is_pointer()) {
-        return 8;
-    }
-    if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
-        return type_size(array->element_type()) * array->element_count();
-    }
-    return 0;
 }
 
-std::optional<std::vector<std::uint64_t>>
-gep_index_strides(const oir::GetElementPtrInst &gep) {
+std::optional<std::vector<std::uint64_t>> gep_index_strides(const oir::GetElementPtrInst &gep) {
     auto *ptr_type = dynamic_cast<oir::PointerType *>(gep.base_ptr()->type());
     if (ptr_type == nullptr) {
         return std::nullopt;
     }
-
-    std::vector<std::uint64_t> strides;
-    auto *cursor = ptr_type->element_type();
-    auto indices = gep.indices();
-    strides.reserve(indices.size());
-    for (std::size_t i = 0; i < indices.size(); ++i) {
-        std::uint64_t stride = 0;
-        if (i == 0) {
-            stride = type_size(cursor);
-        } else if (auto *array = dynamic_cast<oir::ArrayType *>(cursor)) {
-            stride = type_size(array->element_type());
-            cursor = array->element_type();
-        } else {
-            stride = type_size(cursor);
-        }
-
-        if (stride == 0) {
-            return std::nullopt;
-        }
-        strides.push_back(stride);
+    static const oir::DataLayout layout;
+    try {
+        return layout.fixed_gep_index_strides(ptr_type, gep.indices().size());
+    } catch (const std::exception &) {
+        return std::nullopt;
     }
-    return strides;
 }
 
-std::optional<GEPCandidate>
-analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
-            const std::vector<InductionInfo> &inductions) {
+std::optional<GEPCandidate> analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
+                                        const std::vector<InductionInfo> &inductions) {
     if (!gep.has_uses() || value_defined_in_loop(gep.base_ptr(), loop)) {
         return std::nullopt;
     }
@@ -423,7 +399,7 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
             }
         }
         return std::nullopt;
-        };
+    };
 
     std::optional<AffineIndex> induction;
     std::size_t index_pos = 0;
@@ -447,9 +423,8 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
         return std::nullopt;
     }
 
-    const auto step_bytes =
-        induction->induction.step * induction->scale *
-        static_cast<std::int64_t>((*strides)[index_pos]);
+    const auto step_bytes = induction->induction.step * induction->scale *
+                            static_cast<std::int64_t>((*strides)[index_pos]);
     if (step_bytes == 0 || step_bytes % result_elem_size != 0) {
         return std::nullopt;
     }
@@ -471,8 +446,8 @@ analyze_gep(oir::GetElementPtrInst &gep, const oir::Loop &loop,
                         induction->offset_value_sign};
 }
 
-std::vector<GEPCandidate>
-collect_candidates(const oir::Loop &loop, const std::vector<InductionInfo> &inductions) {
+std::vector<GEPCandidate> collect_candidates(const oir::Loop &loop,
+                                             const std::vector<InductionInfo> &inductions) {
     std::vector<GEPCandidate> candidates;
     for (auto *const_block : loop.blocks) {
         auto *block = mutable_block(const_block);
@@ -555,8 +530,7 @@ std::optional<std::int64_t> constant_gep_delta(const GEPCandidate &candidate,
                                                const GEPCandidate &base) {
     if (candidate.gep->base_ptr() != base.gep->base_ptr() ||
         candidate.gep->type() != base.gep->type() ||
-        candidate.induction.phi != base.induction.phi ||
-        candidate.index_pos != base.index_pos ||
+        candidate.induction.phi != base.induction.phi || candidate.index_pos != base.index_pos ||
         candidate.pointer_step != base.pointer_step ||
         candidate.pointer_step_value != base.pointer_step_value ||
         candidate.index_scale != base.index_scale ||
@@ -586,14 +560,12 @@ std::optional<std::int64_t> constant_gep_delta(const GEPCandidate &candidate,
         std::int64_t index_delta = 0;
         if (base_index->offset == std::numeric_limits<std::int64_t>::min() ||
             !add_without_overflow(candidate_index->offset, -base_index->offset, index_delta) ||
-            (*strides)[i] >
-                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            (*strides)[i] > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
             return std::nullopt;
         }
         const auto stride = static_cast<std::int64_t>((*strides)[i]);
-        if (index_delta != 0 &&
-            (index_delta > std::numeric_limits<std::int64_t>::max() / stride ||
-             index_delta < std::numeric_limits<std::int64_t>::min() / stride)) {
+        if (index_delta != 0 && (index_delta > std::numeric_limits<std::int64_t>::max() / stride ||
+                                 index_delta < std::numeric_limits<std::int64_t>::min() / stride)) {
             return std::nullopt;
         }
         std::int64_t updated_delta = 0;
@@ -609,8 +581,7 @@ std::optional<std::int64_t> constant_gep_delta(const GEPCandidate &candidate,
     }
     const auto raw_element_size = type_size(pointer_type->element_type());
     if (raw_element_size == 0 ||
-        raw_element_size >
-            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        raw_element_size > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
         return std::nullopt;
     }
     const auto element_size = static_cast<std::int64_t>(raw_element_size);
@@ -638,16 +609,10 @@ group_shared_lsr_candidates(const std::vector<GEPCandidate> &candidates) {
             constexpr std::int64_t kMaxFoldableByteOffset = 2047;
             if (raw_element_size == 0 ||
                 raw_element_size >
-                    static_cast<std::uint64_t>(
-                        std::numeric_limits<std::int64_t>::max()) ||
-                static_cast<std::int64_t>(raw_element_size) >
-                    kMaxFoldableByteOffset ||
-                *offset <
-                    kMinFoldableByteOffset /
-                        static_cast<std::int64_t>(raw_element_size) ||
-                *offset >
-                    kMaxFoldableByteOffset /
-                        static_cast<std::int64_t>(raw_element_size)) {
+                    static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+                static_cast<std::int64_t>(raw_element_size) > kMaxFoldableByteOffset ||
+                *offset < kMinFoldableByteOffset / static_cast<std::int64_t>(raw_element_size) ||
+                *offset > kMaxFoldableByteOffset / static_cast<std::int64_t>(raw_element_size)) {
                 continue;
             }
 
@@ -769,9 +734,12 @@ group_stack_call_lsr_candidates(const oir::Loop &loop, oir::BasicBlock *latch,
                    g.pointer_step == candidate.pointer_step;
         });
         if (found == groups.end()) {
-            groups.push_back(
-                GEPCandidateGroup{alloca, candidate.induction.phi, candidate.gep->base_ptr(),
-                                  candidate.index_pos, candidate.pointer_step, {candidate}});
+            groups.push_back(GEPCandidateGroup{alloca,
+                                               candidate.induction.phi,
+                                               candidate.gep->base_ptr(),
+                                               candidate.index_pos,
+                                               candidate.pointer_step,
+                                               {candidate}});
         } else {
             found->candidates.push_back(candidate);
         }
@@ -857,9 +825,8 @@ oir::Value *materialize_pointer_step(oir::Module &module, oir::BasicBlock *prehe
     }
     if (candidate.pointer_step == -1) {
         return preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
-            value->type(), oir::Instruction::OpID::Sub,
-            make_int_constant(module, value->type(), 0), value, preheader,
-            "lsr.step.neg"));
+            value->type(), oir::Instruction::OpID::Sub, make_int_constant(module, value->type(), 0),
+            value, preheader, "lsr.step.neg"));
     }
     return preheader->insert_before_terminator(std::make_unique<oir::BinaryInst>(
         value->type(), oir::Instruction::OpID::Mul, value,
@@ -893,10 +860,10 @@ bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preh
         phi->add_incoming(start_ptr, preheader);
 
         auto *step = materialize_pointer_step(module, preheader, candidate);
-        auto *next = static_cast<oir::GetElementPtrInst *>(
-            latch->insert_before_terminator(std::make_unique<oir::GetElementPtrInst>(
-                gep->type(), phi, std::vector<oir::Value *>{step}, latch,
-                lsr_name(*gep, ".next"))));
+        auto *next = static_cast<oir::GetElementPtrInst *>(latch->insert_before_terminator(
+            std::make_unique<oir::GetElementPtrInst>(gep->type(), phi,
+                                                     std::vector<oir::Value *>{step}, latch,
+                                                     lsr_name(*gep, ".next"))));
         phi->add_incoming(next, latch);
 
         for (std::size_t i = 0; i < group.candidates.size(); ++i) {
@@ -921,8 +888,7 @@ bool apply_lsr(oir::Module &module, const oir::Loop &loop, oir::BasicBlock *preh
     return apply_replacements(module, replacements) != 0;
 }
 
-bool apply_stack_call_lsr(oir::Module &module, oir::BasicBlock *preheader,
-                          oir::BasicBlock *latch,
+bool apply_stack_call_lsr(oir::Module &module, oir::BasicBlock *preheader, oir::BasicBlock *latch,
                           const std::vector<GEPCandidateGroup> &groups, Stats &stats) {
     if (groups.empty()) {
         return false;
@@ -950,9 +916,8 @@ bool apply_stack_call_lsr(oir::Module &module, oir::BasicBlock *preheader,
                 base_candidate.gep->type(), base_candidate.gep->base_ptr(), start_indices,
                 preheader, lsr_name(*base_candidate.gep, ".start"))));
 
-        auto *phi =
-            insert_pointer_phi(header, base_candidate.gep->type(),
-                               lsr_name(*base_candidate.gep, ".stack.ptr"));
+        auto *phi = insert_pointer_phi(header, base_candidate.gep->type(),
+                                       lsr_name(*base_candidate.gep, ".stack.ptr"));
         phi->add_incoming(start_ptr, preheader);
 
         auto *step = materialize_pointer_step(module, preheader, base_candidate);

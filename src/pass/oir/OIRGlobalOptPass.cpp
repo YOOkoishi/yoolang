@@ -5,9 +5,7 @@
 #include "oir/OIRScalarOpt.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -18,75 +16,6 @@
 
 namespace pass::oir_opt {
 namespace {
-
-std::string trim(std::string value) {
-    std::size_t begin = 0;
-    while (begin < value.size() &&
-           (value[begin] == ' ' || value[begin] == '\t' || value[begin] == '\n' ||
-            value[begin] == '\r')) {
-        ++begin;
-    }
-    std::size_t end = value.size();
-    while (end > begin &&
-           (value[end - 1] == ' ' || value[end - 1] == '\t' || value[end - 1] == '\n' ||
-            value[end - 1] == '\r')) {
-        --end;
-    }
-    return value.substr(begin, end - begin);
-}
-
-bool parse_i32_literal(const std::string &literal, std::int64_t &out) {
-    errno = 0;
-    char *end = nullptr;
-    const long value = std::strtol(literal.c_str(), &end, 0);
-    if (errno != 0 || end == literal.c_str() || *end != '\0') {
-        return false;
-    }
-    out = static_cast<std::int32_t>(value);
-    return true;
-}
-
-bool parse_f32_literal(const std::string &literal, float &out) {
-    errno = 0;
-    char *end = nullptr;
-    const float value = std::strtof(literal.c_str(), &end);
-    if (errno != 0 || end == literal.c_str() || *end != '\0') {
-        return false;
-    }
-    out = value;
-    return true;
-}
-
-std::vector<std::string> scalar_initializer_tokens(const std::string &literal) {
-    std::vector<std::string> tokens;
-    std::string current;
-    auto flush = [&]() {
-        auto value = trim(current);
-        current.clear();
-        if (!value.empty()) {
-            tokens.push_back(value);
-        }
-    };
-
-    for (char ch : literal) {
-        switch (ch) {
-        case '{':
-        case '}':
-        case ',':
-        case '\n':
-        case '\r':
-        case '\t':
-        case ' ':
-            flush();
-            break;
-        default:
-            current.push_back(ch);
-            break;
-        }
-    }
-    flush();
-    return tokens;
-}
 
 std::uint64_t scalar_element_count(oir::Type *type) {
     if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
@@ -102,9 +31,8 @@ oir::Type *scalar_element_type(oir::Type *type) {
     return type;
 }
 
-std::optional<std::uint64_t> linear_index_for(oir::Type *type,
-                                              const std::vector<std::int64_t> &indices,
-                                              std::size_t &pos) {
+std::optional<std::uint64_t>
+linear_index_for(oir::Type *type, const std::vector<std::int64_t> &indices, std::size_t &pos) {
     auto *array = dynamic_cast<oir::ArrayType *>(type);
     if (array == nullptr) {
         return 0;
@@ -119,6 +47,34 @@ std::optional<std::uint64_t> linear_index_for(oir::Type *type,
         return std::nullopt;
     }
     return index * scalar_element_count(array->element_type()) + *nested;
+}
+
+oir::Value *typed_constant_at_linear_index(oir::Module &module, oir::Constant *constant,
+                                           oir::Type *type, std::uint64_t linear_index,
+                                           oir::Type *load_type) {
+    if (constant == nullptr || type == nullptr) {
+        return nullptr;
+    }
+    if (dynamic_cast<oir::ConstantAggregateZero *>(constant) != nullptr) {
+        return make_zero_constant(module, load_type);
+    }
+    auto *array_type = dynamic_cast<oir::ArrayType *>(type);
+    if (array_type == nullptr) {
+        return linear_index == 0 && constant->type() == load_type ? constant : nullptr;
+    }
+
+    const auto nested_count = scalar_element_count(array_type->element_type());
+    if (nested_count == 0) {
+        return nullptr;
+    }
+    const auto element_index = linear_index / nested_count;
+    const auto nested_index = linear_index % nested_count;
+    auto *array = dynamic_cast<oir::ConstantArray *>(constant);
+    if (array == nullptr || element_index >= array->elements().size()) {
+        return nullptr;
+    }
+    return typed_constant_at_linear_index(module, array->elements()[element_index],
+                                          array_type->element_type(), nested_index, load_type);
 }
 
 bool collect_global_indices(oir::Value *ptr, oir::GlobalVariable *&global,
@@ -161,30 +117,11 @@ oir::Value *constant_array_element_for_global(oir::Module &module, oir::GlobalVa
     if (element_type != load_type) {
         return nullptr;
     }
-    if (trim(global.initializer_literal()).empty() ||
-        trim(global.initializer_literal()) == "zero") {
-        return make_zero_constant(module, element_type);
+    if (auto *initializer = global.initializer()) {
+        return typed_constant_at_linear_index(module, initializer, global.value_type(), *linear,
+                                              load_type);
     }
-
-    auto tokens = scalar_initializer_tokens(global.initializer_literal());
-    if (*linear >= tokens.size()) {
-        return make_zero_constant(module, element_type);
-    }
-    if (element_type->is_integer()) {
-        std::int64_t value = 0;
-        if (!parse_i32_literal(tokens[*linear], value)) {
-            return nullptr;
-        }
-        return make_int_constant(module, element_type, value);
-    }
-    if (element_type->is_float()) {
-        float value = 0.0F;
-        if (!parse_f32_literal(tokens[*linear], value)) {
-            return nullptr;
-        }
-        return module.create_f32(value);
-    }
-    return nullptr;
+    return make_zero_constant(module, element_type);
 }
 
 oir::Value *constant_value_for_global(oir::Module &module, oir::GlobalVariable &global) {
@@ -192,34 +129,11 @@ oir::Value *constant_value_for_global(oir::Module &module, oir::GlobalVariable &
         return nullptr;
     }
 
-    if (auto *init = global.init_value()) {
-        if (init->type() == global.value_type()) {
-            return init;
-        }
+    if (auto *init = global.initializer()) {
+        return init->type() == global.value_type() ? init : nullptr;
     }
 
-    const std::string literal = trim(global.initializer_literal());
-    if (literal.empty() || literal == "zero") {
-        return make_zero_constant(module, global.value_type());
-    }
-
-    if (global.value_type()->is_integer()) {
-        std::int64_t value = 0;
-        if (!parse_i32_literal(literal, value)) {
-            return nullptr;
-        }
-        return make_int_constant(module, global.value_type(), value);
-    }
-
-    if (global.value_type()->is_float()) {
-        float value = 0.0F;
-        if (!parse_f32_literal(literal, value)) {
-            return nullptr;
-        }
-        return module.create_f32(value);
-    }
-
-    return nullptr;
+    return make_zero_constant(module, global.value_type());
 }
 
 } // namespace
@@ -270,7 +184,6 @@ bool propagate_global_constants(oir::Module &module, Stats &stats) {
     stats.globals += static_cast<unsigned>(replacements.size());
     return true;
 }
-
 
 namespace {
 
@@ -337,15 +250,14 @@ oir::LoadInst *insert_entry_load(oir::Function &function, oir::GlobalVariable *g
     }
 
     auto pos = entry->instructions().begin();
-    while (pos != entry->instructions().end() &&
-           ((*pos)->op() == oir::Instruction::OpID::Alloca ||
-            (*pos)->op() == oir::Instruction::OpID::Phi)) {
+    while (pos != entry->instructions().end() && ((*pos)->op() == oir::Instruction::OpID::Alloca ||
+                                                  (*pos)->op() == oir::Instruction::OpID::Phi)) {
         ++pos;
     }
 
-    auto load = std::make_unique<oir::LoadInst>(
-        global->value_type(), global, entry,
-        global->name().empty() ? "global.load" : global->name() + ".entry");
+    auto load = std::make_unique<oir::LoadInst>(global->value_type(), global, entry,
+                                                global->name().empty() ? "global.load"
+                                                                       : global->name() + ".entry");
     auto *raw = load.get();
     raw->set_parent(entry);
     entry->instructions().insert(pos, std::move(load));
@@ -353,15 +265,14 @@ oir::LoadInst *insert_entry_load(oir::Function &function, oir::GlobalVariable *g
 }
 
 oir::AllocaInst *insert_entry_alloca(oir::Function &function, oir::Type *type,
-                                    const std::string &name) {
+                                     const std::string &name) {
     auto *entry = function.entry_block();
     if (entry == nullptr) {
         return nullptr;
     }
 
     auto pos = entry->instructions().begin();
-    while (pos != entry->instructions().end() &&
-           (*pos)->op() == oir::Instruction::OpID::Alloca) {
+    while (pos != entry->instructions().end() && (*pos)->op() == oir::Instruction::OpID::Alloca) {
         ++pos;
     }
 
@@ -504,8 +415,7 @@ create_preheader_phi(oir::BasicBlock *preheader, oir::PhiInst &header_phi,
     }
 
     auto pos = preheader->instructions().begin();
-    while (pos != preheader->instructions().end() &&
-           (*pos)->op() == oir::Instruction::OpID::Phi) {
+    while (pos != preheader->instructions().end() && (*pos)->op() == oir::Instruction::OpID::Phi) {
         ++pos;
     }
     preheader->instructions().insert(pos, std::move(phi));
@@ -623,9 +533,8 @@ bool loop_global_access_is_safe(const oir::Loop &loop, oir::GlobalVariable *glob
                 if (inst->operand(i) != global) {
                     continue;
                 }
-                const bool direct_ptr_use =
-                    (is_direct_global_load(inst.get(), global) && i == 0) ||
-                    (is_direct_global_store(inst.get(), global) && i == 1);
+                const bool direct_ptr_use = (is_direct_global_load(inst.get(), global) && i == 0) ||
+                                            (is_direct_global_store(inst.get(), global) && i == 1);
                 if (!direct_ptr_use) {
                     return false;
                 }
@@ -675,14 +584,13 @@ oir::BasicBlock *split_exit_edge_with_store(oir::Function &function, oir::BasicB
     oir::cfg::remove_edge_no_phi_update(pred, succ);
     oir::cfg::add_edge(pred, split);
 
-    auto load = std::make_unique<oir::LoadInst>(
-        global->value_type(), slot, split,
-        global->name().empty() ? "global.out" : global->name() + ".out");
+    auto load = std::make_unique<oir::LoadInst>(global->value_type(), slot, split,
+                                                global->name().empty() ? "global.out"
+                                                                       : global->name() + ".out");
     auto *load_raw = load.get();
     split->append_instruction(std::move(load));
-    split->append_instruction(
-        std::make_unique<oir::StoreInst>(function.parent()->types().void_ty(), load_raw, global,
-                                         split));
+    split->append_instruction(std::make_unique<oir::StoreInst>(function.parent()->types().void_ty(),
+                                                               load_raw, global, split));
     oir::cfg::append_unconditional_branch(*function.parent(), split, succ);
     oir::cfg::replace_phi_incoming_block(succ, pred, split);
     return split;
@@ -696,9 +604,9 @@ bool promote_loop_global(oir::Function &function, const oir::Loop &loop,
     }
 
     auto *global = access.global;
-    auto *slot = insert_entry_alloca(
-        function, global->value_type(),
-        global->name().empty() ? "global.slot" : global->name() + ".slot");
+    auto *slot =
+        insert_entry_alloca(function, global->value_type(),
+                            global->name().empty() ? "global.slot" : global->name() + ".slot");
     if (slot == nullptr) {
         return false;
     }
@@ -708,9 +616,8 @@ bool promote_loop_global(oir::Function &function, const oir::Loop &loop,
         global->name().empty() ? "global.preload" : global->name() + ".preload");
     auto *pre_load_raw = pre_load.get();
     preheader->insert_before_terminator(std::move(pre_load));
-    preheader->insert_before_terminator(
-        std::make_unique<oir::StoreInst>(function.parent()->types().void_ty(), pre_load_raw, slot,
-                                         preheader));
+    preheader->insert_before_terminator(std::make_unique<oir::StoreInst>(
+        function.parent()->types().void_ty(), pre_load_raw, slot, preheader));
 
     for (auto *load : access.loads) {
         load->set_operand(0, slot);
@@ -798,20 +705,16 @@ PassKind OIRGlobalOptPass::kind() const {
 }
 
 PassResult OIRGlobalOptPass::run(PassContext &context) {
-    return oir_opt::run_oir_transform(context,
-                                      "OIRGlobalOptPass requires OIR module in pass context",
-                                      [](oir::Module &module, oir_opt::Stats &stats) {
-                                          bool changed =
-                                              oir_opt::propagate_global_constants(module, stats);
-                                          changed |= oir_opt::promote_global_loads(module, stats);
-                                          changed |=
-                                              oir_opt::scalar_replacement_of_aggregates(module,
-                                                                                        stats);
-                                          changed |=
-                                              oir_opt::promote_memory_to_registers(module, stats);
-                                          changed |= oir_opt::eliminate_dead_code(module, stats);
-                                          return changed;
-                                      });
+    return oir_opt::run_oir_transform(
+        context, "OIRGlobalOptPass requires OIR module in pass context",
+        [](oir::Module &module, oir_opt::Stats &stats) {
+            bool changed = oir_opt::propagate_global_constants(module, stats);
+            changed |= oir_opt::promote_global_loads(module, stats);
+            changed |= oir_opt::scalar_replacement_of_aggregates(module, stats);
+            changed |= oir_opt::promote_memory_to_registers(module, stats);
+            changed |= oir_opt::eliminate_dead_code(module, stats);
+            return changed;
+        });
 }
 
 } // namespace pass

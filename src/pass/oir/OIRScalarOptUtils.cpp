@@ -204,11 +204,13 @@ bool is_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::Store:
     case oir::Instruction::OpID::Call:
     case oir::Instruction::OpID::MemZero:
+    case oir::Instruction::OpID::FixedABIObjectStoreLane:
         return false;
     case oir::Instruction::OpID::Add:
     case oir::Instruction::OpID::Sub:
     case oir::Instruction::OpID::Mul:
     case oir::Instruction::OpID::And:
+    case oir::Instruction::OpID::Or:
     case oir::Instruction::OpID::Xor:
     case oir::Instruction::OpID::SDiv:
     case oir::Instruction::OpID::SRem:
@@ -225,7 +227,28 @@ bool is_pure_instruction(const oir::Instruction &inst) {
     case oir::Instruction::OpID::SIToFP:
     case oir::Instruction::OpID::FPToSI:
     case oir::Instruction::OpID::Phi:
+    case oir::Instruction::OpID::FixedABIExtractLane:
+    case oir::Instruction::OpID::FixedABIPack:
+    case oir::Instruction::OpID::FixedABIObjectLoadLane:
         return true;
+    case oir::Instruction::OpID::SetVL:
+    case oir::Instruction::OpID::Splat:
+    case oir::Instruction::OpID::StepVector:
+    case oir::Instruction::OpID::ExtractElement:
+    case oir::Instruction::OpID::InsertElement:
+    case oir::Instruction::OpID::ShuffleVector:
+    case oir::Instruction::OpID::VectorSelect:
+    case oir::Instruction::OpID::VectorCast:
+    case oir::Instruction::OpID::VPBinary:
+    case oir::Instruction::OpID::VPCmp:
+    case oir::Instruction::OpID::VPLoad:
+    case oir::Instruction::OpID::VPStore:
+    case oir::Instruction::OpID::MaskedLoad:
+    case oir::Instruction::OpID::MaskedStore:
+    case oir::Instruction::OpID::VPGather:
+    case oir::Instruction::OpID::VPScatter:
+    case oir::Instruction::OpID::VPReduction:
+        return false;
     }
     return false;
 }

@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
-#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -36,8 +35,8 @@ bool get_return_value(oir::BasicBlock *block, oir::Value *&value) {
     return true;
 }
 
-bool match_case_return(oir::BasicBlock *block, oir::Value *&payload,
-                       oir::Instruction::OpID &op, std::int64_t &factor) {
+bool match_case_return(oir::BasicBlock *block, oir::Value *&payload, oir::Instruction::OpID &op,
+                       std::int64_t &factor) {
     if (block == nullptr || block->instructions().size() != 2) {
         return false;
     }
@@ -95,9 +94,8 @@ bool match_chain_block(oir::BasicBlock *block, oir::Value *&selector, oir::Basic
     auto *cmp = dynamic_cast<oir::CmpInst *>(inst_it->get());
     ++inst_it;
     auto *branch = dynamic_cast<oir::BranchInst *>(inst_it->get());
-    if (cmp == nullptr || branch == nullptr || !branch->is_conditional() ||
-        branch->cond() != cmp || cmp->op() != oir::Instruction::OpID::ICmp ||
-        cmp->pred() != oir::CmpPred::EQ) {
+    if (cmp == nullptr || branch == nullptr || !branch->is_conditional() || branch->cond() != cmp ||
+        cmp->op() != oir::Instruction::OpID::ICmp || cmp->pred() != oir::CmpPred::EQ) {
         return false;
     }
 
@@ -186,21 +184,6 @@ bool match_dense_return_chain(oir::Function &function, DenseReturnChain &out) {
     return is_dense(out.factors_by_key);
 }
 
-std::string initializer_for(const std::map<std::int64_t, std::int64_t> &items) {
-    std::ostringstream oss;
-    oss << "{";
-    bool first = true;
-    for (const auto &[_, factor] : items) {
-        if (!first) {
-            oss << ", ";
-        }
-        first = false;
-        oss << factor;
-    }
-    oss << "}";
-    return oss.str();
-}
-
 void clear_body(oir::Function &function) {
     for (auto &block : function.blocks()) {
         for (auto &inst : block->instructions()) {
@@ -229,7 +212,12 @@ bool rewrite_as_factor_table(oir::Function &function, const DenseReturnChain &ch
     auto *array_type = module.types().array_ty(module.types().int32_ty(), count);
     const std::string table_name = next_table_name(module, next_table_id);
     auto *table = module.create_global(table_name, array_type, true);
-    table->set_initializer_literal(initializer_for(chain.factors_by_key));
+    std::vector<oir::Constant *> factors;
+    factors.reserve(chain.factors_by_key.size());
+    for (const auto &[_, factor] : chain.factors_by_key) {
+        factors.push_back(module.create_i32(factor));
+    }
+    table->set_initializer(module.create_constant_array(array_type, factors));
 
     auto *selector = chain.selector;
     auto *payload = chain.payload;
@@ -242,21 +230,20 @@ bool rewrite_as_factor_table(oir::Function &function, const DenseReturnChain &ch
 
     oir::IRBuilder builder(&module);
     builder.set_insert_point(entry);
-    auto *below_min = builder.create_icmp(oir::CmpPred::LT, selector, builder.i32(min_key),
-                                          "dense.below");
+    auto *below_min =
+        builder.create_icmp(oir::CmpPred::LT, selector, builder.i32(min_key), "dense.below");
     builder.create_cond_br(below_min, default_block, range_hi);
 
     builder.set_insert_point(range_hi);
-    auto *above_max = builder.create_icmp(oir::CmpPred::GT, selector, builder.i32(max_key),
-                                          "dense.above");
+    auto *above_max =
+        builder.create_icmp(oir::CmpPred::GT, selector, builder.i32(max_key), "dense.above");
     builder.create_cond_br(above_max, default_block, table_block);
 
     builder.set_insert_point(table_block);
     auto *zero = builder.i32(0);
-    auto *idx = min_key == 0
-                    ? static_cast<oir::Value *>(selector)
-                    : builder.create_binary(oir::Instruction::OpID::Sub, selector,
-                                            builder.i32(min_key), "dense.index");
+    auto *idx = min_key == 0 ? static_cast<oir::Value *>(selector)
+                             : builder.create_binary(oir::Instruction::OpID::Sub, selector,
+                                                     builder.i32(min_key), "dense.index");
     auto *factor_addr =
         builder.create_gep(table, module.types().ptr_ty(module.types().int32_ty()),
                            std::vector<oir::Value *>{zero, idx}, "dense.factor.addr");
