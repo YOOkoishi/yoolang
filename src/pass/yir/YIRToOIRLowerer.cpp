@@ -1,8 +1,11 @@
 #include "pass/yir/YIRToOIRLowerer.h"
 
+#include "builtin/BuiltinRegistry.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,6 +35,10 @@ bool is_scalar_type(const yir::TypePtr &type) {
     return type != nullptr &&
            (type->kind() == yir::Type::Kind::I1 || type->kind() == yir::Type::Kind::I32 ||
             type->kind() == yir::Type::Kind::F32);
+}
+
+bool is_ssa_value_type(const yir::TypePtr &type) {
+    return is_scalar_type(type) || (type != nullptr && (type->is_vector() || type->is_mask()));
 }
 
 yir::TypePtr scalar_element_type(yir::TypePtr type) {
@@ -108,7 +115,9 @@ class Lowerer final {
         declare_functions(module);
 
         for (const auto &function : module.functions()) {
-            lower_function(*function);
+            if (!function->is_external()) {
+                lower_function(*function);
+            }
         }
 
         return std::move(module_);
@@ -120,7 +129,7 @@ class Lowerer final {
             return types().void_ty();
         }
 
-        auto key = type->str();
+        const auto *key = type.get();
         auto found = type_cache_.find(key);
         if (found != type_cache_.end()) {
             return found->second;
@@ -147,19 +156,84 @@ class Lowerer final {
             out = types().array_ty(lower_type(type->element()),
                                    static_cast<std::size_t>(type->count()));
             break;
+        case yir::Type::Kind::Vector:
+            out = types().fixed_vector_ty(lower_type(type->element()), type->count());
+            break;
+        case yir::Type::Kind::Mask:
+            out = types().fixed_vector_ty(types().int1_ty(), type->count());
+            break;
         case yir::Type::Kind::Func: {
             std::vector<oir::Type *> params;
             params.reserve(type->params().size());
             for (const auto &param : type->params()) {
                 params.push_back(lower_type(param));
             }
-            out = types().func_ty(lower_type(type->result()), params);
+            out = types().func_ty(lower_type(type->result()), params, type->is_variadic());
             break;
         }
         }
 
-        type_cache_[std::move(key)] = out;
+        type_cache_[key] = out;
         return out;
+    }
+
+    oir::Constant *lower_constant(const yir::ConstantPtr &constant) {
+        if (constant == nullptr) {
+            throw std::runtime_error("cannot lower a null YIR typed constant");
+        }
+        if (auto found = constant_cache_.find(constant.get()); found != constant_cache_.end()) {
+            return found->second;
+        }
+
+        oir::Constant *lowered = nullptr;
+        if (const auto *integer = dynamic_cast<const yir::ConstantInt *>(constant.get())) {
+            auto *type = lower_type(integer->type());
+            if (type == types().int1_ty()) {
+                lowered = module_->create_i1(integer->value() != 0);
+            } else if (type == types().int32_ty()) {
+                lowered = module_->create_i32(integer->value());
+            } else {
+                throw std::runtime_error("YIR integer constant has an unsupported OIR type");
+            }
+        } else if (const auto *floating =
+                       dynamic_cast<const yir::ConstantFloat *>(constant.get())) {
+            lowered = module_->create_f32(floating->value());
+        } else if (dynamic_cast<const yir::ConstantAggregateZero *>(constant.get()) != nullptr) {
+            lowered = module_->create_zero(lower_type(constant->type()));
+        } else if (const auto *array = dynamic_cast<const yir::ConstantArray *>(constant.get())) {
+            std::vector<oir::Constant *> elements;
+            elements.reserve(array->elements().size());
+            for (const auto &element : array->elements()) {
+                elements.push_back(lower_constant(element));
+            }
+            auto *array_type = dynamic_cast<oir::ArrayType *>(lower_type(array->type()));
+            if (array_type == nullptr) {
+                throw std::runtime_error("YIR array constant did not lower to an OIR array type");
+            }
+            lowered = module_->create_constant_array(array_type, elements);
+        } else if (const auto *vector = dynamic_cast<const yir::ConstantVector *>(constant.get())) {
+            std::vector<oir::Constant *> elements;
+            elements.reserve(vector->lanes().size());
+            for (const auto &lane : vector->lanes()) {
+                elements.push_back(lower_constant(lane));
+            }
+            auto *vector_type = dynamic_cast<oir::VectorType *>(lower_type(vector->type()));
+            if (vector_type == nullptr) {
+                throw std::runtime_error("YIR vector constant did not lower to an OIR vector type");
+            }
+            lowered = module_->create_constant_vector(vector_type, elements);
+        } else if (const auto *mask = dynamic_cast<const yir::ConstantMask *>(constant.get())) {
+            auto *mask_type = dynamic_cast<oir::VectorType *>(lower_type(mask->type()));
+            if (mask_type == nullptr || !mask_type->is_mask()) {
+                throw std::runtime_error("YIR mask constant did not lower to an OIR mask type");
+            }
+            lowered = module_->create_constant_mask(mask_type, mask->packed_bytes());
+        } else {
+            throw std::runtime_error("unsupported YIR typed constant subclass");
+        }
+
+        constant_cache_.emplace(constant.get(), lowered);
+        return lowered;
     }
 
     oir::TypeContext &types() {
@@ -170,8 +244,11 @@ class Lowerer final {
         for (const auto &global : module.globals()) {
             auto *value_type = lower_type(global->storage_type());
             auto *out = module_->create_global(global->name(), value_type, global->is_const());
-            out->set_initializer_literal(global->initializer().empty() ? "zero"
-                                                                       : global->initializer());
+            if (global->typed_initializer()) {
+                out->set_initializer(lower_constant(global->typed_initializer()));
+            } else {
+                out->set_initializer(module_->create_zero(value_type));
+            }
             memory_addresses_[global->address()] = out;
         }
     }
@@ -183,8 +260,9 @@ class Lowerer final {
             for (const auto &param : function->param_types()) {
                 params.push_back(lower_type(param));
             }
-            auto *type = types().func_ty(lower_type(function->return_type()), params);
-            auto *out = module_->create_function(function->name(), type);
+            auto *type = types().func_ty(lower_type(function->return_type()), params,
+                                         function->is_variadic());
+            auto *out = module_->create_function(function->name(), type, function->is_external());
             functions_[function.get()] = out;
         }
     }
@@ -297,6 +375,103 @@ class Lowerer final {
             lower_decay(*decay);
             return;
         }
+        if (const auto *mask_binary = dynamic_cast<const yir::MaskBinaryOp *>(&op)) {
+            lower_mask_binary(*mask_binary);
+            return;
+        }
+        if (const auto *mask_not = dynamic_cast<const yir::MaskNotOp *>(&op)) {
+            lower_mask_not(*mask_not);
+            return;
+        }
+        if (const auto *bit_not = dynamic_cast<const yir::BitNotOp *>(&op)) {
+            lower_bit_not(*bit_not);
+            return;
+        }
+        if (const auto *create = dynamic_cast<const yir::VectorCreateOp *>(&op)) {
+            lower_vector_create(*create);
+            return;
+        }
+        if (const auto *splat = dynamic_cast<const yir::SplatOp *>(&op)) {
+            auto *result_type =
+                require_vector_type(lower_type(op.result()->type()), "yir.vector.splat result");
+            bind_result(op, builder_->create_splat(result_type, value_for(splat->scalar()),
+                                                   result_name(op.result(), "splat")));
+            return;
+        }
+        if (dynamic_cast<const yir::StepVectorOp *>(&op) != nullptr) {
+            auto *result_type =
+                require_vector_type(lower_type(op.result()->type()), "yir.vector.step result");
+            bind_result(op, builder_->create_step_vector(result_type,
+                                                         result_name(op.result(), "stepvector")));
+            return;
+        }
+        if (const auto *extract = dynamic_cast<const yir::ExtractLaneOp *>(&op)) {
+            bind_result(op, builder_->create_extract_element(value_for(extract->vector()),
+                                                             value_for(extract->index()),
+                                                             result_name(op.result(), "extract")));
+            return;
+        }
+        if (const auto *insert = dynamic_cast<const yir::InsertLaneOp *>(&op)) {
+            bind_result(op, builder_->create_insert_element(
+                                value_for(insert->vector()), value_for(insert->lane()),
+                                value_for(insert->index()), result_name(op.result(), "insert")));
+            return;
+        }
+        if (const auto *shuffle = dynamic_cast<const yir::ShuffleOp *>(&op)) {
+            std::vector<std::int64_t> indices;
+            indices.reserve(shuffle->indices().size());
+            for (auto index : shuffle->indices()) {
+                if (index == yir::ShuffleOp::UndefLane) {
+                    indices.push_back(-1);
+                    continue;
+                }
+                if (index > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    throw std::runtime_error("YIR shuffle index does not fit OIR i64 metadata");
+                }
+                indices.push_back(static_cast<std::int64_t>(index));
+            }
+            auto *result_type =
+                require_vector_type(lower_type(op.result()->type()), "yir.vector.shuffle result");
+            bind_result(op, builder_->create_shuffle_vector(result_type, value_for(shuffle->lhs()),
+                                                            value_for(shuffle->rhs()), indices,
+                                                            result_name(op.result(), "shuffle")));
+            return;
+        }
+        if (const auto *select = dynamic_cast<const yir::SelectOp *>(&op)) {
+            bind_result(op, builder_->create_vector_select(value_for(select->mask()),
+                                                           value_for(select->true_value()),
+                                                           value_for(select->false_value()),
+                                                           result_name(op.result(), "select")));
+            return;
+        }
+        if (const auto *cast = dynamic_cast<const yir::VectorCastOp *>(&op)) {
+            lower_vector_cast(*cast);
+            return;
+        }
+        if (const auto *mask_reduce = dynamic_cast<const yir::MaskReduceOp *>(&op)) {
+            lower_mask_reduce(*mask_reduce);
+            return;
+        }
+        if (const auto *reduce = dynamic_cast<const yir::VectorReduceOp *>(&op)) {
+            lower_vector_reduce(*reduce);
+            return;
+        }
+        if (const auto *load = dynamic_cast<const yir::MaskedLoadOp *>(&op)) {
+            lower_masked_load(*load);
+            return;
+        }
+        if (const auto *store = dynamic_cast<const yir::MaskedStoreOp *>(&op)) {
+            lower_masked_store(*store);
+            return;
+        }
+        if (const auto *gather = dynamic_cast<const yir::GatherOp *>(&op)) {
+            lower_gather(*gather);
+            return;
+        }
+        if (const auto *scatter = dynamic_cast<const yir::ScatterOp *>(&op)) {
+            lower_scatter(*scatter);
+            return;
+        }
         if (const auto *icmp = dynamic_cast<const yir::ICmpOp *>(&op)) {
             lower_icmp(*icmp);
             return;
@@ -310,8 +485,17 @@ class Lowerer final {
             return;
         }
         if (dynamic_cast<const yir::ZExtI1ToI32Op *>(&op) != nullptr) {
-            bind_result(op, builder_->create_zext(value_for(op.operands()[0]), types().int32_ty(),
-                                                  result_name(op.result(), "zext")));
+            auto *source = value_for(op.operands()[0]);
+            if (source->type()->is_vector()) {
+                auto *result_type =
+                    require_vector_type(lower_type(op.result()->type()), "vector zext result");
+                bind_result(op,
+                            builder_->create_vector_cast(oir::VectorCastKind::ZExt, result_type,
+                                                         source, result_name(op.result(), "zext")));
+            } else {
+                bind_result(op, builder_->create_zext(source, types().int32_ty(),
+                                                      result_name(op.result(), "zext")));
+            }
             return;
         }
         if (dynamic_cast<const yir::TruncI32ToI1Op *>(&op) != nullptr ||
@@ -320,13 +504,31 @@ class Lowerer final {
             return;
         }
         if (dynamic_cast<const yir::SIToFPOp *>(&op) != nullptr) {
-            bind_result(op, builder_->create_sitofp(value_for(op.operands()[0]), types().float_ty(),
-                                                    result_name(op.result(), "sitofp")));
+            auto *source = value_for(op.operands()[0]);
+            if (source->type()->is_vector()) {
+                auto *result_type =
+                    require_vector_type(lower_type(op.result()->type()), "vector sitofp result");
+                bind_result(op, builder_->create_vector_cast(oir::VectorCastKind::SIToFP,
+                                                             result_type, source,
+                                                             result_name(op.result(), "sitofp")));
+            } else {
+                bind_result(op, builder_->create_sitofp(source, types().float_ty(),
+                                                        result_name(op.result(), "sitofp")));
+            }
             return;
         }
         if (dynamic_cast<const yir::FPToSIOp *>(&op) != nullptr) {
-            bind_result(op, builder_->create_fptosi(value_for(op.operands()[0]), types().int32_ty(),
-                                                    result_name(op.result(), "fptosi")));
+            auto *source = value_for(op.operands()[0]);
+            if (source->type()->is_vector()) {
+                auto *result_type =
+                    require_vector_type(lower_type(op.result()->type()), "vector fptosi result");
+                bind_result(op, builder_->create_vector_cast(oir::VectorCastKind::FPToSI,
+                                                             result_type, source,
+                                                             result_name(op.result(), "fptosi")));
+            } else {
+                bind_result(op, builder_->create_fptosi(source, types().int32_ty(),
+                                                        result_name(op.result(), "fptosi")));
+            }
             return;
         }
         if (dynamic_cast<const yir::NotOp *>(&op) != nullptr) {
@@ -369,8 +571,9 @@ class Lowerer final {
 
     void lower_var(const yir::VarOp &op) {
         auto *result = op.result();
-        if (!is_scalar_type(result->type())) {
-            throw std::runtime_error("non-scalar yir.var should be represented by yir.array_var");
+        if (!is_ssa_value_type(result->type())) {
+            throw std::runtime_error("yir.var must be a scalar, fixed vector, or mask SSA value; "
+                                     "arrays use yir.array_var");
         }
 
         oir::Value *initial =
@@ -412,10 +615,14 @@ class Lowerer final {
         for (const auto &entry : op.entries()) {
             auto *ptr = create_element_ptr(op.array(), constant_indices(entry.indices),
                                            types().ptr_ty(element_type), unique_name("init.addr"));
-            oir::Value *value =
-                entry.value == nullptr
-                    ? literal_value(entry.literal, scalar_element_type(op.array_type()))
-                    : value_for(entry.value);
+            oir::Value *value = nullptr;
+            if (entry.value != nullptr) {
+                value = value_for(entry.value);
+            } else if (entry.constant != nullptr) {
+                value = lower_constant(entry.constant);
+            } else {
+                value = literal_value(entry.literal, scalar_element_type(op.array_type()));
+            }
             builder_->create_store(value, ptr);
         }
     }
@@ -458,6 +665,241 @@ class Lowerer final {
         bind_result(op, gep);
     }
 
+    oir::VectorType *require_vector_type(oir::Type *type, const char *context) {
+        auto *vector = dynamic_cast<oir::VectorType *>(type);
+        if (vector == nullptr) {
+            throw std::runtime_error(std::string(context) + " did not lower to an OIR vector type");
+        }
+        return vector;
+    }
+
+    std::uint64_t fixed_lane_count(const oir::VectorType *type, const char *context) const {
+        if (type == nullptr || type->element_count().is_scalable()) {
+            throw std::runtime_error(std::string(context) + " requires a fixed vector type");
+        }
+        if (type->element_count().min_lanes >
+            static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::runtime_error(std::string(context) +
+                                     " lane count does not fit scalar i32 EVL");
+        }
+        return type->element_count().min_lanes;
+    }
+
+    oir::ConstantMask *fixed_mask_constant(oir::VectorType *mask_type, bool initial_value,
+                                           bool clear_lane_zero = false) {
+        if (mask_type == nullptr || !mask_type->is_mask()) {
+            throw std::runtime_error("fixed mask constant requires an OIR mask type");
+        }
+        const auto lanes = fixed_lane_count(mask_type, "fixed mask constant");
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>((lanes + 7U) / 8U),
+                                        initial_value ? 0xffU : 0U);
+        if (initial_value && lanes % 8U != 0U) {
+            bytes.back() &= static_cast<std::uint8_t>((1U << (lanes % 8U)) - 1U);
+        }
+        if (clear_lane_zero && !bytes.empty()) {
+            bytes[0] &= static_cast<std::uint8_t>(~1U);
+        }
+        return module_->create_constant_mask(mask_type, bytes);
+    }
+
+    oir::ConstantInt *fixed_evl(const oir::VectorType *type, const char *context) {
+        return module_->create_i32(static_cast<std::int64_t>(fixed_lane_count(type, context)));
+    }
+
+    void lower_mask_binary(const yir::MaskBinaryOp &op) {
+        auto *lhs = value_for(op.lhs());
+        auto *rhs = value_for(op.rhs());
+        oir::Value *result = nullptr;
+        switch (op.kind()) {
+        case yir::MaskBinaryOp::Kind::And:
+            result = builder_->create_binary(oir::Instruction::OpID::And, lhs, rhs,
+                                             result_name(op.result(), "mask.and"));
+            break;
+        case yir::MaskBinaryOp::Kind::Xor:
+            result = builder_->create_binary(oir::Instruction::OpID::Xor, lhs, rhs,
+                                             result_name(op.result(), "mask.xor"));
+            break;
+        case yir::MaskBinaryOp::Kind::Or:
+            result = builder_->create_binary(oir::Instruction::OpID::Or, lhs, rhs,
+                                             result_name(op.result(), "mask.or"));
+            break;
+        }
+        bind_result(op, result);
+    }
+
+    void lower_mask_not(const yir::MaskNotOp &op) {
+        auto *mask = value_for(op.mask());
+        auto *mask_type = require_vector_type(mask->type(), "mask not operand");
+        auto *ones = fixed_mask_constant(mask_type, true);
+        bind_result(op, builder_->create_binary(oir::Instruction::OpID::Xor, mask, ones,
+                                                result_name(op.result(), "mask.not")));
+    }
+
+    void lower_bit_not(const yir::BitNotOp &op) {
+        auto *value = value_for(op.value());
+        oir::Value *ones = nullptr;
+        if (auto *vector_type = dynamic_cast<oir::VectorType *>(value->type())) {
+            if (!vector_type->is_integer_vector()) {
+                throw std::runtime_error(
+                    "YIR integer vector bit-not lowered with non-integer type");
+            }
+            ones = builder_->create_splat(vector_type, module_->create_i32(-1),
+                                          unique_name("bitnot.ones"));
+        } else if (value->type() == types().int32_ty()) {
+            ones = module_->create_i32(-1);
+        } else {
+            throw std::runtime_error("YIR bit-not requires scalar or vector i32 input");
+        }
+        bind_result(op, builder_->create_binary(oir::Instruction::OpID::Xor, value, ones,
+                                                result_name(op.result(), "bitnot")));
+    }
+
+    void lower_vector_create(const yir::VectorCreateOp &op) {
+        auto *result_type =
+            require_vector_type(lower_type(op.result()->type()), "yir.vector.create result");
+        oir::Value *current = module_->create_undef(result_type);
+        for (std::size_t index = 0; index < op.lanes().size(); ++index) {
+            const bool last = index + 1 == op.lanes().size();
+            current = builder_->create_insert_element(
+                current, value_for(op.lanes()[index]),
+                module_->create_i32(static_cast<std::int64_t>(index)),
+                last ? result_name(op.result(), "vector.create") : unique_name("vector.create"));
+        }
+        bind_result(op, current);
+    }
+
+    void lower_vector_cast(const yir::VectorCastOp &op) {
+        auto *source = value_for(op.value());
+        auto *source_type = require_vector_type(source->type(), "YIR vector cast source");
+        auto *result_type =
+            require_vector_type(lower_type(op.result()->type()), "YIR vector cast result");
+        if (source_type == result_type) {
+            bind_result(op, source);
+            return;
+        }
+        oir::VectorCastKind kind;
+        if (source_type->is_integer_vector() && result_type->is_float_vector()) {
+            kind = oir::VectorCastKind::SIToFP;
+        } else if (source_type->is_float_vector() && result_type->is_integer_vector()) {
+            kind = oir::VectorCastKind::FPToSI;
+        } else {
+            throw std::runtime_error("unsupported YIR vector element conversion");
+        }
+        bind_result(op, builder_->create_vector_cast(kind, result_type, source,
+                                                     result_name(op.result(), "vector.cast")));
+    }
+
+    oir::VPReductionInst *create_fixed_reduction(oir::ReductionKind kind, bool ordered,
+                                                 oir::Value *vector, const std::string &name) {
+        auto *vector_type = require_vector_type(vector->type(), "fixed reduction input");
+        const auto lanes = fixed_lane_count(vector_type, "fixed reduction input");
+        auto *initial = builder_->create_extract_element(vector, module_->create_i32(0),
+                                                         unique_name("reduce.initial"));
+        auto *mask_type = types().fixed_vector_ty(types().int1_ty(), lanes);
+        auto *active = fixed_mask_constant(mask_type, true, true);
+        return builder_->create_vp_reduction(
+            kind, ordered, vector, active, fixed_evl(vector_type, "fixed reduction input"), initial,
+            oir::TailPolicy::Agnostic, oir::MaskPolicy::Agnostic, name);
+    }
+
+    void lower_mask_reduce(const yir::MaskReduceOp &op) {
+        auto *mask = value_for(op.mask());
+        auto *mask_type = require_vector_type(mask->type(), "mask reduction input");
+        auto *active = fixed_mask_constant(mask_type, true);
+        oir::ReductionKind kind = oir::ReductionKind::Or;
+        bool invert_result = false;
+        bool initial = false;
+        if (op.kind() == yir::MaskReduceOp::Kind::All) {
+            kind = oir::ReductionKind::And;
+            initial = true;
+        } else if (op.kind() == yir::MaskReduceOp::Kind::None) {
+            invert_result = true;
+        }
+        const auto reduction_name =
+            invert_result ? unique_name("mask.reduce") : result_name(op.result(), "mask.reduce");
+        auto *reduced = builder_->create_vp_reduction(
+            kind, false, mask, active, fixed_evl(mask_type, "mask reduction input"),
+            module_->create_i1(initial), oir::TailPolicy::Agnostic, oir::MaskPolicy::Agnostic,
+            reduction_name);
+        oir::Value *result = reduced;
+        if (invert_result) {
+            result = builder_->create_binary(oir::Instruction::OpID::Xor, reduced,
+                                             module_->create_i1(true),
+                                             result_name(op.result(), "mask.none"));
+        }
+        bind_result(op, result);
+    }
+
+    void lower_vector_reduce(const yir::VectorReduceOp &op) {
+        auto *vector = value_for(op.vector());
+        oir::ReductionKind kind;
+        switch (op.kind()) {
+        case yir::VectorReduceOp::Kind::Add:
+            kind = oir::ReductionKind::Add;
+            break;
+        case yir::VectorReduceOp::Kind::Mul:
+            kind = oir::ReductionKind::Mul;
+            break;
+        case yir::VectorReduceOp::Kind::Min:
+            kind = oir::ReductionKind::Min;
+            break;
+        case yir::VectorReduceOp::Kind::Max:
+            kind = oir::ReductionKind::Max;
+            break;
+        case yir::VectorReduceOp::Kind::And:
+            kind = oir::ReductionKind::And;
+            break;
+        case yir::VectorReduceOp::Kind::Xor:
+            kind = oir::ReductionKind::Xor;
+            break;
+        case yir::VectorReduceOp::Kind::Or:
+            kind = oir::ReductionKind::Or;
+            break;
+        }
+        bind_result(op, create_fixed_reduction(kind, op.ordered(), vector,
+                                               result_name(op.result(), "reduce")));
+    }
+
+    void lower_masked_load(const yir::MaskedLoadOp &op) {
+        auto *passthrough = value_for(op.passthrough());
+        auto *vector_type = require_vector_type(passthrough->type(), "masked load passthrough");
+        bind_result(op, builder_->create_masked_load(
+                            vector_type, address_for(op.address()), value_for(op.mask()),
+                            fixed_evl(vector_type, "masked load"), passthrough,
+                            oir::TailPolicy::Agnostic, oir::MaskPolicy::Undisturbed,
+                            static_cast<std::size_t>(op.alignment()),
+                            result_name(op.result(), "masked.load")));
+    }
+
+    void lower_masked_store(const yir::MaskedStoreOp &op) {
+        auto *value = value_for(op.value());
+        auto *vector_type = require_vector_type(value->type(), "masked store value");
+        builder_->create_masked_store(value, address_for(op.address()), value_for(op.mask()),
+                                      fixed_evl(vector_type, "masked store"),
+                                      oir::TailPolicy::Agnostic, oir::MaskPolicy::Agnostic,
+                                      static_cast<std::size_t>(op.alignment()));
+    }
+
+    void lower_gather(const yir::GatherOp &op) {
+        auto *passthrough = value_for(op.passthrough());
+        auto *vector_type = require_vector_type(passthrough->type(), "gather passthrough");
+        bind_result(op, builder_->create_vp_gather(
+                            vector_type, address_for(op.base()), value_for(op.indices()),
+                            value_for(op.mask()), fixed_evl(vector_type, "gather"), passthrough,
+                            oir::TailPolicy::Agnostic, oir::MaskPolicy::Undisturbed,
+                            static_cast<std::size_t>(op.alignment()),
+                            result_name(op.result(), "gather")));
+    }
+
+    void lower_scatter(const yir::ScatterOp &op) {
+        auto *value = value_for(op.value());
+        auto *vector_type = require_vector_type(value->type(), "scatter value");
+        builder_->create_vp_scatter(value, address_for(op.base()), value_for(op.indices()),
+                                    value_for(op.mask()), fixed_evl(vector_type, "scatter"),
+                                    oir::TailPolicy::Agnostic, oir::MaskPolicy::Agnostic,
+                                    static_cast<std::size_t>(op.alignment()));
+    }
+
     void lower_binary(const yir::Operation &op, const yir::BinaryOpBase &binary) {
         oir::Instruction::OpID id;
         if (op.op_name() == "yir.addi") {
@@ -470,6 +912,12 @@ class Lowerer final {
             id = oir::Instruction::OpID::SDiv;
         } else if (op.op_name() == "yir.remsi") {
             id = oir::Instruction::OpID::SRem;
+        } else if (op.op_name() == "yir.andi") {
+            id = oir::Instruction::OpID::And;
+        } else if (op.op_name() == "yir.ori") {
+            id = oir::Instruction::OpID::Or;
+        } else if (op.op_name() == "yir.xori") {
+            id = oir::Instruction::OpID::Xor;
         } else if (op.op_name() == "yir.addf") {
             id = oir::Instruction::OpID::FAdd;
         } else if (op.op_name() == "yir.subf") {
@@ -877,7 +1325,7 @@ class Lowerer final {
 
         auto memory = memory_addresses_.find(value);
         if (memory != memory_addresses_.end()) {
-            if (is_scalar_type(value->type())) {
+            if (is_ssa_value_type(value->type())) {
                 return builder_->create_load(memory->second, lower_type(value->type()),
                                              unique_name(var_name(value) + ".load"));
             }
@@ -953,6 +1401,16 @@ class Lowerer final {
     }
 
     oir::Value *to_bool(oir::Value *value, const std::string &name) {
+        if (const auto *vector = dynamic_cast<const oir::VectorType *>(value->type())) {
+            auto *zero = module_->create_zero(value->type());
+            if (vector->is_float_vector()) {
+                return builder_->create_fcmp(oir::CmpPred::NE, value, zero, name);
+            }
+            if (vector->is_integer_vector()) {
+                return builder_->create_icmp(oir::CmpPred::NE, value, zero, name);
+            }
+            throw std::runtime_error("vector to-bool requires numeric vector input");
+        }
         if (auto *integer = dynamic_cast<oir::IntegerType *>(value->type())) {
             return builder_->create_icmp(oir::CmpPred::NE, value,
                                          integer->bit_width() == 1
@@ -1005,7 +1463,11 @@ class Lowerer final {
         if (auto *existing = module_->get_function(name)) {
             return existing;
         }
-        auto *type = types().func_ty(return_type, arg_types);
+        const auto *descriptor = builtin::BuiltinRegistry::instance().find(name);
+        const bool is_variadic = descriptor != nullptr && descriptor->variadic;
+        const std::vector<oir::Type *> fixed_params =
+            is_variadic ? std::vector<oir::Type *>{} : arg_types;
+        auto *type = types().func_ty(return_type, fixed_params, is_variadic);
         return module_->create_function(name, type, true);
     }
 
@@ -1091,7 +1553,8 @@ class Lowerer final {
     std::unique_ptr<oir::Module> module_;
     std::unique_ptr<oir::IRBuilder> builder_;
     oir::Function *current_function_ = nullptr;
-    std::unordered_map<std::string, oir::Type *> type_cache_;
+    std::unordered_map<const yir::Type *, oir::Type *> type_cache_;
+    std::unordered_map<const yir::Constant *, oir::Constant *> constant_cache_;
     std::unordered_map<const yir::Function *, oir::Function *> functions_;
     std::unordered_map<const yir::Value *, oir::Value *> value_map_;
     std::unordered_map<const yir::Value *, oir::Value *> memory_addresses_;

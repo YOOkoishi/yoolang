@@ -5,9 +5,6 @@
 #include "yir/YIRLoopAnalysis.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cctype>
-#include <cstdlib>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -69,11 +66,10 @@ std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const 
         return std::make_unique<yir::ZeroOp>(op.result()->type(), op.result()->name());
     }
     if (auto *var = dynamic_cast<const yir::VarOp *>(&op)) {
-        return std::make_unique<yir::VarOp>(op.result()->type(),
-                                            var->has_initializer()
-                                                ? map_value(var->initializer(), map)
-                                                : nullptr,
-                                            op.result()->name());
+        return std::make_unique<yir::VarOp>(
+            op.result()->type(),
+            var->has_initializer() ? map_value(var->initializer(), map) : nullptr,
+            op.result()->name());
     }
     if (auto *assign = dynamic_cast<const yir::AssignOp *>(&op)) {
         return std::make_unique<yir::AssignOp>(map_value(assign->target(), map),
@@ -147,8 +143,7 @@ std::unique_ptr<yir::Operation> clone_simple_op(const yir::Operation &op, const 
                                                op.result()->name());
     }
     if (dynamic_cast<const yir::NotOp *>(&op) != nullptr) {
-        return std::make_unique<yir::NotOp>(map_value(op.operands()[0], map),
-                                            op.result()->name());
+        return std::make_unique<yir::NotOp>(map_value(op.operands()[0], map), op.result()->name());
     }
     if (auto *call = dynamic_cast<const yir::CallOp *>(&op)) {
         return std::make_unique<yir::CallOp>(call->callee(), map_values(call->args(), map),
@@ -202,7 +197,7 @@ bool is_unroll_safe(const yir::Region &region) {
 
 bool region_has_if(const yir::Region &region) {
     for (const auto &op : region.operations()) {
-        if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
+        if (dynamic_cast<const yir::IfOp *>(op.get()) != nullptr) {
             return true;
         }
     }
@@ -224,37 +219,12 @@ std::size_t operation_count(const yir::Region &region) {
 }
 
 bool const_i32(const yir::Value *value, std::int64_t &out) {
-    auto *constant = value == nullptr ? nullptr : dynamic_cast<const yir::ConstI32Op *>(value->defining_op());
+    auto *constant =
+        value == nullptr ? nullptr : dynamic_cast<const yir::ConstI32Op *>(value->defining_op());
     if (constant == nullptr) {
         return false;
     }
     out = constant->value();
-    return true;
-}
-
-bool parse_int64_literal(const std::string &literal, std::int64_t &out) {
-    std::size_t begin = 0;
-    while (begin < literal.size() &&
-           std::isspace(static_cast<unsigned char>(literal[begin])) != 0) {
-        ++begin;
-    }
-    std::size_t end = literal.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(literal[end - 1])) != 0) {
-        --end;
-    }
-    if (begin == end || literal.compare(begin, end - begin, "zero") == 0) {
-        out = 0;
-        return begin != end;
-    }
-
-    std::string trimmed = literal.substr(begin, end - begin);
-    char *parse_end = nullptr;
-    errno = 0;
-    const long long value = std::strtoll(trimmed.c_str(), &parse_end, 0);
-    if (errno != 0 || parse_end == trimmed.c_str() || *parse_end != '\0') {
-        return false;
-    }
-    out = static_cast<std::int64_t>(value);
     return true;
 }
 
@@ -380,36 +350,33 @@ bool region_is_straight_line_cloneable(const yir::Region &region) {
     return true;
 }
 
-bool access_has_separate_dimension_for_iv(const yir::ArrayAccess &access,
-                                          const yir::Value *iv) {
+bool access_has_separate_dimension_for_iv(const yir::ArrayAccess &access, const yir::Value *iv) {
     if (iv == nullptr) {
         return false;
     }
-    return std::any_of(access.indices.begin(), access.indices.end(),
-                       [iv](const yir::AffineExpr &index) {
-                           if (index.unknown || index.terms.size() != 1) {
-                               return false;
-                           }
-                           const auto &term = index.terms.front();
-                           return term.value == iv &&
-                                  (term.coefficient == 1 || term.coefficient == -1);
-                       });
+    return std::any_of(
+        access.indices.begin(), access.indices.end(), [iv](const yir::AffineExpr &index) {
+            if (index.unknown || index.terms.size() != 1) {
+                return false;
+            }
+            const auto &term = index.terms.front();
+            return term.value == iv && (term.coefficient == 1 || term.coefficient == -1);
+        });
 }
 
-bool same_element_dependence_is_pointwise(
-    const yir::LoopSummary &summary, const yir::ArrayDependence &dependence,
-    const std::vector<const yir::Value *> &reordered_ivs) {
+bool same_element_dependence_is_pointwise(const yir::LoopSummary &summary,
+                                          const yir::ArrayDependence &dependence,
+                                          const std::vector<const yir::Value *> &reordered_ivs) {
     if (dependence.first >= summary.array_accesses.size() ||
         dependence.second >= summary.array_accesses.size()) {
         return false;
     }
     const auto &first = summary.array_accesses[dependence.first];
     const auto &second = summary.array_accesses[dependence.second];
-    return std::all_of(reordered_ivs.begin(), reordered_ivs.end(),
-                       [&](const yir::Value *iv) {
-                           return access_has_separate_dimension_for_iv(first, iv) &&
-                                  access_has_separate_dimension_for_iv(second, iv);
-                       });
+    return std::all_of(reordered_ivs.begin(), reordered_ivs.end(), [&](const yir::Value *iv) {
+        return access_has_separate_dimension_for_iv(first, iv) &&
+               access_has_separate_dimension_for_iv(second, iv);
+    });
 }
 
 bool dependence_allows_sequential_expansion(const yir::LoopSummary *summary) {
@@ -425,9 +392,8 @@ bool dependence_allows_sequential_expansion(const yir::LoopSummary *summary) {
     return true;
 }
 
-bool dependence_allows_reorder(
-    const yir::LoopSummary *summary,
-    std::initializer_list<const yir::Value *> reordered_ivs) {
+bool dependence_allows_reorder(const yir::LoopSummary *summary,
+                               std::initializer_list<const yir::Value *> reordered_ivs) {
     if (!dependence_allows_sequential_expansion(summary)) {
         return false;
     }
@@ -445,10 +411,9 @@ bool has_ranked_array_access(const yir::LoopSummary *summary, std::size_t rank) 
     if (summary == nullptr) {
         return false;
     }
-    return std::any_of(summary->array_accesses.begin(), summary->array_accesses.end(),
-                       [rank](const yir::ArrayAccess &access) {
-                           return access.indices.size() >= rank;
-                       });
+    return std::any_of(
+        summary->array_accesses.begin(), summary->array_accesses.end(),
+        [rank](const yir::ArrayAccess &access) { return access.indices.size() >= rank; });
 }
 
 std::int64_t affine_coefficient(const yir::AffineExpr &expr, const yir::Value *value) {
@@ -485,8 +450,7 @@ int last_dimension_score(const yir::LoopSummary *summary, const yir::Value *iv) 
     return score;
 }
 
-bool value_depends_on(const yir::Value *value, const yir::Value *needle,
-                      ValueSet &active) {
+bool value_depends_on(const yir::Value *value, const yir::Value *needle, ValueSet &active) {
     if (value == nullptr || needle == nullptr) {
         return false;
     }
@@ -514,8 +478,8 @@ bool value_depends_on(const yir::Value *value, const yir::Value *needle) {
 }
 
 bool loop_bounds_independent(const yir::ForOp &loop, const yir::Value *iv) {
-    return !value_depends_on(loop.lower_bound(), iv) &&
-           !value_depends_on(loop.upper_bound(), iv) && !value_depends_on(loop.step(), iv);
+    return !value_depends_on(loop.lower_bound(), iv) && !value_depends_on(loop.upper_bound(), iv) &&
+           !value_depends_on(loop.step(), iv);
 }
 
 bool is_reduction_assign(const yir::AssignOp &assign) {
@@ -709,22 +673,22 @@ bool collect_reduction_infos_recursive(
     for (const auto &op : region.operations()) {
         if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
             if (!collect_reduction_infos_recursive(if_op->then_region(), locals, reductions,
-                                                   allowed_reduction_results,
-                                                   allowed_reduction_ops, allowed_assigns)) {
+                                                   allowed_reduction_results, allowed_reduction_ops,
+                                                   allowed_assigns)) {
                 return false;
             }
             if (if_op->has_else() &&
                 !collect_reduction_infos_recursive(if_op->else_region(), locals, reductions,
-                                                   allowed_reduction_results,
-                                                   allowed_reduction_ops, allowed_assigns)) {
+                                                   allowed_reduction_results, allowed_reduction_ops,
+                                                   allowed_assigns)) {
                 return false;
             }
             continue;
         }
         if (auto *for_op = dynamic_cast<const yir::ForOp *>(op.get())) {
             if (!collect_reduction_infos_recursive(for_op->body_region(), locals, reductions,
-                                                   allowed_reduction_results,
-                                                   allowed_reduction_ops, allowed_assigns)) {
+                                                   allowed_reduction_results, allowed_reduction_ops,
+                                                   allowed_assigns)) {
                 return false;
             }
             continue;
@@ -829,8 +793,7 @@ bool region_depends_on_value(const yir::Region &region, const yir::Value *needle
     return false;
 }
 
-bool op_or_nested_region_depends_on_value(const yir::Operation &op,
-                                          const yir::Value *needle) {
+bool op_or_nested_region_depends_on_value(const yir::Operation &op, const yir::Value *needle) {
     for (auto *operand : op.operands()) {
         if (value_depends_on(operand, needle)) {
             return true;
@@ -850,8 +813,7 @@ bool op_or_nested_region_depends_on_value(const yir::Operation &op,
     return false;
 }
 
-bool ops_after_depend_on_value(const OpList &ops, std::size_t index,
-                               const yir::Value *needle) {
+bool ops_after_depend_on_value(const OpList &ops, std::size_t index, const yir::Value *needle) {
     for (std::size_t i = index + 1; i < ops.size(); ++i) {
         if (op_or_nested_region_depends_on_value(*ops[i], needle)) {
             return true;
@@ -862,10 +824,9 @@ bool ops_after_depend_on_value(const OpList &ops, std::size_t index,
 
 bool only_additive_reduction_ops(
     const std::unordered_set<const yir::Operation *> &allowed_reduction_ops) {
-    return std::all_of(allowed_reduction_ops.begin(), allowed_reduction_ops.end(),
-                       [](const yir::Operation *op) {
-                           return dynamic_cast<const yir::AddIOp *>(op) != nullptr;
-                       });
+    return std::all_of(
+        allowed_reduction_ops.begin(), allowed_reduction_ops.end(),
+        [](const yir::Operation *op) { return dynamic_cast<const yir::AddIOp *>(op) != nullptr; });
 }
 
 void replace_value_in_region(yir::Region &region, yir::Value *old_value, yir::Value *new_value) {
@@ -919,13 +880,11 @@ bool reduction_target_uses_are_isolated(
     for (const auto &op : region.operations()) {
         if (auto *if_op = dynamic_cast<const yir::IfOp *>(op.get())) {
             if (value_set_contains_dependency(if_op->condition(), targets) ||
-                !reduction_target_uses_are_isolated(if_op->then_region(), targets,
-                                                    allowed_results, allowed_reduction_ops,
-                                                    allowed_assigns) ||
+                !reduction_target_uses_are_isolated(if_op->then_region(), targets, allowed_results,
+                                                    allowed_reduction_ops, allowed_assigns) ||
                 (if_op->has_else() &&
-                 !reduction_target_uses_are_isolated(if_op->else_region(), targets,
-                                                     allowed_results, allowed_reduction_ops,
-                                                     allowed_assigns))) {
+                 !reduction_target_uses_are_isolated(if_op->else_region(), targets, allowed_results,
+                                                     allowed_reduction_ops, allowed_assigns))) {
                 return false;
             }
             continue;
@@ -934,9 +893,8 @@ bool reduction_target_uses_are_isolated(
             if (value_set_contains_dependency(for_op->lower_bound(), targets) ||
                 value_set_contains_dependency(for_op->upper_bound(), targets) ||
                 value_set_contains_dependency(for_op->step(), targets) ||
-                !reduction_target_uses_are_isolated(for_op->body_region(), targets,
-                                                    allowed_results, allowed_reduction_ops,
-                                                    allowed_assigns)) {
+                !reduction_target_uses_are_isolated(for_op->body_region(), targets, allowed_results,
+                                                    allowed_reduction_ops, allowed_assigns)) {
                 return false;
             }
             continue;
@@ -974,8 +932,7 @@ bool reduction_target_uses_are_isolated(
     return true;
 }
 
-bool scalar_assignments_are_vectorizable(const yir::Region &region,
-                                         const yir::Value *induction_var,
+bool scalar_assignments_are_vectorizable(const yir::Region &region, const yir::Value *induction_var,
                                          bool allow_reductions) {
     auto locals = direct_local_scalar_vars(region);
     for (const auto &op : region.operations()) {
@@ -997,8 +954,7 @@ bool scalar_assignments_are_vectorizable(const yir::Region &region,
     return true;
 }
 
-bool has_nonlocal_scalar_assignment(const yir::Region &region,
-                                    const yir::Value *first_induction,
+bool has_nonlocal_scalar_assignment(const yir::Region &region, const yir::Value *first_induction,
                                     const yir::Value *second_induction) {
     auto locals = direct_local_scalar_vars(region);
     for (const auto &op : region.operations()) {
@@ -1076,9 +1032,8 @@ std::size_t count_assignments_to_value(const yir::Region &region, const yir::Val
     return count;
 }
 
-void collect_scalar_assignment_targets(
-    const yir::Region &region,
-    std::unordered_set<const yir::Value *> &targets) {
+void collect_scalar_assignment_targets(const yir::Region &region,
+                                       std::unordered_set<const yir::Value *> &targets) {
     for (const auto &op : region.operations()) {
         if (auto *assign = dynamic_cast<const yir::AssignOp *>(op.get())) {
             targets.insert(assign->target());
@@ -1204,9 +1159,8 @@ int choose_tile_size(std::int64_t outer_trip_count, std::int64_t inner_trip_coun
     return 0;
 }
 
-int choose_unroll_factor(std::int64_t trip_count, std::size_t body_ops,
-                         int max_factor, std::size_t max_unrolled_ops,
-                         bool has_control_flow) {
+int choose_unroll_factor(std::int64_t trip_count, std::size_t body_ops, int max_factor,
+                         std::size_t max_unrolled_ops, bool has_control_flow) {
     if (trip_count <= 0 || max_factor < 2 || body_ops == 0) {
         return 0;
     }
@@ -1258,9 +1212,10 @@ class Optimizer final {
             if (!global->is_const() || global->storage_type() != yir::Type::get_i32()) {
                 continue;
             }
-            std::int64_t value = 0;
-            if (parse_int64_literal(global->initializer(), value)) {
-                constant_globals_[global->address()] = value;
+            const auto *initializer =
+                dynamic_cast<const yir::ConstantInt *>(global->typed_initializer().get());
+            if (initializer != nullptr && initializer->type() == yir::Type::get_i32()) {
+                constant_globals_[global->address()] = initializer->value();
             }
         }
     }
@@ -1274,8 +1229,7 @@ class Optimizer final {
             return false;
         }
         out = found->second;
-        return out >= std::numeric_limits<int>::min() &&
-               out <= std::numeric_limits<int>::max();
+        return out >= std::numeric_limits<int>::min() && out <= std::numeric_limits<int>::max();
     }
 
     void optimize_region(yir::Region &region, const yir::LoopAnalysis &analysis) {
@@ -1291,8 +1245,7 @@ class Optimizer final {
                 optimize_region(while_op->body_region(), analysis);
                 mark_changed(hoist_loop_invariants(ops, i, while_op->body_region(), nullptr));
             } else if (auto *for_op = dynamic_cast<yir::ForOp *>(ops[i].get())) {
-                if (hoist_loop_invariants(ops, i, for_op->body_region(),
-                                          for_op->induction_var())) {
+                if (hoist_loop_invariants(ops, i, for_op->body_region(), for_op->induction_var())) {
                     mark_changed(true);
                     continue;
                 }
@@ -1306,8 +1259,8 @@ class Optimizer final {
                     continue;
                 }
                 optimize_region(for_op->body_region(), analysis);
-                mark_changed(hoist_loop_invariants(ops, i, for_op->body_region(),
-                                                   for_op->induction_var()));
+                mark_changed(
+                    hoist_loop_invariants(ops, i, for_op->body_region(), for_op->induction_var()));
             }
         }
     }
@@ -1390,8 +1343,7 @@ class Optimizer final {
         return step > 0;
     }
 
-    bool try_unroll_countdown_while(OpList &ops, std::size_t &index,
-                                    const yir::WhileOp &while_op) {
+    bool try_unroll_countdown_while(OpList &ops, std::size_t &index, const yir::WhileOp &while_op) {
         auto *iv = truthy_while_condition_value(while_op);
         if (iv == nullptr || !is_unroll_safe(while_op.body_region())) {
             return false;
@@ -1443,8 +1395,7 @@ class Optimizer final {
         return true;
     }
 
-    bool try_fold_repeated_additive_reduction(OpList &ops, std::size_t &index,
-                                              yir::ForOp &for_op) {
+    bool try_fold_repeated_additive_reduction(OpList &ops, std::size_t &index, yir::ForOp &for_op) {
         std::int64_t lower = 0;
         std::int64_t step = 0;
         if (!const_i32_value(for_op.lower_bound(), lower) ||
@@ -1518,8 +1469,7 @@ class Optimizer final {
             derived_name(for_op.upper_bound(), ".repeat.has_trip", "repeat.has_trip"));
         auto *positive_trip_value = positive_trip->result();
         positive_trip->set_parent(parent);
-        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index),
-                   std::move(positive_trip));
+        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index), std::move(positive_trip));
         ++index;
 
         auto folded = std::make_unique<yir::IfOp>(positive_trip_value);
@@ -1532,9 +1482,9 @@ class Optimizer final {
         delta_zero->set_parent(&folded_if->then_region());
         folded_if->then_region().operations().push_back(std::move(delta_zero));
 
-        auto delta_var = std::make_unique<yir::VarOp>(
-            yir::Type::get_i32(), delta_zero_value,
-            derived_name(target, ".repeat.delta", "repeat.delta"));
+        auto delta_var =
+            std::make_unique<yir::VarOp>(yir::Type::get_i32(), delta_zero_value,
+                                         derived_name(target, ".repeat.delta", "repeat.delta"));
         auto *delta_value = delta_var->result();
         delta_var->set_parent(&folded_if->then_region());
         folded_if->then_region().operations().push_back(std::move(delta_var));
@@ -1549,9 +1499,9 @@ class Optimizer final {
         source_body.clear();
         replace_value_in_ops(then_ops, moved_body_begin, target, delta_value);
 
-        auto scaled = std::make_unique<yir::MulIOp>(
-            delta_value, for_op.upper_bound(),
-            derived_name(target, ".repeat.scaled", "repeat.scaled"));
+        auto scaled =
+            std::make_unique<yir::MulIOp>(delta_value, for_op.upper_bound(),
+                                          derived_name(target, ".repeat.scaled", "repeat.scaled"));
         auto *scaled_value = scaled->result();
         scaled->set_parent(&folded_if->then_region());
         then_ops.push_back(std::move(scaled));
@@ -1622,8 +1572,8 @@ class Optimizer final {
         }
 
         const auto count = trip_count(lower, upper, step);
-        const int factor = choose_unroll_factor(count, counted_ops, 8, 320,
-                                                region_has_if(for_op.body_region()));
+        const int factor =
+            choose_unroll_factor(count, counted_ops, 8, 320, region_has_if(for_op.body_region()));
         if (factor == 0) {
             return false;
         }
@@ -1644,13 +1594,12 @@ class Optimizer final {
             ++index;
 
             for (int lane = 1; lane < factor; ++lane) {
-                auto lane_var = std::make_unique<yir::VarOp>(
-                    yir::Type::get_i32(), identity_value,
-                    derived_name(target, ".red.acc", "red.acc"));
+                auto lane_var =
+                    std::make_unique<yir::VarOp>(yir::Type::get_i32(), identity_value,
+                                                 derived_name(target, ".red.acc", "red.acc"));
                 auto *lane_value = lane_var->result();
                 lane_var->set_parent(parent);
-                ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index),
-                           std::move(lane_var));
+                ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index), std::move(lane_var));
                 ++index;
                 lane_accumulators[target].push_back(lane_value);
             }
@@ -1674,8 +1623,7 @@ class Optimizer final {
             ValueMap map;
             map[for_op.induction_var()] = offset_value;
             for (const auto &[target, lanes] : lane_accumulators) {
-                map[const_cast<yir::Value *>(target)] =
-                    lanes[static_cast<std::size_t>(lane - 1)];
+                map[const_cast<yir::Value *>(target)] = lanes[static_cast<std::size_t>(lane - 1)];
             }
             append_clone_sequence(for_op.body_region(), for_op.body_region(), std::move(map),
                                   original_count);
@@ -1698,9 +1646,8 @@ class Optimizer final {
                 combine->set_parent(parent);
                 combines.push_back(std::move(combine));
 
-                auto assign =
-                    std::make_unique<yir::AssignOp>(const_cast<yir::Value *>(target),
-                                                    combined_value);
+                auto assign = std::make_unique<yir::AssignOp>(const_cast<yir::Value *>(target),
+                                                              combined_value);
                 assign->set_parent(parent);
                 combines.push_back(std::move(assign));
             }
@@ -1726,8 +1673,8 @@ class Optimizer final {
         }
 
         const auto *inner_summary = analysis.summary_for(inner);
-        if (!dependence_allows_reorder(
-                inner_summary, {outer.induction_var(), inner->induction_var()}) ||
+        if (!dependence_allows_reorder(inner_summary,
+                                       {outer.induction_var(), inner->induction_var()}) ||
             !has_ranked_array_access(inner_summary, 2)) {
             return false;
         }
@@ -1760,8 +1707,8 @@ class Optimizer final {
         }
 
         const auto *inner_summary = analysis.summary_for(inner);
-        if (!dependence_allows_reorder(
-                inner_summary, {outer.induction_var(), inner->induction_var()}) ||
+        if (!dependence_allows_reorder(inner_summary,
+                                       {outer.induction_var(), inner->induction_var()}) ||
             !has_ranked_array_access(inner_summary, 2)) {
             return false;
         }
@@ -1798,29 +1745,23 @@ class Optimizer final {
         auto *inner_upper_value = inner->upper_bound();
         auto *inner_step_value = inner->step();
 
-        auto *outer_tile_step =
-            insert_const_i32_before(ops, index, tile_size,
-                                    derived_name(outer_iv, ".tile.step", "tile.step"));
-        auto *inner_tile_step =
-            insert_const_i32_before(ops, index, tile_size,
-                                    derived_name(inner_iv, ".tile.step", "tile.step"));
+        auto *outer_tile_step = insert_const_i32_before(
+            ops, index, tile_size, derived_name(outer_iv, ".tile.step", "tile.step"));
+        auto *inner_tile_step = insert_const_i32_before(
+            ops, index, tile_size, derived_name(inner_iv, ".tile.step", "tile.step"));
 
         auto outer_tile_var = std::make_unique<yir::VarOp>(
-            yir::Type::get_i32(), outer_lower_value,
-            derived_name(outer_iv, ".tile", "tile.outer"));
+            yir::Type::get_i32(), outer_lower_value, derived_name(outer_iv, ".tile", "tile.outer"));
         auto *outer_tile_iv = outer_tile_var->result();
         outer_tile_var->set_parent(parent);
-        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index),
-                   std::move(outer_tile_var));
+        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index), std::move(outer_tile_var));
         ++index;
 
         auto inner_tile_var = std::make_unique<yir::VarOp>(
-            yir::Type::get_i32(), inner_lower_value,
-            derived_name(inner_iv, ".tile", "tile.inner"));
+            yir::Type::get_i32(), inner_lower_value, derived_name(inner_iv, ".tile", "tile.inner"));
         auto *inner_tile_iv = inner_tile_var->result();
         inner_tile_var->set_parent(parent);
-        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index),
-                   std::move(inner_tile_var));
+        ops.insert(ops.begin() + static_cast<std::ptrdiff_t>(index), std::move(inner_tile_var));
         ++index;
 
         std::vector<std::unique_ptr<yir::Operation>> payload;
@@ -1831,14 +1772,12 @@ class Optimizer final {
         }
         old_payload.clear();
 
-        auto outer_tile =
-            std::make_unique<yir::ForOp>(outer_tile_iv, outer_lower_value, outer_upper_value,
-                                         outer_tile_step);
+        auto outer_tile = std::make_unique<yir::ForOp>(outer_tile_iv, outer_lower_value,
+                                                       outer_upper_value, outer_tile_step);
         outer_tile->set_parent(parent);
 
-        auto inner_tile =
-            std::make_unique<yir::ForOp>(inner_tile_iv, inner_lower_value, inner_upper_value,
-                                         inner_tile_step);
+        auto inner_tile = std::make_unique<yir::ForOp>(inner_tile_iv, inner_lower_value,
+                                                       inner_upper_value, inner_tile_step);
         auto *inner_tile_raw = inner_tile.get();
         inner_tile->set_parent(&outer_tile->body_region());
         outer_tile->body_region().operations().push_back(std::move(inner_tile));
@@ -1855,16 +1794,14 @@ class Optimizer final {
         inner_limit->set_parent(&inner_tile_raw->body_region());
         inner_tile_raw->body_region().operations().push_back(std::move(inner_limit));
 
-        auto point_outer =
-            std::make_unique<yir::ForOp>(outer_iv, outer_tile_iv, outer_limit_value,
-                                         outer_step_value);
+        auto point_outer = std::make_unique<yir::ForOp>(outer_iv, outer_tile_iv, outer_limit_value,
+                                                        outer_step_value);
         auto *point_outer_raw = point_outer.get();
         point_outer->set_parent(&inner_tile_raw->body_region());
         inner_tile_raw->body_region().operations().push_back(std::move(point_outer));
 
-        auto point_inner =
-            std::make_unique<yir::ForOp>(inner_iv, inner_tile_iv, inner_limit_value,
-                                         inner_step_value);
+        auto point_inner = std::make_unique<yir::ForOp>(inner_iv, inner_tile_iv, inner_limit_value,
+                                                        inner_step_value);
         auto *point_inner_raw = point_inner.get();
         point_inner->set_parent(&point_outer_raw->body_region());
         point_outer_raw->body_region().operations().push_back(std::move(point_inner));
@@ -1890,8 +1827,8 @@ class Optimizer final {
             return false;
         }
         const auto *inner_summary = analysis.summary_for(inner);
-        if (!dependence_allows_reorder(
-                inner_summary, {outer.induction_var(), inner->induction_var()}) ||
+        if (!dependence_allows_reorder(inner_summary,
+                                       {outer.induction_var(), inner->induction_var()}) ||
             !has_ranked_array_access(inner_summary, 1)) {
             return false;
         }
@@ -1900,8 +1837,8 @@ class Optimizer final {
         std::int64_t upper = 0;
         std::int64_t step = 0;
         if (!const_i32_value(outer.lower_bound(), lower) ||
-            !const_i32_value(outer.upper_bound(), upper) ||
-            !const_i32_value(outer.step(), step) || step != 1) {
+            !const_i32_value(outer.upper_bound(), upper) || !const_i32_value(outer.step(), step) ||
+            step != 1) {
             return false;
         }
 
@@ -1949,15 +1886,14 @@ class Optimizer final {
     bool try_vectorize_inner_loop(OpList &ops, std::size_t &index, yir::ForOp &for_op,
                                   const yir::LoopAnalysis &analysis) {
         if (!region_is_straight_line_cloneable(for_op.body_region()) ||
-            !scalar_assignments_are_vectorizable(for_op.body_region(),
-                                                 for_op.induction_var(), true) ||
+            !scalar_assignments_are_vectorizable(for_op.body_region(), for_op.induction_var(),
+                                                 true) ||
             distinct_scalar_assignment_targets(for_op.body_region()) > 1) {
             return false;
         }
 
         const auto *summary = analysis.summary_for(&for_op);
-        if (!dependence_allows_sequential_expansion(summary) ||
-            summary->array_accesses.empty()) {
+        if (!dependence_allows_sequential_expansion(summary) || summary->array_accesses.empty()) {
             return false;
         }
 
@@ -2037,8 +1973,8 @@ class Optimizer final {
                        (for_op.body_region().operations().size() + 1));
         for (std::int64_t iter = 0; iter < trip_count; ++iter) {
             ValueMap map;
-            auto iv_const = std::make_unique<yir::ConstI32Op>(
-                static_cast<int>(lower + iter * step), for_op.induction_var()->name());
+            auto iv_const = std::make_unique<yir::ConstI32Op>(static_cast<int>(lower + iter * step),
+                                                              for_op.induction_var()->name());
             iv_const->set_parent(ops[index]->parent());
             map[for_op.induction_var()] = iv_const->result();
             clones.push_back(std::move(iv_const));
@@ -2062,8 +1998,7 @@ class Optimizer final {
         auto *final_result = final_const->result();
         clones.push_back(std::move(final_const));
 
-        auto final_assign =
-            std::make_unique<yir::AssignOp>(for_op.induction_var(), final_result);
+        auto final_assign = std::make_unique<yir::AssignOp>(for_op.induction_var(), final_result);
         final_assign->set_parent(ops[index]->parent());
         clones.push_back(std::move(final_assign));
 
