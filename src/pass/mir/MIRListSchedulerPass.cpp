@@ -1,5 +1,6 @@
 #include "pass/mir/MIRListSchedulerPass.h"
 
+#include "mir/MachineInstrDesc.h"
 #include "mir/MIRVerifier.h"
 #include "pass/mir/MIRCostModel.h"
 
@@ -46,35 +47,6 @@ struct SchedulePlan {
     unsigned scheduled_cycles = 0;
 };
 
-bool is_branch(mir::Opcode opcode) {
-    switch (opcode) {
-    case mir::Opcode::BranchNonZero:
-    case mir::Opcode::BranchZero:
-    case mir::Opcode::BranchEq:
-    case mir::Opcode::BranchNe:
-    case mir::Opcode::BranchLT:
-    case mir::Opcode::BranchGE:
-    case mir::Opcode::Jump:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool is_store_or_side_effect(mir::Opcode opcode) {
-    switch (opcode) {
-    case mir::Opcode::StoreSlot:
-    case mir::Opcode::StoreMem:
-    case mir::Opcode::StoreMemOffset:
-    case mir::Opcode::MemZero:
-    case mir::Opcode::StoreOutgoingArg:
-    case mir::Opcode::Call:
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool is_zero_reg(const mir::Register &reg) {
     return reg.is_physical() && reg.name == "zero";
 }
@@ -91,7 +63,10 @@ bool has_prera_fixed_physical_operand(const mir::MachineInstr &instr) {
 
 bool is_schedulable_instr(const mir::MachineInstr &instr, bool post_ra) {
     const auto opcode = instr.opcode();
-    if (is_branch(opcode) || is_store_or_side_effect(opcode) || opcode == mir::Opcode::Comment) {
+    const auto &desc = mir::instruction_desc(opcode);
+    if (desc.has_flag(mir::MIF_Branch) || desc.has_flag(mir::MIF_Barrier) ||
+        desc.has_flag(mir::MIF_SideEffects) || desc.may_store() ||
+        opcode == mir::Opcode::Comment) {
         return false;
     }
     if (!post_ra && has_prera_fixed_physical_operand(instr)) {
@@ -111,34 +86,7 @@ bool is_schedulable_instr(const mir::MachineInstr &instr, bool post_ra) {
 }
 
 unsigned opcode_latency(mir::Opcode opcode) {
-    switch (opcode) {
-    case mir::Opcode::LoadMem:
-    case mir::Opcode::LoadMemOffset:
-    case mir::Opcode::LoadSlot:
-    case mir::Opcode::LoadIncomingArg:
-        return 4;
-    case mir::Opcode::Mul:
-    case mir::Opcode::MulW:
-    case mir::Opcode::FMulS:
-        return 4;
-    case mir::Opcode::FAddS:
-    case mir::Opcode::FSubS:
-    case mir::Opcode::FeqS:
-    case mir::Opcode::FltS:
-    case mir::Opcode::FleS:
-    case mir::Opcode::FcvtSW:
-    case mir::Opcode::FcvtWS:
-    case mir::Opcode::FmvWX:
-        return 3;
-    case mir::Opcode::DivW:
-    case mir::Opcode::DivU:
-    case mir::Opcode::RemW:
-        return 12;
-    case mir::Opcode::FDivS:
-        return 16;
-    default:
-        return 1;
-    }
+    return mir::instruction_desc(opcode).latency;
 }
 
 bool same_reg(const mir::Register &lhs, const mir::Register &rhs) {

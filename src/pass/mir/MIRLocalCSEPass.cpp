@@ -1,5 +1,6 @@
 #include "pass/mir/MIRLocalCSEPass.h"
 
+#include "mir/MachineInstrDesc.h"
 #include "pass/mir/MIRCostModel.h"
 #include "pass/mir/MIRPeepholeCommon.h"
 
@@ -182,9 +183,9 @@ std::optional<std::string> cse_key(const mir::MachineInstr &instr,
 }
 
 bool memory_or_call_barrier(mir::Opcode opcode) {
-    return opcode == mir::Opcode::Call || opcode == mir::Opcode::StoreMem ||
-           opcode == mir::Opcode::StoreMemOffset || opcode == mir::Opcode::StoreSlot ||
-           opcode == mir::Opcode::MemZero;
+    const auto &desc = mir::instruction_desc(opcode);
+    return desc.has_flag(mir::MIF_Call) || desc.has_flag(mir::MIF_Barrier) ||
+           desc.may_store();
 }
 
 BlockSet all_blocks(mir::MachineFunction &function) {

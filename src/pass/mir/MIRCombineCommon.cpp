@@ -96,6 +96,7 @@ bool is_pure_def(mir::Opcode opcode) {
     case mir::Opcode::FcvtSW:
     case mir::Opcode::FcvtWS:
     case mir::Opcode::FmvWX:
+    case mir::Opcode::FmvXW:
         return true;
     default:
         return false;

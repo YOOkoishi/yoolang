@@ -1,5 +1,6 @@
 #include "pass/mir/MIRDiagnosticsPass.h"
 
+#include "mir/MachineInstrDesc.h"
 #include "mir/MIRPrinter.h"
 
 #include <sstream>
@@ -11,49 +12,7 @@ namespace {
 
 bool is_move(mir::Opcode opcode) {
     return opcode == mir::Opcode::Move || opcode == mir::Opcode::FMove ||
-           opcode == mir::Opcode::FmvWX;
-}
-
-bool is_jump(mir::Opcode opcode) {
-    return opcode == mir::Opcode::Jump;
-}
-
-bool is_branch(mir::Opcode opcode) {
-    switch (opcode) {
-    case mir::Opcode::BranchNonZero:
-    case mir::Opcode::BranchZero:
-    case mir::Opcode::BranchEq:
-    case mir::Opcode::BranchNe:
-    case mir::Opcode::BranchLT:
-    case mir::Opcode::BranchGE:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool is_load(mir::Opcode opcode) {
-    switch (opcode) {
-    case mir::Opcode::LoadSlot:
-    case mir::Opcode::LoadMem:
-    case mir::Opcode::LoadMemOffset:
-    case mir::Opcode::LoadIncomingArg:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool is_store(mir::Opcode opcode) {
-    switch (opcode) {
-    case mir::Opcode::StoreSlot:
-    case mir::Opcode::StoreMem:
-    case mir::Opcode::StoreMemOffset:
-    case mir::Opcode::StoreOutgoingArg:
-        return true;
-    default:
-        return false;
-    }
+           opcode == mir::Opcode::FmvWX || opcode == mir::Opcode::FmvXW;
 }
 
 MIRStageMetrics collect_metrics(const std::string &stage, const mir::Module &module) {
@@ -77,20 +36,23 @@ MIRStageMetrics collect_metrics(const std::string &stage, const mir::Module &mod
             ++metrics.basic_blocks;
             for (const auto &instr : block->instructions()) {
                 const auto opcode = instr.opcode();
+                const auto &desc = mir::instruction_desc(opcode);
                 ++metrics.instructions;
                 if (is_move(opcode)) {
                     ++metrics.moves;
                 }
-                if (is_jump(opcode)) {
+                if (opcode == mir::Opcode::Jump) {
                     ++metrics.jumps;
                 }
-                if (is_branch(opcode)) {
+                if (desc.has_flag(mir::MIF_Branch) && opcode != mir::Opcode::Jump) {
                     ++metrics.branches;
                 }
-                if (is_load(opcode)) {
+                if (desc.memory == mir::MachineMemoryEffect::Read ||
+                    desc.memory == mir::MachineMemoryEffect::ReadWrite) {
                     ++metrics.loads;
                 }
-                if (is_store(opcode)) {
+                if (desc.memory == mir::MachineMemoryEffect::Write ||
+                    desc.memory == mir::MachineMemoryEffect::ReadWrite) {
                     ++metrics.stores;
                 }
                 if (opcode == mir::Opcode::LoadSlot) {
@@ -99,7 +61,7 @@ MIRStageMetrics collect_metrics(const std::string &stage, const mir::Module &mod
                 if (opcode == mir::Opcode::StoreSlot) {
                     ++metrics.store_slots;
                 }
-                if (opcode == mir::Opcode::Call) {
+                if (mir::machine_instr_may_call(instr)) {
                     ++metrics.calls;
                 }
             }

@@ -1,5 +1,6 @@
 #include "pass/mir/MIRPeepholeDeadDefEliminationPass.h"
 
+#include "mir/MachineInstrDesc.h"
 #include "pass/mir/MIRPeepholeCommon.h"
 
 #include <algorithm>
@@ -111,7 +112,7 @@ PhysRegSet physical_uses(const mir::MachineInstr &instr) {
         }
     }
 
-    if (instr.opcode() == mir::Opcode::Call) {
+    if (mir::machine_instr_may_call(instr)) {
         insert_named_regs(uses, mir::RegisterClass::GPR,
                           {"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"});
         insert_named_regs(uses, mir::RegisterClass::FPR32,
@@ -123,7 +124,7 @@ PhysRegSet physical_uses(const mir::MachineInstr &instr) {
 PhysRegSet physical_defs(const mir::MachineInstr &instr) {
     PhysRegSet defs = explicit_physical_defs(instr);
 
-    if (instr.opcode() == mir::Opcode::Call) {
+    if (mir::machine_instr_may_call(instr)) {
         insert_named_regs(defs, mir::RegisterClass::GPR,
                           {"ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
                            "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"});
@@ -144,8 +145,18 @@ PhysRegSet return_live_out(const mir::MachineFunction &function) {
         return {phys_key("a0", mir::RegisterClass::GPR)};
     case mir::ValueType::F32:
         return {phys_key("fa0", mir::RegisterClass::FPR32)};
-    case mir::ValueType::Void:
     case mir::ValueType::Aggregate:
+        if (function.return_type().size <= 8) {
+            return {phys_key("a0", mir::RegisterClass::GPR)};
+        }
+        if (function.return_type().size <= 16) {
+            return {phys_key("a0", mir::RegisterClass::GPR),
+                    phys_key("a1", mir::RegisterClass::GPR)};
+        }
+        // Aggregates larger than 2*XLEN use a hidden sret pointer.  The
+        // standard ABI does not promise that a0 is preserved or returned.
+        return {};
+    case mir::ValueType::Void:
         return {};
     }
     return {};
