@@ -1,0 +1,64 @@
+// RUN: %compiler --emit-oir -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=SLP
+// RUN: %compiler --emit-oir -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-oir -O3 -fno-slp-vectorize -march=rv64gcv %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-oir -O3 -march=rv64gc %s | FileCheck %s --check-prefix=SCALAR
+// RUN: %compiler --emit-vector-plan -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=PLAN
+// RUN: %compiler --emit-oir -O3 -march=rv64gcv -Rpass=slp %s 2>&1 | FileCheck %s --check-prefix=REMARK
+// RUN: %compiler -S -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=ASM
+
+int slp_input[4] = {};
+int slp_output[4] = {};
+
+void four_lane_add() {
+  int a0 = slp_input[0];
+  int a1 = slp_input[1];
+  int a2 = slp_input[2];
+  int a3 = slp_input[3];
+  int b0 = a0 + 7;
+  int b1 = a1 + 7;
+  int b2 = a2 + 7;
+  int b3 = a3 + 7;
+  slp_output[0] = b0;
+  slp_output[1] = b1;
+  slp_output[2] = b2;
+  slp_output[3] = b3;
+}
+
+int main() {
+  getarray(slp_input);
+  four_lane_add();
+  putarray(4, slp_output);
+  return 0;
+}
+
+// SLP-LABEL: define void @four_lane_add
+// SLP: vp.load <4 x i32>
+// SLP: splat i32 7 to <4 x i32>
+// SLP: vp.add <4 x i32>
+// SLP: vp.store <4 x i32>
+// SLP-NOT: extractelement
+// SLP-NOT: insertelement
+
+// SCALAR-LABEL: define void @four_lane_add
+// SCALAR: load i32
+// SCALAR: add i32
+// SCALAR: store i32
+// SCALAR-NOT: vp.
+
+// PLAN: "vectorizer": "slp"
+// PLAN: "code": "VECTORIZED"
+// PLAN: "scalable": false
+// PLAN: "minimum_lanes": 4
+// PLAN: "uses_mask": true
+
+// REMARK: remark: vectorize(slp): VECTORIZED:
+
+// ASM-LABEL: four_lane_add:
+// ASM: vsetivli {{[a-z0-9]+}}, 4, e32, m1, ta, ma
+// ASM: vmset.m v1
+// ASM: vmand.mm v0, v1, v1
+// ASM-NEXT: vle32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), v0.t
+// ASM: vmv.v.i {{v[0-9]+}}, 7
+// ASM: vadd.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}, v0.t
+// ASM: vse32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), v0.t
+// ASM-NOT: Pseudo
