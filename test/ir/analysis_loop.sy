@@ -29,4 +29,4 @@ int main() {
 
 // ASM-LABEL: sum_to:
 // ASM: {{bge|blt}}
-// ASM: ret
+// ASM: jalr zero, 0(ra)

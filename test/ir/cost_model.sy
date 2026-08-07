@@ -35,4 +35,4 @@ int main() {
 
 // ASM-NOT: [cost-model]
 // ASM-LABEL: main:
-// ASM: ret
+// ASM: jalr zero, 0(ra)

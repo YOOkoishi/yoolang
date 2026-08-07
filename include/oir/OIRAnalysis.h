@@ -1,6 +1,7 @@
 #pragma once
 
 #include "OIR.h"
+#include "OIRDataLayout.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -160,6 +161,9 @@ struct MemoryLocation {
 
 class OIRAliasAnalysis final {
   public:
+    explicit OIRAliasAnalysis(DataLayout data_layout = DataLayout{});
+
+    const DataLayout &data_layout() const;
     AliasResult alias(const Value *a, const Value *b) const;
     MemoryLocation memory_location(const Value *value) const;
     bool points_to_constant_global(const Value *value) const;
@@ -172,7 +176,8 @@ class OIRAliasAnalysis final {
     const Value *underlying_object(const Value *value) const;
     bool is_distinct_object(const Value *value) const;
     std::optional<std::int64_t> constant_gep_offset(const GetElementPtrInst &gep) const;
-    std::uint64_t type_size(const Type *type) const;
+
+    DataLayout data_layout_;
 };
 
 struct FunctionMemorySummary {
@@ -267,6 +272,7 @@ class MemorySSA final {
     MemoryAccess *clobbering_access(const LoadInst &load) const;
     MemoryAccess *clobbering_access(const StoreInst &store) const;
     MemoryAccess *clobbering_access(const CallInst &call) const;
+    MemoryAccess *clobbering_access(const Instruction &memory_instruction) const;
 
   private:
     void build();

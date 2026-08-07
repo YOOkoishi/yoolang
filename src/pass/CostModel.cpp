@@ -1,5 +1,7 @@
 #include "pass/CostModel.h"
 
+#include "target/TargetMachine.h"
+
 #include <algorithm>
 #include <ostream>
 #include <string>
@@ -36,8 +38,7 @@ void print_json_string(std::ostream &out, std::string_view value) {
 
 void print_cost_vector_json(const CostVector &cost, std::ostream &out, const char *indent) {
     out << "{\n";
-#define COST_FIELD(name)                                                                           \
-    out << indent << "  \"" #name "\": " << cost.name << ",\n"
+#define COST_FIELD(name) out << indent << "  \"" #name "\": " << cost.name << ",\n"
     COST_FIELD(static_instrs);
     COST_FIELD(dynamic_instrs);
     COST_FIELD(code_bytes);
@@ -72,8 +73,7 @@ void print_cost_vector_json(const CostVector &cost, std::ostream &out, const cha
 
 void print_risk_vector_json(const RiskVector &risk, std::ostream &out, const char *indent) {
     out << "{\n";
-#define RISK_FIELD(name)                                                                           \
-    out << indent << "  \"" #name "\": " << risk.name << ",\n"
+#define RISK_FIELD(name) out << indent << "  \"" #name "\": " << risk.name << ",\n"
     RISK_FIELD(code_growth);
     RISK_FIELD(live_range_growth);
     RISK_FIELD(register_pressure_growth);
@@ -283,6 +283,47 @@ TargetCostProfile default_target_profile() {
     return TargetCostProfile{};
 }
 
+TargetCostProfile target_profile_for(const target::TargetProfile &profile) {
+    TargetCostProfile result;
+    result.arch = profile.march;
+    result.abi = profile.mabi;
+    result.cpu = profile.cpu;
+    result.tune = profile.tune;
+    result.xlen_bits = static_cast<int>(profile.xlen_bits);
+    result.flen_bits = static_cast<int>(profile.flen_bits);
+    result.stack_align = static_cast<int>(profile.stack_alignment);
+
+    const auto &tuning = profile.tuning;
+    result.alu_i32 = tuning.scalar_alu_cost;
+    result.alu_i64 = tuning.scalar_alu_cost;
+    result.load = tuning.scalar_load_cost;
+    result.store = tuning.scalar_store_cost;
+    result.branch = tuning.scalar_branch_cost;
+    result.spill_load = tuning.scalar_load_cost + tuning.scalar_alu_cost;
+    result.spill_store = tuning.scalar_store_cost + tuning.scalar_alu_cost;
+
+    result.rvv_alu = tuning.vector_alu_cost;
+    result.rvv_unit_load = tuning.vector_load_cost;
+    result.rvv_unit_store = tuning.vector_store_cost;
+    result.rvv_strided_load = tuning.vector_strided_load_cost;
+    result.rvv_strided_store = tuning.vector_strided_store_cost;
+    result.rvv_indexed_load = tuning.vector_indexed_load_cost;
+    result.rvv_indexed_store = tuning.vector_indexed_store_cost;
+    result.rvv_index_setup = tuning.vector_index_setup_cost;
+    result.rvv_segment_base = tuning.vector_segment_base_cost;
+    result.rvv_segment_field = tuning.vector_segment_field_cost;
+    result.rvv_mask = tuning.vector_mask_cost;
+    result.rvv_reduction = tuning.vector_reduction_cost;
+    result.rvv_vsetvl = tuning.vsetvl_cost;
+    result.rvv_spill_load = tuning.vector_spill_load_cost;
+    result.rvv_spill_store = tuning.vector_spill_store_cost;
+    result.rvv_code_size = tuning.code_size_cost;
+    result.rvv_available_registers = static_cast<int>(tuning.available_vector_registers);
+    result.rvv_maximum_lmul = static_cast<int>(tuning.maximum_lmul);
+    result.rvv_maximum_interleave = static_cast<int>(tuning.maximum_interleave_factor);
+    return result;
+}
+
 CostModelPolicy policy_for_kind(CostModelPolicyKind kind) {
     CostModelPolicy policy;
     policy.kind = kind;
@@ -422,8 +463,7 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
         weighted_cost(candidate.before, target) - weighted_cost(candidate.after, target);
     decision.setup_cost = weighted_cost(candidate.setup, target);
     decision.risk_penalty = weighted_risk(candidate.risk, policy);
-    decision.final_score =
-        decision.estimated_gain - decision.setup_cost - decision.risk_penalty;
+    decision.final_score = decision.estimated_gain - decision.setup_cost - decision.risk_penalty;
 
     if (candidate.proof.status == ProofStatus::Proven) {
         decision.legal = true;
@@ -444,8 +484,8 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
         decision.action = DecisionAction::BypassProfitability;
         decision.reject_reason = RejectReason::None;
         decision.profitable = true;
-        decision.reason = candidate.bypass_reason.empty() ? "ProfitabilityBypassed"
-                                                          : candidate.bypass_reason;
+        decision.reason =
+            candidate.bypass_reason.empty() ? "ProfitabilityBypassed" : candidate.bypass_reason;
         return decision;
     }
 
@@ -454,8 +494,7 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
         candidate.risk.code_growth <= policy.small_code_growth_allowance * 2;
     const bool small_inline_growth =
         candidate.kind == TransformKind::Inline &&
-        (candidate.risk.code_growth <= policy.small_code_growth_allowance ||
-         hot_inline_growth);
+        (candidate.risk.code_growth <= policy.small_code_growth_allowance || hot_inline_growth);
     const bool small_loop_growth =
         candidate.risk.code_growth <= policy.small_code_growth_allowance &&
         (candidate.kind == TransformKind::LoopInterchange ||
@@ -472,8 +511,7 @@ TransformDecision decide(const TransformCandidate &candidate, const CostModelPol
 
     if (candidate.risk.code_growth > policy.max_function_code_growth || exceeds_growth_percent) {
         decision.reject_reason = RejectReason::CodeGrowthTooHigh;
-    } else if (candidate.risk.register_pressure_growth >
-               policy.max_register_pressure_growth) {
+    } else if (candidate.risk.register_pressure_growth > policy.max_register_pressure_growth) {
         decision.reject_reason = RejectReason::RegisterPressureTooHigh;
     } else if (candidate.risk.live_range_growth > policy.max_live_range_growth) {
         decision.reject_reason = RejectReason::RegisterPressureTooHigh;
@@ -524,6 +562,33 @@ void print_report_json(const CostModelReport &report, std::ostream &out) {
     out << "  \"target\": ";
     print_json_string(out, report.target.arch + "/" + report.target.abi);
     out << ",\n";
+    out << "  \"cpu\": ";
+    print_json_string(out, report.target.cpu);
+    out << ",\n";
+    out << "  \"tune\": ";
+    print_json_string(out, report.target.tune);
+    out << ",\n";
+    out << "  \"rvv_costs\": {\n"
+        << "    \"alu\": " << report.target.rvv_alu << ",\n"
+        << "    \"unit_load\": " << report.target.rvv_unit_load << ",\n"
+        << "    \"unit_store\": " << report.target.rvv_unit_store << ",\n"
+        << "    \"strided_load\": " << report.target.rvv_strided_load << ",\n"
+        << "    \"strided_store\": " << report.target.rvv_strided_store << ",\n"
+        << "    \"indexed_load\": " << report.target.rvv_indexed_load << ",\n"
+        << "    \"indexed_store\": " << report.target.rvv_indexed_store << ",\n"
+        << "    \"index_setup\": " << report.target.rvv_index_setup << ",\n"
+        << "    \"segment_base\": " << report.target.rvv_segment_base << ",\n"
+        << "    \"segment_field\": " << report.target.rvv_segment_field << ",\n"
+        << "    \"mask\": " << report.target.rvv_mask << ",\n"
+        << "    \"reduction\": " << report.target.rvv_reduction << ",\n"
+        << "    \"vsetvl\": " << report.target.rvv_vsetvl << ",\n"
+        << "    \"spill_load\": " << report.target.rvv_spill_load << ",\n"
+        << "    \"spill_store\": " << report.target.rvv_spill_store << ",\n"
+        << "    \"code_size\": " << report.target.rvv_code_size << ",\n"
+        << "    \"available_registers\": " << report.target.rvv_available_registers << ",\n"
+        << "    \"maximum_lmul\": " << report.target.rvv_maximum_lmul << ",\n"
+        << "    \"maximum_interleave\": " << report.target.rvv_maximum_interleave << "\n"
+        << "  },\n";
     out << "  \"policy\": ";
     print_json_string(out, to_string(report.policy));
     out << ",\n";
@@ -633,26 +698,22 @@ void print_report_text(const CostModelReport &report, std::ostream &out) {
     if (!report.filter.empty()) {
         out << " filter=" << report.filter;
     }
+    out << " cpu=" << report.target.cpu << " tune=" << report.target.tune;
     out << "\n";
     for (const auto &summary : report.summaries) {
         out << "[cost-model] summary stage=" << to_string(summary.stage)
             << " label=" << summary.label << " functions=" << summary.functions
-            << " blocks=" << summary.basic_blocks
-            << " instrs=" << summary.cost.static_instrs
-            << " loads=" << summary.cost.loads
-            << " stores=" << summary.cost.stores
-            << " branches=" << summary.cost.branches
-            << " calls=" << summary.cost.calls
+            << " blocks=" << summary.basic_blocks << " instrs=" << summary.cost.static_instrs
+            << " loads=" << summary.cost.loads << " stores=" << summary.cost.stores
+            << " branches=" << summary.cost.branches << " calls=" << summary.cost.calls
             << " spills=" << summary.cost.estimated_spills
             << " score=" << weighted_cost(summary.cost, report.target) << "\n";
     }
     for (const auto &decision : report.decisions) {
-        out << "[cost-model] " << decision.pass_name << " "
-            << to_string(decision.action) << " transform=" << decision.transform
-            << " scope=" << decision.scope << " gain=" << decision.estimated_gain
-            << " risk=" << decision.risk_penalty
-            << " score=" << decision.final_score
-            << " reason=" << decision.reason << "\n";
+        out << "[cost-model] " << decision.pass_name << " " << to_string(decision.action)
+            << " transform=" << decision.transform << " scope=" << decision.scope
+            << " gain=" << decision.estimated_gain << " risk=" << decision.risk_penalty
+            << " score=" << decision.final_score << " reason=" << decision.reason << "\n";
     }
 }
 

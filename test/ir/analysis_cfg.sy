@@ -27,4 +27,4 @@ int main() {
 
 // ASM-LABEL: choose:
 // ASM: bge
-// ASM: ret
+// ASM: jalr zero, 0(ra)

@@ -1,11 +1,14 @@
 #include "oir/OIRAnalysis.h"
 
+#include "builtin/BuiltinRegistry.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <optional>
 #include <sstream>
+#include <utility>
 
 namespace oir {
 namespace {
@@ -34,6 +37,7 @@ bool is_scev_speculatable(const Instruction &inst) {
     case Instruction::OpID::Sub:
     case Instruction::OpID::Mul:
     case Instruction::OpID::And:
+    case Instruction::OpID::Or:
     case Instruction::OpID::Xor:
     case Instruction::OpID::SDiv:
     case Instruction::OpID::SRem:
@@ -47,6 +51,18 @@ bool is_scev_speculatable(const Instruction &inst) {
     case Instruction::OpID::ZExt:
     case Instruction::OpID::SIToFP:
     case Instruction::OpID::FPToSI:
+    case Instruction::OpID::Splat:
+    case Instruction::OpID::StepVector:
+    case Instruction::OpID::ExtractElement:
+    case Instruction::OpID::InsertElement:
+    case Instruction::OpID::ShuffleVector:
+    case Instruction::OpID::VectorSelect:
+    case Instruction::OpID::VectorCast:
+    case Instruction::OpID::FixedABIExtractLane:
+    case Instruction::OpID::FixedABIPack:
+    case Instruction::OpID::VPBinary:
+    case Instruction::OpID::VPCmp:
+    case Instruction::OpID::VPReduction:
         return true;
     case Instruction::OpID::Ret:
     case Instruction::OpID::Br:
@@ -56,6 +72,15 @@ bool is_scev_speculatable(const Instruction &inst) {
     case Instruction::OpID::Call:
     case Instruction::OpID::MemZero:
     case Instruction::OpID::Phi:
+    case Instruction::OpID::SetVL:
+    case Instruction::OpID::VPLoad:
+    case Instruction::OpID::VPStore:
+    case Instruction::OpID::MaskedLoad:
+    case Instruction::OpID::MaskedStore:
+    case Instruction::OpID::VPGather:
+    case Instruction::OpID::VPScatter:
+    case Instruction::OpID::FixedABIObjectLoadLane:
+    case Instruction::OpID::FixedABIObjectStoreLane:
         return false;
     }
     return false;
@@ -572,8 +597,7 @@ SCEVExpr SCEVExpr::mul(SCEVExpr lhs, SCEVExpr rhs) {
     if (lhs_const.has_value() && rhs_const.has_value()) {
         return constant(*lhs_const * *rhs_const);
     }
-    if ((lhs_const.has_value() && *lhs_const == 0) ||
-        (rhs_const.has_value() && *rhs_const == 0)) {
+    if ((lhs_const.has_value() && *lhs_const == 0) || (rhs_const.has_value() && *rhs_const == 0)) {
         return constant(0);
     }
     if (lhs_const.has_value() && *lhs_const == 1) {
@@ -676,8 +700,8 @@ SCEVExpr ScalarEvolution::expression_for(const Value *value, const Loop *loop) c
     return expression_for_impl(value, loop, active);
 }
 
-SCEVExpr ScalarEvolution::expression_for_impl(
-    const Value *value, const Loop *loop, std::unordered_set<const Value *> &active) const {
+SCEVExpr ScalarEvolution::expression_for_impl(const Value *value, const Loop *loop,
+                                              std::unordered_set<const Value *> &active) const {
     if (value == nullptr) {
         return SCEVExpr::unknown();
     }
@@ -742,8 +766,8 @@ SCEVExpr ScalarEvolution::expression_for_impl(
     return finish(SCEVExpr::symbol(value));
 }
 
-SCEVExpr ScalarEvolution::try_add_rec(
-    const PhiInst &phi, const Loop &loop, std::unordered_set<const Value *> &active) const {
+SCEVExpr ScalarEvolution::try_add_rec(const PhiInst &phi, const Loop &loop,
+                                      std::unordered_set<const Value *> &active) const {
     if (phi.incoming().size() != 2) {
         return SCEVExpr::unknown();
     }
@@ -837,8 +861,7 @@ std::optional<std::int64_t> ScalarEvolution::constant_trip_count(const Loop &loo
 
     auto linear_add_rec = [&](const SCEVExpr &expr,
                               const auto &self) -> std::optional<LinearAddRec> {
-        if (expr.kind() == SCEVKind::AddRec && expr.lhs() != nullptr &&
-            expr.rhs() != nullptr) {
+        if (expr.kind() == SCEVKind::AddRec && expr.lhs() != nullptr && expr.rhs() != nullptr) {
             auto start = constant_expr_value(*expr.lhs());
             auto step = constant_expr_value(*expr.rhs());
             if (start.has_value() && step.has_value()) {
@@ -906,6 +929,13 @@ bool ScalarEvolution::is_loop_invariant(const Value *value, const Loop &loop) co
     return true;
 }
 
+OIRAliasAnalysis::OIRAliasAnalysis(DataLayout data_layout) : data_layout_(std::move(data_layout)) {
+}
+
+const DataLayout &OIRAliasAnalysis::data_layout() const {
+    return data_layout_;
+}
+
 AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
     if (a == b) {
         return AliasResult::MustAlias;
@@ -925,9 +955,8 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
     const bool b_is_stack_object = dynamic_cast<const AllocaInst *>(root_b) != nullptr;
     const auto *known_root_a = root_a != nullptr ? root_a : path_root_a;
     const auto *known_root_b = root_b != nullptr ? root_b : path_root_b;
-    if (root_a != root_b &&
-        ((a_is_stack_object && is_argument_or_distinct_object(known_root_b)) ||
-         (b_is_stack_object && is_argument_or_distinct_object(known_root_a)))) {
+    if (root_a != root_b && ((a_is_stack_object && is_argument_or_distinct_object(known_root_b)) ||
+                             (b_is_stack_object && is_argument_or_distinct_object(known_root_a)))) {
         return AliasResult::NoAlias;
     }
 
@@ -978,25 +1007,6 @@ AliasResult OIRAliasAnalysis::alias(const Value *a, const Value *b) const {
     return AliasResult::MayAlias;
 }
 
-std::uint64_t OIRAliasAnalysis::type_size(const Type *type) const {
-    if (type == nullptr || type->is_void() || type->is_label() || type->is_function()) {
-        return 0;
-    }
-    if (auto *integer = dynamic_cast<const IntegerType *>(type)) {
-        return (integer->bit_width() + 7) / 8;
-    }
-    if (type->is_float()) {
-        return 4;
-    }
-    if (type->is_pointer()) {
-        return 8;
-    }
-    if (auto *array = dynamic_cast<const ArrayType *>(type)) {
-        return type_size(array->element_type()) * array->element_count();
-    }
-    return 0;
-}
-
 std::optional<std::int64_t>
 OIRAliasAnalysis::constant_gep_offset(const GetElementPtrInst &gep) const {
     auto *ptr_type = dynamic_cast<const PointerType *>(gep.base_ptr()->type());
@@ -1004,30 +1014,16 @@ OIRAliasAnalysis::constant_gep_offset(const GetElementPtrInst &gep) const {
         return std::nullopt;
     }
 
-    std::int64_t offset = 0;
-    const Type *cursor = ptr_type->element_type();
-    auto indices = gep.indices();
-    for (std::size_t i = 0; i < indices.size(); ++i) {
-        auto index = constant_int_value(indices[i]);
+    std::vector<std::int64_t> constant_indices;
+    constant_indices.reserve(gep.indices().size());
+    for (auto *operand : gep.indices()) {
+        auto index = constant_int_value(operand);
         if (!index) {
             return std::nullopt;
         }
-
-        std::uint64_t stride = 0;
-        if (i == 0) {
-            stride = type_size(cursor);
-        } else if (auto *array = dynamic_cast<const ArrayType *>(cursor)) {
-            stride = type_size(array->element_type());
-            cursor = array->element_type();
-        } else {
-            stride = type_size(cursor);
-        }
-        if (stride == 0) {
-            return std::nullopt;
-        }
-        offset += *index * static_cast<std::int64_t>(stride);
+        constant_indices.push_back(*index);
     }
-    return offset;
+    return data_layout_.fixed_gep_offset(ptr_type, constant_indices);
 }
 
 MemoryLocation OIRAliasAnalysis::memory_location(const Value *value) const {
@@ -1043,7 +1039,7 @@ MemoryLocation OIRAliasAnalysis::memory_location(const Value *value) const {
             base.offset = std::nullopt;
         }
         if (auto *ptr = dynamic_cast<const PointerType *>(gep->type())) {
-            base.size = type_size(ptr->element_type());
+            base.size = data_layout_.fixed_store_size(ptr->element_type());
         }
         return base;
     }
@@ -1052,7 +1048,7 @@ MemoryLocation OIRAliasAnalysis::memory_location(const Value *value) const {
     loc.base = underlying_object(value);
     loc.offset = 0;
     if (auto *ptr = dynamic_cast<const PointerType *>(value->type())) {
-        loc.size = type_size(ptr->element_type());
+        loc.size = data_layout_.fixed_store_size(ptr->element_type());
     }
     return loc;
 }
@@ -1070,37 +1066,170 @@ bool OIRAliasAnalysis::call_may_clobber(const CallInst &call, const Value *ptr) 
 bool OIRAliasAnalysis::may_read_memory(const Instruction &inst) const {
     switch (inst.op()) {
     case Instruction::OpID::Load:
+    case Instruction::OpID::VPLoad:
+    case Instruction::OpID::MaskedLoad:
+    case Instruction::OpID::VPGather:
     case Instruction::OpID::Call:
+    case Instruction::OpID::FixedABIObjectLoadLane:
+    case Instruction::OpID::FixedABIObjectStoreLane:
+        // Mask lane stores are packed-bit read/modify/write operations, so the
+        // store form conservatively reads as well as writes memory.
         return true;
-    default:
+    case Instruction::OpID::Ret:
+    case Instruction::OpID::Br:
+    case Instruction::OpID::Add:
+    case Instruction::OpID::Sub:
+    case Instruction::OpID::Mul:
+    case Instruction::OpID::SDiv:
+    case Instruction::OpID::SRem:
+    case Instruction::OpID::FAdd:
+    case Instruction::OpID::FSub:
+    case Instruction::OpID::FMul:
+    case Instruction::OpID::FDiv:
+    case Instruction::OpID::ICmp:
+    case Instruction::OpID::FCmp:
+    case Instruction::OpID::Alloca:
+    case Instruction::OpID::Store:
+    case Instruction::OpID::GetElementPtr:
+    case Instruction::OpID::MemZero:
+    case Instruction::OpID::ZExt:
+    case Instruction::OpID::SIToFP:
+    case Instruction::OpID::FPToSI:
+    case Instruction::OpID::Phi:
+    case Instruction::OpID::And:
+    case Instruction::OpID::Or:
+    case Instruction::OpID::Xor:
+    case Instruction::OpID::SetVL:
+    case Instruction::OpID::Splat:
+    case Instruction::OpID::StepVector:
+    case Instruction::OpID::ExtractElement:
+    case Instruction::OpID::InsertElement:
+    case Instruction::OpID::ShuffleVector:
+    case Instruction::OpID::VectorSelect:
+    case Instruction::OpID::VectorCast:
+    case Instruction::OpID::FixedABIExtractLane:
+    case Instruction::OpID::FixedABIPack:
+    case Instruction::OpID::VPBinary:
+    case Instruction::OpID::VPCmp:
+    case Instruction::OpID::VPStore:
+    case Instruction::OpID::MaskedStore:
+    case Instruction::OpID::VPScatter:
+    case Instruction::OpID::VPReduction:
         return false;
     }
+    return true;
 }
 
 bool OIRAliasAnalysis::may_write_memory(const Instruction &inst) const {
     switch (inst.op()) {
     case Instruction::OpID::Store:
     case Instruction::OpID::MemZero:
+    case Instruction::OpID::VPStore:
+    case Instruction::OpID::MaskedStore:
+    case Instruction::OpID::VPScatter:
     case Instruction::OpID::Call:
+    case Instruction::OpID::FixedABIObjectStoreLane:
         return true;
-    default:
+    case Instruction::OpID::Ret:
+    case Instruction::OpID::Br:
+    case Instruction::OpID::Add:
+    case Instruction::OpID::Sub:
+    case Instruction::OpID::Mul:
+    case Instruction::OpID::SDiv:
+    case Instruction::OpID::SRem:
+    case Instruction::OpID::FAdd:
+    case Instruction::OpID::FSub:
+    case Instruction::OpID::FMul:
+    case Instruction::OpID::FDiv:
+    case Instruction::OpID::ICmp:
+    case Instruction::OpID::FCmp:
+    case Instruction::OpID::Alloca:
+    case Instruction::OpID::Load:
+    case Instruction::OpID::GetElementPtr:
+    case Instruction::OpID::ZExt:
+    case Instruction::OpID::SIToFP:
+    case Instruction::OpID::FPToSI:
+    case Instruction::OpID::Phi:
+    case Instruction::OpID::And:
+    case Instruction::OpID::Or:
+    case Instruction::OpID::Xor:
+    case Instruction::OpID::SetVL:
+    case Instruction::OpID::Splat:
+    case Instruction::OpID::StepVector:
+    case Instruction::OpID::ExtractElement:
+    case Instruction::OpID::InsertElement:
+    case Instruction::OpID::ShuffleVector:
+    case Instruction::OpID::VectorSelect:
+    case Instruction::OpID::VectorCast:
+    case Instruction::OpID::FixedABIExtractLane:
+    case Instruction::OpID::FixedABIPack:
+    case Instruction::OpID::FixedABIObjectLoadLane:
+    case Instruction::OpID::VPBinary:
+    case Instruction::OpID::VPCmp:
+    case Instruction::OpID::VPLoad:
+    case Instruction::OpID::MaskedLoad:
+    case Instruction::OpID::VPGather:
+    case Instruction::OpID::VPReduction:
         return false;
     }
+    return true;
 }
 
 bool OIRAliasAnalysis::has_side_effect(const Instruction &inst) const {
     switch (inst.op()) {
     case Instruction::OpID::Store:
     case Instruction::OpID::MemZero:
+    case Instruction::OpID::VPStore:
+    case Instruction::OpID::MaskedStore:
+    case Instruction::OpID::VPScatter:
     case Instruction::OpID::Call:
+    case Instruction::OpID::FixedABIObjectStoreLane:
         return true;
     case Instruction::OpID::Ret:
     case Instruction::OpID::Br:
         // Treat terminators as side-effecting from a DCE perspective: removing them changes CFG.
         return true;
-    default:
+    case Instruction::OpID::Add:
+    case Instruction::OpID::Sub:
+    case Instruction::OpID::Mul:
+    case Instruction::OpID::SDiv:
+    case Instruction::OpID::SRem:
+    case Instruction::OpID::FAdd:
+    case Instruction::OpID::FSub:
+    case Instruction::OpID::FMul:
+    case Instruction::OpID::FDiv:
+    case Instruction::OpID::ICmp:
+    case Instruction::OpID::FCmp:
+    case Instruction::OpID::Alloca:
+    case Instruction::OpID::Load:
+    case Instruction::OpID::GetElementPtr:
+    case Instruction::OpID::ZExt:
+    case Instruction::OpID::SIToFP:
+    case Instruction::OpID::FPToSI:
+    case Instruction::OpID::Phi:
+    case Instruction::OpID::And:
+    case Instruction::OpID::Or:
+    case Instruction::OpID::Xor:
+    case Instruction::OpID::SetVL:
+    case Instruction::OpID::Splat:
+    case Instruction::OpID::StepVector:
+    case Instruction::OpID::ExtractElement:
+    case Instruction::OpID::InsertElement:
+    case Instruction::OpID::ShuffleVector:
+    case Instruction::OpID::VectorSelect:
+    case Instruction::OpID::VectorCast:
+    case Instruction::OpID::FixedABIExtractLane:
+    case Instruction::OpID::FixedABIPack:
+    case Instruction::OpID::FixedABIObjectLoadLane:
+    case Instruction::OpID::VPBinary:
+    case Instruction::OpID::VPCmp:
+    case Instruction::OpID::VPLoad:
+    case Instruction::OpID::MaskedLoad:
+    case Instruction::OpID::VPGather:
+    case Instruction::OpID::VPReduction:
         return false;
     }
+    return true;
 }
 
 const Value *OIRAliasAnalysis::underlying_object(const Value *value) const {
@@ -1121,8 +1250,8 @@ bool OIRAliasAnalysis::is_distinct_object(const Value *value) const {
 
 namespace {
 
-template <typename T> bool set_equal(const std::unordered_set<T> &lhs,
-                                     const std::unordered_set<T> &rhs) {
+template <typename T>
+bool set_equal(const std::unordered_set<T> &lhs, const std::unordered_set<T> &rhs) {
     if (lhs.size() != rhs.size()) {
         return false;
     }
@@ -1324,36 +1453,40 @@ FunctionMemorySummary FunctionModRefAnalysis::unknown_external_summary() const {
 }
 
 FunctionMemorySummary FunctionModRefAnalysis::external_summary(const Function &function) const {
+    std::string_view name = function.name();
+    if (name == "_sysy_starttime") {
+        name = "starttime";
+    } else if (name == "_sysy_stoptime") {
+        name = "stoptime";
+    }
+
+    const auto *descriptor = builtin::BuiltinRegistry::instance().find(name);
+    if (descriptor == nullptr || descriptor->lowering != builtin::LoweringKind::RuntimeCall) {
+        return unknown_external_summary();
+    }
+
     FunctionMemorySummary out;
-    const auto &name = function.name();
-
-    if (name == "getint" || name == "getch" || name == "getfloat") {
-        out.has_side_effect = true;
-        return out;
+    out.has_side_effect = descriptor->has_observable_side_effect;
+    for (auto index : descriptor->read_pointer_parameters) {
+        out.read_param_indices.insert(index);
     }
-    if (name == "putint" || name == "putch" || name == "putfloat" ||
-        name == "starttime" || name == "stoptime" || name == "_sysy_starttime" ||
-        name == "_sysy_stoptime") {
-        out.has_side_effect = true;
-        return out;
+    for (auto index : descriptor->written_pointer_parameters) {
+        out.written_param_indices.insert(index);
     }
-    if (name == "getarray" || name == "getfarray") {
-        out.written_param_indices.insert(0);
-        out.has_side_effect = true;
-        return out;
-    }
-    if (name == "putarray" || name == "putfarray") {
-        out.read_param_indices.insert(1);
-        out.has_side_effect = true;
-        return out;
-    }
-    if (name == "putf") {
+    switch (descriptor->memory_effect) {
+    case builtin::MemoryEffect::None:
+    case builtin::MemoryEffect::Read:
+    case builtin::MemoryEffect::Write:
+    case builtin::MemoryEffect::ReadWrite:
+        break;
+    case builtin::MemoryEffect::Unknown:
+        // putf consumes an implementation-defined format payload.  It can
+        // inspect memory reachable from its variadic arguments but is not a
+        // general memory writer.
         out.reads_unknown = true;
-        out.has_side_effect = true;
-        return out;
+        break;
     }
-
-    return unknown_external_summary();
+    return out;
 }
 
 FunctionMemorySummary FunctionModRefAnalysis::scan_function(const Function &function) const {
@@ -1377,10 +1510,55 @@ FunctionMemorySummary FunctionModRefAnalysis::scan_function(const Function &func
                 continue;
             }
 
+            if (auto *load = dynamic_cast<const VPLoadInst *>(inst.get())) {
+                add_pointer_effect(out, load->ptr(), alias_analysis, false);
+                continue;
+            }
+
+            if (auto *store = dynamic_cast<const VPStoreInst *>(inst.get())) {
+                add_pointer_effect(out, store->ptr(), alias_analysis, true);
+                out.has_side_effect = true;
+                continue;
+            }
+
+            if (auto *gather = dynamic_cast<const VPGatherInst *>(inst.get())) {
+                add_pointer_effect(out, gather->base_ptr(), alias_analysis, false);
+                continue;
+            }
+
+            if (auto *scatter = dynamic_cast<const VPScatterInst *>(inst.get())) {
+                add_pointer_effect(out, scatter->base_ptr(), alias_analysis, true);
+                out.has_side_effect = true;
+                continue;
+            }
+
             if (auto *call = dynamic_cast<const CallInst *>(inst.get())) {
                 auto callee_summary =
                     project_call_summary(*call, call_summary(*call), alias_analysis);
                 merge_summary(out, callee_summary);
+                continue;
+            }
+
+            // Ret/Br are deliberately side-effecting to instruction-level DCE
+            // because deleting a terminator mutates the CFG.  That is not an
+            // observable effect of calling the containing function, however.
+            // Keep the two notions separate or every internal function becomes
+            // impure merely because it has a well-formed terminator.
+            if (inst->op() == Instruction::OpID::Ret || inst->op() == Instruction::OpID::Br) {
+                continue;
+            }
+
+            // New or malformed instruction kinds must not silently disappear
+            // from ModRef.  AliasAnalysis classifies every known pure opcode;
+            // its unknown fallback is conservatively read/write.
+            if (alias_analysis.may_read_memory(*inst)) {
+                out.reads_unknown = true;
+            }
+            if (alias_analysis.may_write_memory(*inst)) {
+                out.writes_unknown = true;
+            }
+            if (alias_analysis.has_side_effect(*inst)) {
+                out.has_side_effect = true;
             }
         }
     }
@@ -1429,8 +1607,8 @@ bool call_param_may_alias(const CallInst &call, const std::unordered_set<std::si
 
 } // namespace
 
-bool FunctionModRefAnalysis::call_may_clobber(
-    const CallInst &call, const Value *ptr, const OIRAliasAnalysis &alias_analysis) const {
+bool FunctionModRefAnalysis::call_may_clobber(const CallInst &call, const Value *ptr,
+                                              const OIRAliasAnalysis &alias_analysis) const {
     if (ptr == nullptr || alias_analysis.points_to_constant_global(ptr)) {
         return false;
     }
@@ -1460,8 +1638,8 @@ bool FunctionModRefAnalysis::call_may_clobber(
     return false;
 }
 
-bool FunctionModRefAnalysis::call_may_read(
-    const CallInst &call, const Value *ptr, const OIRAliasAnalysis &alias_analysis) const {
+bool FunctionModRefAnalysis::call_may_read(const CallInst &call, const Value *ptr,
+                                           const OIRAliasAnalysis &alias_analysis) const {
     if (ptr == nullptr) {
         return true;
     }
@@ -1662,9 +1840,8 @@ MemoryAccess *MemorySSA::create_access(MemoryAccessKind kind, BasicBlock *block,
     return raw;
 }
 
-MemoryAccess *
-MemorySSA::entry_access_for(BasicBlock *block,
-                            const std::unordered_set<BasicBlock *> &reachable) const {
+MemoryAccess *MemorySSA::entry_access_for(BasicBlock *block,
+                                          const std::unordered_set<BasicBlock *> &reachable) const {
     if (block == function_->entry_block()) {
         return live_on_entry_;
     }
@@ -1713,6 +1890,36 @@ void MemorySSA::scan_block(BasicBlock *block, MemoryAccess *start_access) {
             continue;
         }
 
+        if (auto *load = dynamic_cast<VPLoadInst *>(inst)) {
+            auto *access = create_access(MemoryAccessKind::Use, block, load);
+            access->set_defining_access(current);
+            access_for_inst_[load] = access;
+            continue;
+        }
+
+        if (auto *store = dynamic_cast<VPStoreInst *>(inst)) {
+            auto *access = create_access(MemoryAccessKind::Def, block, store);
+            access->set_defining_access(current);
+            access_for_inst_[store] = access;
+            current = access;
+            continue;
+        }
+
+        if (auto *gather = dynamic_cast<VPGatherInst *>(inst)) {
+            auto *access = create_access(MemoryAccessKind::Use, block, gather);
+            access->set_defining_access(current);
+            access_for_inst_[gather] = access;
+            continue;
+        }
+
+        if (auto *scatter = dynamic_cast<VPScatterInst *>(inst)) {
+            auto *access = create_access(MemoryAccessKind::Def, block, scatter);
+            access->set_defining_access(current);
+            access_for_inst_[scatter] = access;
+            current = access;
+            continue;
+        }
+
         if (auto *call = dynamic_cast<CallInst *>(inst)) {
             if (modref_->call_may_write_memory(*call)) {
                 auto *access = create_access(MemoryAccessKind::Def, block, call);
@@ -1724,6 +1931,20 @@ void MemorySSA::scan_block(BasicBlock *block, MemoryAccess *start_access) {
                 access->set_defining_access(current);
                 access_for_inst_[call] = access;
             }
+            continue;
+        }
+
+        // Fail closed for any future opcode which gains memory effects before
+        // MemorySSA learns a more precise pointer model.
+        if (alias_analysis_->may_write_memory(*inst)) {
+            auto *access = create_access(MemoryAccessKind::Def, block, inst);
+            access->set_defining_access(current);
+            access_for_inst_[inst] = access;
+            current = access;
+        } else if (alias_analysis_->may_read_memory(*inst)) {
+            auto *access = create_access(MemoryAccessKind::Use, block, inst);
+            access->set_defining_access(current);
+            access_for_inst_[inst] = access;
         }
     }
     block_end_access_[block] = current;
@@ -1778,11 +1999,43 @@ MemoryAccess *MemorySSA::clobbering_access(const CallInst &call) const {
     return find_call_read_clobber(access->defining_access(), call, active, memo);
 }
 
-MemoryAccess *
-MemorySSA::find_pointer_clobber(MemoryAccess *access, const Value *ptr,
-                                std::unordered_set<const MemoryAccess *> &active,
-                                std::unordered_map<const MemoryAccess *, MemoryAccess *> &memo)
-    const {
+MemoryAccess *MemorySSA::clobbering_access(const Instruction &memory_instruction) const {
+    if (const auto *call = dynamic_cast<const CallInst *>(&memory_instruction)) {
+        return clobbering_access(*call);
+    }
+
+    const Value *ptr = nullptr;
+    if (const auto *load = dynamic_cast<const LoadInst *>(&memory_instruction)) {
+        ptr = load->ptr();
+    } else if (const auto *store = dynamic_cast<const StoreInst *>(&memory_instruction)) {
+        ptr = store->ptr();
+    } else if (const auto *load = dynamic_cast<const VPLoadInst *>(&memory_instruction)) {
+        ptr = load->ptr();
+    } else if (const auto *store = dynamic_cast<const VPStoreInst *>(&memory_instruction)) {
+        ptr = store->ptr();
+    } else if (const auto *gather = dynamic_cast<const VPGatherInst *>(&memory_instruction)) {
+        ptr = gather->base_ptr();
+    } else if (const auto *scatter = dynamic_cast<const VPScatterInst *>(&memory_instruction)) {
+        ptr = scatter->base_ptr();
+    } else if (const auto *memzero = dynamic_cast<const MemZeroInst *>(&memory_instruction)) {
+        ptr = memzero->ptr();
+    }
+
+    auto *access = access_for(&memory_instruction);
+    if (access == nullptr) {
+        return live_on_entry_;
+    }
+    if (ptr == nullptr) {
+        return access->defining_access() == nullptr ? live_on_entry_ : access->defining_access();
+    }
+    std::unordered_set<const MemoryAccess *> active;
+    std::unordered_map<const MemoryAccess *, MemoryAccess *> memo;
+    return find_pointer_clobber(access->defining_access(), ptr, active, memo);
+}
+
+MemoryAccess *MemorySSA::find_pointer_clobber(
+    MemoryAccess *access, const Value *ptr, std::unordered_set<const MemoryAccess *> &active,
+    std::unordered_map<const MemoryAccess *, MemoryAccess *> &memo) const {
     if (access == nullptr) {
         return live_on_entry_;
     }
@@ -1834,11 +2087,9 @@ MemorySSA::find_pointer_clobber(MemoryAccess *access, const Value *ptr,
     return finish(live_on_entry_);
 }
 
-MemoryAccess *
-MemorySSA::find_call_read_clobber(MemoryAccess *access, const CallInst &call,
-                                  std::unordered_set<const MemoryAccess *> &active,
-                                  std::unordered_map<const MemoryAccess *, MemoryAccess *> &memo)
-    const {
+MemoryAccess *MemorySSA::find_call_read_clobber(
+    MemoryAccess *access, const CallInst &call, std::unordered_set<const MemoryAccess *> &active,
+    std::unordered_map<const MemoryAccess *, MemoryAccess *> &memo) const {
     if (access == nullptr) {
         return live_on_entry_;
     }
@@ -1902,14 +2153,19 @@ bool MemorySSA::access_clobbers_pointer(const MemoryAccess &access, const Value 
     if (auto *memzero = dynamic_cast<MemZeroInst *>(inst)) {
         return alias_analysis_->alias(memzero->ptr(), ptr) != AliasResult::NoAlias;
     }
+    if (auto *store = dynamic_cast<VPStoreInst *>(inst)) {
+        return alias_analysis_->alias(store->ptr(), ptr) != AliasResult::NoAlias;
+    }
+    if (auto *scatter = dynamic_cast<VPScatterInst *>(inst)) {
+        return alias_analysis_->alias(scatter->base_ptr(), ptr) != AliasResult::NoAlias;
+    }
     if (auto *call = dynamic_cast<CallInst *>(inst)) {
         return modref_->call_may_clobber(*call, ptr, *alias_analysis_);
     }
-    return false;
+    return true;
 }
 
-bool MemorySSA::access_clobbers_call_read(const MemoryAccess &access,
-                                          const CallInst &call) const {
+bool MemorySSA::access_clobbers_call_read(const MemoryAccess &access, const CallInst &call) const {
     auto *inst = access.instruction();
     if (inst == nullptr || !access.is_def()) {
         return false;
@@ -1921,10 +2177,16 @@ bool MemorySSA::access_clobbers_call_read(const MemoryAccess &access,
     if (auto *memzero = dynamic_cast<MemZeroInst *>(inst)) {
         return modref_->call_may_read(call, memzero->ptr(), *alias_analysis_);
     }
+    if (auto *store = dynamic_cast<VPStoreInst *>(inst)) {
+        return modref_->call_may_read(call, store->ptr(), *alias_analysis_);
+    }
+    if (auto *scatter = dynamic_cast<VPScatterInst *>(inst)) {
+        return modref_->call_may_read(call, scatter->base_ptr(), *alias_analysis_);
+    }
     if (auto *writer = dynamic_cast<CallInst *>(inst)) {
         return modref_->call_may_write_memory(*writer);
     }
-    return false;
+    return true;
 }
 
 } // namespace oir

@@ -6,6 +6,10 @@
 #include <string_view>
 #include <vector>
 
+namespace target {
+struct TargetProfile;
+}
+
 namespace pass::cost_model {
 
 inline constexpr const char *kReportArtifactKey = "cost.model.report";
@@ -108,6 +112,8 @@ enum class CostModelPolicyKind {
 struct TargetCostProfile {
     std::string arch = "rv64gc";
     std::string abi = "lp64d";
+    std::string cpu = "generic-rv64";
+    std::string tune = "generic-rv64";
     int xlen_bits = 64;
     int flen_bits = 64;
     int stack_align = 16;
@@ -128,6 +134,26 @@ struct TargetCostProfile {
     int spill_load = 6;
     int spill_store = 6;
     int code_byte = 1;
+
+    int rvv_alu = 1;
+    int rvv_unit_load = 4;
+    int rvv_unit_store = 4;
+    int rvv_strided_load = 7;
+    int rvv_strided_store = 7;
+    int rvv_indexed_load = 10;
+    int rvv_indexed_store = 11;
+    int rvv_index_setup = 2;
+    int rvv_segment_base = 2;
+    int rvv_segment_field = 3;
+    int rvv_mask = 1;
+    int rvv_reduction = 6;
+    int rvv_vsetvl = 2;
+    int rvv_spill_load = 8;
+    int rvv_spill_store = 8;
+    int rvv_code_size = 1;
+    int rvv_available_registers = 31;
+    int rvv_maximum_lmul = 8;
+    int rvv_maximum_interleave = 1;
 };
 
 struct FrequencyEstimate {
@@ -352,6 +378,7 @@ std::string_view to_string(CostModelPolicyKind policy);
 bool parse_policy_kind(std::string_view text, CostModelPolicyKind &out);
 
 TargetCostProfile default_target_profile();
+TargetCostProfile target_profile_for(const target::TargetProfile &profile);
 CostModelPolicy policy_for_kind(CostModelPolicyKind kind);
 
 CostVector subtract_cost(const CostVector &lhs, const CostVector &rhs);

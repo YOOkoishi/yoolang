@@ -31,7 +31,7 @@ bool is_oir_int_alu(oir::Instruction::OpID op) {
 
 bool is_mir_move(mir::Opcode opcode) {
     return opcode == mir::Opcode::Move || opcode == mir::Opcode::FMove ||
-           opcode == mir::Opcode::FmvWX;
+           opcode == mir::Opcode::FmvWX || opcode == mir::Opcode::FmvXW;
 }
 
 bool is_mir_branch(mir::Opcode opcode) {
