@@ -1,4 +1,6 @@
+#include "oir/OIRDataLayout.h"
 #include "pass/oir/OIRToMIRCommon.h"
+#include "target/RISCVCallingConvention.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -22,7 +24,7 @@ class Lowerer final {
             lowered.name = global->name();
             lowered.type = type_info(global->value_type());
             lowered.is_const = global->is_const();
-            lowered.initializer = global->initializer_literal();
+            lowered.initializer_bytes = lower_global_initializer(*global);
             module_->add_global(std::move(lowered));
         }
 
@@ -60,8 +62,8 @@ class Lowerer final {
         }
         if (auto *integer = dynamic_cast<oir::IntegerType *>(type)) {
             out.value_type = integer->bit_width() == 1 ? mir::ValueType::I1 : mir::ValueType::I32;
-            out.size = 4;
-            out.align = 4;
+            out.size = integer->bit_width() == 1 ? 1 : 4;
+            out.align = integer->bit_width() == 1 ? 1 : 4;
             return out;
         }
         if (type->is_float()) {
@@ -82,11 +84,15 @@ class Lowerer final {
             out.align = 8;
             return out;
         }
-        if (auto *array = dynamic_cast<oir::ArrayType *>(type)) {
-            auto element = type_info(array->element_type());
+        if (type->is_array() || type->is_vector()) {
+            const auto size = data_layout_.fixed_alloc_size(type);
+            if (!size.has_value()) {
+                throw std::runtime_error("scalable OIR type cannot use stack-slot MIR lowering: " +
+                                         type->print());
+            }
             out.value_type = mir::ValueType::Aggregate;
-            out.size = element.size * array->element_count();
-            out.align = element.align;
+            out.size = *size;
+            out.align = data_layout_.abi_alignment(type);
             return out;
         }
         throw std::runtime_error("unsupported OIR type for MIR: " + type->print());
@@ -182,6 +188,8 @@ class Lowerer final {
 
     void emit_parameter_copies(const oir::Function &function) {
         current_block_ = blocks_.at(function.entry_block());
+        const auto &argument_regs = target::riscv_gpr_argument_registers();
+        const auto &float_argument_regs = target::riscv_fpr_argument_registers();
         std::size_t int_reg = 0;
         std::size_t float_reg = 0;
         std::int64_t stack_offset = 0;
@@ -190,10 +198,11 @@ class Lowerer final {
             auto type = type_info(arg->type()).value_type;
             int slot = value_slots_.at(arg.get());
             if (type == mir::ValueType::F32) {
-                if (float_reg < kFArgRegs.size()) {
-                    emit(mir::Opcode::StoreSlot, {mir::MachineOperand::slot(slot),
-                                                  mir::MachineOperand::freg(kFArgRegs[float_reg++]),
-                                                  mir::MachineOperand::type(type)});
+                if (float_reg < float_argument_regs.size()) {
+                    emit(mir::Opcode::StoreSlot,
+                         {mir::MachineOperand::slot(slot),
+                          mir::MachineOperand::freg(float_argument_regs[float_reg++]),
+                          mir::MachineOperand::type(type)});
                 } else {
                     emit(mir::Opcode::LoadIncomingArg,
                          {mir::MachineOperand::freg("ft0"), mir::MachineOperand::imm(stack_offset),
@@ -204,10 +213,11 @@ class Lowerer final {
                     stack_offset += 8;
                 }
             } else {
-                if (int_reg < kArgRegs.size()) {
-                    emit(mir::Opcode::StoreSlot, {mir::MachineOperand::slot(slot),
-                                                  mir::MachineOperand::reg(kArgRegs[int_reg++]),
-                                                  mir::MachineOperand::type(type)});
+                if (int_reg < argument_regs.size()) {
+                    emit(mir::Opcode::StoreSlot,
+                         {mir::MachineOperand::slot(slot),
+                          mir::MachineOperand::reg(argument_regs[int_reg++]),
+                          mir::MachineOperand::type(type)});
                 } else {
                     emit(mir::Opcode::LoadIncomingArg,
                          {mir::MachineOperand::reg("t0"), mir::MachineOperand::imm(stack_offset),
@@ -246,6 +256,7 @@ class Lowerer final {
         case oir::Instruction::OpID::Sub:
         case oir::Instruction::OpID::Mul:
         case oir::Instruction::OpID::And:
+        case oir::Instruction::OpID::Or:
         case oir::Instruction::OpID::Xor:
         case oir::Instruction::OpID::SDiv:
         case oir::Instruction::OpID::SRem:
@@ -281,6 +292,33 @@ class Lowerer final {
         case oir::Instruction::OpID::Br:
             lower_branch(static_cast<const oir::BranchInst &>(inst));
             break;
+        case oir::Instruction::OpID::Splat:
+        case oir::Instruction::OpID::StepVector:
+        case oir::Instruction::OpID::ExtractElement:
+        case oir::Instruction::OpID::InsertElement:
+        case oir::Instruction::OpID::ShuffleVector:
+        case oir::Instruction::OpID::VectorSelect:
+        case oir::Instruction::OpID::VectorCast:
+        case oir::Instruction::OpID::VPBinary:
+        case oir::Instruction::OpID::VPCmp:
+        case oir::Instruction::OpID::VPLoad:
+        case oir::Instruction::OpID::VPStore:
+        case oir::Instruction::OpID::MaskedLoad:
+        case oir::Instruction::OpID::MaskedStore:
+        case oir::Instruction::OpID::VPGather:
+        case oir::Instruction::OpID::VPScatter:
+        case oir::Instruction::OpID::VPReduction:
+        case oir::Instruction::OpID::SetVL:
+            throw std::runtime_error(
+                "RVV MIR legalization is unavailable in the legacy stack lowerer: " + inst.print());
+        case oir::Instruction::OpID::FixedABIExtractLane:
+        case oir::Instruction::OpID::FixedABIPack:
+        case oir::Instruction::OpID::FixedABIObjectLoadLane:
+        case oir::Instruction::OpID::FixedABIObjectStoreLane:
+            throw std::runtime_error(
+                "PORTABLE_FIXED_ABI_BOUNDARY_LOWERING_UNAVAILABLE: portable fixed-ABI "
+                "boundary operation reached legacy stack MIR lowering "
+                "without its dedicated boundary lowering pass");
         case oir::Instruction::OpID::Phi:
             break;
         }
@@ -325,8 +363,7 @@ class Lowerer final {
                 throw std::runtime_error("only zero aggregate stores are supported in MIR v1");
             }
             emit(mir::Opcode::MemZero,
-                 {mir::MachineOperand::reg("t0"),
-                  mir::MachineOperand::imm(0),
+                 {mir::MachineOperand::reg("t0"), mir::MachineOperand::imm(0),
                   mir::MachineOperand::imm(static_cast<std::int64_t>(stored.size))});
             if (static_cast<std::int64_t>(stored.size) >= mir::kMemZeroMemsetThresholdBytes) {
                 current_function_->note_call();
@@ -382,29 +419,19 @@ class Lowerer final {
             throw std::runtime_error("gep base is not a pointer");
         }
 
-        oir::Type *cursor = ptr_type->element_type();
-        std::int64_t constant_offset = 0;
         auto indices = inst.indices();
+        const auto strides = data_layout_.fixed_gep_index_strides(ptr_type, indices.size());
+        if (!strides.has_value()) {
+            throw std::runtime_error("gep path has an unsized or scalable element type");
+        }
+        std::vector<std::int64_t> constant_indices(indices.size(), 0);
         for (std::size_t i = 0; i < indices.size(); ++i) {
-            std::uint64_t stride = 0;
-            if (i == 0) {
-                stride = type_info(cursor).size;
-            } else if (auto *array = dynamic_cast<oir::ArrayType *>(cursor)) {
-                stride = type_info(array->element_type()).size;
-                cursor = array->element_type();
-            } else {
-                stride = type_info(cursor).size;
-            }
-
-            if (stride == 0) {
-                continue;
-            }
-
             if (auto *constant = dynamic_cast<oir::ConstantInt *>(indices[i])) {
-                constant_offset += constant->value() * static_cast<std::int64_t>(stride);
+                constant_indices[i] = constant->value();
                 continue;
             }
 
+            const auto stride = (*strides)[i];
             load_int_value(indices[i], "t1");
             if (stride == 1) {
                 emit(mir::Opcode::Add,
@@ -430,9 +457,13 @@ class Lowerer final {
             }
         }
 
-        if (constant_offset != 0) {
+        const auto constant_offset = data_layout_.fixed_gep_offset(ptr_type, constant_indices);
+        if (!constant_offset.has_value()) {
+            throw std::runtime_error("constant gep byte offset overflows i64");
+        }
+        if (*constant_offset != 0) {
             emit(mir::Opcode::LoadImm,
-                 {mir::MachineOperand::reg("t1"), mir::MachineOperand::imm(constant_offset)});
+                 {mir::MachineOperand::reg("t1"), mir::MachineOperand::imm(*constant_offset)});
             emit(mir::Opcode::Add, {mir::MachineOperand::reg("t0"), mir::MachineOperand::reg("t0"),
                                     mir::MachineOperand::reg("t1")});
         }
@@ -445,6 +476,16 @@ class Lowerer final {
     void lower_int_binary(const oir::BinaryInst &inst) {
         load_int_value(inst.lhs(), "t0");
         load_int_value(inst.rhs(), "t1");
+        if (inst.op() == oir::Instruction::OpID::Or) {
+            emit(mir::Opcode::Xor, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t0"),
+                                    mir::MachineOperand::reg("t1")});
+            emit(mir::Opcode::And, {mir::MachineOperand::reg("t3"), mir::MachineOperand::reg("t0"),
+                                    mir::MachineOperand::reg("t1")});
+            emit(mir::Opcode::Xor, {mir::MachineOperand::reg("t2"), mir::MachineOperand::reg("t2"),
+                                    mir::MachineOperand::reg("t3")});
+            store_reg_to_value_slot(&inst, "t2");
+            return;
+        }
         mir::Opcode opcode = mir::Opcode::AddW;
         switch (inst.op()) {
         case oir::Instruction::OpID::Add:
@@ -609,6 +650,9 @@ class Lowerer final {
         std::string symbol = callee->name();
         current_function_->note_call();
 
+        const auto &argument_regs = target::riscv_gpr_argument_registers();
+        const auto &float_argument_regs = target::riscv_fpr_argument_registers();
+
         std::size_t int_reg = 0;
         std::size_t float_reg = 0;
         std::int64_t stack_offset = 0;
@@ -624,10 +668,11 @@ class Lowerer final {
         for (auto *arg : args) {
             auto type = type_info(arg->type()).value_type;
             if (type == mir::ValueType::F32) {
-                if (float_reg < kFArgRegs.size()) {
+                if (float_reg < float_argument_regs.size()) {
                     load_float_value(arg, "ft0");
-                    emit(mir::Opcode::FMove, {mir::MachineOperand::freg(kFArgRegs[float_reg++]),
-                                              mir::MachineOperand::freg("ft0")});
+                    emit(mir::Opcode::FMove,
+                         {mir::MachineOperand::freg(float_argument_regs[float_reg++]),
+                          mir::MachineOperand::freg("ft0")});
                 } else {
                     load_float_value(arg, "ft0");
                     emit(mir::Opcode::StoreOutgoingArg,
@@ -636,9 +681,9 @@ class Lowerer final {
                     stack_offset += 8;
                 }
             } else {
-                if (int_reg < kArgRegs.size()) {
+                if (int_reg < argument_regs.size()) {
                     load_int_value(arg, "t0");
-                    emit(mir::Opcode::Move, {mir::MachineOperand::reg(kArgRegs[int_reg++]),
+                    emit(mir::Opcode::Move, {mir::MachineOperand::reg(argument_regs[int_reg++]),
                                              mir::MachineOperand::reg("t0")});
                 } else {
                     load_int_value(arg, "t0");
@@ -847,6 +892,7 @@ class Lowerer final {
     };
 
     std::unique_ptr<mir::Module> module_;
+    oir::DataLayout data_layout_;
     mir::MachineFunction *current_function_ = nullptr;
     mir::MachineBasicBlock *current_block_ = nullptr;
     unsigned temp_index_ = 0;

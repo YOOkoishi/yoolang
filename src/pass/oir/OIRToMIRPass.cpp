@@ -3,14 +3,9 @@
 #include "mir/MIRVerifier.h"
 
 #include "pass/oir/OIRToMIRCommon.h"
-
-#include <memory>
+#include "target/TargetMachine.h"
 
 namespace pass {
-
-OIRToMIRPass::OIRToMIRPass(bool use_virtual_registers)
-    : use_virtual_registers_(use_virtual_registers) {
-}
 
 std::string_view OIRToMIRPass::name() const {
     return "OIRToMIRPass";
@@ -27,13 +22,29 @@ PassResult OIRToMIRPass::run(PassContext &context) {
     }
 
     try {
-        std::unique_ptr<mir::Module> lowered;
-        if (use_virtual_registers_ &&
-            !oir_to_mir::should_use_conservative_lowering_for_size(*module)) {
-            lowered = oir_to_mir::lower_with_vregs(*module);
-        } else {
-            lowered = oir_to_mir::lower_with_stack_slots(*module);
-        }
+        const auto *target_machine = context.get_artifact<target::TargetMachine>(
+            target::kTargetMachineArtifactKey);
+        target::TargetMachine default_target_machine;
+        const auto &profile = target_machine == nullptr ? default_target_machine.profile()
+                                                        : target_machine->profile();
+        auto lowered = oir_to_mir::lower_with_vregs(*module, profile);
+        auto &target_info = lowered->target();
+        target_info.triple = profile.triple;
+        target_info.arch = profile.march;
+        target_info.abi = profile.mabi;
+        target_info.cpu = profile.cpu;
+        target_info.tune = profile.tune;
+        target_info.xlen_bits = profile.xlen_bits;
+        target_info.flen_bits = profile.flen_bits;
+        target_info.minimum_vlen_bits = profile.minimum_vlen_bits;
+        target_info.abi_vlen_bits =
+            profile.vector_abi == target::VectorABI::PsABIVector &&
+                    profile.fixed_vector_bits.has_value()
+                ? *profile.fixed_vector_bits
+                : 0U;
+        target_info.stack_align = profile.stack_alignment;
+        target_info.has_vector = profile.has_vector();
+        target_info.psabi_vector = profile.vector_abi == target::VectorABI::PsABIVector;
         auto verify = mir::verify_module(*lowered, mir::MIRVerificationStage::PreRA);
         if (!verify.ok) {
             return PassResult::fail(verify.message);

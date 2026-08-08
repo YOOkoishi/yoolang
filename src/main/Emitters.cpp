@@ -7,6 +7,7 @@
 #include "pass/CostModelDiagnosticsPass.h"
 #include "pass/mir/MIRDiagnosticsPass.h"
 #include "pass/mir/MIRToAsmPass.h"
+#include "pass/oir/OIRVectorizationRemark.h"
 #include "yir/YIRPrinter.h"
 
 #include <cstdint>
@@ -128,6 +129,25 @@ int run_pipeline(pass::PassManager &pm, pass::PassContext &context, std::ostream
 
 bool emit_requested_outputs(const CliOptions &options, pass::PassContext &context,
                             std::ostream &out, std::ostream &err) {
+    const auto *vectorization_remarks =
+        context.get_artifact<pass::oir_vectorize::RemarkLog>(
+            pass::oir_vectorize::kRemarkArtifactKey);
+    const pass::oir_vectorize::RemarkLog empty_vectorization_remarks;
+    const auto &remarks = vectorization_remarks == nullptr
+                              ? empty_vectorization_remarks
+                              : *vectorization_remarks;
+    if (options.rpass) {
+        pass::oir_vectorize::print_remarks_text(
+            remarks, err, true, false, options.rpass_filter);
+    }
+    if (options.rpass_missed) {
+        pass::oir_vectorize::print_remarks_text(
+            remarks, err, false, true, options.rpass_missed_filter);
+    }
+    if (options.emit_vector_plan) {
+        pass::oir_vectorize::print_vector_plan_json(remarks, out);
+    }
+
     if (options.emit_yir) {
         auto *module =
             context.get_artifact<std::unique_ptr<yir::Module>>(pass::ASTToYIRPass::kArtifactKey);
@@ -157,6 +177,20 @@ bool emit_requested_outputs(const CliOptions &options, pass::PassContext &contex
                 return false;
             }
             out << *stage_dump;
+        } else if (!options.emit_asm) {
+            // A plain MIR dump remains a readable pseudo-MIR view even though
+            // compilation continues through explicit pseudo expansion and the
+            // Final verifier.  O0 retains its traditional virtual-register
+            // lowered view; optimized dumps use the allocated pre-expansion
+            // snapshot.  --emit-mir-stage=final is the explicit final-opcode view.
+            const auto stage = options.opt_level == 0 ? "lowered" : "post-ra";
+            auto *snapshot = context.get_artifact<std::string>(
+                pass::MIRDiagnosticsPass::dump_artifact_key(stage));
+            if (snapshot == nullptr) {
+                err << "Readable MIR snapshot was not produced: " << stage << "\n";
+                return false;
+            }
+            out << *snapshot;
         } else {
             auto *module = context.machine_module();
             if (module == nullptr) {
