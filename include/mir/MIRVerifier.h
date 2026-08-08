@@ -9,6 +9,7 @@ namespace mir {
 enum class MIRVerificationStage {
     PreRA,
     PostRA,
+    Final,
 };
 
 struct MIRVerifyResult {
