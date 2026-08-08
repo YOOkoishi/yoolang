@@ -1,9 +1,13 @@
 #include "pass/mir/MIRRegAllocPass.h"
+#include "pass/mir/MIRVectorStatePass.h"
 
+#include "mir/MachineInstrDesc.h"
 #include "mir/MIR.h"
 #include "mir/MIRVerifier.h"
+#include "pass/mir/MIRVectorRegAlloc.h"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <set>
 #include <sstream>
@@ -92,13 +96,13 @@ mir::TypeInfo type_info_for(mir::ValueType type) {
 std::vector<mir::Register> caller_saved(mir::RegisterClass reg_class) {
     std::vector<mir::Register> out;
     if (reg_class == mir::RegisterClass::GPR) {
-        for (const std::string &name :
+        for (const char *name :
              {"t0", "t1", "t2", "t3", "t4", "t5", "a0", "a1", "a2", "a3",
               "a4", "a5", "a6", "a7"}) {
             out.push_back(mir::Register::physical(name, reg_class));
         }
     } else {
-        for (const std::string &name :
+        for (const char *name :
              {"ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8",
               "ft9", "ft10", "ft11", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5",
               "fa6", "fa7"}) {
@@ -111,13 +115,13 @@ std::vector<mir::Register> caller_saved(mir::RegisterClass reg_class) {
 std::vector<mir::Register> callee_saved(mir::RegisterClass reg_class) {
     std::vector<mir::Register> out;
     if (reg_class == mir::RegisterClass::GPR) {
-        for (const std::string &name :
+        for (const char *name :
              {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
               "s11"}) {
             out.push_back(mir::Register::physical(name, reg_class));
         }
     } else {
-        for (const std::string &name :
+        for (const char *name :
              {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
               "fs10", "fs11"}) {
             out.push_back(mir::Register::physical(name, reg_class));
@@ -165,20 +169,8 @@ bool phys_in_set(const std::set<std::string> &set, const mir::Register &reg) {
     return reg.is_physical() && set.find(reg.name) != set.end();
 }
 
-const mir::MachineOperand *memzero_byte_count_operand(const mir::MachineInstr &instr) {
-    if (instr.opcode() != mir::Opcode::MemZero) {
-        return nullptr;
-    }
-    const auto &ops = instr.operands();
-    return ops.size() >= 3 ? &ops[2] : nullptr;
-}
-
 bool memzero_uses_memset(const mir::MachineInstr &instr) {
-    const auto *byte_count = memzero_byte_count_operand(instr);
-    return byte_count != nullptr &&
-           (byte_count->kind() == mir::OperandKind::Reg ||
-            (byte_count->kind() == mir::OperandKind::Imm &&
-             byte_count->int_value() >= mir::kMemZeroMemsetThresholdBytes));
+    return instr.opcode() == mir::Opcode::MemZero && mir::machine_instr_may_call(instr);
 }
 
 std::vector<mir::Register> physical_defs_for_special_instr(const mir::MachineInstr &instr,
@@ -214,13 +206,6 @@ bool is_move_opcode_for_class(mir::Opcode opcode, mir::RegisterClass reg_class) 
            (opcode == mir::Opcode::FMove && reg_class == mir::RegisterClass::FPR32);
 }
 
-bool is_call_like_instr(const mir::MachineInstr &instr) {
-    if (instr.opcode() == mir::Opcode::Call) {
-        return true;
-    }
-    return memzero_uses_memset(instr);
-}
-
 VRegSet live_across_call(const mir::MachineInstr &instr, const VRegSet &live_after,
                          mir::RegisterClass reg_class) {
     VRegSet out = live_after;
@@ -235,7 +220,6 @@ VRegSet live_across_call(const mir::MachineInstr &instr, const VRegSet &live_aft
 class RegAllocator {
   public:
     void run(mir::MachineFunction &function) {
-        function.regs().clear_allocations();
         constexpr int kMaxRewriteIterations = 12;
         for (int iteration = 0; iteration < kMaxRewriteIterations; ++iteration) {
             function.rebuild_cfg();
@@ -430,7 +414,7 @@ class RegAllocator {
             for (auto instr_it = block->instructions().rbegin();
                  instr_it != block->instructions().rend(); ++instr_it) {
                 const auto &instr = *instr_it;
-                if (is_call_like_instr(instr)) {
+                if (mir::machine_instr_may_call(instr)) {
                     for (auto id : live_across_call(instr, live, reg_class)) {
                         const auto *reg = function.regs().virtual_register(id);
                         if (reg != nullptr && reg->reg_class == reg_class) {
@@ -566,7 +550,7 @@ class RegAllocator {
                     }
                 }
 
-                if (is_call_like_instr(instr)) {
+                if (mir::machine_instr_may_call(instr)) {
                     const auto crossing = live_across_call(instr, live, reg_class);
                     for (const auto &phys : caller_saved(reg_class)) {
                         forbid_live(crossing, phys);
@@ -641,15 +625,20 @@ class RegAllocator {
 
         while (!remaining.empty()) {
             auto picked = remaining.end();
-            for (auto it = remaining.begin(); it != remaining.end(); ++it) {
+            // Push larger ids first so the LIFO select phase assigns preferred
+            // colors to earlier virtual registers.  This keeps allocation
+            // deterministic and makes source-order values win t0/ft0 without
+            // changing the graph-simplification invariant.
+            for (auto reverse_it = remaining.rbegin(); reverse_it != remaining.rend();
+                 ++reverse_it) {
                 std::size_t degree = 0;
-                for (auto neighbor : graph.at(*it)) {
+                for (auto neighbor : graph.at(*reverse_it)) {
                     if (remaining.find(neighbor) != remaining.end()) {
                         ++degree;
                     }
                 }
                 if (degree < k) {
-                    picked = it;
+                    picked = std::prev(reverse_it.base());
                     break;
                 }
             }
@@ -965,28 +954,109 @@ std::string_view MIRRegAllocPass::name() const {
     return "MIRRegAllocPass";
 }
 
+namespace {
+
+PassResult run_vector_allocation(PassContext &context) {
+    auto *module = context.machine_module();
+    if (module == nullptr) {
+        return PassResult::fail(
+            "MIRVectorRegAllocPass requires MIR module in pass context");
+    }
+    const auto pre_ra = mir::verify_module(*module, mir::MIRVerificationStage::PreRA);
+    if (!pre_ra.ok) {
+        return PassResult::fail(pre_ra.message);
+    }
+
+    context.erase_artifact(kMIRVectorRelegalizeArtifactKey);
+    MIRVectorRegAllocator vector_allocator;
+    for (auto &function : module->functions()) {
+        function->regs().clear_allocations();
+        if (function->is_external()) {
+            continue;
+        }
+        auto vector_result = vector_allocator.run(*function);
+        if (!vector_result.success) {
+            if (!vector_result.relegalize_requests.empty()) {
+                context.set_artifact<MIRVectorRelegalizeRequests>(
+                    kMIRVectorRelegalizeArtifactKey,
+                    std::move(vector_result.relegalize_requests));
+            }
+            return PassResult::fail(std::move(vector_result.message));
+        }
+    }
+    return PassResult::ok(true);
+}
+
+PassResult run_scalar_allocation(PassContext &context) {
+    auto *module = context.machine_module();
+    if (module == nullptr) {
+        return PassResult::fail(
+            "MIRScalarRegAllocPass requires MIR module in pass context");
+    }
+    RegAllocator allocator;
+    for (auto &function : module->functions()) {
+        if (!function->is_external()) {
+            allocator.run(*function);
+        }
+    }
+    const auto verify =
+        mir::verify_module(*module, mir::MIRVerificationStage::PostRA);
+    if (!verify.ok) {
+        return PassResult::fail(verify.message);
+    }
+    return PassResult::ok(true);
+}
+
+} // namespace
+
+std::string_view MIRVectorRegAllocPass::name() const {
+    return "MIRVectorRegAllocPass";
+}
+
+PassKind MIRVectorRegAllocPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult MIRVectorRegAllocPass::run(PassContext &context) {
+    try {
+        return run_vector_allocation(context);
+    } catch (const std::exception &exception) {
+        return PassResult::fail(exception.what());
+    }
+}
+
+std::string_view MIRScalarRegAllocPass::name() const {
+    return "MIRScalarRegAllocPass";
+}
+
+PassKind MIRScalarRegAllocPass::kind() const {
+    return PassKind::Transform;
+}
+
+PassResult MIRScalarRegAllocPass::run(PassContext &context) {
+    try {
+        return run_scalar_allocation(context);
+    } catch (const std::exception &exception) {
+        return PassResult::fail(exception.what());
+    }
+}
+
 PassKind MIRRegAllocPass::kind() const {
     return PassKind::Transform;
 }
 
 PassResult MIRRegAllocPass::run(PassContext &context) {
-    auto *module = context.machine_module();
-    if (module == nullptr) {
-        return PassResult::fail("MIRRegAllocPass requires MIR module in pass context");
-    }
-
     try {
-        RegAllocator allocator;
-        for (auto &function : module->functions()) {
-            if (!function->is_external()) {
-                allocator.run(*function);
-            }
+        auto vector_result = run_vector_allocation(context);
+        if (!vector_result.success) {
+            return vector_result;
         }
-        auto verify = mir::verify_module(*module, mir::MIRVerificationStage::PostRA);
-        if (!verify.ok) {
-            return PassResult::fail(verify.message);
+        MIRVectorStatePass state_pass;
+        auto state_result = state_pass.run(context);
+        if (!state_result.success) {
+            return state_result;
         }
-        return PassResult::ok(true);
+        return run_scalar_allocation(context);
     } catch (const std::exception &ex) {
         return PassResult::fail(ex.what());
     }
