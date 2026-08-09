@@ -99,8 +99,8 @@ int main() {
 // ASM-LABEL: pretested_pointer_exit:
 // ASM: andi {{[a-z0-9]+}}, {{[a-z0-9]+}}, 3
 // ASM: .Lpretested_pointer_exit_{{.*}}unroll4.dispatch:
-// ASM: beqz {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}while.body
+// ASM: beq a6, zero, .Lpretested_pointer_exit_while.body.17
 // ASM: .Lpretested_pointer_exit_{{.*}}unroll4.peel:
-// ASM: bnez {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}unroll4.peel
+// ASM: bne a6, zero, .Lpretested_pointer_exit_while.cond.16.unroll4.peel
 // ASM: .Lpretested_pointer_exit_{{.*}}unroll4.peel.done:
 // ASM: bne {{[a-z0-9]+}}, {{[a-z0-9]+}}, .Lpretested_pointer_exit_{{.*}}while.body

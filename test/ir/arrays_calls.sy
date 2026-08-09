@@ -30,5 +30,9 @@ int main() {
 
 // ASM: .globl a
 // ASM-LABEL: sum:
-// ASM: la t0, a
-// ASM: call sum
+// ASM: .Lsum.pcrel.0:
+// ASM-NEXT: auipc t0, %pcrel_hi(a)
+// ASM-NEXT: addi t0, t0, %pcrel_lo(.Lsum.pcrel.0)
+// ASM: .Lmain.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(sum)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Lmain.call.0)(ra)

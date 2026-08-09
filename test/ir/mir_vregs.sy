@@ -118,4 +118,6 @@ int main() {
 // ASM: lw {{.*}}, 184(sp)
 // ASM-LABEL: main:
 // ASM: sd {{.*}}, 184(sp)
-// ASM: call pressure
+// ASM: .Lmain.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(pressure)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Lmain.call.0)(ra)

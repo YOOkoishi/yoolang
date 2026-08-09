@@ -34,5 +34,5 @@ int main() {
 // MIR-NOT: edge.
 
 // ASM-LABEL: main:
-// ASM: bnez
-// ASM: ret
+// ASM: bne t1, zero, .Lmain_while.body.2
+// ASM: jalr zero, 0(ra)

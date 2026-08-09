@@ -218,7 +218,7 @@ int main() {
 // ASM-LABEL: cmp_eq:
 // ASM: bne
 // ASM-LABEL: cmp_ge_const:
-// ASM: li {{.*}}, 1234
+// ASM: addi t0, zero, 1234
 // ASM: blt
 // ASM-NOT: xori
 // ASM-LABEL: cmp_ne_zero:
@@ -226,7 +226,7 @@ int main() {
 // ASM-NOT: snez
 // ASM-LABEL: float_ne_branch:
 // ASM: feq.s
-// ASM: bnez
+// ASM: bne t0, zero, .Lfloat_ne_branch_if.end.3
 // ASM-NOT: xori
 // ASM-LABEL: nonnegative_divrem:
 // ASM: srliw {{.*}}, 3
@@ -271,14 +271,20 @@ int main() {
 // ASM: sd zero
 // ASM-NOT: sw zero
 // ASM-LABEL: stack_zero_after_nonzero_fill:
-// ASM: li t3, -1
+// ASM: addi t3, zero, -1
 // ASM-NOT: sd zero, 0(t3)
 // ASM: sd zero
 // ASM-LABEL: stack_zero_after_large_memset:
-// ASM: call memset
-// ASM: call putarray
+// ASM: .Lstack_zero_after_large_memset.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(memset)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Lstack_zero_after_large_memset.call.0)(ra)
+// ASM: .Lstack_zero_after_large_memset.call.1:
+// ASM-NEXT: auipc ra, %pcrel_hi(putarray)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Lstack_zero_after_large_memset.call.1)(ra)
 // ASM-NOT: sd zero, 0(a0)
 // ASM: sd zero
 // ASM-LABEL: stack_zero_merge_disagreement:
 // ASM-NOT: sd zero, 0(t3)
-// ASM: call putarray
+// ASM: .Lstack_zero_merge_disagreement.call.0:
+// ASM-NEXT: auipc ra, %pcrel_hi(putarray)
+// ASM-NEXT: jalr ra, %pcrel_lo(.Lstack_zero_merge_disagreement.call.0)(ra)

@@ -16,7 +16,9 @@ int main() {
 // ASM-NOT: .option pic
 // ASM: .option nopic
 // ASM-NOT: .option pic
-// ASM: la {{[a-z0-9]+}}, medany_global
+// ASM: .Lread_medany_global.pcrel.0:
+// ASM-NEXT: auipc t0, %pcrel_hi(medany_global)
+// ASM-NEXT: addi t0, t0, %pcrel_lo(.Lread_medany_global.pcrel.0)
 
 // RELOC-NOT: R_RISCV_GOT_HI20
 // RELOC: R_RISCV_PCREL_HI20 {{.*}}medany_global
