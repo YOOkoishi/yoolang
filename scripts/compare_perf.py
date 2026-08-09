@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -12,6 +11,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+try:
+    from perf_common import normalize_output, positive_geomean, read_sysy_expected_output
+except ModuleNotFoundError:  # Support namespace-package imports in programmatic tests.
+    from scripts.perf_common import (
+        normalize_output,
+        positive_geomean,
+        read_sysy_expected_output,
+    )
 
 
 @dataclass
@@ -215,7 +223,7 @@ def _resolve_optional_binary(env_name: str) -> Path | None:
 
 
 def _normalize_text(text: str) -> str:
-    return text.replace("\r\n", "\n").strip()
+    return normalize_output(text)
 
 
 def _collect_cases() -> list[Path]:
@@ -748,19 +756,7 @@ def _expected_input(case: Path) -> Optional[Path]:
 
 
 def _expected_output(case: Path) -> tuple[str, int] | None:
-    candidate = case.with_suffix(".out")
-    if not candidate.exists():
-        return None
-
-    text = candidate.read_text(errors="replace").replace("\r\n", "\n").strip()
-    if not text:
-        return "", 0
-
-    lines = text.splitlines()
-    last = lines[-1].strip()
-    if re.fullmatch(r"-?\d+", last):
-        return "\n".join(lines[:-1]).strip(), int(last)
-    return text, 0
+    return read_sysy_expected_output(case)
 
 
 def _case_work_dir(case: Path) -> Path:
@@ -935,10 +931,7 @@ def _parse_time_cell(value: object) -> Optional[float]:
 
 
 def _geomean(values: list[float]) -> Optional[float]:
-    positive_values = [value for value in values if value > 0.0]
-    if not positive_values:
-        return None
-    return math.exp(sum(math.log(value) for value in positive_values) / len(positive_values))
+    return positive_geomean(values)
 
 
 def _format_ratio(value: Optional[float]) -> str:

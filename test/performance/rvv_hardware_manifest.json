@@ -1,0 +1,245 @@
+{
+  "schema_version": 3,
+  "name": "yoolang-rvv-release-hardware-corpus",
+  "description": "Deduplicated native-hardware scalar versus RVV release corpus. QEMU timing is forbidden.",
+  "protocol": {
+    "primary_metric": "cycles",
+    "minimum_warmups": 3,
+    "minimum_repetitions": 11,
+    "default_warmups": 3,
+    "default_repetitions": 15,
+    "compile_warmups": 1,
+    "compile_repetitions": 5,
+    "max_relative_mad": 0.05
+  },
+  "thresholds": {
+    "unit_stride_geomean_min_speedup": 1.5,
+    "vectorizable_corpus_geomean_min_speedup": 1.15,
+    "hotspot_max_slowdown_fraction": 0.05,
+    "negative_control_max_geomean_regression": 0.02,
+    "compile_time_max_geomean_regression": 0.1
+  },
+  "build": {
+    "scalar": {
+      "compiler_args": [
+        "{source}",
+        "-S",
+        "-O3",
+        "-march=rv64gc",
+        "-mabi=lp64d",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-o",
+        "{assembly}"
+      ],
+      "linker_args": [
+        "-static",
+        "-mcmodel=medany",
+        "-march=rv64gc",
+        "-mabi=lp64d",
+        "{assembly}",
+        "{runtime_lib}",
+        "-o",
+        "{binary}"
+      ]
+    },
+    "rvv": {
+      "compiler_args": [
+        "{source}",
+        "-S",
+        "-O3",
+        "-march=rv64gcv",
+        "-mabi=lp64d",
+        "-fvectorize",
+        "-fslp-vectorize",
+        "-mrvv-vector-bits=scalable",
+        "-o",
+        "{assembly}"
+      ],
+      "vector_plan_args": [
+        "--emit-vector-plan",
+        "-O3",
+        "-march=rv64gcv",
+        "-mabi=lp64d",
+        "-fvectorize",
+        "-fslp-vectorize",
+        "-mrvv-vector-bits=scalable",
+        "{source}"
+      ],
+      "post_ra_mir_args": [
+        "--emit-mir",
+        "--emit-mir-stage=post-ra",
+        "-O3",
+        "-march=rv64gcv",
+        "-mabi=lp64d",
+        "-fvectorize",
+        "-fslp-vectorize",
+        "-mrvv-vector-bits=scalable",
+        "{source}"
+      ],
+      "linker_args": [
+        "-static",
+        "-mcmodel=medany",
+        "-march=rv64gcv",
+        "-mabi=lp64d",
+        "{assembly}",
+        "{runtime_lib}",
+        "-o",
+        "{binary}"
+      ]
+    }
+  },
+  "kernels": [
+    {
+      "id": "matrix-mm3",
+      "source": "test/performance/01_mm3.sy",
+      "input": "test/performance/01_mm3.in",
+      "output": "test/performance/01_mm3.out",
+      "binary_name": "matrix-mm3",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "matrix-multiply",
+      "tags": ["unit-stride", "matrix", "integer"],
+      "hotspot": true
+    },
+    {
+      "id": "matrix-matmul2",
+      "source": "test/performance/matmul2.sy",
+      "input": "test/performance/matmul2.in",
+      "output": "test/performance/matmul2.out",
+      "binary_name": "matrix-matmul2",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "matrix-multiply",
+      "tags": ["matrix", "reduction", "mixed-stride"],
+      "hotspot": false
+    },
+    {
+      "id": "matrix-mixed3",
+      "source": "test/performance/many_mat_cal-3.sy",
+      "input": "test/performance/many_mat_cal-3.in",
+      "output": "test/performance/many_mat_cal-3.out",
+      "binary_name": "matrix-mixed3",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "matrix-mixed",
+      "tags": ["unit-stride", "matrix", "elementwise", "reduction"],
+      "hotspot": true
+    },
+    {
+      "id": "conv2d-3",
+      "source": "test/performance/conv2d-3.sy",
+      "input": "test/performance/conv2d-3.in",
+      "output": "test/performance/conv2d-3.out",
+      "binary_name": "conv2d-3",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "convolution-2d",
+      "tags": ["unit-stride", "convolution", "stencil-like", "reduction"],
+      "hotspot": true
+    },
+    {
+      "id": "stencil-3d-3",
+      "source": "test/performance/sl3.sy",
+      "input": "test/performance/sl3.in",
+      "output": "test/performance/sl3.out",
+      "binary_name": "stencil-3d-3",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "stencil-3d",
+      "tags": ["unit-stride", "stencil", "integer"],
+      "hotspot": true
+    },
+    {
+      "id": "trsm-3",
+      "source": "test/performance/h-10-03.sy",
+      "input": "test/performance/h-10-03.in",
+      "output": "test/performance/h-10-03.out",
+      "binary_name": "trsm-3",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "trsm",
+      "tags": ["unit-stride", "matrix", "float"],
+      "hotspot": true
+    },
+    {
+      "id": "fft-2",
+      "source": "test/performance/fft2.sy",
+      "input": "test/performance/fft2.in",
+      "output": "test/performance/fft2.out",
+      "binary_name": "fft-2",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "fft",
+      "tags": ["fft", "recursive", "pointwise"],
+      "hotspot": false
+    },
+    {
+      "id": "transpose-2",
+      "source": "test/performance/transpose2.sy",
+      "input": "test/performance/transpose2.in",
+      "output": "test/performance/transpose2.out",
+      "binary_name": "transpose-2",
+      "classification": "expected-vectorizable",
+      "minimum_verified_vectorized_loops": 1,
+      "dedupe_group": "transpose",
+      "tags": ["transpose", "mixed-stride", "if-conversion"],
+      "hotspot": false
+    },
+    {
+      "id": "pointer-chasing-shuffle2",
+      "source": "test/performance/shuffle2.sy",
+      "input": "test/performance/shuffle2.in",
+      "output": "test/performance/shuffle2.out",
+      "binary_name": "pointer-chasing-shuffle2",
+      "classification": "negative-control",
+      "dedupe_group": "pointer-chasing-hash",
+      "tags": ["pointer-chasing", "indirect-memory"],
+      "hotspot": false
+    },
+    {
+      "id": "dependent-scheduling3",
+      "source": "test/performance/optimization_scheduling3.sy",
+      "input": "test/performance/optimization_scheduling3.in",
+      "output": "test/performance/optimization_scheduling3.out",
+      "binary_name": "dependent-scheduling3",
+      "classification": "negative-control",
+      "dedupe_group": "loop-carried-dependence",
+      "tags": ["strong-dependence", "scalar-recurrence"],
+      "hotspot": false
+    },
+    {
+      "id": "recursive-knapsack3",
+      "source": "test/performance/knapsack_naive-3.sy",
+      "input": "test/performance/knapsack_naive-3.in",
+      "output": "test/performance/knapsack_naive-3.out",
+      "binary_name": "recursive-knapsack3",
+      "classification": "negative-control",
+      "dedupe_group": "recursive-search",
+      "tags": ["recursion", "branch-heavy"],
+      "hotspot": false
+    },
+    {
+      "id": "dynamic-programming-nussinov3",
+      "source": "test/performance/h-8-03.sy",
+      "input": "test/performance/h-8-03.in",
+      "output": "test/performance/h-8-03.out",
+      "binary_name": "dynamic-programming-nussinov3",
+      "classification": "negative-control",
+      "dedupe_group": "dynamic-programming-dependence",
+      "tags": ["strong-dependence", "dynamic-programming"],
+      "hotspot": false
+    },
+    {
+      "id": "recursive-collatz3",
+      "source": "test/performance/h-1-03.sy",
+      "input": "test/performance/h-1-03.in",
+      "output": "test/performance/h-1-03.out",
+      "binary_name": "recursive-collatz3",
+      "classification": "negative-control",
+      "dedupe_group": "recursive-control",
+      "tags": ["recursion", "control-flow"],
+      "hotspot": false
+    }
+  ]
+}
