@@ -1,0 +1,28 @@
+int masked_guard_allfalse(int inaccessible[]) {
+  mask<7> active = mask<7>{};
+  vector<int,7> passthrough = vector<int,7>{11, 13, 17, 19, 23, 29, 31};
+  vector<int,7> values = vector<int,7>{101, 103, 107, 109, 113, 127, 131};
+  vector<int,7> loaded = masked_load(inaccessible, active, passthrough);
+  masked_store(inaccessible, active, values);
+  return loaded[0] + loaded[1] + loaded[2] + loaded[3] +
+         loaded[4] + loaded[5] + loaded[6];
+}
+
+int masked_guard_sparse(int boundary[], int observed[]) {
+  mask<7> active = mask<7>{1, 0, 1, 0, 0, 0, 0};
+  vector<int,7> passthrough =
+      vector<int,7>{211, 223, 227, 229, 233, 239, 241};
+  vector<int,7> replacement =
+      vector<int,7>{1001, 1002, 1003, 1004, 1005, 1006, 1007};
+  vector<int,7> loaded = masked_load(boundary, active, passthrough);
+  masked_store(boundary, active, replacement);
+  observed[0] = loaded[0];
+  observed[1] = loaded[1];
+  observed[2] = loaded[2];
+  observed[3] = loaded[3];
+  observed[4] = loaded[4];
+  observed[5] = loaded[5];
+  observed[6] = loaded[6];
+  return loaded[0] + loaded[1] + loaded[2] + loaded[3] +
+         loaded[4] + loaded[5] + loaded[6];
+}
