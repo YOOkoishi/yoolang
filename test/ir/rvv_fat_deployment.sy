@@ -1,0 +1,27 @@
+// RUN: %compiler %s -S -O0 -mrvv-deployment=fat | FileCheck %s
+
+int fat_fixed(int seed) {
+  vector<int,3> values = vector<int,3>{1, 2, 3};
+  vector<int,3> result = values + vector<int,3>(seed);
+  return result[0] + result[2];
+}
+
+// CHECK: .attribute arch, "rv64gc"
+// CHECK-NOT: .attribute arch, "rv64gcv"
+// CHECK: .hidden __yoolang_scalar_fat_fixed
+// CHECK-LABEL: __yoolang_scalar_fat_fixed:
+// CHECK-NOT: vset
+// CHECK: .size __yoolang_scalar_fat_fixed, .-__yoolang_scalar_fat_fixed
+// CHECK: .option push
+// CHECK-NEXT: .option arch, +v
+// CHECK: .hidden __yoolang_rvv_fat_fixed
+// CHECK-LABEL: __yoolang_rvv_fat_fixed:
+// CHECK: vsetivli
+// CHECK: .option pop
+// CHECK: .weak __yoolang_rvv_available
+// CHECK-LABEL: fat_fixed:
+// CHECK: lla t0, __yoolang_rvv_available
+// CHECK: beqz t0, .L__yoolang_dispatch_fat_fixed_scalar
+// CHECK: jalr ra, 0(t0)
+// CHECK: tail __yoolang_scalar_fat_fixed
+// CHECK: tail __yoolang_rvv_fat_fixed
