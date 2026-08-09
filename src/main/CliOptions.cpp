@@ -20,9 +20,33 @@ void print_help(const char *program, std::ostream &out) {
         << "  -h, --help       Show this help message\n"
         << "  -S, --emit-asm   Lower to RISC-V assembly (default)\n"
         << "  -o <file>        Write output to <file> instead of stdout\n"
-        << "  -O1              Enable OIR optimizations, vreg MIR lowering, RA, and MIR "
-           "optimizations\n"
-        << "  --polyhedral     Force the YIR polyhedral pipeline under -O1\n"
+        << "  -O0              Disable automatic optimization (default)\n"
+        << "  -O1              Enable scalar OIR/MIR optimizations\n"
+        << "  -O2              Enable scalar optimization and Loop Vectorizer\n"
+        << "  -O3              Enable Loop/SLP vectorization and interleave exploration\n"
+        << "  -march=<arch>     Select RISC-V ISA (default: rv64gc)\n"
+        << "  -mabi=<abi>       Select ABI (currently lp64d)\n"
+        << "  -mcpu=<cpu>       Select target CPU (generic-rv64 or generic-rvv)\n"
+        << "  -mtune=<cpu>      Select cost tuning (generic-rv64 or generic-rvv)\n"
+        << "  -fvectorize / -fno-vectorize\n"
+        << "                   Enable or disable Loop Vectorizer\n"
+        << "  -fslp-vectorize / -fno-slp-vectorize\n"
+        << "                   Enable or disable SLP Vectorizer\n"
+        << "  -mrvv-vector-bits=scalable|N\n"
+        << "                   Select a VLEN-agnostic or fixed VLEN profile\n"
+        << "  -mrvv-deployment=scalar|compile-time|fat\n"
+        << "                   Select scalar-only, compile-time RVV, or fat deployment\n"
+        << "                   (fat emits rv64gc/RVV variants with runtime dispatch)\n"
+        << "  -mvector-abi=standard|psabi-vector\n"
+        << "                   Select the public vector calling convention\n"
+        << "                   (psabi-vector is currently fail-closed pending fixed\n"
+        << "                    vector tuples and GCC/Clang interoperability)\n"
+        << "  -Rpass[=<filter>] Emit successful optimization remarks\n"
+        << "  -Rpass-missed[=<filter>]\n"
+        << "                   Emit missed optimization remarks\n"
+        << "  --emit-vector-plan\n"
+        << "                   Emit machine-readable loop-vectorization plans/remarks\n"
+        << "  --polyhedral     Force the YIR polyhedral pipeline under optimization\n"
         << "  --emit-ast       Dump the parsed AST through the pass pipeline\n"
         << "  --emit-yir       Lower the parsed AST to YIR and dump it\n"
         << "  --emit-oir       Lower the parsed AST to SSA OIR, verify it, and dump it\n"
@@ -34,7 +58,8 @@ void print_help(const char *program, std::ostream &out) {
         << "  --emit-cost-model[=json]\n"
         << "                   Dump cost-model summaries and decisions without emitting assembly\n"
         << "  --cost-model-filter=<pass-or-transform>\n"
-        << "                   Restrict cost-model decision diagnostics to a pass or transform name\n"
+        << "                   Restrict cost-model decision diagnostics to a pass or transform "
+           "name\n"
         << "  --cost-model-policy=conservative|balanced|aggressive\n"
         << "                   Select the cost-model profitability policy (default: balanced)\n"
         << "  --emit-poly      Dump YIR polyhedral SCoP/model/dependence artifacts\n";
@@ -88,6 +113,169 @@ bool parse_command_line(int argc, char **argv, CliOptions &options, std::string 
         }
         if (arg == "--emit-mir-metrics") {
             options.emit_mir_metrics = true;
+            continue;
+        }
+        if (arg == "--emit-vector-plan") {
+            options.emit_vector_plan = true;
+            continue;
+        }
+        if (arg == "-fvectorize") {
+            options.loop_vectorize_override = true;
+            continue;
+        }
+        if (arg == "-fno-vectorize") {
+            options.loop_vectorize_override = false;
+            continue;
+        }
+        if (arg == "-fslp-vectorize") {
+            options.slp_vectorize_override = true;
+            continue;
+        }
+        if (arg == "-fno-slp-vectorize") {
+            options.slp_vectorize_override = false;
+            continue;
+        }
+        if (arg == "-Rpass") {
+            options.rpass = true;
+            continue;
+        }
+        if (arg.rfind("-Rpass=", 0) == 0) {
+            options.rpass = true;
+            options.rpass_filter = arg.substr(std::string("-Rpass=").size());
+            continue;
+        }
+        if (arg == "-Rpass-missed") {
+            options.rpass_missed = true;
+            continue;
+        }
+        if (arg.rfind("-Rpass-missed=", 0) == 0) {
+            options.rpass_missed = true;
+            options.rpass_missed_filter = arg.substr(std::string("-Rpass-missed=").size());
+            continue;
+        }
+        const std::string march_prefix = "-march=";
+        if (arg.rfind(march_prefix, 0) == 0) {
+            options.target.march = arg.substr(march_prefix.size());
+            options.target.march_explicit = true;
+            continue;
+        }
+        if (arg == "-march") {
+            if (i + 1 >= argc) {
+                error = "-march requires an architecture";
+                return false;
+            }
+            options.target.march = argv[++i];
+            options.target.march_explicit = true;
+            continue;
+        }
+        const std::string mabi_prefix = "-mabi=";
+        if (arg.rfind(mabi_prefix, 0) == 0) {
+            options.target.mabi = arg.substr(mabi_prefix.size());
+            continue;
+        }
+        if (arg == "-mabi") {
+            if (i + 1 >= argc) {
+                error = "-mabi requires an ABI";
+                return false;
+            }
+            options.target.mabi = argv[++i];
+            continue;
+        }
+        const std::string mcpu_prefix = "-mcpu=";
+        if (arg.rfind(mcpu_prefix, 0) == 0) {
+            options.target.cpu = arg.substr(mcpu_prefix.size());
+            options.target.cpu_explicit = true;
+            continue;
+        }
+        if (arg == "-mcpu") {
+            if (i + 1 >= argc) {
+                error = "-mcpu requires a CPU name";
+                return false;
+            }
+            options.target.cpu = argv[++i];
+            options.target.cpu_explicit = true;
+            continue;
+        }
+        const std::string mtune_prefix = "-mtune=";
+        if (arg.rfind(mtune_prefix, 0) == 0) {
+            options.target.tune = arg.substr(mtune_prefix.size());
+            options.target.tune_explicit = true;
+            continue;
+        }
+        if (arg == "-mtune") {
+            if (i + 1 >= argc) {
+                error = "-mtune requires a CPU name";
+                return false;
+            }
+            options.target.tune = argv[++i];
+            options.target.tune_explicit = true;
+            continue;
+        }
+        const std::string target_prefix = "--target=";
+        if (arg.rfind(target_prefix, 0) == 0) {
+            options.target.triple = arg.substr(target_prefix.size());
+            continue;
+        }
+        if (arg == "--target") {
+            if (i + 1 >= argc) {
+                error = "--target requires a triple";
+                return false;
+            }
+            options.target.triple = argv[++i];
+            continue;
+        }
+        const std::string deployment_prefix = "-mrvv-deployment=";
+        if (arg.rfind(deployment_prefix, 0) == 0) {
+            if (!target::parse_rvv_deployment(arg.substr(deployment_prefix.size()),
+                                              options.target, error)) {
+                return false;
+            }
+            continue;
+        }
+        if (arg == "-mrvv-deployment") {
+            if (i + 1 >= argc) {
+                error = "-mrvv-deployment requires scalar, compile-time, or fat";
+                return false;
+            }
+            if (!target::parse_rvv_deployment(argv[++i], options.target, error)) {
+                return false;
+            }
+            continue;
+        }
+        const std::string vector_bits_prefix = "-mrvv-vector-bits=";
+        if (arg.rfind(vector_bits_prefix, 0) == 0) {
+            if (!target::parse_vector_bits(arg.substr(vector_bits_prefix.size()), options.target,
+                                           error)) {
+                return false;
+            }
+            continue;
+        }
+        if (arg == "-mrvv-vector-bits") {
+            if (i + 1 >= argc) {
+                error = "-mrvv-vector-bits requires a value";
+                return false;
+            }
+            if (!target::parse_vector_bits(argv[++i], options.target, error)) {
+                return false;
+            }
+            continue;
+        }
+        const std::string vector_abi_prefix = "-mvector-abi=";
+        if (arg.rfind(vector_abi_prefix, 0) == 0) {
+            if (!target::parse_vector_abi(arg.substr(vector_abi_prefix.size()), options.target,
+                                          error)) {
+                return false;
+            }
+            continue;
+        }
+        if (arg == "-mvector-abi") {
+            if (i + 1 >= argc) {
+                error = "-mvector-abi requires a value";
+                return false;
+            }
+            if (!target::parse_vector_abi(argv[++i], options.target, error)) {
+                return false;
+            }
             continue;
         }
         if (arg == "--emit-cost-model") {
@@ -160,13 +348,9 @@ bool parse_command_line(int argc, char **argv, CliOptions &options, std::string 
             options.output_path = argv[++i];
             continue;
         }
-        if (arg == "-O1") {
-            options.opt_level = 1;
+        if (arg == "-O0" || arg == "-O1" || arg == "-O2" || arg == "-O3") {
+            options.opt_level = arg[2] - '0';
             continue;
-        }
-        if (arg == "-O2" || arg == "-O3") {
-            error = "only -O1 is supported";
-            return false;
         }
         if (!arg.empty() && arg[0] == '-') {
             error = "unknown option: " + arg;
@@ -179,34 +363,68 @@ bool parse_command_line(int argc, char **argv, CliOptions &options, std::string 
         options.input_path = std::move(arg);
     }
 
-    if (!options.show_help && options.input_path.empty()) {
+    if (options.show_help) {
+        return true;
+    }
+
+    if (options.input_path.empty()) {
         error = "missing input file";
         return false;
     }
 
-    if (!options.show_help && options.emit_poly && options.opt_level != 1) {
-        error = "--emit-poly requires -O1";
+    if (!target::finalize_target_profile(options.target, error)) {
         return false;
     }
 
-    if (!options.show_help && options.emit_mir_metrics &&
-        (options.emit_ast || options.emit_yir || options.emit_oir || options.emit_mir ||
-         options.emit_asm || options.emit_poly)) {
+    // O0 is a hard semantic pipeline boundary: explicit source vectors still
+    // lower, but no automatic vectorizer runs even when an enabling flag was
+    // also supplied.  At optimized levels the flags may override the default
+    // O2/O3 thresholds without bypassing vectorization legality.
+    options.loop_vectorize =
+        options.opt_level != 0 && options.loop_vectorize_override.value_or(options.opt_level >= 2);
+    options.slp_vectorize =
+        options.opt_level != 0 && options.slp_vectorize_override.value_or(options.opt_level >= 3);
+
+    if ((options.loop_vectorize || options.slp_vectorize) && !options.target.has_vector() &&
+        options.target.deployment != target::DeploymentMode::Multiversion) {
+        // Portable source vectors remain legal and scalarize on rv64gc.  Automatic
+        // vectorization has no profitable target representation without V/Zve.
+        options.loop_vectorize = false;
+        options.slp_vectorize = false;
+    }
+
+    if (options.emit_poly && options.opt_level == 0) {
+        error = "--emit-poly requires an optimization level of at least -O1";
+        return false;
+    }
+
+    if (options.emit_mir_metrics && (options.emit_ast || options.emit_yir || options.emit_oir ||
+                                     options.emit_mir || options.emit_asm || options.emit_poly)) {
         error = "--emit-mir-metrics cannot be combined with other emit options";
         return false;
     }
 
-    if (!options.show_help && options.emit_cost_model &&
+    if (options.emit_cost_model &&
         (options.emit_ast || options.emit_yir || options.emit_oir || options.emit_mir ||
-         options.emit_mir_metrics || options.emit_asm || options.emit_poly)) {
+         options.emit_mir_metrics || options.emit_asm || options.emit_poly ||
+         options.emit_vector_plan)) {
         error = "--emit-cost-model cannot be combined with other emit options";
         return false;
     }
 
-    if (!options.show_help && !options.emit_ast && !options.emit_yir && !options.emit_oir &&
-        !options.emit_mir && !options.emit_mir_metrics && !options.emit_cost_model &&
-        !options.emit_asm && !options.emit_poly) {
+    if (!options.emit_ast && !options.emit_yir && !options.emit_oir && !options.emit_mir &&
+        !options.emit_mir_metrics && !options.emit_cost_model && !options.emit_asm &&
+        !options.emit_poly && !options.emit_vector_plan) {
         options.emit_asm = true;
+    }
+
+    if (options.target.deployment == target::DeploymentMode::Multiversion &&
+        (!options.emit_asm || options.emit_ast || options.emit_yir || options.emit_oir ||
+         options.emit_mir || options.emit_mir_metrics || options.emit_cost_model ||
+         options.emit_poly || options.emit_vector_plan)) {
+        error = "FAT_UNSUPPORTED_EMIT_MODE: fat deployment currently supports assembly "
+                "output only";
+        return false;
     }
 
     return true;

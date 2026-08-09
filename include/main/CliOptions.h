@@ -1,8 +1,10 @@
 #pragma once
 
 #include "pass/CostModel.h"
+#include "target/TargetMachine.h"
 
 #include <iosfwd>
+#include <optional>
 #include <string>
 
 namespace driver {
@@ -11,6 +13,16 @@ struct CliOptions {
     std::string input_path;
     std::string output_path;
     int opt_level = 0;
+    target::TargetProfile target;
+    bool loop_vectorize = false;
+    bool slp_vectorize = false;
+    std::optional<bool> loop_vectorize_override;
+    std::optional<bool> slp_vectorize_override;
+    bool emit_vector_plan = false;
+    bool rpass = false;
+    bool rpass_missed = false;
+    std::string rpass_filter;
+    std::string rpass_missed_filter;
     bool emit_ast = false;
     bool emit_yir = false;
     bool emit_oir = false;

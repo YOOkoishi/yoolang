@@ -27,6 +27,7 @@ int main(int argc, char **argv) {
 
     pass::PassContext context;
     context.set_ast(std::move(ast));
+    driver::initialize_target_machine(context, options);
     driver::initialize_cost_model_report(context, options);
 
     std::ofstream output_file;

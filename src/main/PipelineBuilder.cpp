@@ -10,9 +10,16 @@
 #include "pass/mir/MIRListSchedulerPass.h"
 #include "pass/mir/MIRPeepholePipelinePass.h"
 #include "pass/mir/MIRRegAllocPass.h"
+#include "pass/mir/MIRVectorStatePass.h"
+#include "pass/mir/MIRPseudoExpansionPass.h"
 #include "pass/mir/MIRToAsmPass.h"
+#include "pass/oir/OIRFatMultiversionPass.h"
+#include "pass/oir/OIRLoopVectorizerPass.h"
 #include "pass/oir/OIROptimizationPipelinePass.h"
+#include "pass/oir/OIRPortableVectorScalarizerPass.h"
+#include "pass/oir/OIRSLPVectorizerPass.h"
 #include "pass/oir/OIRToMIRPass.h"
+#include "pass/oir/OIRVectorCleanupPass.h"
 #include "pass/yir/YIRLoopAnalysisPass.h"
 #include "pass/yir/YIRLoopOptimizationPass.h"
 #include "pass/yir/YIRMemoryForwardingPass.h"
@@ -28,17 +35,18 @@ namespace {
 
 bool needs_yir(const CliOptions &options) {
     return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm ||
-           options.emit_poly || options.emit_mir_metrics || options.emit_cost_model;
+           options.emit_poly || options.emit_mir_metrics || options.emit_cost_model ||
+           options.emit_vector_plan;
 }
 
 bool needs_oir(const CliOptions &options) {
     return options.emit_oir || options.emit_mir || options.emit_asm || options.emit_mir_metrics ||
-           options.emit_cost_model;
+           options.emit_cost_model || options.emit_vector_plan;
 }
 
 bool needs_post_poly_yir_pipeline(const CliOptions &options) {
     return options.emit_yir || options.emit_oir || options.emit_mir || options.emit_asm ||
-           options.emit_mir_metrics || options.emit_cost_model;
+           options.emit_mir_metrics || options.emit_cost_model || options.emit_vector_plan;
 }
 
 bool needs_mir(const CliOptions &options) {
@@ -47,7 +55,7 @@ bool needs_mir(const CliOptions &options) {
 }
 
 bool optimizations_enabled(const CliOptions &options) {
-    return options.opt_level == 1;
+    return options.opt_level > 0;
 }
 
 bool polyhedral_enabled(const CliOptions &options) {
@@ -55,7 +63,10 @@ bool polyhedral_enabled(const CliOptions &options) {
 }
 
 bool mir_diagnostics_enabled(const CliOptions &options) {
-    return options.emit_mir_metrics || !options.emit_mir_stage.empty();
+    const bool preserve_readable_mir =
+        options.emit_mir && !options.emit_asm && options.emit_mir_stage.empty();
+    return options.emit_mir_metrics || !options.emit_mir_stage.empty() ||
+           preserve_readable_mir;
 }
 
 bool cost_model_diagnostics_enabled(const CliOptions &options) {
@@ -110,25 +121,56 @@ void add_oir_pipeline(pass::PassManager &pm, const CliOptions &options) {
             pass::cost_model::CostIRStage::OIR, "oir-before", options.cost_model_policy,
             options.cost_model_filter);
     }
+    if (options.target.deployment == target::DeploymentMode::Multiversion) {
+        pass::OIRFatMultiversionOptions fat_options;
+        fat_options.loop_vectorize = options.loop_vectorize;
+        fat_options.slp_vectorize = options.slp_vectorize;
+        fat_options.explore_interleave = options.opt_level >= 3;
+        fat_options.optimize_mir = optimizations_enabled(options);
+        pm.add_pass<pass::OIRFatMultiversionPass>(fat_options);
+        return;
+    }
     if (optimizations_enabled(options)) {
         pm.add_pass<pass::OIROptimizationPipelinePass>();
+    }
+    // OIR is target-independent and remains a faithful typed-vector
+    // observation point.  Scalarize only when this compilation continues to
+    // target-specific MIR; otherwise --emit-oir must retain vector/mask IR.
+    if (needs_mir(options) && !options.target.has_vector()) {
+        pm.add_pass<pass::OIRPortableVectorScalarizerPass>();
     }
     if (cost_model_diagnostics_enabled(options)) {
         pm.add_pass<pass::CostModelDiagnosticsPass>(pass::cost_model::CostIRStage::OIR, "oir",
                                                     options.cost_model_policy,
                                                     options.cost_model_filter);
     }
+    bool produced_vector_ir = false;
+    if (options.loop_vectorize) {
+        pass::oir_vectorize::LoopVectorizerOptions vectorizer_options;
+        vectorizer_options.enabled = true;
+        vectorizer_options.explore_interleave = options.opt_level >= 3;
+        pm.add_pass<pass::OIRLoopVectorizerPass>(vectorizer_options);
+        produced_vector_ir = true;
+    }
+    if (options.slp_vectorize) {
+        pass::oir_vectorize::SLPVectorizerOptions vectorizer_options;
+        vectorizer_options.enabled = true;
+        pm.add_pass<pass::OIRSLPVectorizerPass>(vectorizer_options);
+        produced_vector_ir = true;
+    }
+    if (produced_vector_ir) {
+        pm.add_pass<pass::OIRVectorCleanupPass>();
+    }
 }
 
 void add_mir_pipeline(pass::PassManager &pm, const CliOptions &options) {
-    if (!needs_mir(options)) {
+    if (!needs_mir(options) ||
+        options.target.deployment == target::DeploymentMode::Multiversion) {
         return;
     }
 
-    const bool emit_readable_prera_mir = options.emit_mir && !options.emit_asm;
-    const bool use_virtual_registers = optimizations_enabled(options) || emit_readable_prera_mir;
     const bool record_diagnostics = mir_diagnostics_enabled(options);
-    pm.add_pass<pass::OIRToMIRPass>(use_virtual_registers);
+    pm.add_pass<pass::OIRToMIRPass>();
     if (record_diagnostics) {
         pm.add_pass<pass::MIRDiagnosticsPass>("lowered", mir::MIRVerificationStage::PreRA);
     }
@@ -141,34 +183,38 @@ void add_mir_pipeline(pass::PassManager &pm, const CliOptions &options) {
         }
         pm.add_pass<pass::MIRPeepholePipelinePass>(false);
         pm.add_pass<pass::MIRListSchedulerPass>(false);
-        if (record_diagnostics) {
-            pm.add_pass<pass::MIRDiagnosticsPass>("pre-ra", mir::MIRVerificationStage::PreRA);
-        }
-        pm.add_pass<pass::MIRRegAllocPass>();
-        if (record_diagnostics) {
-            pm.add_pass<pass::MIRDiagnosticsPass>("post-ra", mir::MIRVerificationStage::PostRA);
-        }
+    }
+
+    if (record_diagnostics) {
+        pm.add_pass<pass::MIRDiagnosticsPass>("pre-ra", mir::MIRVerificationStage::PreRA);
+    }
+    pm.add_pass<pass::MIRVectorRegAllocPass>();
+    pm.add_pass<pass::MIRVectorStatePass>();
+    pm.add_pass<pass::MIRScalarRegAllocPass>();
+    if (record_diagnostics) {
+        pm.add_pass<pass::MIRDiagnosticsPass>("post-ra", mir::MIRVerificationStage::PostRA);
+    }
+
+    if (optimizations_enabled(options)) {
         pm.add_pass<pass::MIRPeepholePipelinePass>(true);
         pm.add_pass<pass::MIRListSchedulerPass>(true);
-        if (record_diagnostics) {
-            pm.add_pass<pass::MIRDiagnosticsPass>("final", mir::MIRVerificationStage::PostRA);
-        }
-        if (cost_model_diagnostics_enabled(options)) {
-            pm.add_pass<pass::CostModelDiagnosticsPass>(
-                pass::cost_model::CostIRStage::FinalMIR, "final-mir",
-                options.cost_model_policy, options.cost_model_filter);
-        }
-    } else if (record_diagnostics) {
-        pm.add_pass<pass::MIRDiagnosticsPass>("final", mir::MIRVerificationStage::PreRA);
-    } else if (cost_model_diagnostics_enabled(options)) {
+    }
+
+    pm.add_pass<pass::MIRPseudoExpansionPass>();
+
+    if (record_diagnostics) {
+        pm.add_pass<pass::MIRDiagnosticsPass>("final", mir::MIRVerificationStage::Final);
+    }
+    if (cost_model_diagnostics_enabled(options)) {
         pm.add_pass<pass::CostModelDiagnosticsPass>(
-            pass::cost_model::CostIRStage::PreRAMIR, "lowered-mir", options.cost_model_policy,
+            pass::cost_model::CostIRStage::FinalMIR, "final-mir", options.cost_model_policy,
             options.cost_model_filter);
     }
 }
 
 void add_asm_pipeline(pass::PassManager &pm, const CliOptions &options) {
-    if (options.emit_asm) {
+    if (options.emit_asm &&
+        options.target.deployment != target::DeploymentMode::Multiversion) {
         pm.add_pass<pass::MIRToAsmPass>();
     }
 }
@@ -180,10 +226,15 @@ void initialize_cost_model_report(pass::PassContext &context, const CliOptions &
         return;
     }
     pass::cost_model::CostModelReport report;
-    report.target = pass::cost_model::default_target_profile();
+    report.target = pass::cost_model::target_profile_for(options.target);
     report.policy = options.cost_model_policy;
     report.filter = options.cost_model_filter;
     context.set_artifact(pass::cost_model::kReportArtifactKey, std::move(report));
+}
+
+void initialize_target_machine(pass::PassContext &context, const CliOptions &options) {
+    context.set_artifact(target::kTargetMachineArtifactKey,
+                         target::TargetMachine(options.target));
 }
 
 pass::PassManager build_compilation_pipeline(const CliOptions &options, std::ostream &out) {
