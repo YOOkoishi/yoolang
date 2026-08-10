@@ -23,12 +23,73 @@ DEFAULT_BINARY = ROOT / "build/linux/x86_64/release/compiler"
 DEFAULT_WORK_DIR = ROOT / "tmp/test-run"
 DEFAULT_RUNTIME = ROOT / "runtime/libsysy_riscv.a"
 RISCV_CODE_MODEL_FLAGS = ["-mcmodel=medany"]
+DEFAULT_MARCH = "rv64gc"
+DEFAULT_MABI = "lp64d"
+QEMU_SCALAR_CPU = os.environ.get("QEMU_SCALAR_CPU", "rv64,v=false")
 STAGE_FLAGS = {
     "yir": "--emit-yir",
     "oir": "--emit-oir",
     "mir": "--emit-mir",
     "asm": "-S",
 }
+
+# Every *_infra_tests.py file is discovered automatically.  These legacy
+# names predate the suffix convention and remain first-class infra gates.
+LEGACY_INFRA_SCRIPTS = (
+    "calling_convention_tests.py",
+    "i1_layout_tests.py",
+    "rvv_differential_tests.py",
+    "rvv_guard_page_tests.py",
+    "rvv_mask_guard_tests.py",
+    "vectorization_analysis_tests.py",
+    "vectorization_remark_tests.py",
+    "yir_vector_tests.py",
+    "yir_to_oir_vector_tests.py",
+)
+
+# These scripts assemble/link and/or execute RISC-V binaries.  The `host`
+# profile excludes them explicitly; `toolchain` and `all` run them fail-closed.
+TOOLCHAIN_INFRA_SCRIPTS = frozenset(
+    {
+        "portable_vector_e2e_infra_tests.py",
+        "psabi_vector_abi_e2e_infra_tests.py",
+        "psabi_vector_staged_runtime_infra_tests.py",
+        "rvv_alias_versioning_perf_corpus_infra_tests.py",
+        "rvv_backend_infra_tests.py",
+        "rvv_differential_tests.py",
+        "rvv_fixed_chunk_backend_infra_tests.py",
+        "rvv_fixed_value_backend_infra_tests.py",
+        "rvv_fat_multiversion_infra_tests.py",
+        "rvv_fat_standard_abi_infra_tests.py",
+        "rvv_guard_page_tests.py",
+        "rvv_indexed_reduction_backend_infra_tests.py",
+        "rvv_interleave2_infra_tests.py",
+        "rvv_lmul_vlen_boundary_infra_tests.py",
+        "rvv_mask_guard_tests.py",
+        "rvv_oversized_vector_semantics_infra_tests.py",
+        "rvv_perf_corpus_vectorization_infra_tests.py",
+        "rvv_remaining_perf_corpus_infra_tests.py",
+        "rvv_runtime_dispatch_infra_tests.py",
+        "rvv_random_differential_infra_tests.py",
+        "rvv_scalable_lmul_consistency_infra_tests.py",
+        "rvv_strided_memory_backend_infra_tests.py",
+        "rvv_toolchain_infra_tests.py",
+        "standard_vector_aggregate_abi_e2e_infra_tests.py",
+        "vector_numeric_semantics_infra_tests.py",
+        "vector_mask_select_e2e_infra_tests.py",
+    }
+)
+
+# Scripts with an explicit --compiler interface receive the exact runner
+# binary as an argument.  YOOLANG_COMPILER is also set for every infra child so
+# compiler-backed scripts without argparse cannot silently select another build.
+COMPILER_ARG_INFRA_SCRIPTS = frozenset(
+    {
+        "target_infra_tests.py",
+        "vector_docs_infra_tests.py",
+        "vectorization_docs_infra_tests.py",
+    }
+)
 
 
 @dataclasses.dataclass
@@ -46,6 +107,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-root", type=Path, default=ROOT / "test")
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
     parser.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
+    parser.add_argument(
+        "--march",
+        default=DEFAULT_MARCH,
+        help="RISC-V ISA passed consistently to compiler and linker",
+    )
+    parser.add_argument(
+        "--mabi",
+        default=DEFAULT_MABI,
+        help="RISC-V ABI passed consistently to compiler and linker",
+    )
+    parser.add_argument(
+        "--qemu-cpu",
+        default=QEMU_SCALAR_CPU,
+        help=(
+            "explicit qemu-riscv64 CPU string; RVV tests should pass "
+            "rv64,v=true,vlen=N,elen=64"
+        ),
+    )
     parser.add_argument("--xfail-file", type=Path, default=ROOT / "test/xfail.txt")
     parser.add_argument(
         "--suite",
@@ -88,15 +167,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--infra-timeout",
         type=float,
-        default=20.0,
+        default=120.0,
         help="infra test subprocess timeout in seconds",
+    )
+    parser.add_argument(
+        "--infra-profile",
+        choices=["all", "host", "toolchain"],
+        default="all",
+        help=(
+            "infra capability profile: host excludes cross-toolchain/QEMU scripts; "
+            "toolchain runs only those scripts; all requires every discovered script"
+        ),
+    )
+    parser.add_argument(
+        "--require-e2e-tools",
+        action="store_true",
+        help="treat a missing RISC-V linker, QEMU, or runtime archive as an e2e failure",
+    )
+    parser.add_argument(
+        "--fail-on-skip",
+        action="store_true",
+        help="return failure when any selected test reports SKIP",
     )
     parser.add_argument(
         "--opt-level",
         type=int,
-        choices=[0, 1],
+        choices=[0, 1, 2, 3],
         default=0,
         help="compiler optimization level for stage/e2e compiler invocations",
+    )
+    parser.add_argument(
+        "--o0",
+        action="store_const",
+        const=0,
+        dest="opt_level",
+        help="shorthand for --opt-level 0",
     )
     parser.add_argument(
         "--o1",
@@ -104,6 +209,20 @@ def parse_args() -> argparse.Namespace:
         const=1,
         dest="opt_level",
         help="shorthand for --opt-level 1",
+    )
+    parser.add_argument(
+        "--o2",
+        action="store_const",
+        const=2,
+        dest="opt_level",
+        help="shorthand for --opt-level 2",
+    )
+    parser.add_argument(
+        "--o3",
+        action="store_const",
+        const=3,
+        dest="opt_level",
+        help="shorthand for --opt-level 3",
     )
     parser.add_argument(
         "--max-input-bytes",
@@ -148,6 +267,7 @@ def run_process(
     input_bytes: bytes | None = None,
     stdout_target=subprocess.PIPE,
     timeout: float,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         argv,
@@ -157,6 +277,7 @@ def run_process(
         stderr=subprocess.PIPE,
         timeout=timeout,
         check=False,
+        env=env,
     )
 
 
@@ -165,6 +286,10 @@ def short_output(data: bytes, limit: int = 4096) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n... <truncated> ...\n"
+
+
+def contains_skip_line(detail: str) -> bool:
+    return any(line.startswith("SKIP ") for line in detail.splitlines())
 
 
 def discover_sources(test_root: Path, pattern: str | None) -> list[Path]:
@@ -305,13 +430,59 @@ def run_filecheck(
     return TestResult(suite, rel(source), "PASS", time.monotonic() - start)
 
 
-def run_infra(timeout: float) -> TestResult:
+def discover_infra_scripts(pattern: str | None = None) -> list[Path]:
+    scripts = set((ROOT / "scripts").glob("*_infra_tests.py"))
+    for name in LEGACY_INFRA_SCRIPTS:
+        script = ROOT / "scripts" / name
+        if script.exists():
+            scripts.add(script)
+    return sorted(
+        script for script in scripts if pattern is None or pattern in rel(script)
+    )
+
+
+def select_infra_scripts(
+    scripts: Iterable[Path], profile: str
+) -> tuple[list[Path], list[Path]]:
+    selected: list[Path] = []
+    excluded: list[Path] = []
+    for script in scripts:
+        requires_toolchain = script.name in TOOLCHAIN_INFRA_SCRIPTS
+        matches = (
+            profile == "all"
+            or (profile == "host" and not requires_toolchain)
+            or (profile == "toolchain" and requires_toolchain)
+        )
+        (selected if matches else excluded).append(script)
+    return selected, excluded
+
+
+def infra_profile_requires_toolchain(profile: str) -> bool:
+    return profile in {"toolchain", "all"}
+
+
+def infra_command(script: Path, binary: Path) -> list[str]:
+    argv = [sys.executable, str(script)]
+    if script.name in COMPILER_ARG_INFRA_SCRIPTS:
+        argv.extend(["--compiler", str(binary)])
+    return argv
+
+
+def run_infra(
+    script: Path, binary: Path, timeout: float, *, require_toolchain: bool = False
+) -> TestResult:
     start = time.monotonic()
-    script = ROOT / "scripts/oir_infra_tests.py"
+    argv = infra_command(script, binary)
+    env = os.environ.copy()
+    env["YOOLANG_COMPILER"] = str(binary)
+    env["YOOLANG_INFRA_TOOLCHAIN_REQUIRED"] = "1" if require_toolchain else "0"
     try:
-        proc = run_process([sys.executable, str(script)], timeout=timeout)
+        proc = run_process(argv, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return TestResult("infra", rel(script), "FAIL", time.monotonic() - start, "infra tests timed out")
+    if proc.returncode == 77:
+        detail = short_output(proc.stdout or proc.stderr) or "infra script reported unavailable capability"
+        return TestResult("infra", rel(script), "SKIP", time.monotonic() - start, detail)
     if proc.returncode != 0:
         detail = ""
         if proc.stdout:
@@ -319,7 +490,10 @@ def run_infra(timeout: float) -> TestResult:
         if proc.stderr:
             detail += "stderr:\n" + short_output(proc.stderr)
         return TestResult("infra", rel(script), "FAIL", time.monotonic() - start, detail)
-    return TestResult("infra", rel(script), "PASS", time.monotonic() - start, short_output(proc.stdout))
+    detail = short_output(proc.stdout)
+    if contains_skip_line(detail):
+        return TestResult("infra", rel(script), "SKIP", time.monotonic() - start, detail)
+    return TestResult("infra", rel(script), "PASS", time.monotonic() - start, detail)
 
 
 def compiler_opt_flags(opt_level: int) -> list[str]:
@@ -328,13 +502,26 @@ def compiler_opt_flags(opt_level: int) -> list[str]:
     return [f"-O{opt_level}"]
 
 
-def run_stage(source: Path, stage: str, binary: Path, compile_timeout: float, opt_level: int) -> TestResult:
+def run_stage(
+    source: Path,
+    stage: str,
+    binary: Path,
+    compile_timeout: float,
+    opt_level: int,
+    target_flags: list[str],
+) -> TestResult:
     suffix = f", -O{opt_level}" if opt_level else ""
     name = f"{rel(source)} [{stage}{suffix}]"
     start = time.monotonic()
     try:
         proc = run_process(
-            [str(binary), STAGE_FLAGS[stage], *compiler_opt_flags(opt_level), str(source)],
+            [
+                str(binary),
+                STAGE_FLAGS[stage],
+                *target_flags,
+                *compiler_opt_flags(opt_level),
+                str(source),
+            ],
             stdout_target=subprocess.DEVNULL,
             timeout=compile_timeout,
         )
@@ -383,15 +570,21 @@ def run_e2e(
     run_timeout: float,
     max_input_bytes: int,
     opt_level: int,
+    target_flags: list[str],
+    qemu_cpu: str,
+    require_tools: bool,
 ) -> TestResult:
     start = time.monotonic()
     name = rel(source) if opt_level == 0 else f"{rel(source)} [-O{opt_level}]"
+    unavailable_status = "FAIL" if require_tools else "SKIP"
     if gcc is None:
-        return TestResult("e2e", name, "SKIP", detail="riscv64-linux-gnu-gcc not found")
+        return TestResult("e2e", name, unavailable_status, detail="riscv64-linux-gnu-gcc not found")
     if qemu is None:
-        return TestResult("e2e", name, "SKIP", detail="qemu-riscv64 not found")
+        return TestResult("e2e", name, unavailable_status, detail="qemu-riscv64 not found")
     if not runtime.exists():
-        return TestResult("e2e", name, "SKIP", detail=f"runtime archive not found: {runtime}")
+        return TestResult(
+            "e2e", name, unavailable_status, detail=f"runtime archive not found: {runtime}"
+        )
 
     input_path = source.with_suffix(".in")
     expected_path = source.with_suffix(".out")
@@ -406,7 +599,15 @@ def run_e2e(
 
     try:
         compile_proc = run_process(
-            [str(binary), str(source), "-S", *compiler_opt_flags(opt_level), "-o", str(asm_path)],
+            [
+                str(binary),
+                str(source),
+                "-S",
+                *target_flags,
+                *compiler_opt_flags(opt_level),
+                "-o",
+                str(asm_path),
+            ],
             stdout_target=subprocess.DEVNULL,
             timeout=compile_timeout,
         )
@@ -417,7 +618,16 @@ def run_e2e(
 
     try:
         link_proc = run_process(
-            [gcc, "-static", *RISCV_CODE_MODEL_FLAGS, str(asm_path), str(runtime), "-o", str(exe_path)],
+            [
+                gcc,
+                "-static",
+                *target_flags,
+                *RISCV_CODE_MODEL_FLAGS,
+                str(asm_path),
+                str(runtime),
+                "-o",
+                str(exe_path),
+            ],
             timeout=link_timeout,
         )
     except subprocess.TimeoutExpired:
@@ -428,7 +638,11 @@ def run_e2e(
 
     input_bytes = input_path.read_bytes() if input_path.exists() else b""
     try:
-        run_proc = run_process([qemu, str(exe_path)], input_bytes=input_bytes, timeout=run_timeout)
+        run_proc = run_process(
+            [qemu, "-cpu", qemu_cpu, str(exe_path)],
+            input_bytes=input_bytes,
+            timeout=run_timeout,
+        )
     except subprocess.TimeoutExpired:
         return TestResult("e2e", name, "FAIL", time.monotonic() - start, "program timed out")
 
@@ -456,7 +670,7 @@ def run_many(label: str, jobs: int, items: Iterable, worker, xfails: list[tuple[
             result = apply_xfail(future.result(), xfails)
             results.append(result)
             print(f"{result.status:4} {result.suite:9} {result.name} ({result.elapsed:.2f}s)")
-            if result.status == "FAIL" and result.detail:
+            if result.status in {"FAIL", "SKIP"} and result.detail:
                 print(indent(result.detail.rstrip(), "    "))
     return results
 
@@ -477,7 +691,7 @@ def ensure_ready(args: argparse.Namespace) -> None:
     args.work_dir.mkdir(parents=True, exist_ok=True)
 
 
-def summarize(results: list[TestResult]) -> int:
+def summarize(results: list[TestResult], *, fail_on_skip: bool = False) -> int:
     passed = sum(1 for result in results if result.status == "PASS")
     failed = sum(1 for result in results if result.status == "FAIL")
     skipped = sum(1 for result in results if result.status == "SKIP")
@@ -487,7 +701,7 @@ def summarize(results: list[TestResult]) -> int:
         f"\nsummary: {passed} passed, {failed} failed, {skipped} skipped, "
         f"{xfailed} xfailed, {xpassed} xpassed"
     )
-    return 1 if failed or xpassed else 0
+    return 1 if failed or xpassed or (fail_on_skip and skipped) else 0
 
 
 def main() -> int:
@@ -507,13 +721,42 @@ def main() -> int:
     stages = args.stage or sorted(STAGE_FLAGS)
     xfails = load_xfails(args.xfail_file)
     results: list[TestResult] = []
+    target_flags = [f"-march={args.march}", f"-mabi={args.mabi}"]
 
     if "infra" in suites:
-        result = apply_xfail(run_infra(infra_timeout), xfails)
-        results.append(result)
-        print(f"{result.status:4} {result.suite:9} {result.name} ({result.elapsed:.2f}s)")
-        if result.status == "FAIL" and result.detail:
-            print(indent(result.detail.rstrip(), "    "))
+        discovered = discover_infra_scripts(args.filter)
+        infra_scripts, excluded_infra = select_infra_scripts(discovered, args.infra_profile)
+        print(
+            f"[infra] profile={args.infra_profile}, discovered={len(discovered)}, "
+            f"selected={len(infra_scripts)}, excluded={len(excluded_infra)}"
+        )
+        if args.infra_profile == "host" and excluded_infra:
+            detail = (
+                "cross-toolchain/QEMU scripts excluded by --infra-profile=host: "
+                + ", ".join(script.name for script in excluded_infra)
+            )
+            result = TestResult("infra", "RISC-V toolchain capability group", "SKIP", detail=detail)
+            results.append(result)
+            print(f"{result.status:4} {result.suite:9} {result.name}")
+            print(indent(result.detail, "    "))
+        for script in infra_scripts:
+            result = apply_xfail(
+                run_infra(
+                    script,
+                    args.binary,
+                    infra_timeout,
+                    require_toolchain=infra_profile_requires_toolchain(args.infra_profile),
+                ),
+                xfails,
+            )
+            results.append(result)
+            print(f"{result.status:4} {result.suite:9} {result.name} ({result.elapsed:.2f}s)")
+            if result.detail and (
+                result.status in {"FAIL", "SKIP"}
+                or args.verbose
+                or contains_skip_line(result.detail)
+            ):
+                print(indent(result.detail.rstrip(), "    "))
 
     if "filecheck" in suites:
         tests = discover_filecheck_tests(args.test_root, args.filter)
@@ -549,7 +792,10 @@ def main() -> int:
                 "stage",
                 args.jobs,
                 stage_items,
-                lambda item: run_stage(item[0], item[1], args.binary, compile_timeout, args.opt_level),
+                lambda item: run_stage(
+                    item[0], item[1], args.binary, compile_timeout, args.opt_level,
+                    target_flags,
+                ),
                 xfails,
             )
         )
@@ -575,12 +821,15 @@ def main() -> int:
                     run_timeout,
                     args.max_input_bytes,
                     args.opt_level,
+                    target_flags,
+                    args.qemu_cpu,
+                    args.require_e2e_tools,
                 ),
                 xfails,
             )
         )
 
-    return summarize(results)
+    return summarize(results, fail_on_skip=args.fail_on_skip)
 
 
 if __name__ == "__main__":
