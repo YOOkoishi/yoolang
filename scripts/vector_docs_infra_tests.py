@@ -14,6 +14,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs/vector-mask-language.md"
 REGISTRY = ROOT / "src/builtin/BuiltinRegistry.cpp"
+EXAMPLE_DIR = ROOT / "test/examples"
 
 VECTOR_BUILTINS = (
     "select",
@@ -38,7 +39,7 @@ VECTOR_BUILTINS = (
 )
 
 EXAMPLES = {
-    ROOT / "examples/vector_value_semantics.sy": {
+    EXAMPLE_DIR / "vector_value_semantics.sy": {
         "--emit-yir": (
             "vector<1 x i32>",
             "vector<3 x f32>",
@@ -63,7 +64,7 @@ EXAMPLES = {
             "xor <31 x i32>",
         ),
     },
-    ROOT / "examples/vector_intrinsics.sy": {
+    EXAMPLE_DIR / "vector_intrinsics.sy": {
         "--emit-yir": (
             "yir.vector.select",
             "yir.mask.any",
@@ -233,7 +234,7 @@ def validate_registry_and_document() -> int:
     if missing_doc:
         return fail("intrinsic names missing from documentation", ", ".join(missing_doc))
 
-    example_text = (ROOT / "examples/vector_intrinsics.sy").read_text(encoding="utf-8")
+    example_text = (EXAMPLE_DIR / "vector_intrinsics.sy").read_text(encoding="utf-8")
     missing_example = [
         name
         for name in VECTOR_BUILTINS
