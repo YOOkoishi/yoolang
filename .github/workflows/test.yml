@@ -794,9 +794,11 @@ jobs:
 
       - name: Upload perf artifacts
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: perf-report
+          retention-days: 1
           path: |
             build/github-actions/functional-tests.log
             build/github-actions/perf-tests.log
@@ -813,15 +815,12 @@ jobs:
             public/instruction-report/index.html
             public/instruction-report/instruction_count_compare.json
             public/instruction-report/history.html
-            public/instruction-report/runs
             public/perf-report/index.html
             public/perf-report/perf_compare.json
             public/perf-report/history.html
-            public/perf-report/runs
             public/index.html
             public/history.html
             public/report-history.json
-            public/branches
           if-no-files-found: warn
 
       - name: Upload instruction report to Pages
