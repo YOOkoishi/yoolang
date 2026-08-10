@@ -18,6 +18,7 @@ docs/tasks/YYYY-MM-DD-slug.md
 
 | Task | Status | Branch | Last update |
 | --- | --- | --- | --- |
+| [RVV 1.0, Auto-vectorization, and First-class Vector/Mask GA](2026-08-16-rvv-vector-ga.md) | in_progress | `rvv` working tree | 2026-08-16 |
 | [Yoolang Compiler Design Documentation](2026-08-05-yoolang-compiler-design.md) | ready_for_review | `master` working tree | 2026-08-05 |
 | [General Semantics-Preserving Performance Optimizations](2026-08-04-general-performance-optimizations.md) | ready_for_review | `task/general-performance-optimizations` | 2026-08-04 |
 | [Loop Performance Audit And Optimization Integration](2026-07-31-loop-performance-integration.md) | verifying | `master` working tree | 2026-07-31 |

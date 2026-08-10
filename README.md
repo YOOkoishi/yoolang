@@ -9,7 +9,11 @@
 本项目开发中使用了 OpenAI Codex。AI 辅助范围包括部分编译器源代码、脚本、测试和
 文档；工具、生成范围及人工复核状态详见 [AI 使用声明](docs/AI_USAGE.md)。
 
-yoolang 总体的设计文档可以参考 [yoolang-design](docs/yoolang-design.md)
+yoolang 总体的设计文档可以参考 [yoolang-design](docs/yoolang-design.md)。源语言
+fixed vector/mask 的正式语义、intrinsic 与当前实现边界见
+[vector/mask 语言语义](docs/vector-mask-language.md)。声明无函数体的 C/FFI 符号可使用显式
+`extern` 原型，语法和严格重声明/调用规则见
+[external function declarations](docs/extern-functions.md)。
 
 ## 使用方法
 
@@ -28,8 +32,13 @@ compiler xxx.sy -S -o xxx.s #功能测试流程
 
 compiler xxx.sy -S -o xxx.s -O1 #启用优化
 
+compiler xxx.sy -S -O2 -mrvv-deployment=fat -o xxx.s #rv64gc + RVV runtime dispatch
+
 compiler --help #查看额外参数
 ```
+
+fat 部署的 scalar-public ABI 支持集、弱 detector 链接方式和 fail-closed 边界见
+[RVV fat deployment](docs/rvv-fat-deployment.md)。
 
 ## 测试
 
