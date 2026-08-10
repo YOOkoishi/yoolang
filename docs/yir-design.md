@@ -47,6 +47,22 @@ YIR 所有操作的基类都是 `Operation`，但它最深刻的地方在于：*
    ```
    当流水线遍历到 `WhileOp` 时，你可以认为遇到了一层新的套娃。你不需要再通过所谓的数据流回边 (Back-edge) 分析去寻找循环到底囊括了多少代码，只要简单地去遍历 `body_region_` `内的算子即可。
 
+## 4. Fixed vector 与 mask
+
+YIR 直接保存源语言的固定长度值类型：`vector<N x i32>`、`vector<N x f32>` 与独立的
+`mask<N>`；vector 不是 array，也不会发生数组到指针 decay。依赖硬件 VLEN 的 scalable
+vector 只在 lowering 到 OIR 后出现，因此不能进入 YIR global/object/公开 ABI。
+
+YIR 的 typed constant tree 包含整数、binary32 浮点、aggregate zero、array、vector 和 packed
+mask。mask lane `i` 使用 byte `i/8` 的 bit `i%8`，末字节未使用高位必须为零；global
+initializer 不存在 textual fallback。
+
+向量 operation 覆盖显式 splat/stepvector、逐 lane 算术与比较、mask bitwise、select、
+extract/insert/shuffle、数值 cast、masked load/store、gather/scatter 和 ordered/unordered
+reduction。比较产生同 shape 的 `mask<N>`；结构化 `if`/`while` 条件仍必须是 scalar i1。
+`YIRVerifier` 对 shape、element family、lane/index、mask、alignment、reduction ordering、
+typed initializer 和函数签名 fail closed，YIR→OIR 只消费通过验证的结构化节点。
+
 ## 小结：结构化的威力
 
 这种 **“Region 包裹 Operation -> 某些 Operation 又包裹 Region”** 的递归互指结构，使得 YIR 成为了中端分析（Middle-end Analysis）的神兵利器。

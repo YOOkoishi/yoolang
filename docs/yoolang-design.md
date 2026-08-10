@@ -1,38 +1,46 @@
 # yoolang 编译器设计
 
-yoolang 是一个使用 C++17 编写的 SysY 编译器，面向 RV64GC/LP64D 平台。编译器采用自研的
-AST、YIR、OIR 和 MIR，将源语言结构逐步转换为 RISC-V 汇编，并在 `-O1` 模式下完成从
-多面体循环变换、SSA 优化到寄存器分配的完整优化流程。
+yoolang 是一个使用 C++17 编写的 SysY 编译器，默认面向 RV64GC/LP64D，并可显式选择
+RVV 1.0/Zve 目标。编译器采用自研的 AST、YIR、OIR 和 MIR，将标量及一等 fixed
+vector/mask 逐步转换为 RISC-V 汇编；`-O0` 到 `-O3` 共用同一套 vreg lowering、寄存器
+分配与 Final verifier，`-O2` 启用 Loop Vectorizer，`-O3` 再启用 SLP 与 interleave 探索。
 
 ## 1. 设计目标
 
 - 通过分层 IR 保存不同阶段最有价值的信息：YIR 保存结构化循环，OIR 表达 SSA/CFG，MIR
   表达目标指令和寄存器约束。
 - 在能够证明语义等价的前提下尽早优化，并通过代价模型控制代码膨胀、寄存器压力和编译开销。
-- 面向 RV64GC 生成稳定、可汇编链接的代码，遵循 LP64D 调用约定和 16 字节栈对齐要求。
+- 面向 RV64GC/RVV 1.0 生成稳定、可汇编链接的代码；公开 fixed vector/mask 仍遵循
+  LP64D standard aggregate ABI，并保持 16 字节栈对齐要求。
 - 以 IR 验证和端到端测试保障正确性，以动态指令统计和性能基线评估优化效果。
 
 ## 2. 系统架构
 
 ![yoolang -O1 编译器架构](image/yoolang-compiler-architecture.png)
 
-默认模式采用较直接的栈槽式代码生成：
+所有优化级别都采用统一的 vreg/RA 后端；无 V 目标在进入 target-specific MIR 前将可移植
+fixed vector/mask 事务化逐 lane scalarize：
 
 ```text
 Lexer / Parser -> AST Semantic Analysis -> ASTToYIR
-  -> YIRToOIR -> OIRToMIR (stack-slot) -> MIRToAsm
+  -> YIRToOIR -> [portable scalarize when target has no V]
+  -> OIRToMIR (virtual registers) -> vector RA -> VL/VTYPE dataflow
+  -> scalar RA -> pseudo expansion -> Final verifier -> MIRToAsm
 ```
 
-`-O1` 模式的主流水线为：
+优化流水线为：
 
 ```text
 ASTSemanticAnalysis -> ASTToYIR
   -> YIRView -> YIRPolyhedralPipeline (Auto) -> YIRMemoryForwarding
   -> YIRLoopOptimization -> YIRLoopAnalysis -> YIRToOIR
-  -> OIROptimizationPipeline -> OIRToMIR (virtual registers)
+  -> OIROptimizationPipeline
+  -> [O2: LoopVectorizer] -> [O3: SLPVectorizer] -> VectorCleanup
+  -> OIRToMIR (virtual registers)
   -> MIRCombine -> MIRPreRAPeephole -> MIRPreRAListScheduler
-  -> MIRRegAlloc -> MIRPostRAPeephole -> MIRPostRAListScheduler
-  -> MIRToAsm
+  -> MIRVectorRegAlloc -> MIRVectorState -> MIRScalarRegAlloc
+  -> MIRPostRAPeephole -> MIRPostRAListScheduler
+  -> MIRPseudoExpansion -> FinalVerifier -> MIRToAsm
 ```
 
 PassManager 顺序执行各阶段，并通过统一上下文传递 IR、分析结果和优化报告。
