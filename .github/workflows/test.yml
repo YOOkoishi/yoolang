@@ -4,7 +4,19 @@ on:
   push:
     branches:
       - "**"
+  schedule:
+    - cron: "0 3 * * 0"
   workflow_dispatch:
+    inputs:
+      rvv_diff_tier:
+        description: "Additional RVV random differential tier"
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - extended
+          - nightly
 
 permissions:
   contents: read
@@ -132,14 +144,24 @@ jobs:
           echo "xmake not found after setup_env.sh"
           exit 1
 
-      - name: Check runner dependencies
+      - name: Check host test dependencies
         run: |
           command -v python3
           command -v cmake
           command -v clang++
+          command -v FileCheck
+
+      # This self-hosted runner is the required RVV/QEMU lane.  Developers or
+      # generic x86 runners can use `--infra-profile host`, where this capability
+      # group is reported as SKIP instead of being silently omitted.
+      - name: Check required RISC-V toolchain and QEMU dependencies
+        run: |
           command -v qemu-riscv64
+          command -v riscv64-linux-gnu-as
           command -v riscv64-linux-gnu-gcc
           command -v riscv64-linux-gnu-g++
+          command -v riscv64-linux-gnu-objdump
+          command -v riscv64-linux-gnu-readelf
           test -f runtime/libsysy_riscv.a
 
       - name: Build (xmake release)
@@ -147,13 +169,83 @@ jobs:
           xmake f -m release
           xmake -vD
 
+      - name: Run host compiler infrastructure and FileCheck tests
+        run: |
+          python3 scripts/run_tests.py \
+            --suite infra \
+            --infra-profile host \
+            --infra-timeout 120 \
+            --suite filecheck \
+            --compile-timeout 60
+
+      - name: Run required portable and RVV QEMU infrastructure
+        run: |
+          python3 scripts/run_tests.py \
+            --suite infra \
+            --infra-profile toolchain \
+            --fail-on-skip \
+            --infra-timeout 180
+
+      - name: Run scheduled RVV nightly differential matrix
+        if: github.event_name == 'schedule'
+        run: |
+          python3 scripts/rvv_random_differential_infra_tests.py \
+            --tier nightly \
+            --timeout 180
+
+      - name: Run requested RVV extended differential matrix
+        if: github.event_name == 'workflow_dispatch' && inputs.rvv_diff_tier != 'smoke'
+        run: |
+          python3 scripts/rvv_random_differential_infra_tests.py \
+            --tier "${{ inputs.rvv_diff_tier }}" \
+            --timeout 180
+
+      - name: Run scalar O0 regression tests
+        run: |
+          python3 scripts/run_tests.py \
+            --suite stage \
+            --suite e2e \
+            --test-root test/functional \
+            --runtime runtime/libsysy_riscv.a \
+            --o0 \
+            --require-e2e-tools \
+            --fail-on-skip \
+            --max-input-bytes 0 \
+            --compile-timeout 60
+
+      - name: Run scalar O2 and O3 regression tests
+        run: |
+          python3 scripts/run_tests.py \
+            --suite stage \
+            --suite e2e \
+            --test-root test/functional \
+            --runtime runtime/libsysy_riscv.a \
+            --march rv64gc \
+            --mabi lp64d \
+            --opt-level 2 \
+            --require-e2e-tools \
+            --fail-on-skip \
+            --max-input-bytes 0 \
+            --compile-timeout 60
+          python3 scripts/run_tests.py \
+            --suite stage \
+            --suite e2e \
+            --test-root test/functional \
+            --runtime runtime/libsysy_riscv.a \
+            --march rv64gc \
+            --mabi lp64d \
+            --opt-level 3 \
+            --require-e2e-tools \
+            --fail-on-skip \
+            --max-input-bytes 0 \
+            --compile-timeout 60
+
       - name: Run functional tests
         id: functional_tests
-        continue-on-error: true
         run: |
           set -o pipefail
           mkdir -p build/github-actions
-          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --compile-timeout 60 2>&1 | tee build/github-actions/functional-tests.log
+          python3 scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --require-e2e-tools --fail-on-skip --max-input-bytes 0 --compile-timeout 60 2>&1 | tee build/github-actions/functional-tests.log
 
       - name: Validate performance judgement
         run: |
@@ -597,7 +689,7 @@ jobs:
               f"- Commit: `{os.environ.get('GITHUB_SHA', 'unknown')[:12]}`",
               "",
               "## ✅ Functional Tests",
-              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --compile-timeout 60`",
+              "- Command: `scripts/run_tests.py --suite stage --suite e2e --test-root test/functional --runtime runtime/libsysy_riscv.a --o1 --require-e2e-tools --fail-on-skip --max-input-bytes 0 --compile-timeout 60`",
               f"- Status: {'✅' if functional_status == 'PASS' else '❌'} {functional_status}",
           ]
 
@@ -761,13 +853,25 @@ jobs:
           if log_path.exists():
               text = log_path.read_text(errors="replace")
               match = re.search(
-                  r"summary:\s+\d+ passed,\s+(\d+) failed,\s+\d+ skipped,\s+\d+ xfailed,\s+\d+ xpassed",
+                  r"summary:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+"
+                  r"(\d+) xfailed,\s+(\d+) xpassed",
                   text,
               )
               if match:
-                  failed = int(match.group(1))
+                  failed = int(match.group(2))
+                  skipped = int(match.group(3))
+                  xpassed = int(match.group(5))
                   if failed > 0:
                       print(f"Functional tests failed: {failed}")
+                      sys.exit(1)
+                  if skipped > 0:
+                      print(f"Functional release gate skipped selected tests: {skipped}")
+                      sys.exit(1)
+                  if xpassed > 0:
+                      print(f"Functional release gate has unexpected passes: {xpassed}")
+                      sys.exit(1)
+                  if os.environ["FUNCTIONAL_OUTCOME"] != "success":
+                      print("Functional test process failed despite a zero-failure summary.")
                       sys.exit(1)
                   print("Functional tests passed.")
                   sys.exit(0)
