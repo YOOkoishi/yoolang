@@ -502,6 +502,44 @@ branch 范围。后续若输出机器码，需把超范围 conditional branch �
 - 默认打印可被 GNU as 接受的伪指令：`li`, `la`, `call`, `j`, `ret`, `mv`。
 - 汇编参数应匹配 runtime：`-march=rv64gc -mabi=lp64d`。
 
+### 11.2 RVV VL/VTYPE 状态数据流
+
+RVV 指令对 `vl` 和 `vtype` 有隐式依赖，不能仅在指令选择时记住“最后一条
+`vsetvli`”。MIR 把 `VL`/`VTYPE`/`VXRM`/`VXSAT`/`VSTART` 建模为真实的隐式机器
+状态：RVV consumer 显式 use 相关状态，`vset{i}vli` 显式 def `VL/VTYPE`，任何可能
+调用的指令都隐式 def 五个状态并因此杀死已知配置。
+
+`MIRVectorStatePass` 在向量寄存器分配之后、标量寄存器分配之前运行：
+
+1. 为每个 AVL 请求分配稳定的 `vl-id`。这个身份基于立即数、VLMAX 或标量
+   vreg，不依赖后续标量 RA 选择的物理寄存器名。
+2. 对每个函数做 CFG 固定点数据流。格状态分量跟踪硬件 SEW/LMUL、tail/mask
+   policy、实际 VL 身份和可重建的 AVL 请求；固定向量的逻辑 lane 数不伪装成
+   硬件 VTYPE。
+3. 在 diamond 汇合和 loop backedge 做分量 meet。如果前驱仅 policy 不同但
+   SEW/LMUL 与 VL 身份一致，插入 `vsetvli zero, zero` 保留 VL 并恢复所需
+   policy；如果 VL 身份不同，只在有可证明的 AVL 请求时才重建，否则 fail
+   closed。
+4. 删除结果无用且对入状态没有任何改变的冗余 state set。
+5. 将每条 consumer 需要的 `vl-id` 写回结构化 `MachineVectorInfo`。PostRA 调度和
+   pseudo expansion 后的 Final verifier 重新运行同一 CFG 分析，因此任何非法重排、
+   漏配置或 call 后误用都会稳定拒绝。
+
+生产 pipeline 的相对顺序是：
+
+```text
+PreRA schedule
+  -> vector RA
+  -> CFG VL/VTYPE state pass
+  -> scalar RA
+  -> PostRA peephole/schedule
+  -> pseudo expansion
+  -> Final verifier
+```
+
+这个顺序允许状态修复仍使用 AVL 的标量 vreg，同时让后续调度器通过隐式
+use/def 看到真实硬件依赖。
+
 ## 12. 文本 MIR 格式
 
 建议 `--emit-mir` 输出可读、可 snapshot 的格式：
