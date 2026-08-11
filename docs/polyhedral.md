@@ -1204,11 +1204,14 @@ t, i  ->  t, i + t
 
 ---
 
-## Pass 6.4：`vectorization-prep`（可选）
+## Pass 6.4：`vectorization-prep`（RVV 目标可用）
 
 ### 功能
 
-为未来 RVV 或 SIMD 优化做准备。
+对已证明输出点相互独立的整数 reduction，Polyhedral pass 生成 factor-2/4 lane pack，并通过
+`YIRPolyhedralTransformSummary::rvv_preparations` 交给 OIR SLP。SLP 再独立执行 target、依赖、
+memory order、cost 和 verifier 检查，成功后复用现有 OIR→MIR RVV lowering；失败时仍保留
+语义等价且经过收益判断的标量 unroll-and-jam。
 
 ### 典型操作
 
@@ -1216,6 +1219,8 @@ t, i  ->  t, i + t
 - 保证内层 loop stride-1
 - 对齐 memory access
 - 提取连续 load/store pattern
+- 共享 lane-invariant reduction slice
+- 为独立 output lane 构造 SLP pack
 ```
 
 ---

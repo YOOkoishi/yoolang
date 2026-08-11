@@ -32,6 +32,12 @@ OIR pipeline 先运行标量优化固定点，再运行自动向量化：
 `-fslp-vectorize` 只是启用开关；它们不会绕过合法性或收益判断，也不等同于 pass
 内部 programmatic `force` 选项。
 
+RVV 目标还有一条受限的 Polyhedral→SLP 衔接：多面体分析证明 output-reduction 的输出点
+彼此独立后，可生成 factor-2/4 lane pack，并通过显式 pass artifact 请求 OIR SLP 接手。
+因此在 `-O1 -fvectorize` 或 `-O2` 下，即使通用 SLP 默认关闭，这类 lane pack 仍会运行一次
+SLP 合法性、收益和 verifier；没有该 artifact 时不会额外运行。显式
+`-fno-slp-vectorize` 会关闭这条衔接。标量目标继续使用原有 register-blocked lowering。
+
 自动向量化还要求 target profile 提供 V 或兼容的 Zve 能力以及相应的 32-bit
 整数/浮点 vector element family。例如测试使用 `-march=rv64gcv`。CLI 在 non-V
 target（例如 `-march=rv64gc`）上不会调度自动向量器，因此 `--emit-vector-plan`

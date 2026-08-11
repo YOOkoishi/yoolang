@@ -31,6 +31,7 @@
 | runtime alias versioning | 部分 | 可构造 overflow-safe affine ranges 的受限 two-block/rotated CFG |
 | SLP | 部分 | fixed i32/f32 N=3/7、连续 memory、算术/compare/mask producer tree |
 | O3 interleave | 部分 | simple independent plan 的真实 factor 2；复杂 recipe 降级 factor 1 |
+| Polyhedral output-reduction | 部分 | 已证明独立的整数 factor-2/4 output lane pack 交给 OIR SLP；动态范围保留标量 tail，其他 SCoP 形态仍由普通 Loop/SLP 重新分析 |
 | 复杂 CFG/mixed conversion/无法物化 range | 拒绝 | 给出稳定 reason；`force` 不绕 legality |
 
 ## RVV 后端
@@ -68,4 +69,3 @@
   同一随机 kernel body 作为第四/第五条 oracle。
 - 正式性能脚本、manifest、cycles/instructions/IPC/阈值判定已实现；当前机器不是原生 RVV
   固频硬件，正式性能门未运行。因此仓库当前状态是“功能实现收尾，未达到 Release/GA”。
-
