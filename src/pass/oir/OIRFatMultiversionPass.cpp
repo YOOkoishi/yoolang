@@ -116,7 +116,8 @@ BranchCompilation compile_branch(std::unique_ptr<oir::Module> module,
             produced_vector_ir = true;
         }
         if (produced_vector_ir) {
-            pipeline.add_pass<OIRCFGCleanupPass>();
+            pipeline.add_pass<OIRCFGCleanupPass>(
+                OIRCFGCleanupMode::PreserveStructure);
             pipeline.add_pass<OIRVectorCleanupPass>();
         }
     } else {

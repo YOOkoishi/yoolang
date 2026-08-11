@@ -179,7 +179,8 @@ void add_oir_pipeline(pass::PassManager &pm, const CliOptions &options) {
         produced_vector_ir = true;
     }
     if (produced_vector_ir) {
-        pm.add_pass<pass::OIRCFGCleanupPass>();
+        pm.add_pass<pass::OIRCFGCleanupPass>(
+            pass::OIRCFGCleanupMode::PreserveStructure);
         pm.add_pass<pass::OIRVectorCleanupPass>();
     }
 }

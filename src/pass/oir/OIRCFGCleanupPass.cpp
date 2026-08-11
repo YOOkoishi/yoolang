@@ -302,6 +302,16 @@ bool cleanup_cfg(oir::Module &module, Stats &stats) {
     return changed;
 }
 
+bool remove_unreachable_cfg(oir::Module &module, Stats &stats) {
+    bool changed = false;
+    for (auto &function : module.functions()) {
+        if (!function->is_external()) {
+            changed |= remove_unreachable_blocks(*function, stats);
+        }
+    }
+    return changed;
+}
+
 } // namespace pass::oir_opt
 
 namespace pass {
@@ -315,16 +325,23 @@ PassKind OIRCFGCleanupPass::kind() const {
 }
 
 PassResult OIRCFGCleanupPass::run(PassContext &context) {
+    const auto mode = mode_;
     return oir_opt::run_oir_transform(context,
                                       "OIRCFGCleanupPass requires OIR module in pass context",
-                                      [](oir::Module &module, oir_opt::Stats &stats) {
+                                      [mode](oir::Module &module, oir_opt::Stats &stats) {
                                           bool changed = false;
                                           bool iteration_changed = false;
                                           do {
                                               iteration_changed =
                                                   oir_opt::simplify_branches(module, stats);
-                                              iteration_changed |=
-                                                  oir_opt::cleanup_cfg(module, stats);
+                                              if (mode == OIRCFGCleanupMode::Full) {
+                                                  iteration_changed |=
+                                                      oir_opt::cleanup_cfg(module, stats);
+                                              } else {
+                                                  iteration_changed |=
+                                                      oir_opt::remove_unreachable_cfg(module,
+                                                                                      stats);
+                                              }
                                               iteration_changed |=
                                                   oir_opt::eliminate_dead_code(module, stats);
                                               changed |= iteration_changed;
