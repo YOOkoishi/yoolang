@@ -318,9 +318,17 @@ PassResult OIRCFGCleanupPass::run(PassContext &context) {
     return oir_opt::run_oir_transform(context,
                                       "OIRCFGCleanupPass requires OIR module in pass context",
                                       [](oir::Module &module, oir_opt::Stats &stats) {
-                                          bool changed = oir_opt::simplify_branches(module, stats);
-                                          changed |= oir_opt::cleanup_cfg(module, stats);
-                                          changed |= oir_opt::eliminate_dead_code(module, stats);
+                                          bool changed = false;
+                                          bool iteration_changed = false;
+                                          do {
+                                              iteration_changed =
+                                                  oir_opt::simplify_branches(module, stats);
+                                              iteration_changed |=
+                                                  oir_opt::cleanup_cfg(module, stats);
+                                              iteration_changed |=
+                                                  oir_opt::eliminate_dead_code(module, stats);
+                                              changed |= iteration_changed;
+                                          } while (iteration_changed);
                                           return changed;
                                       });
 }

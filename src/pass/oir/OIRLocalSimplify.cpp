@@ -800,6 +800,37 @@ bool fold_branch(oir::Module &module, oir::BasicBlock &block,
     return true;
 }
 
+bool empty_arm_can_fold_to_merge(const oir::BasicBlock &block,
+                                 const oir::BasicBlock &arm,
+                                 const oir::BasicBlock &merge) {
+    if (arm.instructions().size() != 1 || arm.predecessors().size() != 1 ||
+        arm.predecessors().front() != &block) {
+        return false;
+    }
+    auto *arm_branch = dynamic_cast<oir::BranchInst *>(arm.terminator());
+    if (arm_branch == nullptr || arm_branch->is_conditional() ||
+        arm_branch->target_bb() != &merge)
+        return false;
+
+    for (const auto &owned : merge.instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(owned.get());
+        if (phi == nullptr)
+            break;
+        oir::Value *direct_value = nullptr;
+        oir::Value *arm_value = nullptr;
+        for (const auto &[value, predecessor] : phi->incoming()) {
+            if (predecessor == &block)
+                direct_value = value;
+            if (predecessor == &arm)
+                arm_value = value;
+        }
+        if (direct_value == nullptr || arm_value == nullptr ||
+            direct_value != arm_value)
+            return false;
+    }
+    return true;
+}
+
 bool simplify_branches(oir::Module &module, Stats &stats) {
     bool changed = false;
     for (auto &function : module.functions()) {
@@ -816,6 +847,16 @@ bool simplify_branches(oir::Module &module, Stats &stats) {
                 continue;
             }
             if (branch->true_bb() == branch->false_bb()) {
+                changed |= fold_branch(module, *block, term_it, true, stats);
+                continue;
+            }
+            if (empty_arm_can_fold_to_merge(*block, *branch->true_bb(),
+                                            *branch->false_bb())) {
+                changed |= fold_branch(module, *block, term_it, false, stats);
+                continue;
+            }
+            if (empty_arm_can_fold_to_merge(*block, *branch->false_bb(),
+                                            *branch->true_bb())) {
                 changed |= fold_branch(module, *block, term_it, true, stats);
                 continue;
             }

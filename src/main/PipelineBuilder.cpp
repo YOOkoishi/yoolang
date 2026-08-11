@@ -14,6 +14,7 @@
 #include "pass/mir/MIRPseudoExpansionPass.h"
 #include "pass/mir/MIRToAsmPass.h"
 #include "pass/oir/OIRFatMultiversionPass.h"
+#include "pass/oir/OIRCFGCleanupPass.h"
 #include "pass/oir/OIRLoopVectorizerPass.h"
 #include "pass/oir/OIROptimizationPipelinePass.h"
 #include "pass/oir/OIRPortableVectorScalarizerPass.h"
@@ -178,6 +179,7 @@ void add_oir_pipeline(pass::PassManager &pm, const CliOptions &options) {
         produced_vector_ir = true;
     }
     if (produced_vector_ir) {
+        pm.add_pass<pass::OIRCFGCleanupPass>();
         pm.add_pass<pass::OIRVectorCleanupPass>();
     }
 }

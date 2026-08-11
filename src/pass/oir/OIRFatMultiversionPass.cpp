@@ -8,6 +8,7 @@
 #include "pass/mir/MIRRegAllocPass.h"
 #include "pass/mir/MIRToAsmPass.h"
 #include "pass/oir/OIRFatMultiversion.h"
+#include "pass/oir/OIRCFGCleanupPass.h"
 #include "pass/oir/OIRLoopVectorizerPass.h"
 #include "pass/oir/OIROptimizationPipelinePass.h"
 #include "pass/oir/OIRPortableVectorScalarizerPass.h"
@@ -115,6 +116,7 @@ BranchCompilation compile_branch(std::unique_ptr<oir::Module> module,
             produced_vector_ir = true;
         }
         if (produced_vector_ir) {
+            pipeline.add_pass<OIRCFGCleanupPass>();
             pipeline.add_pass<OIRVectorCleanupPass>();
         }
     } else {
