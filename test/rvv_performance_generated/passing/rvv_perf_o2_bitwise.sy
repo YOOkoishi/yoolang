@@ -1,0 +1,21 @@
+// O2 bitwise loop derived from crypto/CRC preprocessing kernels.
+int values[17] = {0, 1, 2, 3, 4, 5, 6, 7, 8,
+                  9, 10, 11, 12, 13, 14, 15, 16};
+
+int main() {
+  int n = getint();
+  int i = 0;
+  while (i < n) {
+    values[i] = (values[i] ^ 85) & 255;
+    i = i + 1;
+  }
+  if (values[0] != 85 || values[1] != 84 || values[2] != 87 ||
+      values[3] != 86 || values[4] != 81 || values[5] != 80 ||
+      values[6] != 83 || values[7] != 82 || values[8] != 93 ||
+      values[9] != 92 || values[10] != 95 || values[11] != 94 ||
+      values[12] != 89 || values[13] != 88 || values[14] != 91 ||
+      values[15] != 90 || values[16] != 69) {
+    return 1;
+  }
+  return 0;
+}

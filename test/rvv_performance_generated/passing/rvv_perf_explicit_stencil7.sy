@@ -1,0 +1,13 @@
+// Derived from test/performance/sl3.sy: seven-neighbour stencil arithmetic.
+int main() {
+  vector<int,7> base = iota(vector<int,7>{}) + vector<int,7>(7);
+  vector<int,7> sum = base + (base + 1) + (base + 2) + (base + 3) +
+                      (base + 4) + (base + 5) + (base + 6);
+  vector<int,7> result = sum / vector<int,7>(7);
+  if (result[0] != 10 || result[1] != 11 || result[2] != 12 ||
+      result[3] != 13 || result[4] != 14 || result[5] != 15 ||
+      result[6] != 16) {
+    return 1;
+  }
+  return 0;
+}

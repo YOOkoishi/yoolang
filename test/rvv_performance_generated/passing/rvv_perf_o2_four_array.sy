@@ -1,0 +1,23 @@
+// Four independent unit-stride streams, shaped like a matrix row kernel.
+int a[19] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+int b[19] = {19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
+int c[19] = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8};
+int d[19] = {2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9, 0, 4, 5, 9, 0, 4};
+int output[19] = {};
+int expected[19] = {20, 30, 54, 57, 78, 85, 92, 94, 102, 95,
+                    100, 99, 91, 91, 80, 62, 44, 39, 23};
+
+int main() {
+  int n = getint();
+  int i = 0;
+  while (i < n) {
+    output[i] = a[i] * b[i] + c[i] - d[i];
+    i = i + 1;
+  }
+  i = 0;
+  while (i < n) {
+    if (output[i] != expected[i]) return 10 + i;
+    i = i + 1;
+  }
+  return 0;
+}

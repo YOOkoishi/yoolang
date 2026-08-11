@@ -1,0 +1,12 @@
+// Derived from test/performance/01_mm3.sy: one contiguous matrix row update.
+int main() {
+  vector<int,7> c = vector<int,7>{1, 2, 3, 4, 5, 6, 7};
+  vector<int,7> b = vector<int,7>{7, 6, 5, 4, 3, 2, 1};
+  vector<int,7> result = c * vector<int,7>(3) + b;
+  if (result[0] != 10 || result[1] != 12 || result[2] != 14 ||
+      result[3] != 16 || result[4] != 18 || result[5] != 20 ||
+      result[6] != 22) {
+    return 1;
+  }
+  return 0;
+}

@@ -67,6 +67,7 @@ TOOLCHAIN_INFRA_SCRIPTS = frozenset(
         "rvv_lmul_vlen_boundary_infra_tests.py",
         "rvv_mask_guard_tests.py",
         "rvv_oversized_vector_semantics_infra_tests.py",
+        "rvv_performance_generated_cases_infra_tests.py",
         "rvv_perf_corpus_vectorization_infra_tests.py",
         "rvv_remaining_perf_corpus_infra_tests.py",
         "rvv_runtime_dispatch_infra_tests.py",

@@ -1,0 +1,19 @@
+// O3-only SLP pack shaped like four adjacent matrix-row operations.
+int input[4] = {3, -2, 7, 11};
+int output[4] = {};
+
+int main() {
+  int a0 = input[0];
+  int a1 = input[1];
+  int a2 = input[2];
+  int a3 = input[3];
+  output[0] = a0 * 3 + 7;
+  output[1] = a1 * 3 + 7;
+  output[2] = a2 * 3 + 7;
+  output[3] = a3 * 3 + 7;
+  if (output[0] != 16 || output[1] != 1 ||
+      output[2] != 28 || output[3] != 40) {
+    return 1;
+  }
+  return 0;
+}

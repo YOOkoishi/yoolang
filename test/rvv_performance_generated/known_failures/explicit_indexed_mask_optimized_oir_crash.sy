@@ -1,0 +1,14 @@
+// Known regression discovered by rvv_perf_explicit_masked_memory coverage.
+// Reproducer: compiler %s --emit-oir -O1/-O2/-O3 -march=rv64gcv
+// Current result: compiler exits with SIGSEGV.
+int data[16] = {0, 10, 20, 30, 40, 50, 60, 70,
+                80, 90, 100, 110, 120, 130, 140, 150};
+int output[16] = {};
+
+int main() {
+  vector<int,7> indices = vector<int,7>{0, 2, 4, 6, 8, 10, 12};
+  mask<7> active = mask<7>{1, 0, 1, 1, 0, 1, 1};
+  vector<int,7> loaded = gather(data, indices, active, vector<int,7>(-1000));
+  scatter(output, indices, active, loaded + 5);
+  return output[0] != 5;
+}

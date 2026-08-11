@@ -1,0 +1,23 @@
+// In-place update: one object is both the load and store base.
+int values[31] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                  10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                  20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30};
+int expected[31] = {3, 8, 13, 18, 23, 28, 33, 38, 43, 48,
+                    53, 58, 63, 68, 73, 78, 83, 88, 93, 98,
+                    103, 108, 113, 118, 123, 128, 133, 138, 143, 148, 153};
+
+int main() {
+  int n = getint();
+  int i = 0;
+  while (i < n) {
+    values[i] = values[i] * 5 + 3;
+    i = i + 1;
+  }
+  i = 0;
+  while (i < n) {
+    if (values[i] != expected[i]) return 10 + i;
+    i = i + 1;
+  }
+  if (values[n] != n) return 2;
+  return 0;
+}
