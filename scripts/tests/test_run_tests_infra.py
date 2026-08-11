@@ -154,6 +154,7 @@ class WorkflowGateTests(unittest.TestCase):
         for spelling in (
             "--infra-profile host",
             "--infra-profile toolchain",
+            "--suite poly",
             "--infra-timeout 120",
             "--infra-timeout 180",
             "--require-e2e-tools",
@@ -199,6 +200,15 @@ class WorkflowGateTests(unittest.TestCase):
         self.assertIn("needs: functional-and-perf", deploy_job)
         self.assertIn("name: github-pages", deploy_job)
         self.assertIn("url: ${{ steps.deployment.outputs.page_url }}", deploy_job)
+
+        perf_upload_step = workflow.split("- name: Upload perf artifacts", 1)[1].split(
+            "- name:", 1
+        )[0]
+        self.assertIn(
+            "github.ref_name == github.event.repository.default_branch",
+            perf_upload_step,
+        )
+        self.assertIn("continue-on-error: true", perf_upload_step)
 
 
 if __name__ == "__main__":
