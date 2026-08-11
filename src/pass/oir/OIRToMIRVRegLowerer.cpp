@@ -3006,17 +3006,17 @@ class VRegLowerer final {
         mir::VectorMaskPolicy mask_policy = mir::VectorMaskPolicy::Agnostic) {
         const auto config = data_config_for(type);
         if (config.is_scalable() && evl == nullptr) {
-            if (!dominating_scalable_config_.has_value() ||
-                !has_equivalent_vtype(dominating_scalable_config_->type, config) ||
-                dominating_scalable_config_->avl == nullptr) {
-                fail_vector_legalization("scalable operation requires a dominating SetVL with " +
-                                         machine_vector_type_name(config));
-            }
             if (current_vector_config_.has_value() && current_vector_config_->type == config &&
                 current_vector_config_->vl_kind == ActiveVLKind::VLMAX &&
                 current_vector_config_->tail_policy == tail_policy &&
                 current_vector_config_->mask_policy == mask_policy) {
                 return;
+            }
+            if (!dominating_scalable_config_.has_value() ||
+                !has_equivalent_vtype(dominating_scalable_config_->type, config) ||
+                dominating_scalable_config_->avl == nullptr) {
+                fail_vector_legalization("scalable operation requires a dominating SetVL with " +
+                                         machine_vector_type_name(config));
             }
             // A plain scalable SSA operation denotes every lane in its
             // register group.  It must not inherit a smaller VP EVL merely
@@ -7888,6 +7888,13 @@ class VRegLowerer final {
                     "vector copy requires identical source and destination types");
             }
             const auto config = data_config_for(*dst.vector_type);
+            if (config.is_scalable() && !dominating_scalable_config_.has_value()) {
+                // Phi copies are emitted in synthetic edge blocks, outside the
+                // lexical block containing the SetVL that defines the value.
+                // A full-register copy is independent of that predecessor's
+                // active EVL, so establish VLMAX locally before copying it.
+                emit_vlmax_setvli(config);
+            }
             ensure_vector_configuration(config);
             mir::MachineVectorInfo info(config);
             info.operation = mir::RVVOperation::Copy;

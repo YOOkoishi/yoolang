@@ -7,6 +7,7 @@ namespace pass {
 struct OIRFatMultiversionOptions final {
     bool loop_vectorize = false;
     bool slp_vectorize = false;
+    bool slp_polyhedral_rvv_preparation = false;
     bool explore_interleave = false;
     bool optimize_mir = false;
 };

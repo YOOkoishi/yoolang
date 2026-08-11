@@ -14,6 +14,7 @@
 #include "pass/oir/OIRSLPVectorizerPass.h"
 #include "pass/oir/OIRToMIRPass.h"
 #include "pass/oir/OIRVectorCleanupPass.h"
+#include "pass/yir/YIRPolyhedralTransformPass.h"
 #include "target/TargetMachine.h"
 
 #include <memory>
@@ -313,6 +314,15 @@ PassResult OIRFatMultiversionPass::run(PassContext &context) {
         return PassResult::fail("FAT_TARGET_REQUIRED: target deployment is not fat");
     }
 
+    auto effective_options = options_;
+    if (effective_options.slp_polyhedral_rvv_preparation) {
+        const auto *summary = context.get_artifact<YIRPolyhedralTransformSummary>(
+            std::string(YIRPolyhedralTransformSummary::kArtifactKey));
+        effective_options.slp_vectorize =
+            effective_options.slp_vectorize ||
+            (summary != nullptr && summary->rvv_preparations != 0);
+    }
+
     std::string error;
     auto eligibility = oir_fat::analyze_eligibility(*module);
     if (!eligibility.eligible) {
@@ -340,11 +350,13 @@ PassResult OIRFatMultiversionPass::run(PassContext &context) {
         return PassResult::fail(std::move(error));
     }
 
-    auto scalar = compile_branch(std::move(scalar_module), scalar_profile, false, options_);
+    auto scalar = compile_branch(std::move(scalar_module), scalar_profile, false,
+                                 effective_options);
     if (!scalar.success) {
         return PassResult::fail(std::move(scalar.error));
     }
-    auto vector = compile_branch(std::move(vector_module), vector_profile, true, options_);
+    auto vector = compile_branch(std::move(vector_module), vector_profile, true,
+                                 effective_options);
     if (!vector.success) {
         return PassResult::fail(std::move(vector.error));
     }

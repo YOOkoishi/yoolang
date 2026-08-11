@@ -41,6 +41,7 @@ struct BlockStats final {
     unsigned maximum_lanes = 0;
     unsigned scalar_cost = 0;
     unsigned vector_cost = 0;
+    bool scalable = false;
 };
 
 class NameGenerator final {
@@ -861,6 +862,305 @@ PlanChoice cost_plan(unsigned lanes, unsigned scalar_cost, unsigned vector_cost)
     return plan;
 }
 
+struct InterleavedReductionLane final {
+    oir::PhiInst *accumulator = nullptr;
+    oir::Value *seed = nullptr;
+    oir::BinaryInst *term = nullptr;
+    oir::LoadInst *lane_load = nullptr;
+    oir::BinaryInst *update = nullptr;
+    oir::StoreInst *store = nullptr;
+};
+
+struct InterleavedReductionPack final {
+    oir::BasicBlock *preheader = nullptr;
+    oir::BasicBlock *store_block = nullptr;
+    oir::Value *common_term_operand = nullptr;
+    bool common_term_operand_is_lhs = true;
+    oir::Instruction::OpID term_op = oir::Instruction::OpID::Mul;
+    std::vector<InterleavedReductionLane> lanes;
+};
+
+bool memory_pack_is_reorder_safe(
+    oir::BasicBlock &block, const std::vector<oir::Instruction *> &pack,
+    const oir::OIRAliasAnalysis &alias_analysis, bool stores) {
+    if (pack.empty())
+        return false;
+    std::unordered_set<const oir::Instruction *> allowed(pack.begin(), pack.end());
+    auto current = find_instruction(block, pack.front());
+    if (current == block.instructions().end())
+        return false;
+    std::size_t next_lane = 0;
+    for (; current != block.instructions().end(); ++current) {
+        auto *instruction = current->get();
+        if (next_lane < pack.size() && instruction == pack[next_lane]) {
+            ++next_lane;
+            if (next_lane == pack.size())
+                return true;
+            continue;
+        }
+        if (allowed.find(instruction) != allowed.end())
+            return false;
+        const bool barrier =
+            stores ? instruction_is_between_memory_barrier(*instruction, alias_analysis)
+                   : alias_analysis.may_write_memory(*instruction);
+        if (barrier)
+            return false;
+    }
+    return false;
+}
+
+std::optional<InterleavedReductionLane>
+match_interleaved_reduction_lane(oir::PhiInst &phi, oir::BasicBlock &block) {
+    if (!is_i32(phi.type()) || phi.incoming().size() != 2 || phi.uses().size() != 1)
+        return std::nullopt;
+
+    oir::Value *seed = nullptr;
+    oir::BasicBlock *preheader = nullptr;
+    oir::BinaryInst *update = nullptr;
+    for (const auto &[value, predecessor] : phi.incoming()) {
+        if (predecessor == &block) {
+            update = dynamic_cast<oir::BinaryInst *>(value);
+        } else {
+            seed = value;
+            preheader = predecessor;
+        }
+    }
+    if (seed == nullptr || preheader == nullptr || update == nullptr ||
+        update->parent() != &block || update->op() != oir::Instruction::OpID::Add ||
+        (update->lhs() != &phi && update->rhs() != &phi) ||
+        phi.uses().front().user != update) {
+        return std::nullopt;
+    }
+
+    auto *term = dynamic_cast<oir::BinaryInst *>(
+        update->lhs() == &phi ? update->rhs() : update->lhs());
+    if (term == nullptr || term->parent() != &block || !is_supported_binary(*term) ||
+        term->type() != phi.type() || term->uses().size() != 1 ||
+        term->uses().front().user != update) {
+        return std::nullopt;
+    }
+
+    oir::StoreInst *store = nullptr;
+    bool saw_phi_backedge = false;
+    for (const auto &use : update->uses()) {
+        if (use.user == &phi) {
+            saw_phi_backedge = true;
+            continue;
+        }
+        auto *candidate = dynamic_cast<oir::StoreInst *>(use.user);
+        if (candidate == nullptr || candidate->value() != update || store != nullptr)
+            return std::nullopt;
+        store = candidate;
+    }
+    if (!saw_phi_backedge || store == nullptr || update->uses().size() != 2)
+        return std::nullopt;
+
+    return InterleavedReductionLane{&phi, seed, term, nullptr, update, store};
+}
+
+std::optional<InterleavedReductionPack>
+find_interleaved_reduction_pack(oir::BasicBlock &block,
+                                const oir::OIRAliasAnalysis &alias_analysis,
+                                const SLPVectorizerOptions &options) {
+    InterleavedReductionPack pack;
+    for (auto &owned : block.instructions()) {
+        auto *phi = dynamic_cast<oir::PhiInst *>(owned.get());
+        if (phi == nullptr)
+            continue;
+        auto lane = match_interleaved_reduction_lane(*phi, block);
+        if (!lane)
+            continue;
+        oir::BasicBlock *preheader = nullptr;
+        for (const auto &[value, predecessor] : phi->incoming()) {
+            if (value == lane->seed)
+                preheader = predecessor;
+        }
+        if (preheader == nullptr)
+            continue;
+        if (pack.preheader == nullptr) {
+            pack.preheader = preheader;
+            pack.store_block = lane->store->parent();
+            pack.term_op = lane->term->op();
+        }
+        if (preheader != pack.preheader || lane->store->parent() != pack.store_block ||
+            lane->term->op() != pack.term_op)
+            continue;
+        pack.lanes.push_back(*lane);
+    }
+
+    if (pack.lanes.size() < options.minimum_lanes ||
+        pack.lanes.size() > options.maximum_lanes || pack.preheader == nullptr ||
+        pack.store_block == nullptr || pack.preheader->instructions().empty()) {
+        return std::nullopt;
+    }
+
+    const auto match_term_orientation = [&](bool common_is_lhs) {
+        auto *common = common_is_lhs ? pack.lanes.front().term->lhs()
+                                     : pack.lanes.front().term->rhs();
+        for (auto &lane : pack.lanes) {
+            auto *candidate_common = common_is_lhs ? lane.term->lhs() : lane.term->rhs();
+            auto *candidate_load = dynamic_cast<oir::LoadInst *>(
+                common_is_lhs ? lane.term->rhs() : lane.term->lhs());
+            if (!equivalent_splat_value(common, candidate_common) || candidate_load == nullptr ||
+                candidate_load->type() != lane.accumulator->type() ||
+                candidate_load->uses().size() != 1 ||
+                candidate_load->uses().front().user != lane.term) {
+                return false;
+            }
+            lane.lane_load = candidate_load;
+        }
+        pack.common_term_operand = common;
+        pack.common_term_operand_is_lhs = common_is_lhs;
+        return true;
+    };
+    if (!match_term_orientation(true) && !match_term_orientation(false))
+        return std::nullopt;
+
+    for (const auto &lane : pack.lanes) {
+        if (!address_info(lane.lane_load->ptr(), alias_analysis))
+            return std::nullopt;
+    }
+    std::stable_sort(pack.lanes.begin(), pack.lanes.end(), [&](const auto &lhs, const auto &rhs) {
+        return address_info(lhs.lane_load->ptr(), alias_analysis)->offset <
+               address_info(rhs.lane_load->ptr(), alias_analysis)->offset;
+    });
+
+    for (const auto &lane : pack.lanes) {
+        if (!equivalent_splat_value(pack.lanes.front().seed, lane.seed))
+            return std::nullopt;
+    }
+
+    std::vector<oir::LoadInst *> loads;
+    std::vector<oir::StoreInst *> stores;
+    std::vector<oir::Instruction *> load_instructions;
+    std::vector<oir::Instruction *> store_instructions;
+    for (const auto &lane : pack.lanes) {
+        loads.push_back(lane.lane_load);
+        stores.push_back(lane.store);
+        load_instructions.push_back(lane.lane_load);
+        store_instructions.push_back(lane.store);
+    }
+    if (!instructions_are_contiguous(loads, alias_analysis,
+                                     [](const auto &load) { return load.ptr(); }) ||
+        !instructions_are_contiguous(stores, alias_analysis,
+                                     [](const auto &store) { return store.ptr(); }) ||
+        !memory_pack_is_reorder_safe(block, load_instructions, alias_analysis, false) ||
+        !memory_pack_is_reorder_safe(*pack.store_block, store_instructions, alias_analysis,
+                                     true)) {
+        return std::nullopt;
+    }
+    return pack;
+}
+
+bool transform_interleaved_reduction_pack(
+    oir::Module &module, oir::Function &function, oir::BasicBlock &block,
+    const InterleavedReductionPack &pack, const target::TargetProfile &target,
+    const SLPVectorizerOptions &options, NameGenerator &names, MutationJournal &journal,
+    BlockStats &stats, SLPVectorizerResult &result,
+    std::vector<PendingRemark> &pending) {
+    const auto lanes = static_cast<unsigned>(pack.lanes.size());
+    auto *scalar_type = pack.lanes.front().accumulator->type();
+    if (!target_supports(target, scalar_type)) {
+        record_rejection(result, pending, function, block,
+                         SLPReasonCode::RejectTargetFeature,
+                         "target does not support interleaved i32 reduction vectors");
+        return false;
+    }
+    const auto scalar_cost =
+        lanes * static_cast<unsigned>(target.tuning.scalar_load_cost +
+                                      target.tuning.scalar_store_cost +
+                                      2 * target.tuning.scalar_alu_cost);
+    const auto vector_cost =
+        static_cast<unsigned>(target.tuning.vector_load_cost +
+                              target.tuning.vector_store_cost +
+                              2 * target.tuning.vector_alu_cost +
+                              target.tuning.vector_mask_cost + target.tuning.vsetvl_cost);
+    const auto plan = cost_plan(lanes, scalar_cost, vector_cost);
+    if (!options.force && vector_cost >= scalar_cost) {
+        record_rejection(result, pending, function, block, SLPReasonCode::RejectCost,
+                         "interleaved reduction vector pack is not profitable", plan);
+        return false;
+    }
+
+    auto *vector_type = module.types().scalable_vector_ty(scalar_type, lanes);
+    auto *preheader_anchor = pack.preheader->instructions().back().get();
+    auto *preheader_vl = journal.insert_before<oir::SetVLInst>(
+        *pack.preheader, preheader_anchor, module.types().int32_ty(), vector_type,
+        module.create_i32(lanes), pack.preheader, names.next("reduction.preheader.vl"));
+    auto *seed = journal.insert_before<oir::SplatInst>(
+        *pack.preheader, preheader_anchor, vector_type, pack.lanes.front().seed,
+        pack.preheader, names.next("reduction.seed"));
+
+    auto *vector_phi = journal.insert_before<oir::PhiInst>(
+        block, pack.lanes.front().accumulator, vector_type, &block,
+        names.next("reduction.phi"));
+    auto *body_anchor = pack.lanes.front().lane_load;
+    auto *mask_type = module.types().scalable_vector_ty(module.types().int1_ty(), lanes);
+    auto *body_vl = journal.insert_before<oir::SetVLInst>(
+        block, body_anchor, module.types().int32_ty(), vector_type, preheader_vl,
+        &block, names.next("reduction.vl"));
+    auto *active_mask = journal.insert_before<oir::SplatInst>(
+        block, body_anchor, mask_type, module.create_i1(true), &block,
+        names.next("reduction.active"));
+    oir::VPMetadata metadata{active_mask, body_vl, module.create_undef(vector_type),
+                             oir::TailPolicy::Agnostic, oir::MaskPolicy::Agnostic};
+    auto *vector_load = journal.insert_before<oir::VPLoadInst>(
+        block, body_anchor, oir::Instruction::OpID::VPLoad, vector_type,
+        pack.lanes.front().lane_load->ptr(), 1, metadata, &block,
+        names.next("reduction.load"));
+    auto *common = journal.insert_before<oir::SplatInst>(
+        block, body_anchor, vector_type, pack.common_term_operand, &block,
+        names.next("reduction.splat"));
+    auto *term_lhs = pack.common_term_operand_is_lhs
+                         ? static_cast<oir::Value *>(common)
+                         : static_cast<oir::Value *>(vector_load);
+    auto *term_rhs = pack.common_term_operand_is_lhs
+                         ? static_cast<oir::Value *>(vector_load)
+                         : static_cast<oir::Value *>(common);
+    auto *vector_term = journal.insert_before<oir::VPBinaryInst>(
+        block, body_anchor, vector_type, pack.term_op, term_lhs, term_rhs,
+        metadata, &block, names.next("reduction.term"));
+    auto *vector_update = journal.insert_before<oir::VPBinaryInst>(
+        block, body_anchor, vector_type, oir::Instruction::OpID::Add, vector_phi,
+        vector_term, metadata, &block, names.next("reduction.update"));
+    vector_phi->add_incoming(vector_update, &block);
+    vector_phi->add_incoming(seed, pack.preheader);
+
+    oir::VPMetadata store_metadata{active_mask, body_vl, nullptr,
+                                   oir::TailPolicy::Agnostic,
+                                   oir::MaskPolicy::Agnostic};
+    journal.insert_before<oir::VPStoreInst>(
+        *pack.store_block, pack.lanes.front().store,
+        oir::Instruction::OpID::VPStore, module.types().void_ty(), vector_update,
+        pack.lanes.front().store->ptr(), 1, store_metadata, pack.store_block);
+
+    std::vector<oir::Instruction *> stores;
+    std::vector<oir::Instruction *> phis;
+    std::vector<oir::Instruction *> updates;
+    std::vector<oir::Instruction *> terms;
+    std::vector<oir::Instruction *> loads;
+    for (const auto &lane : pack.lanes) {
+        stores.push_back(lane.store);
+        phis.push_back(lane.accumulator);
+        updates.push_back(lane.update);
+        terms.push_back(lane.term);
+        loads.push_back(lane.lane_load);
+    }
+    journal.detach(*pack.store_block, stores);
+    journal.detach(block, phis);
+    journal.detach(block, updates);
+    journal.detach(block, terms);
+    journal.detach(block, loads);
+
+    stats.packs += 4;
+    stats.replaced += lanes * 5;
+    stats.maximum_lanes = std::max(stats.maximum_lanes, lanes);
+    stats.scalar_cost += scalar_cost;
+    stats.vector_cost += vector_cost;
+    stats.scalable = true;
+    return true;
+}
+
 bool transform_load_pack(oir::Module &module, oir::Function &function, oir::BasicBlock &block,
                          const std::vector<oir::LoadInst *> &pack,
                          const target::TargetProfile &target, const SLPVectorizerOptions &options,
@@ -1188,6 +1488,15 @@ SLPVectorizerResult SLPVectorizer::run(oir::Module &module, const target::Target
                 BlockStats stats;
                 stats.function = &function;
                 stats.block = &block;
+                if (auto reduction_pack =
+                        find_interleaved_reduction_pack(block, alias_analysis, options_);
+                    reduction_pack &&
+                    transform_interleaved_reduction_pack(
+                        module, function, block, *reduction_pack, target, options_, names,
+                        journal, stats, result, pending_rejections)) {
+                    changed_blocks.push_back(stats);
+                    continue;
+                }
                 unsigned load_candidates = 0;
                 bool saw_load_memory_order_barrier = false;
                 auto load_packs =
@@ -1352,9 +1661,11 @@ SLPVectorizerResult SLPVectorizer::run(oir::Module &module, const target::Target
         publish_remark(remarks, pending);
     for (const auto &stats : changed_blocks) {
         PlanChoice plan = cost_plan(stats.maximum_lanes, stats.scalar_cost, stats.vector_cost);
+        plan.scalable = stats.scalable;
         SLPDiagnostic diagnostic{
             SLPReasonCode::Vectorized, stats.function->name(), stats.block->name(),
-            "transformed and verified " + std::to_string(stats.packs) + " fixed-width SLP pack(s)"};
+            "transformed and verified " + std::to_string(stats.packs) +
+                (stats.scalable ? " scalable SLP pack(s)" : " fixed-width SLP pack(s)")};
         result.diagnostics.push_back(diagnostic);
         publish_remark(remarks, {diagnostic, plan});
         result.changed = true;

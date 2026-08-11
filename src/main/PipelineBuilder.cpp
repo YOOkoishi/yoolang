@@ -62,6 +62,18 @@ bool polyhedral_enabled(const CliOptions &options) {
     return optimizations_enabled(options) && options.enable_polyhedral;
 }
 
+bool polyhedral_rvv_preparation_enabled(const CliOptions &options) {
+    const bool vector_deployment =
+        options.target.has_vector() ||
+        options.target.deployment == target::DeploymentMode::Multiversion;
+    const bool slp_handoff_allowed =
+        !options.slp_vectorize_override.has_value() ||
+        options.slp_vectorize_override.value();
+    return polyhedral_enabled(options) && vector_deployment &&
+           (options.loop_vectorize || options.slp_vectorize) &&
+           slp_handoff_allowed;
+}
+
 bool mir_diagnostics_enabled(const CliOptions &options) {
     const bool preserve_readable_mir =
         options.emit_mir && !options.emit_asm && options.emit_mir_stage.empty();
@@ -78,6 +90,7 @@ bool cost_model_active(const CliOptions &options) {
 }
 
 void add_ast_pipeline(pass::PassManager &pm, const CliOptions &options, std::ostream &out) {
+    const bool prepare_rvv = polyhedral_rvv_preparation_enabled(options);
     if (options.emit_ast) {
         pm.add_pass<pass::ASTDumpPass>(out);
     }
@@ -89,16 +102,17 @@ void add_ast_pipeline(pass::PassManager &pm, const CliOptions &options, std::ost
             if (polyhedral_enabled(options)) {
                 if (options.emit_poly) {
                     pm.add_pass<pass::YIRPolyhedralPipelinePass>(
-                        pass::YIRPolyhedralPipelineMode::Force, false);
+                        pass::YIRPolyhedralPipelineMode::Force, false, prepare_rvv);
                     pm.add_pass<pass::YIRPolyhedralDumpPass>(out);
                     if (needs_post_poly_yir_pipeline(options)) {
                         pm.add_pass<pass::YIRPolyhedralPipelinePass>(
-                            pass::YIRPolyhedralPipelineMode::Force);
+                            pass::YIRPolyhedralPipelineMode::Force, true, prepare_rvv);
                     }
                 } else {
                     pm.add_pass<pass::YIRPolyhedralPipelinePass>(
                         options.force_polyhedral ? pass::YIRPolyhedralPipelineMode::Force
-                                                 : pass::YIRPolyhedralPipelineMode::Auto);
+                                                 : pass::YIRPolyhedralPipelineMode::Auto,
+                        true, prepare_rvv);
                 }
             }
             if (needs_post_poly_yir_pipeline(options)) {
@@ -125,6 +139,8 @@ void add_oir_pipeline(pass::PassManager &pm, const CliOptions &options) {
         pass::OIRFatMultiversionOptions fat_options;
         fat_options.loop_vectorize = options.loop_vectorize;
         fat_options.slp_vectorize = options.slp_vectorize;
+        fat_options.slp_polyhedral_rvv_preparation =
+            polyhedral_rvv_preparation_enabled(options);
         fat_options.explore_interleave = options.opt_level >= 3;
         fat_options.optimize_mir = optimizations_enabled(options);
         pm.add_pass<pass::OIRFatMultiversionPass>(fat_options);
@@ -152,10 +168,13 @@ void add_oir_pipeline(pass::PassManager &pm, const CliOptions &options) {
         pm.add_pass<pass::OIRLoopVectorizerPass>(vectorizer_options);
         produced_vector_ir = true;
     }
-    if (options.slp_vectorize) {
+    const bool polyhedral_slp =
+        polyhedral_rvv_preparation_enabled(options) && !options.slp_vectorize;
+    if (options.slp_vectorize || polyhedral_slp) {
         pass::oir_vectorize::SLPVectorizerOptions vectorizer_options;
         vectorizer_options.enabled = true;
-        pm.add_pass<pass::OIRSLPVectorizerPass>(vectorizer_options);
+        pm.add_pass<pass::OIRSLPVectorizerPass>(vectorizer_options,
+                                                polyhedral_slp);
         produced_vector_ir = true;
     }
     if (produced_vector_ir) {

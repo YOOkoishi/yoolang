@@ -1,5 +1,6 @@
 #include "pass/oir/OIRSLPVectorizerPass.h"
 
+#include "pass/yir/YIRPolyhedralTransformPass.h"
 #include "target/TargetMachine.h"
 
 #include <exception>
@@ -7,8 +8,11 @@
 
 namespace pass {
 
-OIRSLPVectorizerPass::OIRSLPVectorizerPass(oir_vectorize::SLPVectorizerOptions options)
-    : options_(std::move(options)) {
+OIRSLPVectorizerPass::OIRSLPVectorizerPass(
+    oir_vectorize::SLPVectorizerOptions options,
+    bool require_polyhedral_rvv_preparation)
+    : options_(std::move(options)),
+      require_polyhedral_rvv_preparation_(require_polyhedral_rvv_preparation) {
 }
 
 std::string_view OIRSLPVectorizerPass::name() const {
@@ -23,6 +27,14 @@ PassResult OIRSLPVectorizerPass::run(PassContext &context) {
     auto *module = context.ssa_module();
     if (module == nullptr) {
         return PassResult::fail("OIRSLPVectorizerPass requires OIR module in pass context");
+    }
+    if (require_polyhedral_rvv_preparation_) {
+        const auto *summary = context.get_artifact<YIRPolyhedralTransformSummary>(
+            std::string(YIRPolyhedralTransformSummary::kArtifactKey));
+        if (summary == nullptr || summary->rvv_preparations == 0) {
+            return PassResult::ok(false,
+                                  "skipped: no polyhedral RVV preparation");
+        }
     }
     const auto *target_machine =
         context.get_artifact<target::TargetMachine>(target::kTargetMachineArtifactKey);
