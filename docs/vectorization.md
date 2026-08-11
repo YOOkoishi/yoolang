@@ -35,15 +35,17 @@ OIR pipeline 先运行标量优化固定点，再运行自动向量化：
 RVV 目标还有一条受限的 Polyhedral→SLP 衔接：多面体分析证明 output-reduction 的输出点
 彼此独立后，可生成 i32/f32 factor-2/4 lane pack，并通过显式 pass artifact 请求 OIR SLP
 接手。f32 只在输出点之间并行，每个输出通道内部仍按原循环顺序累加，因此不需要
-fast-math。reduction term 可以是连续 lane load，也可以是 common scalar 与连续 lane load
-组成的二元算术。若多面体变换生成所有输出 lane 共用条件的规范 diamond，SLP 会保留原标量
+fast-math。reduction term 可以是连续 lane load、common scalar 与连续 lane load 组成的
+二元算术，或两个地址流均连续的 lane-load 二元算术。若多面体变换生成所有输出 lane
+共用条件的规范 diamond，SLP 会保留原标量
 分支，并把 header accumulator、条件内更新、merge phi 和最终 store 作为一个 fixed-width
 CFG pack；固定宽度来自已经证明的 factor-2/4 输出分组，RVV 后端仍按实际 VLEN 合法化。
 条件为假时整个 vector accumulator 保持不变，不把共同条件误解成逐 lane mask。
 lane 条件不同时，仅规范的连续 condition-load/compare 与连续 update-load 进入受限
-diamond-chain 变换；update term 可以是直接 load 或 common×lane-load。condition 形成 vector
-mask，update-load 延后为 RVV masked load；各 lane 原本重复的 common load 使用零索引 masked
-gather，仍只在对应条件为真时访存。mask-undisturbed add 保持条件为假的 accumulator lane；
+diamond-chain 变换；update term 可以是直接 load、common×lane-load，或两个地址流均连续的
+lane-load×lane-load。condition 形成 vector mask，所有 update-load 都延后为共享该 mask 的 RVV
+masked load；各 lane 原本重复的 common load 使用零索引 masked gather，仍只在对应条件为真时
+访存。第二个地址流不连续且也不是同址重复 load 时稳定拒绝。mask-undisturbed add 保持条件为假的 accumulator lane；
 若 scalar update 位于 false arm，则以全真 mask XOR condition 构造逻辑反向 mask，包含浮点
 unordered 情况，不依赖把比较谓词近似改写为另一个 ordered predicate；RVV lowering 将该
 恒等式折叠为单条 mask-not。

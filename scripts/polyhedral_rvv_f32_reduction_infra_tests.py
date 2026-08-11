@@ -56,6 +56,25 @@ SOURCES = {
         "vmnand.mm",
         "vfadd.vv",
     ),
+    ROOT / "test/poly/61_float_lane_guarded_dual_load_reduction_rvv.sy": (
+        "vle32.v",
+        "vse32.v",
+        "vmflt.vv",
+        "vfmul.vv",
+        "vfadd.vv",
+    ),
+    ROOT / "test/poly/62_float_output_dual_load_reduction_rvv.sy": (
+        "vle32.v",
+        "vse32.v",
+        "vfmul.vv",
+        "vfadd.vv",
+    ),
+    ROOT / "test/poly/63_float_shared_guard_dual_load_reduction_rvv.sy": (
+        "vle32.v",
+        "vse32.v",
+        "vfmul.vv",
+        "vfadd.vv",
+    ),
 }
 RUNTIME = ROOT / "runtime/libsysy_riscv.a"
 VLENS = (128, 256, 512, 1024)

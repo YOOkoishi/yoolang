@@ -863,10 +863,17 @@ PlanChoice cost_plan(unsigned lanes, unsigned scalar_cost, unsigned vector_cost)
     return plan;
 }
 
+enum class ReductionTermInputKind {
+    Splat,
+    RepeatedLoad,
+    ContiguousLoad,
+};
+
 struct InterleavedReductionLane final {
     oir::PhiInst *accumulator = nullptr;
     oir::Value *seed = nullptr;
     oir::BinaryInst *term = nullptr;
+    oir::LoadInst *common_load = nullptr;
     oir::LoadInst *lane_load = nullptr;
     oir::BinaryInst *update = nullptr;
     oir::StoreInst *store = nullptr;
@@ -881,6 +888,8 @@ struct InterleavedReductionPack final {
     oir::Instruction::OpID update_op = oir::Instruction::OpID::Add;
     oir::Type *scalar_type = nullptr;
     bool has_binary_term = false;
+    ReductionTermInputKind common_term_kind =
+        ReductionTermInputKind::Splat;
     std::vector<InterleavedReductionLane> lanes;
 };
 
@@ -972,7 +981,8 @@ match_interleaved_reduction_lane(oir::PhiInst &phi, oir::BasicBlock &block) {
     if (!saw_phi_backedge || store == nullptr || update->uses().size() != 2)
         return std::nullopt;
 
-    return InterleavedReductionLane{&phi, seed, term, direct_load, update, store};
+    return InterleavedReductionLane{
+        &phi, seed, term, nullptr, direct_load, update, store};
 }
 
 std::optional<InterleavedReductionPack>
@@ -1021,20 +1031,38 @@ find_interleaved_reduction_pack(oir::BasicBlock &block,
     const auto match_term_orientation = [&](bool common_is_lhs) {
         auto *common = common_is_lhs ? pack.lanes.front().term->lhs()
                                      : pack.lanes.front().term->rhs();
+        bool common_is_splat = true;
         for (auto &lane : pack.lanes) {
             auto *candidate_common = common_is_lhs ? lane.term->lhs() : lane.term->rhs();
             auto *candidate_load = dynamic_cast<oir::LoadInst *>(
                 common_is_lhs ? lane.term->rhs() : lane.term->lhs());
-            if (!equivalent_splat_value(common, candidate_common) || candidate_load == nullptr ||
+            if (candidate_load == nullptr ||
+                candidate_load->parent() != &block ||
                 candidate_load->type() != lane.accumulator->type() ||
                 candidate_load->uses().size() != 1 ||
                 candidate_load->uses().front().user != lane.term) {
                 return false;
             }
             lane.lane_load = candidate_load;
+            lane.common_load = nullptr;
+            common_is_splat &= equivalent_splat_value(common, candidate_common);
         }
         pack.common_term_operand = common;
         pack.common_term_operand_is_lhs = common_is_lhs;
+        pack.common_term_kind = ReductionTermInputKind::Splat;
+        if (common_is_splat)
+            return true;
+        for (auto &lane : pack.lanes) {
+            auto *candidate_common = dynamic_cast<oir::LoadInst *>(
+                common_is_lhs ? lane.term->lhs() : lane.term->rhs());
+            if (candidate_common == nullptr || candidate_common->parent() != &block ||
+                candidate_common->type() != lane.accumulator->type() ||
+                candidate_common->uses().size() != 1 ||
+                candidate_common->uses().front().user != lane.term)
+                return false;
+            lane.common_load = candidate_common;
+        }
+        pack.common_term_kind = ReductionTermInputKind::ContiguousLoad;
         return true;
     };
     if (pack.has_binary_term &&
@@ -1056,17 +1084,33 @@ find_interleaved_reduction_pack(oir::BasicBlock &block,
     }
 
     std::vector<oir::LoadInst *> loads;
+    std::vector<oir::LoadInst *> common_loads;
     std::vector<oir::StoreInst *> stores;
-    std::vector<oir::Instruction *> load_instructions;
+    std::unordered_set<oir::Instruction *> candidate_load_instructions;
     std::vector<oir::Instruction *> store_instructions;
     for (const auto &lane : pack.lanes) {
         loads.push_back(lane.lane_load);
+        if (lane.common_load != nullptr)
+            common_loads.push_back(lane.common_load);
         stores.push_back(lane.store);
-        load_instructions.push_back(lane.lane_load);
+        candidate_load_instructions.insert(lane.lane_load);
+        if (lane.common_load != nullptr)
+            candidate_load_instructions.insert(lane.common_load);
         store_instructions.push_back(lane.store);
+    }
+    std::vector<oir::Instruction *> load_instructions;
+    load_instructions.reserve(candidate_load_instructions.size());
+    for (const auto &owned : block.instructions()) {
+        if (candidate_load_instructions.find(owned.get()) !=
+            candidate_load_instructions.end())
+            load_instructions.push_back(owned.get());
     }
     if (!instructions_are_contiguous(loads, alias_analysis,
                                      [](const auto &load) { return load.ptr(); }) ||
+        (!common_loads.empty() &&
+         !instructions_are_contiguous(
+             common_loads, alias_analysis,
+             [](const auto &load) { return load.ptr(); })) ||
         !instructions_are_contiguous(stores, alias_analysis,
                                      [](const auto &store) { return store.ptr(); }) ||
         !memory_pack_is_reorder_safe(block, load_instructions, alias_analysis, false) ||
@@ -1094,12 +1138,16 @@ bool transform_interleaved_reduction_pack(
         return false;
     }
     const auto arithmetic_cost = pack.has_binary_term ? 2U : 1U;
+    const auto common_load_cost =
+        pack.common_term_kind == ReductionTermInputKind::ContiguousLoad ? 1U : 0U;
     const auto scalar_cost =
-        lanes * static_cast<unsigned>(target.tuning.scalar_load_cost +
+        lanes * static_cast<unsigned>((1U + common_load_cost) *
+                                          target.tuning.scalar_load_cost +
                                       target.tuning.scalar_store_cost +
                                       arithmetic_cost * target.tuning.scalar_alu_cost);
     const auto vector_cost =
-        static_cast<unsigned>(target.tuning.vector_load_cost +
+        static_cast<unsigned>((1U + common_load_cost) *
+                                  target.tuning.vector_load_cost +
                               target.tuning.vector_store_cost +
                               arithmetic_cost * target.tuning.vector_alu_cost +
                               target.tuning.vsetvl_cost);
@@ -1140,9 +1188,17 @@ bool transform_interleaved_reduction_pack(
         names.next("reduction.load"));
     oir::Value *vector_term = vector_load;
     if (pack.has_binary_term) {
-        auto *common = journal.insert_before<oir::SplatInst>(
-            block, body_anchor, vector_type, pack.common_term_operand, &block,
-            names.next("reduction.splat"));
+        oir::Value *common = nullptr;
+        if (pack.common_term_kind == ReductionTermInputKind::ContiguousLoad) {
+            common = journal.insert_before<oir::VPLoadInst>(
+                block, body_anchor, oir::Instruction::OpID::VPLoad, vector_type,
+                pack.lanes.front().common_load->ptr(), 1, metadata, &block,
+                names.next("reduction.common.load"));
+        } else {
+            common = journal.insert_before<oir::SplatInst>(
+                block, body_anchor, vector_type, pack.common_term_operand, &block,
+                names.next("reduction.splat"));
+        }
         auto *term_lhs = pack.common_term_operand_is_lhs
                              ? static_cast<oir::Value *>(common)
                              : static_cast<oir::Value *>(vector_load);
@@ -1178,6 +1234,8 @@ bool transform_interleaved_reduction_pack(
         updates.push_back(lane.update);
         if (lane.term != nullptr)
             terms.push_back(lane.term);
+        if (lane.common_load != nullptr)
+            loads.push_back(lane.common_load);
         loads.push_back(lane.lane_load);
     }
     journal.detach(*pack.store_block, stores);
@@ -1186,8 +1244,9 @@ bool transform_interleaved_reduction_pack(
     journal.detach(block, terms);
     journal.detach(block, loads);
 
-    stats.packs += pack.has_binary_term ? 4 : 3;
-    stats.replaced += lanes * (pack.has_binary_term ? 5 : 4);
+    stats.packs += (pack.has_binary_term ? 4U : 3U) + common_load_cost;
+    stats.replaced +=
+        lanes * ((pack.has_binary_term ? 5U : 4U) + common_load_cost);
     stats.maximum_lanes = std::max(stats.maximum_lanes, lanes);
     stats.scalar_cost += scalar_cost;
     stats.vector_cost += vector_cost;
@@ -1201,6 +1260,7 @@ struct GuardedInterleavedReductionLane final {
     oir::Value *seed = nullptr;
     oir::PhiInst *merge = nullptr;
     oir::BinaryInst *term = nullptr;
+    oir::LoadInst *common_load = nullptr;
     oir::LoadInst *lane_load = nullptr;
     oir::BinaryInst *update = nullptr;
     oir::StoreInst *store = nullptr;
@@ -1218,6 +1278,8 @@ struct GuardedInterleavedReductionPack final {
     oir::Instruction::OpID update_op = oir::Instruction::OpID::Add;
     oir::Type *scalar_type = nullptr;
     bool has_binary_term = false;
+    ReductionTermInputKind common_term_kind =
+        ReductionTermInputKind::Splat;
     std::vector<GuardedInterleavedReductionLane> lanes;
 };
 
@@ -1333,7 +1395,7 @@ match_guarded_interleaved_reduction_lane(oir::PhiInst &phi,
         return std::nullopt;
 
     return GuardedInterleavedReductionLane{
-        &phi, seed, merge, term, direct_load, update, store};
+        &phi, seed, merge, term, nullptr, direct_load, update, store};
 }
 
 std::optional<GuardedInterleavedReductionPack>
@@ -1390,20 +1452,38 @@ find_guarded_interleaved_reduction_pack(
     const auto match_term_orientation = [&](bool common_is_lhs) {
         auto *common = common_is_lhs ? pack.lanes.front().term->lhs()
                                      : pack.lanes.front().term->rhs();
+        bool common_is_splat = true;
         for (auto &lane : pack.lanes) {
             auto *candidate_common = common_is_lhs ? lane.term->lhs() : lane.term->rhs();
             auto *candidate_load = dynamic_cast<oir::LoadInst *>(
                 common_is_lhs ? lane.term->rhs() : lane.term->lhs());
-            if (!equivalent_splat_value(common, candidate_common) ||
-                candidate_load == nullptr ||
+            if (candidate_load == nullptr ||
+                candidate_load->parent() != pack.update_block ||
                 candidate_load->type() != lane.accumulator->type() ||
                 candidate_load->uses().size() != 1 ||
                 candidate_load->uses().front().user != lane.term)
                 return false;
             lane.lane_load = candidate_load;
+            lane.common_load = nullptr;
+            common_is_splat &= equivalent_splat_value(common, candidate_common);
         }
         pack.common_term_operand = common;
         pack.common_term_operand_is_lhs = common_is_lhs;
+        pack.common_term_kind = ReductionTermInputKind::Splat;
+        if (common_is_splat)
+            return true;
+        for (auto &lane : pack.lanes) {
+            auto *candidate_common = dynamic_cast<oir::LoadInst *>(
+                common_is_lhs ? lane.term->lhs() : lane.term->rhs());
+            if (candidate_common == nullptr ||
+                candidate_common->parent() != pack.update_block ||
+                candidate_common->type() != lane.accumulator->type() ||
+                candidate_common->uses().size() != 1 ||
+                candidate_common->uses().front().user != lane.term)
+                return false;
+            lane.common_load = candidate_common;
+        }
+        pack.common_term_kind = ReductionTermInputKind::ContiguousLoad;
         return true;
     };
     if (pack.has_binary_term &&
@@ -1424,17 +1504,33 @@ find_guarded_interleaved_reduction_pack(
     }
 
     std::vector<oir::LoadInst *> loads;
+    std::vector<oir::LoadInst *> common_loads;
     std::vector<oir::StoreInst *> stores;
-    std::vector<oir::Instruction *> load_instructions;
+    std::unordered_set<oir::Instruction *> candidate_load_instructions;
     std::vector<oir::Instruction *> store_instructions;
     for (const auto &lane : pack.lanes) {
         loads.push_back(lane.lane_load);
+        if (lane.common_load != nullptr)
+            common_loads.push_back(lane.common_load);
         stores.push_back(lane.store);
-        load_instructions.push_back(lane.lane_load);
+        candidate_load_instructions.insert(lane.lane_load);
+        if (lane.common_load != nullptr)
+            candidate_load_instructions.insert(lane.common_load);
         store_instructions.push_back(lane.store);
+    }
+    std::vector<oir::Instruction *> load_instructions;
+    load_instructions.reserve(candidate_load_instructions.size());
+    for (const auto &owned : pack.update_block->instructions()) {
+        if (candidate_load_instructions.find(owned.get()) !=
+            candidate_load_instructions.end())
+            load_instructions.push_back(owned.get());
     }
     if (!instructions_are_contiguous(loads, alias_analysis,
                                      [](const auto &load) { return load.ptr(); }) ||
+        (!common_loads.empty() &&
+         !instructions_are_contiguous(
+             common_loads, alias_analysis,
+             [](const auto &load) { return load.ptr(); })) ||
         !instructions_are_contiguous(stores, alias_analysis,
                                      [](const auto &store) { return store.ptr(); }) ||
         !memory_pack_is_reorder_safe(*pack.update_block, load_instructions,
@@ -1463,12 +1559,16 @@ bool transform_guarded_interleaved_reduction_pack(
     }
 
     const auto arithmetic_cost = pack.has_binary_term ? 2U : 1U;
+    const auto common_load_cost =
+        pack.common_term_kind == ReductionTermInputKind::ContiguousLoad ? 1U : 0U;
     const auto scalar_cost =
-        lanes * static_cast<unsigned>(target.tuning.scalar_load_cost +
+        lanes * static_cast<unsigned>((1U + common_load_cost) *
+                                          target.tuning.scalar_load_cost +
                                       target.tuning.scalar_store_cost +
                                       arithmetic_cost * target.tuning.scalar_alu_cost);
     const auto vector_cost =
-        static_cast<unsigned>(target.tuning.vector_load_cost +
+        static_cast<unsigned>((1U + common_load_cost) *
+                                  target.tuning.vector_load_cost +
                               target.tuning.vector_store_cost +
                               arithmetic_cost * target.tuning.vector_alu_cost);
     auto plan = cost_plan(lanes, scalar_cost, vector_cost);
@@ -1499,10 +1599,19 @@ bool transform_guarded_interleaved_reduction_pack(
         pack.update_block, names.next("guarded.reduction.load"));
     oir::Value *vector_term = vector_load;
     if (pack.has_binary_term) {
-        auto *common = journal.insert_before<oir::SplatInst>(
-            *pack.update_block, update_anchor, vector_type,
-            pack.common_term_operand, pack.update_block,
-            names.next("guarded.reduction.splat"));
+        oir::Value *common = nullptr;
+        if (pack.common_term_kind == ReductionTermInputKind::ContiguousLoad) {
+            common = journal.insert_before<oir::VPLoadInst>(
+                *pack.update_block, update_anchor,
+                oir::Instruction::OpID::VPLoad, vector_type,
+                pack.lanes.front().common_load->ptr(), 1, update_metadata,
+                pack.update_block, names.next("guarded.reduction.common.load"));
+        } else {
+            common = journal.insert_before<oir::SplatInst>(
+                *pack.update_block, update_anchor, vector_type,
+                pack.common_term_operand, pack.update_block,
+                names.next("guarded.reduction.splat"));
+        }
         auto *term_lhs = pack.common_term_operand_is_lhs
                              ? static_cast<oir::Value *>(common)
                              : static_cast<oir::Value *>(vector_load);
@@ -1546,6 +1655,8 @@ bool transform_guarded_interleaved_reduction_pack(
         updates.push_back(lane.update);
         if (lane.term != nullptr)
             terms.push_back(lane.term);
+        if (lane.common_load != nullptr)
+            loads.push_back(lane.common_load);
         loads.push_back(lane.lane_load);
         stores.push_back(lane.store);
     }
@@ -1556,8 +1667,9 @@ bool transform_guarded_interleaved_reduction_pack(
     journal.detach(*pack.update_block, loads);
     journal.detach(*pack.header, accumulators);
 
-    stats.packs += pack.has_binary_term ? 5 : 4;
-    stats.replaced += lanes * (pack.has_binary_term ? 6 : 5);
+    stats.packs += (pack.has_binary_term ? 5U : 4U) + common_load_cost;
+    stats.replaced +=
+        lanes * ((pack.has_binary_term ? 6U : 5U) + common_load_cost);
     stats.maximum_lanes = std::max(stats.maximum_lanes, lanes);
     stats.scalar_cost += scalar_cost;
     stats.vector_cost += vector_cost;
@@ -1597,7 +1709,8 @@ struct LaneGuardedReductionPack final {
     bool common_term_operand_is_lhs = true;
     oir::Instruction::OpID term_op = oir::Instruction::OpID::Mul;
     bool has_binary_term = false;
-    bool common_term_is_repeated_load = false;
+    ReductionTermInputKind common_term_kind =
+        ReductionTermInputKind::Splat;
     oir::Type *scalar_type = nullptr;
     oir::Type *condition_scalar_type = nullptr;
     std::vector<LaneGuardedReductionLane> lanes;
@@ -1876,11 +1989,14 @@ find_lane_guarded_reduction_pack(
         }
         pack.common_term_operand_is_lhs = common_is_lhs;
         pack.common_term_operand = common;
-        pack.common_term_is_repeated_load = false;
+        pack.common_term_kind = ReductionTermInputKind::Splat;
         if (common_is_splat)
             return true;
 
         std::optional<AddressInfo> common_address;
+        bool common_address_is_repeated = true;
+        std::vector<oir::LoadInst *> common_loads;
+        common_loads.reserve(pack.lanes.size());
         for (auto &lane : pack.lanes) {
             auto *candidate_common = dynamic_cast<oir::LoadInst *>(
                 common_is_lhs ? lane.term->lhs() : lane.term->rhs());
@@ -1893,15 +2009,25 @@ find_lane_guarded_reduction_pack(
             auto address = address_info(candidate_common->ptr(), alias_analysis);
             if (!address)
                 return false;
-            if (common_address &&
-                (address->base != common_address->base ||
-                 address->offset != common_address->offset ||
-                 address->size != common_address->size))
-                return false;
+            if (common_address) {
+                common_address_is_repeated &=
+                    address->base == common_address->base &&
+                    address->offset == common_address->offset &&
+                    address->size == common_address->size;
+            }
             common_address = address;
             lane.common_load = candidate_common;
+            common_loads.push_back(candidate_common);
         }
-        pack.common_term_is_repeated_load = true;
+        if (common_address_is_repeated) {
+            pack.common_term_kind = ReductionTermInputKind::RepeatedLoad;
+            return true;
+        }
+        if (!instructions_are_contiguous(
+                common_loads, alias_analysis,
+                [](const auto &load) { return load.ptr(); }))
+            return false;
+        pack.common_term_kind = ReductionTermInputKind::ContiguousLoad;
         return true;
     };
     if (pack.has_binary_term &&
@@ -2001,16 +2127,24 @@ bool transform_lane_guarded_reduction_pack(
     }
 
     const auto arithmetic_cost = pack.has_binary_term ? 3U : 2U;
-    const auto common_load_cost = pack.common_term_is_repeated_load ? 1U : 0U;
+    const auto common_load_cost =
+        pack.common_term_kind == ReductionTermInputKind::Splat ? 0U : 1U;
     const auto scalar_cost = lanes * static_cast<unsigned>(
         (2U + common_load_cost) * target.tuning.scalar_load_cost +
         target.tuning.scalar_store_cost +
         arithmetic_cost * target.tuning.scalar_alu_cost +
         target.tuning.scalar_branch_cost);
-    const auto common_vector_load_cost =
-        pack.common_term_is_repeated_load
-            ? static_cast<unsigned>(target.tuning.vector_strided_load_cost)
-            : 0U;
+    const auto common_vector_load_cost = [&]() -> unsigned {
+        switch (pack.common_term_kind) {
+        case ReductionTermInputKind::Splat:
+            return 0U;
+        case ReductionTermInputKind::RepeatedLoad:
+            return static_cast<unsigned>(target.tuning.vector_strided_load_cost);
+        case ReductionTermInputKind::ContiguousLoad:
+            return static_cast<unsigned>(target.tuning.vector_load_cost);
+        }
+        return 0U;
+    }();
     const auto inverted_mask_cost =
         pack.update_on_true
             ? 0U
@@ -2032,11 +2166,12 @@ bool transform_lane_guarded_reduction_pack(
     auto *latch_anchor = pack.latch->terminator();
     auto *lane_pointer = pack.lanes.front().lane_load->ptr();
     auto *common_pointer =
-        pack.common_term_is_repeated_load
+        pack.common_term_kind != ReductionTermInputKind::Splat
             ? pack.lanes.front().common_load->ptr()
             : nullptr;
     const bool common_is_available =
-        !pack.has_binary_term || pack.common_term_is_repeated_load ||
+        !pack.has_binary_term ||
+        pack.common_term_kind != ReductionTermInputKind::Splat ||
         value_is_available_in_block(pack.common_term_operand, *pack.latch,
                                     dominators);
     if (!pointer_can_be_materialized_in_block(lane_pointer, *pack.latch,
@@ -2128,7 +2263,7 @@ bool transform_lane_guarded_reduction_pack(
     oir::Value *vector_term = vector_load;
     if (pack.has_binary_term) {
         oir::Value *common = nullptr;
-        if (pack.common_term_is_repeated_load) {
+        if (pack.common_term_kind == ReductionTermInputKind::RepeatedLoad) {
             auto *index_type =
                 module.types().fixed_vector_ty(module.types().int32_ty(), lanes);
             auto *zero_indices = journal.insert_before<oir::SplatInst>(
@@ -2137,6 +2272,12 @@ bool transform_lane_guarded_reduction_pack(
             common = journal.insert_before<oir::VPGatherInst>(
                 *pack.latch, latch_anchor, vector_type, common_load_base,
                 zero_indices, 1, load_metadata, pack.latch,
+                names.next("lane.guard.common.load"));
+        } else if (pack.common_term_kind ==
+                   ReductionTermInputKind::ContiguousLoad) {
+            common = journal.insert_before<oir::VPLoadInst>(
+                *pack.latch, latch_anchor, oir::Instruction::OpID::VPLoad,
+                vector_type, common_load_base, 1, load_metadata, pack.latch,
                 names.next("lane.guard.common.load"));
         } else {
             common = journal.insert_before<oir::SplatInst>(

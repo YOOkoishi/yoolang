@@ -14,7 +14,7 @@ int main() {
       float sum = 0.0;
       while (k < 64) {
         if (gate[k][j] > 0.0) {
-          sum = sum + weight[k][j] * input[k][j];
+          sum = sum + weight[j][k] * input[k][j];
         }
         k = k + 1;
       }
@@ -26,8 +26,8 @@ int main() {
   return 0;
 }
 
-// The two weight loads address different output lanes.  They are not a
-// broadcast common operand, so the common-load gather recipe must fail closed.
+// The weight loads are neither a broadcast nor contiguous across the output
+// lanes.  The dual-load recipe must therefore fail closed.
 // RVV-OIR-NOT: slp.lane.guard.common.load
 // RVV-OIR-NOT: slp.lane.guard.term
 // RVV-OIR: ret i32 0
