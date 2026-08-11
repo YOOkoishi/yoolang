@@ -576,16 +576,43 @@ SCEVExpr SCEVExpr::add(SCEVExpr lhs, SCEVExpr rhs) {
     if (rhs_const.has_value() && *rhs_const == 0) {
         return lhs;
     }
-    if (lhs.kind() == SCEVKind::AddRec && lhs.lhs() != nullptr && lhs.rhs() != nullptr) {
+
+    auto make_add = [](SCEVExpr add_lhs, SCEVExpr add_rhs) {
+        SCEVExpr expr(SCEVKind::Add);
+        expr.lhs_ = std::make_shared<SCEVExpr>(std::move(add_lhs));
+        expr.rhs_ = std::make_shared<SCEVExpr>(std::move(add_rhs));
+        return expr;
+    };
+    auto contains_add_rec_for = [](const SCEVExpr &expr, const Loop *loop,
+                                   const auto &self) -> bool {
+        if (expr.kind() == SCEVKind::AddRec && expr.loop() == loop) {
+            return true;
+        }
+        return (expr.lhs() != nullptr && self(*expr.lhs(), loop, self)) ||
+               (expr.rhs() != nullptr && self(*expr.rhs(), loop, self));
+    };
+
+    if (lhs.kind() == SCEVKind::AddRec && rhs.kind() == SCEVKind::AddRec &&
+        lhs.lhs() != nullptr && lhs.rhs() != nullptr && rhs.lhs() != nullptr &&
+        rhs.rhs() != nullptr) {
+        if (lhs.loop() == rhs.loop()) {
+            return add_rec(add(*lhs.lhs(), *rhs.lhs()), add(*lhs.rhs(), *rhs.rhs()),
+                           lhs.loop());
+        }
+        // Without loop-nesting information there is no safe canonical outer
+        // recurrence for two different AddRecs.  Preserve the expression
+        // instead of inventing a stride for either loop.
+        return make_add(std::move(lhs), std::move(rhs));
+    }
+    if (lhs.kind() == SCEVKind::AddRec && lhs.lhs() != nullptr && lhs.rhs() != nullptr &&
+        !contains_add_rec_for(rhs, lhs.loop(), contains_add_rec_for)) {
         return add_rec(add(*lhs.lhs(), std::move(rhs)), *lhs.rhs(), lhs.loop());
     }
-    if (rhs.kind() == SCEVKind::AddRec && rhs.lhs() != nullptr && rhs.rhs() != nullptr) {
+    if (rhs.kind() == SCEVKind::AddRec && rhs.lhs() != nullptr && rhs.rhs() != nullptr &&
+        !contains_add_rec_for(lhs, rhs.loop(), contains_add_rec_for)) {
         return add_rec(add(std::move(lhs), *rhs.lhs()), *rhs.rhs(), rhs.loop());
     }
-    SCEVExpr expr(SCEVKind::Add);
-    expr.lhs_ = std::make_shared<SCEVExpr>(std::move(lhs));
-    expr.rhs_ = std::make_shared<SCEVExpr>(std::move(rhs));
-    return expr;
+    return make_add(std::move(lhs), std::move(rhs));
 }
 
 SCEVExpr SCEVExpr::mul(SCEVExpr lhs, SCEVExpr rhs) {

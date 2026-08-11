@@ -1,0 +1,79 @@
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv %s | FileCheck %s --check-prefix=EXPLICIT
+// RUN: %compiler --emit-oir -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=STRIDE
+// RUN: %compiler --emit-oir -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=EXPLICIT
+// RUN: %compiler --emit-oir -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=STRIDE
+// RUN: %compiler --emit-oir -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=EXPLICIT
+// RUN: %compiler -S -O2 -march=rv64gcv %s | FileCheck %s --check-prefix=ASM
+// RUN: %compiler -S -O3 -march=rv64gcv %s | FileCheck %s --check-prefix=ASM
+
+int input[4096];
+int output[4096];
+
+void stride2_load(int n) {
+  int i = 0;
+  while (i < n) {
+    output[i] = input[i * 2] + 1;
+    i = i + 1;
+  }
+}
+
+void stride2_load_store(int n) {
+  int i = 0;
+  while (i < n) {
+    output[i * 2] = input[i * 2] + 2;
+    i = i + 1;
+  }
+}
+
+void nonlinear_index(int n) {
+  int i = 0;
+  while (i < n) {
+    output[i] = input[i + i * i];
+    i = i + 1;
+  }
+}
+
+int masked_memory() {
+  mask<7> active = mask<7>{1, 0, 1, 1, 0, 1, 1};
+  vector<int,7> loaded = masked_load(input, active, vector<int,7>(-1000));
+  masked_store(output, active, loaded + 5);
+  return 0;
+}
+
+int indexed_memory() {
+  vector<int,7> indices = vector<int,7>{0, 2, 4, 6, 8, 10, 12};
+  mask<7> active = mask<7>{1, 0, 1, 1, 0, 1, 1};
+  vector<int,7> loaded = gather(input, indices, active, vector<int,7>(-1000));
+  scatter(output, indices, active, loaded + 5);
+  return 0;
+}
+
+int main() {
+  return 0;
+}
+
+// EXPLICIT-LABEL: define i32 @masked_memory
+// EXPLICIT: masked.load
+// EXPLICIT: masked.store
+// EXPLICIT-LABEL: define i32 @indexed_memory
+// EXPLICIT: vp.gather
+// EXPLICIT: vp.scatter
+
+// STRIDE-LABEL: define void @stride2_load
+// STRIDE: vp.gather
+// STRIDE: vp.store
+// STRIDE-LABEL: define void @stride2_load_store
+// STRIDE: vp.gather
+// STRIDE: vp.scatter
+// STRIDE-LABEL: define void @nonlinear_index
+// STRIDE-NOT: vp.
+// STRIDE: ret void
+
+// ASM-LABEL: stride2_load:
+// ASM-NOT: vle32.v
+// ASM: vlse32.v
+// ASM: vse32.v
+// ASM-LABEL: stride2_load_store:
+// ASM-NOT: vle32.v
+// ASM: vlse32.v
+// ASM: vsse32.v

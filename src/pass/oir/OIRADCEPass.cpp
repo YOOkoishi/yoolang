@@ -11,28 +11,21 @@
 namespace pass::oir_opt {
 namespace {
 
-bool is_live_root(const oir::Instruction &inst, const oir::FunctionModRefAnalysis &modref) {
-    if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
-        return modref.call_has_side_effect(*call);
-    }
-
-    switch (inst.op()) {
-    case oir::Instruction::OpID::Ret:
-    case oir::Instruction::OpID::Br:
-    case oir::Instruction::OpID::Store:
-    case oir::Instruction::OpID::MemZero:
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool is_removable_instruction(const oir::Instruction &inst,
                               const oir::FunctionModRefAnalysis &modref) {
     if (auto *call = dynamic_cast<const oir::CallInst *>(&inst)) {
         return !modref.call_has_side_effect(*call);
     }
     return is_pure_instruction(inst);
+}
+
+bool is_live_root(const oir::Instruction &inst, const oir::FunctionModRefAnalysis &modref) {
+    // ADCE must propagate liveness from every instruction it will retain.
+    // Keeping an instruction while deleting one of its operands leaves a
+    // dangling SSA reference.  This matters especially for the conservatively
+    // non-removable VP/masked instruction family, whose pointer, mask, EVL,
+    // passthrough, and index definitions may otherwise look dead.
+    return !is_removable_instruction(inst, modref);
 }
 
 bool run_adce_on_function(oir::Function &function, const oir::FunctionModRefAnalysis &modref,
