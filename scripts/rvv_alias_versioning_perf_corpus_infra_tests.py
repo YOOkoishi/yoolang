@@ -264,7 +264,13 @@ def main() -> int:
             run([gcc, "-c", "-march=rv64gcv", "-mabi=lp64d", str(rvv_asm), "-o", str(rvv_obj)])
             run([gcc, "-c", "-march=rv64gc", "-mabi=lp64d", str(scalar_asm), "-o", str(scalar_obj)])
             disassembly = run([objdump, "-d", str(rvv_obj)]).stdout
-            required_ops = {"vsetvli", "vle32.v", "vloxei32.v", "vmul.vv", "vadd.vv", "vse32.v"}
+            # The invariant A operand is an OIR gather with a zero index
+            # stride, which the backend canonically selects as vlse32.v with
+            # an x0 byte stride instead of materializing indexed offsets.
+            required_ops = {
+                "vsetvli", "vle32.v", "vlse32.v",
+                "vmul.vv", "vadd.vv", "vse32.v",
+            }
             missing = required_ops - decoded_vector_mnemonics(disassembly)
             require(not missing, "01_mm3 object lacks decoded RVV ops: " + ", ".join(sorted(missing)))
             require("__yoolang_ranges_disjoint" in rvv_asm.read_text(encoding="utf-8"),
