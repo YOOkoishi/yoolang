@@ -159,6 +159,10 @@ def verify_source(
             disassembly,
         )
     )
+    # GNU objdump may print vmnand.mm vd, vs, vs using its canonical vmnot.m
+    # pseudo spelling.  Both decode the same exact mask-negation instruction.
+    if "vmnot.m" in decoded:
+        decoded.add("vmnand.mm")
     for mnemonic in required_mnemonics:
         require(mnemonic in decoded, f"{source.name}: objdump lacks {mnemonic}")
 
