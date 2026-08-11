@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -341,6 +342,51 @@ def write_history_pages(public_dir: Path, runs: list[dict[str, Any]], pages_base
     (public_dir / "instruction-report" / "history.html").write_text(instruction_html)
 
 
+def prune_report_directories(public_dir: Path, runs: list[dict[str, Any]]) -> None:
+    """Keep generated run directories consistent with the bounded history index."""
+    default_branch = os.environ.get("GITHUB_REPOSITORY_DEFAULT_BRANCH", "main")
+    main_run_ids: set[str] = set()
+    branch_run_ids: dict[str, set[str]] = {}
+    for row in runs:
+        run_id = str(row.get("run_id", ""))
+        branch = str(row.get("branch", ""))
+        if not run_id:
+            continue
+        is_main = bool(row.get("is_main_branch")) or branch == default_branch
+        if is_main:
+            main_run_ids.add(run_id)
+        elif branch:
+            branch_run_ids.setdefault(safe_branch_name(branch), set()).add(run_id)
+
+    def prune_runs(root: Path, retained: set[str]) -> None:
+        if not root.is_dir():
+            return
+        for child in root.iterdir():
+            if child.name in retained:
+                continue
+            if child.is_symlink() or child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
+
+    prune_runs(public_dir / "perf-report" / "runs", main_run_ids)
+    prune_runs(public_dir / "instruction-report" / "runs", main_run_ids)
+
+    branches_root = public_dir / "branches"
+    if not branches_root.is_dir():
+        return
+    for branch_dir in branches_root.iterdir():
+        retained = branch_run_ids.get(branch_dir.name)
+        if retained is None:
+            if branch_dir.is_symlink() or branch_dir.is_file():
+                branch_dir.unlink()
+            elif branch_dir.is_dir():
+                shutil.rmtree(branch_dir)
+            continue
+        prune_runs(branch_dir / "perf-report" / "runs", retained)
+        prune_runs(branch_dir / "instruction-report" / "runs", retained)
+
+
 def main() -> int:
     args = parse_args()
     public_dir = args.public_dir
@@ -380,6 +426,7 @@ def main() -> int:
     runs = [row for row in runs if str(row.get("run_id", "")) != run_id]
     runs.insert(0, current)
     runs = runs[:MAX_HISTORY]
+    prune_report_directories(public_dir, runs)
     history_path.write_text(json.dumps({"runs": runs}, ensure_ascii=True, indent=2) + "\n")
     write_report_index(public_dir, runs, "root")
     write_history_pages(public_dir, runs, args.pages_base_url)

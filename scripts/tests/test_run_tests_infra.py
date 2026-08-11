@@ -169,9 +169,17 @@ class WorkflowGateTests(unittest.TestCase):
             "command -v riscv64-linux-gnu-readelf",
             "command -v qemu-riscv64",
             'cron: "0 3 * * 0"',
-            "--tier nightly",
-            'inputs.rvv_diff_tier != \'smoke\'',
-            '--tier "${{ inputs.rvv_diff_tier }}"',
+            "Run event-selected RVV differential matrix",
+            "tier=smoke",
+            'if [ "$EVENT_NAME" = "schedule" ]',
+            "tier=nightly",
+            'elif [ "$EVENT_NAME" = "workflow_dispatch" ]',
+            'tier="$REQUESTED_TIER"',
+            '--tier "$tier"',
+            "name: github-pages",
+            "actions/configure-pages@v6",
+            "actions/upload-pages-artifact@v5",
+            "actions/deploy-pages@v5",
         ):
             self.assertIn(spelling, workflow)
 

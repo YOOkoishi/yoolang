@@ -28,6 +28,9 @@ jobs:
   functional-and-perf:
     runs-on: [self-hosted, linux, x64, yoolang]
     timeout-minutes: 60
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy_instruction_pages.outputs.page_url }}
     concurrency:
       group: ci-${{ github.ref }}
       cancel-in-progress: false
@@ -186,18 +189,24 @@ jobs:
             --fail-on-skip \
             --infra-timeout 180
 
-      - name: Run scheduled RVV nightly differential matrix
-        if: github.event_name == 'schedule'
+      - name: Run event-selected RVV differential matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TIER: ${{ inputs.rvv_diff_tier || 'smoke' }}
         run: |
+          tier=smoke
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            tier=nightly
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tier="$REQUESTED_TIER"
+          fi
+          case "$tier" in
+            smoke|extended|nightly) ;;
+            *) echo "Unsupported RVV differential tier: $tier"; exit 2 ;;
+          esac
+          echo "Running RVV differential tier: $tier (event: $EVENT_NAME)"
           python3 scripts/rvv_random_differential_infra_tests.py \
-            --tier nightly \
-            --timeout 180
-
-      - name: Run requested RVV extended differential matrix
-        if: github.event_name == 'workflow_dispatch' && inputs.rvv_diff_tier != 'smoke'
-        run: |
-          python3 scripts/rvv_random_differential_infra_tests.py \
-            --tier "${{ inputs.rvv_diff_tier }}" \
+            --tier "$tier" \
             --timeout 180
 
       - name: Run scalar O0 regression tests
@@ -414,19 +423,18 @@ jobs:
 
       - name: Configure GitHub Pages
         if: always()
-        continue-on-error: true
         id: configure_pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
         with:
           enablement: true
 
       - name: Generate instruction count report page
         if: always()
-        continue-on-error: true
         env:
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           PAGES_BASE_URL: ${{ steps.configure_pages.outputs.base_url }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          YOOLANG_REPORT_HISTORY_LIMIT: "25"
         run: |
           pages_history_dir="$HOME/.cache/yoolang-ci/pages-history"
           if [ -d "$pages_history_dir" ]; then
@@ -795,7 +803,7 @@ jobs:
       - name: Upload perf artifacts
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-report
           retention-days: 1
@@ -826,16 +834,15 @@ jobs:
       - name: Upload instruction report to Pages
         if: always()
         id: upload_instruction_pages
-        continue-on-error: true
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: public
+          retention-days: 1
 
       - name: Deploy instruction report to Pages
         if: always()
         id: deploy_instruction_pages
-        continue-on-error: true
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
       - name: Fail job if functional tests failed
         if: always()
@@ -896,12 +903,11 @@ jobs:
           perf_outcome = os.environ.get("PERF_OUTCOME", "unknown")
           report_path = Path("build/perf-ci/perf-report.json")
 
-          if perf_outcome != "success":
-              print(f"Performance test step did not complete successfully: {perf_outcome}")
-              sys.exit(1)
-
           if not report_path.exists():
-              print(f"Performance report is missing: {report_path}")
+              print(
+                  f"Performance report is missing: {report_path}; "
+                  f"performance step outcome was {perf_outcome}"
+              )
               sys.exit(1)
 
           try:
@@ -912,11 +918,30 @@ jobs:
 
           status = str(report.get("status", "UNKNOWN"))
           failures = report.get("failures")
-          if status != "PASS":
-              print(f"Performance report status is {status}, expected PASS")
+          if status != "PASS" or failures != 0:
+              print(
+                  f"Performance report failed: status={status}, "
+                  f"failures={failures}, step_outcome={perf_outcome}"
+              )
+              rows = report.get("rows", [])
+              failed_rows = [
+                  row for row in rows
+                  if isinstance(row, dict) and row.get("status") != "OK"
+              ]
+              for row in failed_rows[:20]:
+                  case = row.get("case", "<unknown>")
+                  detail = str(row.get("detail", "")).splitlines()
+                  reason = detail[0] if detail else row.get("status", "FAILED")
+                  print(f"- {case}: {reason}")
+              if len(failed_rows) > 20:
+                  print(f"- ... and {len(failed_rows) - 20} more failed cases")
               sys.exit(1)
-          if failures != 0:
-              print(f"Performance report failures is {failures}, expected 0")
+
+          if perf_outcome != "success":
+              print(
+                  "Performance process failed despite a PASS report: "
+                  f"step_outcome={perf_outcome}"
+              )
               sys.exit(1)
 
           insn_summary = report.get("instruction_count_summary", {})
