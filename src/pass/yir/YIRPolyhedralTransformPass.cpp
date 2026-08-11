@@ -365,6 +365,27 @@ bool is_wave_unroll_safe(const yir::Region &region) {
     return true;
 }
 
+bool is_output_reduction_invariant_setup_op(const yir::Operation &op) {
+    return dynamic_cast<const yir::ConstI32Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::ConstF32Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::ConstBoolOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ZeroOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::AddIOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::SubIOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::MulIOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::AddFOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::SubFOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::MulFOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ICmpOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::FCmpOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ZExtI1ToI32Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::TruncI32ToI1Op *>(&op) != nullptr ||
+           dynamic_cast<const yir::SIToFPOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::FPToSIOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::ToBoolOp *>(&op) != nullptr ||
+           dynamic_cast<const yir::NotOp *>(&op) != nullptr;
+}
+
 bool is_parallel_wave_unroll_safe(const yir::Region &region) {
     for (const auto &op : region.operations()) {
         if (dynamic_cast<const yir::WhileOp *>(op.get()) != nullptr ||
@@ -2082,6 +2103,7 @@ private:
         yir::ForOp *output_loop = nullptr;
         yir::AssignOp *reduction_reset = nullptr;
         yir::VarOp *reduction_induction_var = nullptr;
+        std::vector<yir::Operation *> invariant_setup_ops;
         yir::VarOp *accumulator = nullptr;
         yir::ForOp *reduction_loop = nullptr;
         yir::ArrayStoreOp *output_store = nullptr;
@@ -2093,15 +2115,29 @@ private:
     };
 
     OutputReductionUnrollJam::LaneLowering
-    choose_reduction_lane_lowering(const ReductionBodyMetrics &metrics) const {
+    choose_reduction_lane_lowering(const ReductionBodyMetrics &metrics,
+                                   const yir::TypePtr &accumulator_type) const {
         (void)metrics;
-        if (!enable_rvv_preparation_ || target_profile_ == nullptr) {
+        if (!enable_rvv_preparation_ || target_profile_ == nullptr ||
+            accumulator_type == nullptr) {
             return OutputReductionUnrollJam::LaneLowering::Scalar;
         }
         const bool vector_target = target_profile_->has_vector() ||
                                    target_profile_->deployment ==
                                        target::DeploymentMode::Multiversion;
-        if (vector_target) {
+        const bool is_float = accumulator_type->is_float();
+        bool supports_element =
+            target_profile_->supports_vector_element(is_float, 32);
+        if (target_profile_->deployment == target::DeploymentMode::Multiversion) {
+            target::TargetProfile scalar_profile;
+            target::TargetProfile vector_profile;
+            std::string error;
+            supports_element = target::make_rvv_multiversion_profiles(
+                                   *target_profile_, scalar_profile,
+                                   vector_profile, error) &&
+                               vector_profile.supports_vector_element(is_float, 32);
+        }
+        if (vector_target && supports_element) {
             return OutputReductionUnrollJam::LaneLowering::RVV;
         }
         return OutputReductionUnrollJam::LaneLowering::Scalar;
@@ -2147,11 +2183,18 @@ private:
                 if (assign->target() != accumulator) {
                     return false;
                 }
-                auto *add = dynamic_cast<const yir::AddIOp *>(
+                auto *update = dynamic_cast<const yir::BinaryOpBase *>(
                     assign->value() == nullptr ? nullptr
                                                : assign->value()->defining_op());
-                if (add == nullptr ||
-                    ((add->lhs() == accumulator) == (add->rhs() == accumulator))) {
+                const bool valid_integer_add =
+                    accumulator->type() == yir::Type::get_i32() &&
+                    dynamic_cast<const yir::AddIOp *>(update) != nullptr;
+                const bool valid_float_add =
+                    accumulator->type() == yir::Type::get_f32() &&
+                    dynamic_cast<const yir::AddFOp *>(update) != nullptr;
+                if ((!valid_integer_add && !valid_float_add) ||
+                    ((update->lhs() == accumulator) ==
+                     (update->rhs() == accumulator))) {
                     return false;
                 }
                 saw_update = true;
@@ -2201,7 +2244,8 @@ private:
         int factor, std::size_t body_cost,
         const ReductionBodyMetrics &body_metrics,
         const LaneInvariantSliceMetrics &shared_metrics,
-        OutputReductionUnrollJam::LaneLowering lowering) const {
+        OutputReductionUnrollJam::LaneLowering lowering,
+        bool floating_reduction) const {
         std::int64_t reduction_lower = 0;
         std::int64_t reduction_upper = 0;
         std::int64_t reduction_step = 0;
@@ -2253,7 +2297,9 @@ private:
         std::ostringstream proof;
         proof << "independent output points are unrolled and jammed over one "
               << (body_metrics.guarded ? "guarded " : "")
-              << "side-effect-free integer reduction loop"
+              << "side-effect-free order-preserving "
+              << (floating_reduction ? "f32" : "i32")
+              << " reduction loop"
               << "; lane-invariant shared_ops=" << shared_metrics.operations
               << ", shared_loads=" << shared_metrics.loads
               << ", shared_branches=" << shared_metrics.branches;
@@ -2336,14 +2382,16 @@ private:
         }
 
         auto &ops = output_loop.body_region().operations();
-        if (ops.size() != 4) {
+        if (ops.size() < 4) {
             return false;
         }
-        auto *reset = dynamic_cast<yir::AssignOp *>(ops[0].get());
-        auto *reduction_induction_var = dynamic_cast<yir::VarOp *>(ops[0].get());
-        auto *accumulator = dynamic_cast<yir::VarOp *>(ops[1].get());
-        auto *reduction_loop = dynamic_cast<yir::ForOp *>(ops[2].get());
-        auto *store = dynamic_cast<yir::ArrayStoreOp *>(ops[3].get());
+        const auto accumulator_index = ops.size() - 3;
+        auto *accumulator =
+            dynamic_cast<yir::VarOp *>(ops[accumulator_index].get());
+        auto *reduction_loop =
+            dynamic_cast<yir::ForOp *>(ops[accumulator_index + 1].get());
+        auto *store =
+            dynamic_cast<yir::ArrayStoreOp *>(ops[accumulator_index + 2].get());
         if (accumulator == nullptr || reduction_loop == nullptr || store == nullptr ||
             accumulator->result() == nullptr ||
             !accumulator->has_initializer() || store->value() != accumulator->result() ||
@@ -2355,6 +2403,38 @@ private:
             value_depends_on_value(reduction_loop->step(),
                                    output_loop.induction_var())) {
             return false;
+        }
+
+        yir::AssignOp *reset = nullptr;
+        yir::VarOp *reduction_induction_var = nullptr;
+        std::vector<yir::Operation *> invariant_setup_ops;
+        for (std::size_t index = 0; index < accumulator_index; ++index) {
+            auto *op = ops[index].get();
+            if (auto *assign = dynamic_cast<yir::AssignOp *>(op);
+                assign != nullptr &&
+                assign->target() == reduction_loop->induction_var()) {
+                if (reset != nullptr) {
+                    return false;
+                }
+                reset = assign;
+                continue;
+            }
+            if (auto *var = dynamic_cast<yir::VarOp *>(op);
+                var != nullptr && var->result() == reduction_loop->induction_var()) {
+                if (reduction_induction_var != nullptr) {
+                    return false;
+                }
+                reduction_induction_var = var;
+                continue;
+            }
+            if (!is_output_reduction_invariant_setup_op(*op) ||
+                op->result() == nullptr ||
+                value_depends_on_value(op->result(), output_loop.induction_var()) ||
+                value_depends_on_value(op->result(), reduction_loop->induction_var()) ||
+                clone_wave_unroll_op(*op, {}) == nullptr) {
+                return false;
+            }
+            invariant_setup_ops.push_back(op);
         }
 
         const bool resets_external_induction =
@@ -2400,7 +2480,8 @@ private:
         const auto body_cost = wave_unroll_operation_count(reduction_loop->body_region());
         const auto body_metrics =
             reduction_body_metrics(reduction_loop->body_region());
-        const auto lowering = choose_reduction_lane_lowering(body_metrics);
+        const auto lowering = choose_reduction_lane_lowering(
+            body_metrics, accumulator->result()->type());
         auto shared_slices = analyze_lane_invariant_slices(
             reduction_loop->body_region(), output_loop.induction_var(),
             accumulator->result());
@@ -2429,7 +2510,8 @@ private:
             }
             if (output_reduction_unroll_jam_is_profitable(
                     output_loop, *reduction_loop, candidate_factor, body_cost,
-                    body_metrics, shared_slices.metrics, lowering)) {
+                    body_metrics, shared_slices.metrics, lowering,
+                    accumulator->result()->type()->is_float())) {
                 factor = candidate_factor;
                 break;
             }
@@ -2438,7 +2520,8 @@ private:
             return false;
         }
 
-        candidate = {&output_loop, reset, reduction_induction_var, accumulator,
+        candidate = {&output_loop, reset, reduction_induction_var,
+                     std::move(invariant_setup_ops), accumulator,
                      reduction_loop, store, factor, !exact_upper,
                      body_metrics.guarded, lowering,
                      std::move(shared_slices)};
@@ -2511,10 +2594,23 @@ private:
 
         yir::Value *promoted_reduction_iv = reduction_loop->induction_var();
         ValueMap reduction_map;
+        for (auto *setup_op : candidate.invariant_setup_ops) {
+            auto clone = clone_wave_unroll_op(*setup_op, reduction_map);
+            if (clone == nullptr) {
+                return false;
+            }
+            auto *original_result = setup_op->result();
+            auto *cloned_result = clone->result();
+            append(std::move(clone));
+            if (original_result != nullptr && cloned_result != nullptr) {
+                reduction_map.emplace(original_result, cloned_result);
+            }
+        }
         if (candidate.reduction_induction_var != nullptr) {
             auto promoted_iv = std::make_unique<yir::VarOp>(
                 candidate.reduction_induction_var->result()->type(),
-                candidate.reduction_induction_var->initializer(),
+                map_value(candidate.reduction_induction_var->initializer(),
+                          reduction_map),
                 reduction_temp_name("iv", next_reduction_temp_++));
             promoted_reduction_iv = promoted_iv->result();
             reduction_map.emplace(reduction_loop->induction_var(),
