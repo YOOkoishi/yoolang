@@ -31,7 +31,7 @@
 | runtime alias versioning | 部分 | 可构造 overflow-safe affine ranges 的受限 two-block/rotated CFG |
 | SLP | 部分 | fixed i32/f32 N=3/7、连续 memory、算术/compare/mask producer tree |
 | O3 interleave | 部分 | simple independent plan 的真实 factor 2；复杂 recipe 降级 factor 1 |
-| Polyhedral output-reduction | 部分 | 已证明独立的整数 factor-2/4 output lane pack 交给 OIR SLP；动态范围保留标量 tail，其他 SCoP 形态仍由普通 Loop/SLP 重新分析 |
+| Polyhedral output-reduction | 部分 | 已证明独立的 i32/f32 factor-2/4 output lane pack 交给 OIR SLP；支持直接连续 lane load 或 common×lane-load term、无条件循环、共用条件 diamond，以及“连续条件 load+compare、连续 guarded load”的 lane-local diamond chain；更新可位于条件 true/false arm，false arm 使用精确反向 mask；lane-local 的重复 common load 以零索引 masked gather 保持 guard 访存语义，并在 RVV 选择为零步长 `vlse32.v`；f32 保持每个输出通道的累加顺序，动态范围保留标量 tail，其他 SCoP 形态仍由普通 Loop/SLP 重新分析 |
 | 复杂 CFG/mixed conversion/无法物化 range | 拒绝 | 给出稳定 reason；`force` 不绕 legality |
 
 ## RVV 后端
