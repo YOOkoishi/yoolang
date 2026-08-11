@@ -319,6 +319,7 @@ enum class Opcode {
     RVVMergeVFM,
     RVVLoadUnit,
     RVVStoreUnit,
+    RVVLoadStridedTA,
     RVVLoadStrided,
     RVVStoreStrided,
     RVVLoadSegment2,

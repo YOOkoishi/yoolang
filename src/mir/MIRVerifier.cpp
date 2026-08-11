@@ -733,6 +733,7 @@ class Verifier {
         case Opcode::RVVLoadUnitTA:
         case Opcode::RISCVVLoadUnit:
         case Opcode::RVVLoadUnit:
+        case Opcode::RVVLoadStridedTA:
         case Opcode::RVVLoadStrided:
         case Opcode::RISCVVLoadStrided:
         case Opcode::RVVLoadSegment2:

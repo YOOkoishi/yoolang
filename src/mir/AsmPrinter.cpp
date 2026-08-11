@@ -758,6 +758,7 @@ void AsmPrinter::print_instr(const MachineFunction &function, const MachineInstr
     case Opcode::RVVIntBinaryVVTA:
     case Opcode::RVVFloatBinaryVVTA:
     case Opcode::RVVLoadUnitTA:
+    case Opcode::RVVLoadStridedTA:
     case Opcode::RVVCompareVVTA:
     case Opcode::RVVIntBinaryVV:
     case Opcode::RVVIntBinaryVX:

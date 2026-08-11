@@ -249,6 +249,13 @@ constexpr std::array<MachineOperandConstraint, 5> kLoadStrided = {{
     kVectorVV[4],
 }};
 
+constexpr std::array<MachineOperandConstraint, 4> kLoadStridedTA = {{
+    kSplatVXTA[0],
+    operand(MachineOperandConstraintKind::Register, MachineOperandRole::Use, MRC_GPR),
+    operand(MachineOperandConstraintKind::Register, MachineOperandRole::Use, MRC_GPR),
+    kVectorVV[4],
+}};
+
 constexpr std::array<MachineOperandConstraint, 4> kStoreStrided = {{
     kVectorVV[2],
     operand(MachineOperandConstraintKind::Register, MachineOperandRole::Use, MRC_GPR),
@@ -554,6 +561,8 @@ constexpr std::array<MachineInstrDesc, static_cast<std::size_t>(Opcode::Count)> 
     vector_desc("PseudoVLE", 5, 6, 3, 4, kLoadUnit, MIF_None, MachineMemoryEffect::Read, 5),
     vector_desc("PseudoVSE", 4, 5, 2, 3, kStoreUnit, MIF_SideEffects,
                 MachineMemoryEffect::Write, 1),
+    vector_desc("PseudoVLSE_TA", 5, 6, 3, 4, kLoadStridedTA, MIF_None,
+                MachineMemoryEffect::Read, 6),
     vector_desc("PseudoVLSE", 6, 7, 4, 5, kLoadStrided, MIF_None,
                 MachineMemoryEffect::Read, 6),
     vector_desc("PseudoVSSE", 5, 6, 3, 4, kStoreStrided, MIF_SideEffects,

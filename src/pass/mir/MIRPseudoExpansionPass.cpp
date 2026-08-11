@@ -431,6 +431,7 @@ mir::Opcode expanded_rvv_opcode(const mir::MachineInstr &instr) {
         return mir::Opcode::RISCVVCompareVV;
     case mir::Opcode::RVVStoreUnit:
         return mir::Opcode::RISCVVStoreUnit;
+    case mir::Opcode::RVVLoadStridedTA:
     case mir::Opcode::RVVLoadStrided:
         return mir::Opcode::RISCVVLoadStrided;
     case mir::Opcode::RVVStoreStrided:
