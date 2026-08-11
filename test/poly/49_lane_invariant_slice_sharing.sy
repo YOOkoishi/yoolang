@@ -1,6 +1,7 @@
 // RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
 // RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
 // RUN: %compiler --emit-vector-plan -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-PLAN
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-OIR
 // RUN: %compiler -S -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-ASM
 
 int a[64][64];
@@ -42,14 +43,28 @@ int main() {
 
 // COST: "candidate_id": "output-reduction-unroll-and-jam-factor-2"
 // COST: "action": "Accept"
-// COST: "summary": "independent output points are unrolled and jammed over one guarded side-effect-free integer reduction loop; lane-invariant shared_ops=8, shared_loads=2, shared_branches=1"
+// COST: "summary": "independent output points are unrolled and jammed over one guarded side-effect-free order-preserving i32 reduction loop; lane-invariant shared_ops=8, shared_loads=2, shared_branches=1"
 
 // RVV-PLAN: "vectorizer": "slp"
 // RVV-PLAN: "code": "VECTORIZED"
+// RVV-PLAN: "explanation": "SLP_VECTORIZED: transformed and verified 5 fixed-width SLP pack(s)"
+// RVV-PLAN: "scalable": false
 // RVV-PLAN: "minimum_lanes": 2
 
+// RVV-OIR-DAG: %slp.guarded.reduction.phi = phi {{.*}} : <2 x i32>
+// RVV-OIR-DAG: %slp.guarded.reduction.load = vp.load <2 x i32>
+// RVV-OIR-DAG: %slp.guarded.reduction.term = vp.mul <2 x i32>
+// RVV-OIR-DAG: %slp.guarded.reduction.update = vp.add <2 x i32>
+// RVV-OIR-DAG: %slp.guarded.reduction.merge = phi {{.*}} : <2 x i32>
+// RVV-OIR-DAG: vp.store <2 x i32> %slp.guarded.reduction.merge
+
 // RVV-ASM-LABEL: main:
-// RVV-ASM: vsetivli
-// RVV-ASM: vse32.v
-// RVV-ASM: vsetivli
-// RVV-ASM: vle32.v
+// RVV-ASM-NOT: vmset.m
+// RVV-ASM-NOT: vmand.mm
+// RVV-ASM-DAG: vsetivli
+// RVV-ASM-DAG: vle32.v
+// RVV-ASM-DAG: vmul.vv
+// RVV-ASM-DAG: vadd.vv
+// RVV-ASM-DAG: vse32.v
+// RVV-ASM-NOT: vmset.m
+// RVV-ASM-NOT: vmand.mm

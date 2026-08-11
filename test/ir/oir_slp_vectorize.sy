@@ -55,10 +55,12 @@ int main() {
 
 // ASM-LABEL: four_lane_add:
 // ASM: vsetivli {{[a-z0-9]+}}, 4, e32, m1, ta, ma
-// ASM: vmset.m v1
-// ASM: vmand.mm v0, v1, v1
-// ASM-NEXT: vle32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), v0.t
+// ASM-NOT: vmset.m
+// ASM-NOT: vmand.mm
+// ASM: vle32.v {{v[0-9]+}}, ({{[a-z0-9]+}})
 // ASM: vmv.v.i {{v[0-9]+}}, 7
-// ASM: vadd.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}, v0.t
-// ASM: vse32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), v0.t
+// ASM: vadd.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}
+// ASM: vse32.v {{v[0-9]+}}, ({{[a-z0-9]+}})
+// ASM-NOT: vmset.m
+// ASM-NOT: vmand.mm
 // ASM-NOT: Pseudo

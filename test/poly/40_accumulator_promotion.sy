@@ -44,7 +44,7 @@ int main() {
 
 // RVV-COST: "candidate_id": "output-reduction-unroll-and-jam-factor-4"
 // RVV-COST: "action": "Accept"
-// RVV-COST: "summary": "independent output points are unrolled and jammed over one side-effect-free integer reduction loop; lane-invariant shared_ops=1, shared_loads=1, shared_branches=0; lowering=rvv-prevectorization"
+// RVV-COST: "summary": "independent output points are unrolled and jammed over one side-effect-free order-preserving i32 reduction loop; lane-invariant shared_ops=1, shared_loads=1, shared_branches=0; lowering=rvv-prevectorization"
 
 // RVV-PLAN: "vectorizer": "slp"
 // RVV-PLAN: "code": "VECTORIZED"

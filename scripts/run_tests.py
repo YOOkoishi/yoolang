@@ -52,6 +52,7 @@ LEGACY_INFRA_SCRIPTS = (
 TOOLCHAIN_INFRA_SCRIPTS = frozenset(
     {
         "portable_vector_e2e_infra_tests.py",
+        "polyhedral_rvv_f32_reduction_infra_tests.py",
         "psabi_vector_abi_e2e_infra_tests.py",
         "psabi_vector_staged_runtime_infra_tests.py",
         "rvv_alias_versioning_perf_corpus_infra_tests.py",

@@ -40,5 +40,5 @@ int main() {
 // COST: "transform": "LoopUnroll"
 // COST: "candidate_id": "output-reduction-unroll-and-jam-factor-2"
 // COST: "action": "Accept"
-// COST: "summary": "independent output points are unrolled and jammed over one guarded side-effect-free integer reduction loop; lane-invariant shared_ops=1, shared_loads=1, shared_branches=0"
+// COST: "summary": "independent output points are unrolled and jammed over one guarded side-effect-free order-preserving i32 reduction loop; lane-invariant shared_ops=1, shared_loads=1, shared_branches=0"
 // COST: "register_pressure_growth": 3

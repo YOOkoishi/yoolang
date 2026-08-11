@@ -1,0 +1,71 @@
+// RUN: %compiler --emit-vector-plan -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-PLAN
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-OIR
+// RUN: %compiler -S -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-ASM
+// RUN: %compiler -S -O1 -march=rv64gc -fvectorize --polyhedral %s | FileCheck %s --check-prefix=SCALAR-ASM
+
+int gate[64][64];
+int weight[64];
+int input[64][64];
+int output[64][64];
+
+int main() {
+  int row = 0;
+  while (row < 64) {
+    weight[row] = 2;
+    int column = 0;
+    while (column < 64) {
+      gate[row][column] = 1;
+      if (column % 2 == 0) {
+        gate[row][column] = -1;
+      }
+      input[row][column] = 1;
+      output[row][column] = -1;
+      column = column + 1;
+    }
+    row = row + 1;
+  }
+
+  int i = 0;
+  while (i < 64) {
+    int j = 0;
+    while (j < 64) {
+      int k = 0;
+      int sum = 0;
+      while (k < 64) {
+        if (gate[k][j] > 0) {
+          sum = sum + weight[k] * input[k][j];
+        }
+        k = k + 1;
+      }
+      output[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  return output[0][0] + output[0][1] - 128;
+}
+
+// RVV-PLAN: "vectorizer": "slp"
+// RVV-PLAN: "code": "VECTORIZED"
+// RVV-PLAN: "explanation": "SLP_VECTORIZED: transformed and verified 7 fixed-width SLP pack(s)"
+// RVV-PLAN: "uses_mask": true
+
+// RVV-OIR-DAG: %slp.lane.guard.condition = vp.icmp gt <2 x i32>
+// RVV-OIR-DAG: %slp.lane.guard.common.load = vp.gather <2 x i32>{{.*}}mask <2 x i1> %slp.lane.guard.condition
+// RVV-OIR-DAG: %slp.lane.guard.load = vp.load <2 x i32>{{.*}}mask <2 x i1> %slp.lane.guard.condition
+// RVV-OIR-DAG: %slp.lane.guard.term = vp.mul <2 x i32>{{.*}}mask <2 x i1> %slp.lane.guard.condition
+// RVV-OIR-DAG: %slp.lane.guard.update = vp.add <2 x i32>{{.*}}mask <2 x i1> %slp.lane.guard.condition
+// RVV-OIR-DAG: vp.store <2 x i32> %slp.lane.guard.update
+
+// RVV-ASM-LABEL: main:
+// RVV-ASM-DAG: vmslt.vv
+// RVV-ASM-DAG: vlse32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), {{[a-z0-9]+}}, v0.t
+// RVV-ASM-DAG: vmul.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}, v0.t
+// RVV-ASM-DAG: vadd.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}, v0.t
+// RVV-ASM-DAG: vse32.v
+
+// SCALAR-ASM-LABEL: main:
+// SCALAR-ASM-NOT: vset
+// SCALAR-ASM-NOT: vmul.vv
+// SCALAR-ASM: .size main

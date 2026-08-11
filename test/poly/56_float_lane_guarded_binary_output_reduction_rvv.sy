@@ -1,0 +1,89 @@
+// RUN: %compiler --emit-vector-plan -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-PLAN
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-OIR
+// RUN: %compiler --emit-mir-stage=pre-ra -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-MIR
+// RUN: %compiler -S -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-ASM
+// RUN: %compiler -S -O1 -march=rv64gc -fvectorize --polyhedral %s | FileCheck %s --check-prefix=SCALAR-ASM
+// RUN: %compiler -S -O1 -fvectorize -mrvv-deployment=fat --polyhedral %s | FileCheck %s --check-prefix=FAT
+
+float gate[64][64];
+float weight[64];
+float input[64][64];
+float output[64][64];
+
+int main() {
+  int row = 0;
+  while (row < 64) {
+    weight[row] = 0.25;
+    int column = 0;
+    while (column < 64) {
+      gate[row][column] = 1.0;
+      if (column % 2 == 0) {
+        gate[row][column] = -1.0;
+      }
+      input[row][column] = 2.0;
+      output[row][column] = -1.0;
+      column = column + 1;
+    }
+    row = row + 1;
+  }
+
+  int i = 0;
+  while (i < 64) {
+    int j = 0;
+    while (j < 64) {
+      int k = 0;
+      float sum = 0.0;
+      while (k < 64) {
+        if (gate[k][j] > 0.0) {
+          sum = sum + weight[k] * input[k][j];
+        }
+        k = k + 1;
+      }
+      output[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  if (output[0][0] != 0.0 || output[0][1] != 32.0 ||
+      output[63][62] != 0.0 || output[63][63] != 32.0) {
+    return 1;
+  }
+  return 0;
+}
+
+// RVV-PLAN: "vectorizer": "slp"
+// RVV-PLAN: "code": "VECTORIZED"
+// RVV-PLAN: "explanation": "SLP_VECTORIZED: transformed and verified 7 fixed-width SLP pack(s)"
+// RVV-PLAN: "uses_mask": true
+
+// RVV-OIR-DAG: %slp.lane.guard.condition = vp.fcmp gt <2 x float>
+// RVV-OIR-DAG: %slp.lane.guard.load = vp.load <2 x float>{{.*}}mask <2 x i1> %slp.lane.guard.condition
+// RVV-OIR-DAG: %slp.lane.guard.term = vp.fmul <2 x float>{{.*}}mask <2 x i1> %slp.lane.guard.condition
+// RVV-OIR-DAG: %slp.lane.guard.update = vp.fadd <2 x float>{{.*}}mask <2 x i1> %slp.lane.guard.condition
+// RVV-OIR-DAG: vp.store <2 x float> %slp.lane.guard.update
+
+// RVV-MIR: PseudoVLSE_TA
+// RVV-MIR-SAME: zero
+// RVV-MIR-SAME: passthrough=none
+
+// RVV-ASM-LABEL: main:
+// RVV-ASM-DAG: vmflt.vv
+// RVV-ASM-DAG: vle32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), v0.t
+// RVV-ASM-DAG: vlse32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), {{[a-z0-9]+}}, v0.t
+// RVV-ASM-DAG: vfmul.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}, v0.t
+// RVV-ASM-DAG: vfadd.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}, v0.t
+// RVV-ASM-DAG: vse32.v
+
+// SCALAR-ASM-LABEL: main:
+// SCALAR-ASM-NOT: vset
+// SCALAR-ASM-NOT: vfmul.vv
+// SCALAR-ASM: .size main
+
+// FAT-LABEL: __yoolang_scalar_main:
+// FAT-NOT: vset
+// FAT: .size __yoolang_scalar_main
+// FAT-LABEL: __yoolang_rvv_main:
+// FAT-DAG: vmflt.vv
+// FAT-DAG: vlse32.v {{v[0-9]+}}, ({{[a-z0-9]+}}), {{[a-z0-9]+}}, v0.t
+// FAT-DAG: vfmul.vv {{v[0-9]+}}, {{v[0-9]+}}, {{v[0-9]+}}, v0.t

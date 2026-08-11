@@ -1,0 +1,87 @@
+// RUN: %compiler --emit-cost-model=json -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-COST
+// RUN: %compiler --emit-vector-plan -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-PLAN
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-OIR
+// RUN: %compiler -S -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-ASM
+// RUN: %compiler -S -O1 -march=rv64gc -fvectorize --polyhedral %s | FileCheck %s --check-prefix=SCALAR-ASM
+// RUN: %compiler -S -O1 -fvectorize -mrvv-deployment=fat --polyhedral %s | FileCheck %s --check-prefix=FAT
+
+float a[64][64];
+float b[64][64];
+float c[64][64];
+
+int main() {
+  int row = 0;
+  while (row < 64) {
+    int column = 0;
+    while (column < 64) {
+      a[row][column] = 1.0;
+      b[row][column] = 0.25;
+      c[row][column] = -1.0;
+      column = column + 1;
+    }
+    row = row + 1;
+  }
+
+  int i = 0;
+  while (i < 64) {
+    int j = 0;
+    while (j < 64) {
+      int k = 0;
+      float sum = 0.0;
+      while (k < 64) {
+        sum = sum + a[i][k] * b[k][j];
+        k = k + 1;
+      }
+      c[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  if (c[0][0] != 16.0 || c[0][63] != 16.0 || c[63][0] != 16.0 ||
+      c[63][63] != 16.0) {
+    return 1;
+  }
+  return 0;
+}
+
+// RVV-COST: "candidate_id": "output-reduction-unroll-and-jam-factor-4"
+// RVV-COST: "action": "Accept"
+// RVV-COST: "summary": "independent output points are unrolled and jammed over one side-effect-free order-preserving f32 reduction loop
+
+// RVV-PLAN: "vectorizer": "slp"
+// RVV-PLAN: "code": "VECTORIZED"
+// RVV-PLAN: "scalable": true
+// RVV-PLAN: "minimum_lanes": 4
+// RVV-PLAN: "uses_mask": false
+
+// RVV-OIR: %slp.reduction.phi = phi {{.*}} : <vscale x 4 x float>
+// RVV-OIR: %slp.reduction.load = vp.load <vscale x 4 x float>
+// RVV-OIR: %slp.reduction.term = vp.fmul <vscale x 4 x float>
+// RVV-OIR: %slp.reduction.update = vp.fadd <vscale x 4 x float>
+// RVV-OIR: vp.store <vscale x 4 x float> %slp.reduction.update
+
+// RVV-ASM-LABEL: main:
+// RVV-ASM-NOT: vmset.m
+// RVV-ASM-NOT: vmand.mm
+// RVV-ASM: vsetivli
+// RVV-ASM: vle32.v
+// RVV-ASM: vfmul.vv
+// RVV-ASM: vfadd.vv
+// RVV-ASM: vse32.v
+// RVV-ASM-NOT: vmset.m
+// RVV-ASM-NOT: vmand.mm
+
+// SCALAR-ASM-LABEL: main:
+// SCALAR-ASM-NOT: vset
+// SCALAR-ASM-NOT: vfadd
+// SCALAR-ASM-NOT: vfmul
+// SCALAR-ASM: .size main
+
+// FAT-LABEL: __yoolang_scalar_main:
+// FAT-NOT: vset
+// FAT: .size __yoolang_scalar_main
+// FAT-LABEL: __yoolang_rvv_main:
+// FAT: vsetivli
+// FAT: vfmul.vv
+// FAT: vfadd.vv
+// FAT: vse32.v
