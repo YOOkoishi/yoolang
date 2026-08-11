@@ -619,12 +619,16 @@ bool module_is_profitable_for_auto_polyhedral(const yir::Module &module,
 
 } // namespace
 
-YIRPolyhedralPipelinePass::YIRPolyhedralPipelinePass(bool run_transform)
-    : YIRPolyhedralPipelinePass(YIRPolyhedralPipelineMode::Force, run_transform) {}
+YIRPolyhedralPipelinePass::YIRPolyhedralPipelinePass(bool run_transform,
+                                                     bool enable_rvv_preparation)
+    : YIRPolyhedralPipelinePass(YIRPolyhedralPipelineMode::Force, run_transform,
+                                enable_rvv_preparation) {}
 
 YIRPolyhedralPipelinePass::YIRPolyhedralPipelinePass(YIRPolyhedralPipelineMode mode,
-                                                     bool run_transform)
-    : mode_(mode), run_transform_(run_transform) {}
+                                                     bool run_transform,
+                                                     bool enable_rvv_preparation)
+    : mode_(mode), run_transform_(run_transform),
+      enable_rvv_preparation_(enable_rvv_preparation) {}
 
 std::string_view YIRPolyhedralPipelinePass::name() const {
     return "YIRPolyhedralPipelinePass";
@@ -707,7 +711,7 @@ PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
 
             PassManager structural;
             structural.add_pass<YIRPolyhedralTransformPass>(
-                YIRPolyhedralTransformMode::Structural);
+                YIRPolyhedralTransformMode::Structural, enable_rvv_preparation_);
             ++structural_rounds;
             if (auto error = run_manager(structural)) {
                 return PassResult::fail(std::move(*error));
@@ -739,7 +743,7 @@ PassResult YIRPolyhedralPipelinePass::run(PassContext &context) {
 
         PassManager local;
         local.add_pass<YIRPolyhedralTransformPass>(
-            YIRPolyhedralTransformMode::Local);
+            YIRPolyhedralTransformMode::Local, enable_rvv_preparation_);
         if (auto error = run_manager(local)) {
             return PassResult::fail(std::move(*error));
         }

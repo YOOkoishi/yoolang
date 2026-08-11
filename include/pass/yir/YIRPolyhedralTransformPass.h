@@ -27,13 +27,18 @@ struct YIRPolyhedralTransformSummary {
     std::size_t interchanges = 0;
     std::size_t tilings = 0;
     std::size_t fusions = 0;
+    // Number of independent-output lane packs intentionally left in scalar
+    // form for the OIR SLP vectorizer.  Keeping this hand-off explicit lets
+    // the ordinary RVV backend own vector types, masks, VL and VTYPE.
+    std::size_t rvv_preparations = 0;
 };
 
 class YIRPolyhedralTransformPass final : public Pass {
   public:
     explicit YIRPolyhedralTransformPass(
-        YIRPolyhedralTransformMode mode = YIRPolyhedralTransformMode::Full)
-        : mode_(mode) {}
+        YIRPolyhedralTransformMode mode = YIRPolyhedralTransformMode::Full,
+        bool enable_rvv_preparation = false)
+        : mode_(mode), enable_rvv_preparation_(enable_rvv_preparation) {}
 
     std::string_view name() const override;
     PassKind kind() const override;
@@ -41,6 +46,7 @@ class YIRPolyhedralTransformPass final : public Pass {
 
   private:
     YIRPolyhedralTransformMode mode_;
+    bool enable_rvv_preparation_;
 };
 
 } // namespace pass

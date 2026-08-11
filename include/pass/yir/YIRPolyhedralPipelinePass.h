@@ -13,8 +13,10 @@ enum class YIRPolyhedralPipelineMode {
 
 class YIRPolyhedralPipelinePass final : public Pass {
   public:
-    explicit YIRPolyhedralPipelinePass(bool run_transform = true);
-    YIRPolyhedralPipelinePass(YIRPolyhedralPipelineMode mode, bool run_transform = true);
+    explicit YIRPolyhedralPipelinePass(bool run_transform = true,
+                                       bool enable_rvv_preparation = false);
+    YIRPolyhedralPipelinePass(YIRPolyhedralPipelineMode mode, bool run_transform = true,
+                              bool enable_rvv_preparation = false);
 
     std::string_view name() const override;
     PassKind kind() const override;
@@ -23,6 +25,7 @@ class YIRPolyhedralPipelinePass final : public Pass {
   private:
     YIRPolyhedralPipelineMode mode_;
     bool run_transform_;
+    bool enable_rvv_preparation_;
 };
 
 } // namespace pass

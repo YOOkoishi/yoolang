@@ -5,6 +5,7 @@
 #include "pass/yir/YIRPolyhedralCanonicalizePass.h"
 #include "pass/yir/YIRPolyhedralDependenceAnalysisPass.h"
 #include "pass/yir/YIRPolyhedralModelBuildPass.h"
+#include "target/TargetMachine.h"
 #include "yir/Presburger.h"
 #include "yir/YIR.h"
 #include "yir/YIRVerifier.h"
@@ -1941,9 +1942,13 @@ public:
     explicit PolyhedralTransformer(yir::Module &module, PolyModelInfo& model_info,
                                    PolyDependenceInfo& dep_info,
                                    const YIRPolyhedralCanonicalInfo& canonical_info,
-                                   cost_model::CostModelReport *cost_report = nullptr)
+                                   cost_model::CostModelReport *cost_report = nullptr,
+                                   const target::TargetProfile *target_profile = nullptr,
+                                   bool enable_rvv_preparation = false)
         : module_(module), model_info_(model_info), dep_info_(dep_info),
-          canonical_info_(canonical_info), cost_report_(cost_report), num_interchanged_(0), num_tiled_(0),
+          canonical_info_(canonical_info), cost_report_(cost_report),
+          target_profile_(target_profile),
+          enable_rvv_preparation_(enable_rvv_preparation), num_interchanged_(0), num_tiled_(0),
           num_fused_(0),
           num_serial_wavefronts_(0), num_parallel_wavefronts_(0), num_wave_unrolls_(0),
           num_parallel_wave_unrolls_(0), num_same_iteration_reloads_(0),
@@ -1954,6 +1959,7 @@ public:
           num_relation_legality_proofs_(0), num_relation_legality_rejections_(0),
           num_relation_legality_unknown_(0), num_domain_partitions_(0),
           num_reduction_privatizations_(0), num_output_reduction_unroll_jams_(0),
+          num_output_reduction_rvv_preparations_(0),
           num_lane_invariant_ops_shared_(0) {}
 
     bool transform(YIRPolyhedralTransformMode mode) {
@@ -2044,6 +2050,9 @@ public:
     std::size_t num_output_reduction_unroll_jams() const {
         return num_output_reduction_unroll_jams_;
     }
+    std::size_t num_output_reduction_rvv_preparations() const {
+        return num_output_reduction_rvv_preparations_;
+    }
     std::size_t num_lane_invariant_ops_shared() const {
         return num_lane_invariant_ops_shared_;
     }
@@ -2064,9 +2073,9 @@ private:
     struct OutputReductionUnrollJam {
         enum class LaneLowering {
             Scalar,
-            // TODO(rvv): select this lowering when vector semantics and target
-            // feature plumbing are available. Legality remains shared with the
-            // scalar register-blocked form.
+            // Materialize a target-independent scalar lane pack and hand it to
+            // the OIR SLP vectorizer.  OIR/MIR remain the owners of vector
+            // types, RVV VL/VTYPE state and target-specific legality.
             RVV,
         };
 
@@ -2083,12 +2092,18 @@ private:
         LaneInvariantSliceInfo shared_slices;
     };
 
-    static OutputReductionUnrollJam::LaneLowering
-    choose_reduction_lane_lowering(const ReductionBodyMetrics &metrics) {
+    OutputReductionUnrollJam::LaneLowering
+    choose_reduction_lane_lowering(const ReductionBodyMetrics &metrics) const {
         (void)metrics;
-        // TODO(rvv): consult target vector features and a vector cost model.
-        // The candidate legality contract intentionally does not depend on the
-        // eventual scalar or RVV lowering.
+        if (!enable_rvv_preparation_ || target_profile_ == nullptr) {
+            return OutputReductionUnrollJam::LaneLowering::Scalar;
+        }
+        const bool vector_target = target_profile_->has_vector() ||
+                                   target_profile_->deployment ==
+                                       target::DeploymentMode::Multiversion;
+        if (vector_target) {
+            return OutputReductionUnrollJam::LaneLowering::RVV;
+        }
         return OutputReductionUnrollJam::LaneLowering::Scalar;
     }
 
@@ -2185,7 +2200,8 @@ private:
         const yir::ForOp &output_loop, const yir::ForOp &reduction_loop,
         int factor, std::size_t body_cost,
         const ReductionBodyMetrics &body_metrics,
-        const LaneInvariantSliceMetrics &shared_metrics) const {
+        const LaneInvariantSliceMetrics &shared_metrics,
+        OutputReductionUnrollJam::LaneLowering lowering) const {
         std::int64_t reduction_lower = 0;
         std::int64_t reduction_upper = 0;
         std::int64_t reduction_step = 0;
@@ -2241,6 +2257,9 @@ private:
               << "; lane-invariant shared_ops=" << shared_metrics.operations
               << ", shared_loads=" << shared_metrics.loads
               << ", shared_branches=" << shared_metrics.branches;
+        if (lowering == OutputReductionUnrollJam::LaneLowering::RVV) {
+            proof << "; lowering=rvv-prevectorization";
+        }
         model_candidate.proof.summary = proof.str();
 
         auto &before = model_candidate.before;
@@ -2381,6 +2400,7 @@ private:
         const auto body_cost = wave_unroll_operation_count(reduction_loop->body_region());
         const auto body_metrics =
             reduction_body_metrics(reduction_loop->body_region());
+        const auto lowering = choose_reduction_lane_lowering(body_metrics);
         auto shared_slices = analyze_lane_invariant_slices(
             reduction_loop->body_region(), output_loop.induction_var(),
             accumulator->result());
@@ -2409,7 +2429,7 @@ private:
             }
             if (output_reduction_unroll_jam_is_profitable(
                     output_loop, *reduction_loop, candidate_factor, body_cost,
-                    body_metrics, shared_slices.metrics)) {
+                    body_metrics, shared_slices.metrics, lowering)) {
                 factor = candidate_factor;
                 break;
             }
@@ -2420,8 +2440,7 @@ private:
 
         candidate = {&output_loop, reset, reduction_induction_var, accumulator,
                      reduction_loop, store, factor, !exact_upper,
-                     body_metrics.guarded,
-                     choose_reduction_lane_lowering(body_metrics),
+                     body_metrics.guarded, lowering,
                      std::move(shared_slices)};
         return true;
     }
@@ -2435,7 +2454,6 @@ private:
         auto *output_store = candidate.output_store;
         if (output_loop == nullptr || accumulator == nullptr || reduction_loop == nullptr ||
             output_store == nullptr || candidate.factor < 2 ||
-            candidate.lowering != OutputReductionUnrollJam::LaneLowering::Scalar ||
             output_index >= parent.operations().size() ||
             induction_value_is_live_after(parent, output_index,
                                           output_loop->induction_var())) {
@@ -2578,6 +2596,9 @@ private:
             candidate.shared_slices.metrics.operations *
             static_cast<std::size_t>(candidate.factor - 1);
         ++num_output_reduction_unroll_jams_;
+        if (candidate.lowering == OutputReductionUnrollJam::LaneLowering::RVV) {
+            ++num_output_reduction_rvv_preparations_;
+        }
         return true;
     }
 
@@ -7787,6 +7808,8 @@ private:
     PolyDependenceInfo& dep_info_;
     const YIRPolyhedralCanonicalInfo& canonical_info_;
     cost_model::CostModelReport *cost_report_;
+    const target::TargetProfile *target_profile_;
+    bool enable_rvv_preparation_;
 
     std::size_t num_interchanged_;
     std::size_t num_tiled_;
@@ -7811,6 +7834,7 @@ private:
     std::size_t num_domain_partitions_;
     std::size_t num_reduction_privatizations_;
     std::size_t num_output_reduction_unroll_jams_;
+    std::size_t num_output_reduction_rvv_preparations_;
     std::size_t num_lane_invariant_ops_shared_;
     std::unordered_set<std::size_t> fused_scope_ids_;
     std::size_t next_stencil_temp_ = 0;
@@ -7864,8 +7888,18 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
             cost_model::kReportArtifactKey);
     }
 
+    const auto *target_machine = context.get_artifact<target::TargetMachine>(
+        target::kTargetMachineArtifactKey);
+    if (enable_rvv_preparation_ && target_machine == nullptr) {
+        return PassResult::fail(
+            "YIRPolyhedralTransformPass requires target.machine for RVV preparation");
+    }
+    const auto *target_profile =
+        target_machine == nullptr ? nullptr : &target_machine->profile();
+
     PolyhedralTransformer transformer(**artifact, *model_info, *dep_info, *canonical_info,
-                                      cost_report);
+                                      cost_report, target_profile,
+                                      enable_rvv_preparation_);
     bool changed = transformer.transform(mode_);
 
     if (changed) {
@@ -7901,6 +7935,8 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
         << transformer.num_reduction_privatizations()
         << ", output_reduction_unroll_jams="
         << transformer.num_output_reduction_unroll_jams()
+        << ", output_reduction_rvv_preparations="
+        << transformer.num_output_reduction_rvv_preparations()
         << ", lane_invariant_ops_shared="
         << transformer.num_lane_invariant_ops_shared();
 
@@ -7911,6 +7947,7 @@ PassResult YIRPolyhedralTransformPass::run(PassContext &context) {
             transformer.num_interchanged(),
             transformer.num_tiled(),
             transformer.num_fused(),
+            transformer.num_output_reduction_rvv_preparations(),
         });
 
     return PassResult::ok(changed, oss.str());
