@@ -28,9 +28,6 @@ jobs:
   functional-and-perf:
     runs-on: [self-hosted, linux, x64, yoolang]
     timeout-minutes: 60
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy_instruction_pages.outputs.page_url }}
     concurrency:
       group: ci-${{ github.ref }}
       cancel-in-progress: false
@@ -832,17 +829,12 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload instruction report to Pages
-        if: always()
+        if: ${{ always() && github.ref_name == github.event.repository.default_branch }}
         id: upload_instruction_pages
         uses: actions/upload-pages-artifact@v5
         with:
           path: public
           retention-days: 1
-
-      - name: Deploy instruction report to Pages
-        if: always()
-        id: deploy_instruction_pages
-        uses: actions/deploy-pages@v5
 
       - name: Fail job if functional tests failed
         if: always()
@@ -974,8 +966,8 @@ jobs:
           ACTOR: ${{ github.actor }}
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           HEAD_COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
-          PAGES_BASE_URL: ${{ steps.deploy_instruction_pages.outputs.page_url }}
-          PAGES_DEPLOY_OUTCOME: ${{ steps.deploy_instruction_pages.outcome }}
+          PAGES_BASE_URL: ${{ steps.configure_pages.outputs.base_url }}
+          PAGES_DEPLOY_OUTCOME: ${{ github.ref_name == github.event.repository.default_branch && 'scheduled' || 'skipped' }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           python3 - <<'PY'
@@ -1067,21 +1059,21 @@ jobs:
           def instruction_report_line() -> str:
               base_url = os.environ.get("PAGES_BASE_URL", "").strip()
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
-              if base_url and outcome == "success":
+              if base_url and outcome in {"success", "scheduled"}:
                   return f"🔗 指令数详细报告: {base_url.rstrip('/')}{_branch_path()}/instruction-report/"
               return "🔗 指令数详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/instruction-report/index.html`"
 
           def perf_report_line() -> str:
               base_url = os.environ.get("PAGES_BASE_URL", "").strip()
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
-              if base_url and outcome == "success":
+              if base_url and outcome in {"success", "scheduled"}:
                   return f"🔗 性能详细报告: {base_url.rstrip('/')}{_branch_path()}/perf-report/"
               return "🔗 性能详细报告: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/perf-report/index.html`"
 
           def history_report_line() -> str:
               base_url = os.environ.get("PAGES_BASE_URL", "").strip()
               outcome = os.environ.get("PAGES_DEPLOY_OUTCOME", "").strip()
-              if base_url and outcome == "success":
+              if base_url and outcome in {"success", "scheduled"}:
                   return f"🔗 历史报告索引: {base_url.rstrip('/')}/history.html"
               return "🔗 历史报告索引: GitHub Pages 暂不可用，请查看 CI artifact `perf-report` 中的 `public/history.html`"
 
@@ -1327,3 +1319,22 @@ jobs:
           except Exception as exc:
               print(f"Discord notification failed unexpectedly: {exc!r}")
           PY
+
+  deploy-pages:
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
+    needs: functional-and-perf
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy instruction report to Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -176,7 +176,6 @@ class WorkflowGateTests(unittest.TestCase):
             'elif [ "$EVENT_NAME" = "workflow_dispatch" ]',
             'tier="$REQUESTED_TIER"',
             '--tier "$tier"',
-            "name: github-pages",
             "actions/configure-pages@v6",
             "actions/upload-pages-artifact@v5",
             "actions/deploy-pages@v5",
@@ -190,6 +189,16 @@ class WorkflowGateTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", functional_step)
         self.assertIn("FUNCTIONAL_OUTCOME", workflow)
         self.assertIn("Fail job if functional tests failed", workflow)
+
+        functional_job, deploy_job = workflow.split("\n  deploy-pages:\n", 1)
+        self.assertNotIn("\n    environment:\n", functional_job)
+        self.assertIn(
+            "if: ${{ github.ref_name == github.event.repository.default_branch }}",
+            deploy_job,
+        )
+        self.assertIn("needs: functional-and-perf", deploy_job)
+        self.assertIn("name: github-pages", deploy_job)
+        self.assertIn("url: ${{ steps.deployment.outputs.page_url }}", deploy_job)
 
 
 if __name__ == "__main__":
