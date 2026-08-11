@@ -756,9 +756,11 @@ def assert_final_mir(final_mir: str) -> None:
             raise RuntimeError(f"Final MIR retains scalar pseudo {opcode}")
     if "PseudoV" in final_mir:
         raise RuntimeError("Final MIR retains an RVV pseudo")
-    for opcode in ("VSETVLI", "VMSET.M", "VLE", "VMV.V.I", "VINT.VV", "VSE"):
+    for opcode in ("VSETVLI", "VLE", "VMV.V.I", "VINT.VV", "VSE"):
         if re.search(rf"^  {re.escape(opcode)}(?: |$)", final_mir, re.MULTILINE) is None:
             raise RuntimeError(f"Final MIR lacks concrete opcode {opcode}")
+    if re.search(r"^  VMSET\.M(?: |$)", final_mir, re.MULTILINE) is not None:
+        raise RuntimeError("all-true loop mask was not eliminated from Final MIR")
 
 
 def test_compiler_pipeline(
@@ -802,9 +804,11 @@ def test_compiler_pipeline(
         ]
     )
     assembly_text = assembly.read_text(encoding="utf-8")
-    for mnemonic in ("vsetvli", "vmset.m", "vle32.v", "vadd.vv", "vse32.v"):
+    for mnemonic in ("vsetvli", "vle32.v", "vadd.vv", "vse32.v"):
         if mnemonic not in assembly_text:
             raise RuntimeError(f"compiler assembly lacks {mnemonic}")
+    if "vmset.m" in assembly_text or "v0.t" in assembly_text:
+        raise RuntimeError("all-true loop mask survived in compiler assembly")
     alias = re.search(
         r"^\s+(li|la|mv|j|call|ret|bnez|beqz)(?:\s|$)",
         assembly_text,
@@ -819,7 +823,6 @@ def test_compiler_pipeline(
     disassembly = run_checked([objdump, "-dr", str(obj)]).stdout.decode()
     for needle in (
         "vsetvli",
-        "vmset.m",
         "vle32.v",
         "vadd.vv",
         "vse32.v",
@@ -828,6 +831,8 @@ def test_compiler_pipeline(
     ):
         if needle not in disassembly:
             raise RuntimeError(f"RVV object disassembly lacks {needle}")
+    if "vmset.m" in disassembly or "v0.t" in disassembly:
+        raise RuntimeError("all-true loop mask survived in object disassembly")
     print("PASS rvv_final_assembly_and_objdump")
 
     run_checked(

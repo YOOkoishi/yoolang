@@ -3092,8 +3092,28 @@ class VRegLowerer final {
             return false;
         return std::all_of(inst.uses().begin(), inst.uses().end(), [&](const auto &use) {
             const auto *vp = dynamic_cast<const oir::VPInstruction *>(use.user);
-            return vp != nullptr && vp->active_mask() == &inst &&
-                   vp_mask_is_all_true(*vp);
+            if (vp == nullptr || vp->active_mask() != &inst ||
+                !vp_mask_is_all_true(*vp)) {
+                return false;
+            }
+            if (const auto *compare = dynamic_cast<const oir::VPCmpInst *>(vp)) {
+                return !is_oversized_fixed_vector(
+                    dynamic_cast<const oir::VectorType *>(compare->lhs()->type()));
+            }
+            if (const auto *load = dynamic_cast<const oir::VPLoadInst *>(vp)) {
+                return !is_oversized_fixed_vector(
+                    dynamic_cast<const oir::VectorType *>(load->type()));
+            }
+            if (const auto *store = dynamic_cast<const oir::VPStoreInst *>(vp)) {
+                return !is_oversized_fixed_vector(
+                    dynamic_cast<const oir::VectorType *>(store->value()->type()));
+            }
+            if (const auto *binary = dynamic_cast<const oir::VPBinaryInst *>(vp)) {
+                const auto *type = dynamic_cast<const oir::VectorType *>(binary->type());
+                return type != nullptr && !type->is_mask() &&
+                       !is_oversized_fixed_vector(type);
+            }
+            return false;
         });
     }
 
@@ -4453,6 +4473,10 @@ class VRegLowerer final {
         auto lhs = value_reg(inst.lhs());
         auto rhs = value_reg(inst.rhs());
         const bool unmasked = vp_mask_is_all_true(inst);
+        std::optional<mir::Register> ordinary_mask;
+        if (!unmasked) {
+            ordinary_mask = value_reg(inst.active_mask());
+        }
         bool swap_operands = false;
         const auto operation = lower_compare_operation(inst.pred(), swap_operands);
         if (swap_operands) {
@@ -4476,8 +4500,7 @@ class VRegLowerer final {
                 mir::MachineOperand::reg_def(value_regs_.at(&inst)),
                 mir::MachineOperand::reg_use(lhs), mir::MachineOperand::reg_use(rhs)};
             if (!unmasked) {
-                auto execution_mask =
-                    prepare_execution_mask(value_reg(inst.active_mask()), type);
+                auto execution_mask = prepare_execution_mask(*ordinary_mask, type);
                 info.mask_operand = operands.size();
                 operands.push_back(mir::MachineOperand::reg_use(execution_mask));
             }
@@ -4491,8 +4514,7 @@ class VRegLowerer final {
             mir::MachineOperand::reg_use(*passthrough),
             mir::MachineOperand::reg_use(lhs), mir::MachineOperand::reg_use(rhs)};
         if (!unmasked) {
-            auto execution_mask =
-                prepare_execution_mask(value_reg(inst.active_mask()), type);
+            auto execution_mask = prepare_execution_mask(*ordinary_mask, type);
             info.mask_operand = operands.size();
             operands.push_back(mir::MachineOperand::reg_use(execution_mask));
         }
@@ -4562,6 +4584,10 @@ class VRegLowerer final {
         auto dst = value_regs_.at(&inst);
         auto address = value_reg(inst.ptr());
         const bool unmasked = vp_mask_is_all_true(inst);
+        std::optional<mir::Register> ordinary_mask;
+        if (!unmasked) {
+            ordinary_mask = value_reg(inst.active_mask());
+        }
         const auto tail_policy = lower_tail_policy(inst.tail_policy());
         const auto mask_policy = lower_mask_policy(inst.mask_policy());
         std::optional<mir::Register> passthrough;
@@ -4583,7 +4609,7 @@ class VRegLowerer final {
                                         std::move(info));
                 return;
             }
-            auto mask = prepare_execution_mask(value_reg(inst.active_mask()), type);
+            auto mask = prepare_execution_mask(*ordinary_mask, type);
             info.mask_operand = 2;
             emit_vector_instruction(mir::Opcode::RVVLoadUnitTA,
                                     {mir::MachineOperand::reg_def(dst),
@@ -4593,7 +4619,7 @@ class VRegLowerer final {
         } else {
             std::optional<mir::Register> mask;
             if (!unmasked) {
-                mask = prepare_execution_mask(value_reg(inst.active_mask()), type);
+                mask = prepare_execution_mask(*ordinary_mask, type);
             }
             info.passthrough_operand = 1;
             std::vector<mir::MachineOperand> operands = {
@@ -4651,6 +4677,10 @@ class VRegLowerer final {
         auto value = value_reg(inst.value());
         auto address = value_reg(inst.ptr());
         const bool unmasked = vp_mask_is_all_true(inst);
+        std::optional<mir::Register> ordinary_mask;
+        if (!unmasked) {
+            ordinary_mask = value_reg(inst.active_mask());
+        }
         const auto tail_policy = lower_tail_policy(inst.tail_policy());
         const auto mask_policy = lower_mask_policy(inst.mask_policy());
         ensure_vector_configuration(type, inst.evl(), tail_policy, mask_policy);
@@ -4662,7 +4692,7 @@ class VRegLowerer final {
         std::vector<mir::MachineOperand> operands = {mir::MachineOperand::reg_use(value),
                                                      mir::MachineOperand::reg_use(address)};
         if (!unmasked) {
-            auto mask = prepare_execution_mask(value_reg(inst.active_mask()), type);
+            auto mask = prepare_execution_mask(*ordinary_mask, type);
             info.mask_operand = operands.size();
             operands.push_back(mir::MachineOperand::reg_use(mask));
         }
@@ -5882,6 +5912,10 @@ class VRegLowerer final {
         auto lhs = value_reg(inst.lhs());
         auto rhs = value_reg(inst.rhs());
         const bool unmasked = vp_mask_is_all_true(inst);
+        std::optional<mir::Register> ordinary_mask;
+        if (!unmasked) {
+            ordinary_mask = value_reg(inst.active_mask());
+        }
         const auto tail_policy = lower_tail_policy(inst.tail_policy());
         const auto mask_policy = lower_mask_policy(inst.mask_policy());
         std::optional<mir::Register> passthrough;
@@ -5902,7 +5936,7 @@ class VRegLowerer final {
                 mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(lhs),
                 mir::MachineOperand::reg_use(rhs)};
             if (!unmasked) {
-                auto mask = prepare_execution_mask(value_reg(inst.active_mask()), type);
+                auto mask = prepare_execution_mask(*ordinary_mask, type);
                 info.mask_operand = operands.size();
                 operands.push_back(mir::MachineOperand::reg_use(mask));
             }
@@ -5915,7 +5949,7 @@ class VRegLowerer final {
                 mir::MachineOperand::reg_def(dst), mir::MachineOperand::reg_use(*passthrough),
                 mir::MachineOperand::reg_use(lhs), mir::MachineOperand::reg_use(rhs)};
             if (!unmasked) {
-                auto mask = prepare_execution_mask(value_reg(inst.active_mask()), type);
+                auto mask = prepare_execution_mask(*ordinary_mask, type);
                 info.mask_operand = operands.size();
                 operands.push_back(mir::MachineOperand::reg_use(mask));
             }
