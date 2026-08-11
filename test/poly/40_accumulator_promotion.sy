@@ -1,5 +1,11 @@
 // RUN: %compiler --emit-yir -O1 --polyhedral %s | FileCheck %s
 // RUN: %compiler --emit-cost-model=json -O1 --polyhedral %s | FileCheck %s --check-prefix=COST
+// RUN: %compiler --emit-cost-model=json -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-COST
+// RUN: %compiler --emit-vector-plan -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-PLAN
+// RUN: %compiler --emit-oir -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-OIR
+// RUN: %compiler -S -O1 -march=rv64gcv -fvectorize --polyhedral %s | FileCheck %s --check-prefix=RVV-ASM
+// RUN: %compiler -S -O1 -march=rv64gcv -fvectorize -fno-slp-vectorize --polyhedral %s | FileCheck %s --check-prefix=NO-RVV
+// RUN: %compiler -S -O1 -fvectorize -mrvv-deployment=fat --polyhedral %s | FileCheck %s --check-prefix=FAT
 
 int a[64][64];
 int b[64][64];
@@ -35,3 +41,41 @@ int main() {
 // COST: "transform": "LoopUnroll"
 // COST: "candidate_id": "output-reduction-unroll-and-jam-factor-4"
 // COST: "action": "Accept"
+
+// RVV-COST: "candidate_id": "output-reduction-unroll-and-jam-factor-4"
+// RVV-COST: "action": "Accept"
+// RVV-COST: "summary": "independent output points are unrolled and jammed over one side-effect-free integer reduction loop; lane-invariant shared_ops=1, shared_loads=1, shared_branches=0; lowering=rvv-prevectorization"
+
+// RVV-PLAN: "vectorizer": "slp"
+// RVV-PLAN: "code": "VECTORIZED"
+// RVV-PLAN: "scalable": true
+// RVV-PLAN: "minimum_lanes": 4
+
+// RVV-OIR: %slp.reduction.phi = phi {{.*}} : <vscale x 4 x i32>
+// RVV-OIR: %slp.reduction.load = vp.load <vscale x 4 x i32>
+// RVV-OIR: %slp.reduction.term = vp.mul <vscale x 4 x i32>
+// RVV-OIR: %slp.reduction.update = vp.add <vscale x 4 x i32>
+// RVV-OIR: vp.store <vscale x 4 x i32> %slp.reduction.update
+
+// RVV-ASM-LABEL: main:
+// RVV-ASM: vsetivli
+// RVV-ASM: vle32.v
+// RVV-ASM: vmul.vv
+// RVV-ASM: vadd.vv
+// RVV-ASM: vse32.v
+
+// NO-RVV-LABEL: main:
+// NO-RVV-NOT: vset
+// NO-RVV-NOT: vle32.v
+// NO-RVV-NOT: vse32.v
+// NO-RVV: .size main
+
+// FAT-LABEL: __yoolang_scalar_main:
+// FAT-NOT: vset
+// FAT: .size __yoolang_scalar_main
+// FAT-LABEL: __yoolang_rvv_main:
+// FAT: vsetivli
+// FAT: vle32.v
+// FAT: vmul.vv
+// FAT: vadd.vv
+// FAT: vse32.v
