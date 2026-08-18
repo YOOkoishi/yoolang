@@ -18,6 +18,8 @@ const char *binary_op_symbol(BinaryOp op) {
         return "/";
     case BinaryOp::Mod:
         return "%";
+    case BinaryOp::MatMul:
+        return "@";
     case BinaryOp::Lt:
         return "<";
     case BinaryOp::Le:
@@ -162,6 +164,8 @@ std::string ASTPrinter::type_name(const TypeSyntaxRef &type) const {
                const_expr_name(*type->lane_expression()) + ">";
     case TypeSyntax::Kind::Mask:
         return "mask<" + const_expr_name(*type->lane_expression()) + ">";
+    case TypeSyntax::Kind::Tensor:
+        return "tensor " + type_name(type->tensor_element_type());
     }
     return "<missing-type>";
 }
@@ -178,6 +182,8 @@ std::string ASTPrinter::binary_op_name(BinaryOp op) const {
         return "Div";
     case BinaryOp::Mod:
         return "Mod";
+    case BinaryOp::MatMul:
+        return "MatMul";
     case BinaryOp::Lt:
         return "Lt";
     case BinaryOp::Le:

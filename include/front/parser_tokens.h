@@ -43,6 +43,9 @@ enum TokenKind {
     // 外部函数原型
     TOK_EXTERN = 280,
     TOK_ELLIPSIS = 281,
+
+    // tensor int a[2][3]：维度仍由声明符中的 [] 保存。
+    TOK_TENSOR = 282,
 };
 
 // Lexer 产生的语义值

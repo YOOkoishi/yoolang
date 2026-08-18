@@ -21,6 +21,7 @@ class SemanticType final {
         Float,
         FixedVector,
         Mask,
+        Tensor,
         Array,
         Pointer,
         Function,
@@ -54,6 +55,9 @@ class SemanticType final {
     bool is_mask() const {
         return kind_ == Kind::Mask;
     }
+    bool is_tensor() const {
+        return kind_ == Kind::Tensor;
+    }
     bool is_array() const {
         return kind_ == Kind::Array;
     }
@@ -64,8 +68,13 @@ class SemanticType final {
         return kind_ == Kind::Function;
     }
 
-    // Fixed vectors and arrays carry an element type. Other kinds return null.
+    // Fixed vectors、tensor 和 arrays carry an element type. Other kinds return null.
     SemanticTypeRef element_type() const;
+
+    // tensor 的每一维都保存在类型中；普通数组仍用 array_bound()/element_type()。
+    const std::vector<std::uint64_t> &tensor_shape() const {
+        return tensor_shape_;
+    }
 
     // Pointers carry a pointee type. Other kinds return null.
     SemanticTypeRef pointee_type() const;
@@ -101,6 +110,7 @@ class SemanticType final {
     Kind kind_ = Kind::Error;
     SemanticTypeRef contained_type_ = nullptr;
     std::uint64_t count_ = 0;
+    std::vector<std::uint64_t> tensor_shape_;
     std::vector<SemanticTypeRef> parameter_types_;
     SemanticTypeRef return_type_ = nullptr;
     bool is_variadic_ = false;
@@ -131,6 +141,8 @@ class SemanticTypeContext final {
     // language. A zero lane count is rejected.
     SemanticTypeRef fixed_vector_type(SemanticTypeRef element_type, std::uint64_t lane_count);
     SemanticTypeRef mask_type(std::uint64_t lane_count);
+    SemanticTypeRef tensor_type(SemanticTypeRef element_type,
+                                const std::vector<std::uint64_t> &shape);
     SemanticTypeRef array_type(SemanticTypeRef element_type, std::uint64_t bound);
     SemanticTypeRef pointer_type(SemanticTypeRef pointee_type);
     SemanticTypeRef function_type(SemanticTypeRef return_type,
@@ -176,6 +188,8 @@ class SemanticTypeContext final {
 
     std::unordered_map<TypeAndCountKey, SemanticTypeRef, TypeAndCountKeyHash> vector_types_;
     std::unordered_map<std::uint64_t, SemanticTypeRef> mask_types_;
+    // key 是形如 "i:2:3" 的简单字符串，避免为这个小功能再写复杂 hash。
+    std::unordered_map<std::string, SemanticTypeRef> tensor_types_;
     std::unordered_map<TypeAndCountKey, SemanticTypeRef, TypeAndCountKeyHash> array_types_;
     std::unordered_map<SemanticTypeRef, SemanticTypeRef> pointer_types_;
     std::unordered_map<FunctionKey, SemanticTypeRef, FunctionKeyHash> function_types_;

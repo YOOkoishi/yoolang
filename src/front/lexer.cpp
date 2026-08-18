@@ -159,6 +159,8 @@ int scan_keyword_or_identifier(front::SourceLocation begin, std::size_t begin_of
         kind = TOK_VECTOR;
     } else if (name == "mask") {
         kind = TOK_MASK;
+    } else if (name == "tensor") {
+        kind = TOK_TENSOR;
     } else if (name == "extern") {
         kind = TOK_EXTERN;
     } else {
@@ -381,6 +383,7 @@ int nextToken() {
     case '&':
     case '^':
     case '|':
+    case '@':
         return scan_punctuation(begin, begin_offset);
     default:
         advance();

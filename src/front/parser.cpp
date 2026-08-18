@@ -57,8 +57,7 @@ class Parser final {
                 std::string name;
                 front::SourceRange name_range;
                 if (return_type != nullptr && consume_identifier(name, &name_range) && check('(')) {
-                    auto function =
-                        parse_function(std::move(return_type), std::move(name), false);
+                    auto function = parse_function(std::move(return_type), std::move(name), false);
                     if (function != nullptr) {
                         unit->functions.push_back(std::move(function));
                     } else {
@@ -77,8 +76,8 @@ class Parser final {
                 if (possible_return_type == nullptr || !consume_identifier(name, &name_range)) {
                     synchronize_declaration();
                 } else if (check('(')) {
-                    auto function =
-                        parse_function(std::move(possible_return_type), std::move(name), false);
+                    auto function = parse_function(std::move(possible_return_type),
+                                                   std::move(name), false);
                     if (function != nullptr) {
                         unit->functions.push_back(std::move(function));
                     } else {
@@ -125,7 +124,8 @@ class Parser final {
     bool stop_at_type_greater_ = false;
 
     static bool is_basic_type_start(int kind) {
-        return kind == TOK_INT || kind == TOK_FLOAT || kind == TOK_VECTOR || kind == TOK_MASK;
+        return kind == TOK_INT || kind == TOK_FLOAT || kind == TOK_VECTOR || kind == TOK_MASK ||
+               kind == TOK_TENSOR;
     }
 
     static bool is_type_start(int kind) {
@@ -277,8 +277,21 @@ class Parser final {
             }
             return TypeSyntax::make_mask(std::move(lane_expression), span(begin, previous().range));
         }
+        if (match(TOK_TENSOR)) {
+            BuiltinType element_type = BuiltinType::Int;
+            if (match(TOK_INT)) {
+                element_type = BuiltinType::Int;
+            } else if (match(TOK_FLOAT)) {
+                element_type = BuiltinType::Float;
+            } else {
+                syntax_error(front::DiagnosticCode::ParseExpectedToken,
+                             "expected int or float after tensor");
+                return nullptr;
+            }
+            return TypeSyntax::make_tensor(element_type, span(begin, previous().range));
+        }
         syntax_error(front::DiagnosticCode::ParseExpectedToken,
-                     "expected int, float, vector, or mask type");
+                     "expected int, float, vector, mask, or tensor type");
         return nullptr;
     }
 
@@ -541,6 +554,9 @@ class Parser final {
             if (declaration) {
                 return parse_declaration();
             }
+        }
+        if (check(TOK_TENSOR)) {
+            return parse_declaration();
         }
 
         if (check(TOK_IF)) {
@@ -890,7 +906,7 @@ class Parser final {
         if (expression == nullptr) {
             return nullptr;
         }
-        while (check('*') || check('/') || check('%')) {
+        while (check('*') || check('/') || check('%') || check('@')) {
             const int op = current().kind;
             ++position_;
             auto rhs = parse_unary_expression();
@@ -902,6 +918,8 @@ class Parser final {
                 binary_op = BinaryOp::Div;
             } else if (op == '%') {
                 binary_op = BinaryOp::Mod;
+            } else if (op == '@') {
+                binary_op = BinaryOp::MatMul;
             }
             expression = make_binary(binary_op, std::move(expression), std::move(rhs));
         }

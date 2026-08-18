@@ -4,6 +4,7 @@
 
 - [yoolang-design.md](yoolang-design.md): 编译器总设计，包含系统架构、模块划分、各层 IR、Pass、优化策略、后端与持续集成。
 - [vector-mask-language.md](vector-mask-language.md): 已实现的源语言 fixed vector/mask 类型、表达式、intrinsic、布局和 ABI 边界。
+- [tensor-language.md](tensor-language.md): tensor 语法、语义符号表、array 展开、逐元素/矩阵运算与 sret 返回约定。
 - [extern-functions.md](extern-functions.md): 源语言 `extern` 函数原型、重复/冲突声明、variadic 限制以及 AST→YIR→OIR 保留契约。
 - [vectorization.md](vectorization.md): 当前 OIR Loop/SLP 自动向量化 pipeline、VLA/VP 语义、合法性边界、成本与诊断契约。
 - [rvv-support-matrix.md](rvv-support-matrix.md): 当前语言、IR、向量器、RVV 后端、ABI/部署的完成、部分支持和 fail-closed 边界。

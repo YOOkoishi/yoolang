@@ -45,9 +45,13 @@ class Lowerer final : public ASTVisitor {
         yir::TypePtr type;
         bool is_const = false;
         bool is_array = false;
+        // tensor 形参在语义层仍是 Tensor，在 YIR 中是指向完整 array 对象的指针。
+        bool is_tensor = false;
         bool is_global = false;
         bool is_builtin = false;
         bool is_variadic = false;
+        bool has_sret = false;
+        yir::TypePtr sret_storage_type;
         yir::Function *function = nullptr;
         yir::TypePtr return_type;
         std::vector<yir::TypePtr> param_types;
@@ -143,6 +147,12 @@ class Lowerer final : public ASTVisitor {
             return;
         }
 
+        if (require_expr_type(node)->is_tensor()) {
+            last_value_ = node.op == BinaryOp::MatMul ? lower_tensor_matmul(node)
+                                                       : lower_tensor_binary(node);
+            return;
+        }
+
         yir::Value *lhs = lower_expr(*node.lhs);
         yir::Value *rhs = lower_expr(*node.rhs);
         auto *result_type = require_expr_type(node);
@@ -170,6 +180,8 @@ class Lowerer final : public ASTVisitor {
         case BinaryOp::Mod:
             last_value_ = emit<yir::RemSIOp>(lhs, rhs, fresh_temp());
             return;
+        case BinaryOp::MatMul:
+            break; // tensor 已在 switch 之前展开。
         case BinaryOp::Lt:
         case BinaryOp::Le:
         case BinaryOp::Gt:
@@ -214,7 +226,9 @@ class Lowerer final : public ASTVisitor {
             last_value_ = value;
             return;
         case UnaryOp::Neg:
-            if (result_type->is_float()) {
+            if (result_type->is_tensor()) {
+                last_value_ = lower_tensor_neg(value, result_type);
+            } else if (result_type->is_float()) {
                 auto *zero = emit<yir::ConstF32Op>(0.0F, fresh_temp());
                 last_value_ = emit<yir::SubFOp>(zero, value, fresh_temp());
             } else if (result_type->is_fixed_vector()) {
@@ -253,13 +267,33 @@ class Lowerer final : public ASTVisitor {
             return;
         }
         std::vector<yir::Value *> args;
-        args.reserve(node.args.size());
-        for (auto &argument : node.args)
-            args.push_back(lower_expr(*argument));
+        args.reserve(node.args.size() + (callee->has_sret ? 1 : 0));
+        yir::Value *sret_result = nullptr;
+        if (callee->has_sret) {
+            // 调用者拥有返回对象：先分配 array，再把它的地址作为隐藏第一个参数。
+            sret_result = emit<yir::ArrayVarOp>(callee->sret_storage_type,
+                                                fresh_name("tensor.ret"));
+            auto *address = emit<yir::ElemAddrOp>(
+                sret_result, std::vector<yir::Value *>{},
+                yir::Type::get_ptr(callee->sret_storage_type), fresh_temp());
+            args.push_back(address);
+        }
+        for (auto &argument : node.args) {
+            auto *value = lower_expr(*argument);
+            if (require_expr_type(*argument)->is_tensor() && value->type()->is_array()) {
+                // 局部 tensor、运算临时值和 sret 返回槽都是 ArrayVar；传参时取整个
+                // array 对象的地址。若实参本身已是 tensor 形参/切片，它已经是指针。
+                auto storage_type = type_for_semantic(require_expr_type(*argument));
+                value = emit<yir::ElemAddrOp>(
+                    value, std::vector<yir::Value *>{}, yir::Type::get_ptr(storage_type),
+                    fresh_temp());
+            }
+            args.push_back(value);
+        }
 
-        auto *op =
-            emit<yir::CallOp>(node.func_name, std::move(args), callee->return_type, fresh_temp());
-        last_value_ = op == nullptr ? nullptr : op;
+        auto *op = emit<yir::CallOp>(node.func_name, std::move(args), callee->return_type,
+                                     fresh_temp());
+        last_value_ = callee->has_sret ? sret_result : op;
     }
 
     void visit(TypedVectorLiteralExpr &node) override {
@@ -308,6 +342,15 @@ class Lowerer final : public ASTVisitor {
             errors_.push_back("cannot assign to const variable: " + node.target->name);
             return;
         }
+        auto *target_semantic_type = require_expr_type(*node.target);
+        if (target_semantic_type->is_tensor()) {
+            // 整体赋值写根数组；a[0] = row 这种切片赋值则先取得子数组地址。
+            auto *destination = node.target->indices.empty()
+                                    ? target->value
+                                    : lower_lval_value(*node.target);
+            emit_tensor_copy(value, destination, target_semantic_type);
+            return;
+        }
         if (node.target->indices.empty()) {
             emit<yir::AssignOp>(target->value, value);
             return;
@@ -324,6 +367,14 @@ class Lowerer final : public ASTVisitor {
     }
 
     void visit(ReturnStmt &node) override {
+        if (current_sret_ != nullptr) {
+            // 源代码仍是 return tensor_expr；YIR 中先复制到隐藏返回地址，再 return void。
+            if (node.expr)
+                emit_tensor_copy(lower_expr(*node.expr), current_sret_,
+                                 current_sret_semantic_type_);
+            emit<yir::ReturnOp>();
+            return;
+        }
         if (!node.expr) {
             emit<yir::ReturnOp>();
             return;
@@ -388,7 +439,11 @@ class Lowerer final : public ASTVisitor {
             auto *array = emit<yir::ArrayVarOp>(storage_type, fresh_name(node.name));
             define_variable(node.name, array, storage_type, node.is_const, true, false);
             if (node.init) {
-                emit_array_init(array, semantic_type, *node.init);
+                if (semantic_type->is_tensor() && node.init->expr) {
+                    emit_tensor_copy(lower_expr(*node.init->expr), array, semantic_type);
+                } else {
+                    emit_array_init(array, semantic_type, *node.init);
+                }
             }
             return;
         }
@@ -425,6 +480,10 @@ class Lowerer final : public ASTVisitor {
 
         if (node.is_external) {
             name_counts_.clear();
+            if (function_symbol->has_sret) {
+                current_function_->add_param(
+                    yir::Type::get_ptr(function_symbol->sret_storage_type), "sret.arg");
+            }
             for (std::size_t i = 0; i < node.params.size(); ++i) {
                 const auto &param = node.params[i];
                 auto *parameter_semantic_type = model_.parameter_type(param);
@@ -435,7 +494,7 @@ class Lowerer final : public ASTVisitor {
                 }
                 const std::string base =
                     param.name.empty() ? "arg" + std::to_string(i) : param.name + ".arg";
-                current_function_->add_param(type_for_semantic(parameter_semantic_type),
+                current_function_->add_param(lower_parameter_type(parameter_semantic_type),
                                              fresh_name(base));
             }
             current_function_ = nullptr;
@@ -443,11 +502,16 @@ class Lowerer final : public ASTVisitor {
             return;
         }
 
-        current_return_type_ = type_for_semantic(function_type->return_type());
+        current_return_type_ = function_symbol->return_type;
         name_counts_.clear();
         temp_counter_ = 0;
 
         enter_scope();
+        if (function_symbol->has_sret) {
+            current_sret_ = current_function_->add_param(
+                yir::Type::get_ptr(function_symbol->sret_storage_type), "sret.arg");
+            current_sret_semantic_type_ = function_type->return_type();
+        }
         for (std::size_t i = 0; i < node.params.size(); ++i) {
             const auto &param = node.params[i];
             auto *parameter_semantic_type = model_.parameter_type(param);
@@ -456,10 +520,15 @@ class Lowerer final : public ASTVisitor {
                      "'");
                 continue;
             }
-            auto parameter_type = type_for_semantic(parameter_semantic_type);
+            auto parameter_type = lower_parameter_type(parameter_semantic_type);
             yir::Value *param_value =
                 current_function_->add_param(parameter_type, fresh_name(param.name + ".arg"));
-            if (!parameter_semantic_type->is_pointer()) {
+            if (parameter_semantic_type->is_tensor()) {
+                // 形参按普通数组传址，但符号仍标记为 tensor，使下标和整体运算按
+                // tensor 的完整形状解释。
+                define_variable(param.name, param_value, parameter_type, false, true, false,
+                                true);
+            } else if (!parameter_semantic_type->is_pointer()) {
                 auto *var = emit<yir::VarOp>(parameter_type, param_value, fresh_name(param.name));
                 define_variable(param.name, var, parameter_type, false, false, false);
             } else {
@@ -475,6 +544,8 @@ class Lowerer final : public ASTVisitor {
         current_function_ = nullptr;
         current_region_ = nullptr;
         current_return_type_ = nullptr;
+        current_sret_ = nullptr;
+        current_sret_semantic_type_ = nullptr;
     }
 
     void visit(CompUnit &node) override {
@@ -507,13 +578,22 @@ class Lowerer final : public ASTVisitor {
             }
             std::vector<yir::TypePtr> param_types;
             for (auto *parameter : semantic_function_type->parameter_types())
-                param_types.push_back(type_for_semantic(parameter));
-            auto return_type = type_for_semantic(semantic_function_type->return_type());
+                param_types.push_back(lower_parameter_type(parameter));
+            const bool has_sret = semantic_function_type->return_type()->is_tensor();
+            auto sret_storage_type = has_sret
+                                         ? type_for_semantic(semantic_function_type->return_type())
+                                         : nullptr;
+            if (has_sret)
+                param_types.insert(param_types.begin(),
+                                   yir::Type::get_ptr(sret_storage_type));
+            auto return_type = has_sret ? yir::Type::get_void()
+                                        : type_for_semantic(semantic_function_type->return_type());
             auto *function =
                 module_->add_function(func->name, return_type, param_types,
                                       semantic_function_type->is_variadic(), func->is_external);
             define_function(func->name, function, return_type, std::move(param_types), false,
-                            semantic_function_type->is_variadic());
+                            semantic_function_type->is_variadic(), has_sret,
+                            std::move(sret_storage_type));
         }
 
         for (auto *func : canonical_functions) {
@@ -590,6 +670,14 @@ class Lowerer final : public ASTVisitor {
                                          type_for_semantic(type->element_type()));
         case sema::SemanticType::Kind::Mask:
             return yir::Type::get_mask(type->lane_count());
+        case sema::SemanticType::Kind::Tensor: {
+            // YIR 不认识 tensor：从最后一维向外包成普通 array。
+            auto result = type_for_semantic(type->element_type());
+            const auto &shape = type->tensor_shape();
+            for (std::size_t i = shape.size(); i-- > 0;)
+                result = yir::Type::get_array(shape[i], result);
+            return result;
+        }
         case sema::SemanticType::Kind::Array:
             return yir::Type::get_array(type->array_bound(),
                                         type_for_semantic(type->element_type()));
@@ -605,6 +693,13 @@ class Lowerer final : public ASTVisitor {
         }
         }
         return yir::Type::get_i32();
+    }
+
+    yir::TypePtr lower_parameter_type(sema::SemanticTypeRef type) {
+        auto lowered = type_for_semantic(type);
+        // 源语言保留 Tensor，YIR ABI 则与 array 一样传地址。这里指向完整
+        // array 对象，因而所有维度都保留下来，切片和 @ 不会丢失第一维。
+        return type->is_tensor() ? yir::Type::get_ptr(lowered) : lowered;
     }
 
     yir::Value *apply_semantic_conversions(Expr &expression, yir::Value *value) {
@@ -645,6 +740,141 @@ class Lowerer final : public ASTVisitor {
             }
         }
         return value;
+    }
+
+    std::vector<yir::Value *>
+    tensor_indices(yir::Value *base, const std::vector<std::uint64_t> &coordinates) {
+        std::vector<yir::Value *> indices;
+        indices.reserve(coordinates.size() + 1);
+        // ElemAddr 返回 ptr<子数组>。YIR 对指针基址要求额外的第一个“指针下标”，
+        // 固定写 0 表示仍在这个子数组对象内；根 ArrayVar 则不需要这个 0。
+        if (base->type()->is_ptr())
+            indices.push_back(emit<yir::ConstI32Op>(0, fresh_temp()));
+        for (auto coordinate : coordinates) {
+            indices.push_back(
+                emit<yir::ConstI32Op>(static_cast<int>(coordinate), fresh_temp()));
+        }
+        return indices;
+    }
+
+    yir::Value *emit_tensor_scalar_op(BinaryOp op, yir::Value *lhs, yir::Value *rhs,
+                                      bool is_float) {
+        switch (op) {
+        case BinaryOp::Add:
+            return is_float ? emit<yir::AddFOp>(lhs, rhs, fresh_temp())
+                            : emit<yir::AddIOp>(lhs, rhs, fresh_temp());
+        case BinaryOp::Sub:
+            return is_float ? emit<yir::SubFOp>(lhs, rhs, fresh_temp())
+                            : emit<yir::SubIOp>(lhs, rhs, fresh_temp());
+        case BinaryOp::Mul:
+            return is_float ? emit<yir::MulFOp>(lhs, rhs, fresh_temp())
+                            : emit<yir::MulIOp>(lhs, rhs, fresh_temp());
+        case BinaryOp::Div:
+            return is_float ? emit<yir::DivFOp>(lhs, rhs, fresh_temp())
+                            : emit<yir::DivSIOp>(lhs, rhs, fresh_temp());
+        default:
+            fail("FE_SEMANTIC_MODEL_INCONSISTENT: invalid element-wise tensor operator");
+            return nullptr;
+        }
+    }
+
+    yir::Value *lower_tensor_binary(BinaryExpr &node) {
+        auto *result_semantic_type = require_expr_type(node);
+        auto *lhs_semantic_type = require_expr_type(*node.lhs);
+        auto *rhs_semantic_type = require_expr_type(*node.rhs);
+
+        // 两个操作数各求值一次，避免 a + foo() 之类的标量表达式被每个元素重复执行。
+        auto *lhs = lower_expr(*node.lhs);
+        auto *rhs = lower_expr(*node.rhs);
+        auto result_type = type_for_semantic(result_semantic_type);
+        auto *result = emit<yir::ArrayVarOp>(result_type, fresh_name("tensor.tmp"));
+        const auto &shape = result_semantic_type->tensor_shape();
+        const auto total = suffix_element_count(shape, 0);
+        auto element_type = type_for_semantic(result_semantic_type->element_type());
+        const bool is_float = result_semantic_type->element_type()->is_float();
+
+        for (std::uint64_t flat = 0; flat < total; ++flat) {
+            const auto coordinates = coordinates_for_index(shape, flat);
+            auto *left = lhs;
+            auto *right = rhs;
+            if (lhs_semantic_type->is_tensor())
+                left = emit<yir::ArrayLoadOp>(lhs, tensor_indices(lhs, coordinates), element_type,
+                                              fresh_temp());
+            if (rhs_semantic_type->is_tensor())
+                right = emit<yir::ArrayLoadOp>(rhs, tensor_indices(rhs, coordinates), element_type,
+                                               fresh_temp());
+            auto *value = emit_tensor_scalar_op(node.op, left, right, is_float);
+            emit<yir::ArrayStoreOp>(value, result, tensor_indices(result, coordinates));
+        }
+        return result;
+    }
+
+    yir::Value *lower_tensor_neg(yir::Value *source, sema::SemanticTypeRef semantic_type) {
+        auto storage_type = type_for_semantic(semantic_type);
+        auto *result = emit<yir::ArrayVarOp>(storage_type, fresh_name("tensor.neg"));
+        const auto &shape = semantic_type->tensor_shape();
+        const auto total = suffix_element_count(shape, 0);
+        auto element_type = type_for_semantic(semantic_type->element_type());
+        const bool is_float = semantic_type->element_type()->is_float();
+        auto *zero = is_float ? emit<yir::ConstF32Op>(0.0F, fresh_temp())
+                              : emit<yir::ConstI32Op>(0, fresh_temp());
+        for (std::uint64_t flat = 0; flat < total; ++flat) {
+            const auto coordinates = coordinates_for_index(shape, flat);
+            auto *value = emit<yir::ArrayLoadOp>(source, tensor_indices(source, coordinates),
+                                                 element_type, fresh_temp());
+            value = emit_tensor_scalar_op(BinaryOp::Sub, zero, value, is_float);
+            emit<yir::ArrayStoreOp>(value, result, tensor_indices(result, coordinates));
+        }
+        return result;
+    }
+
+    yir::Value *lower_tensor_matmul(BinaryExpr &node) {
+        auto *lhs_type = require_expr_type(*node.lhs);
+        auto *rhs_type = require_expr_type(*node.rhs);
+        auto *result_semantic_type = require_expr_type(node);
+        auto *lhs = lower_expr(*node.lhs);
+        auto *rhs = lower_expr(*node.rhs);
+        auto result_type = type_for_semantic(result_semantic_type);
+        auto *result = emit<yir::ArrayVarOp>(result_type, fresh_name("tensor.matmul"));
+        auto element_type = type_for_semantic(result_semantic_type->element_type());
+        const bool is_float = result_semantic_type->element_type()->is_float();
+        const auto rows = lhs_type->tensor_shape()[0];
+        const auto inner = lhs_type->tensor_shape()[1];
+        const auto columns = rhs_type->tensor_shape()[1];
+
+        // @ 直接展开成朴素 i-j-k 乘加；功能清楚，也让后续现有优化 pass 自己处理。
+        for (std::uint64_t i = 0; i < rows; ++i) {
+            for (std::uint64_t j = 0; j < columns; ++j) {
+                auto *sum = is_float ? emit<yir::ConstF32Op>(0.0F, fresh_temp())
+                                     : emit<yir::ConstI32Op>(0, fresh_temp());
+                for (std::uint64_t k = 0; k < inner; ++k) {
+                    auto *left = emit<yir::ArrayLoadOp>(
+                        lhs, tensor_indices(lhs, {i, k}), element_type, fresh_temp());
+                    auto *right = emit<yir::ArrayLoadOp>(
+                        rhs, tensor_indices(rhs, {k, j}), element_type, fresh_temp());
+                    auto *product =
+                        emit_tensor_scalar_op(BinaryOp::Mul, left, right, is_float);
+                    sum = emit_tensor_scalar_op(BinaryOp::Add, sum, product, is_float);
+                }
+                emit<yir::ArrayStoreOp>(sum, result, tensor_indices(result, {i, j}));
+            }
+        }
+        return result;
+    }
+
+    void emit_tensor_copy(yir::Value *source, yir::Value *destination,
+                          sema::SemanticTypeRef semantic_type) {
+        if (!source || !destination) return;
+        const auto &shape = semantic_type->tensor_shape();
+        const auto total = suffix_element_count(shape, 0);
+        auto element_type = type_for_semantic(semantic_type->element_type());
+        for (std::uint64_t flat = 0; flat < total; ++flat) {
+            const auto coordinates = coordinates_for_index(shape, flat);
+            auto *value = emit<yir::ArrayLoadOp>(source, tensor_indices(source, coordinates),
+                                                 element_type, fresh_temp());
+            emit<yir::ArrayStoreOp>(value, destination,
+                                    tensor_indices(destination, coordinates));
+        }
     }
 
     void lower_builtin_call(CallExpr &call, const sema::BuiltinBinding &binding) {
@@ -825,6 +1055,12 @@ class Lowerer final : public ASTVisitor {
     IndexPath lower_index_path(const Symbol &symbol, LValExpr &lvalue) {
         IndexPath path;
         auto current = symbol.type;
+        if (symbol.is_tensor && current->is_ptr()) {
+            // tensor 形参是 ptr<完整 array>。先用 0 进入这个 array 对象，再让
+            // 源代码中的每个下标各剥离一维；普通 array 形参仍沿用原有 decay。
+            path.object_indices.push_back(emit<yir::ConstI32Op>(0, fresh_temp()));
+            current = current->pointee();
+        }
         for (auto &index_expression : lvalue.indices) {
             auto *index = lower_expr(*index_expression);
             if (current->is_vector() || current->is_mask()) {
@@ -975,6 +1211,7 @@ class Lowerer final : public ASTVisitor {
     }
 
     sema::SemanticTypeRef array_leaf_semantic_type(sema::SemanticTypeRef type) const {
+        if (type && type->is_tensor()) return type->element_type();
         while (type && type->is_array())
             type = type->element_type();
         return type;
@@ -1015,7 +1252,7 @@ class Lowerer final : public ASTVisitor {
         }
         if (constant->type()->is_fixed_vector())
             return std::make_shared<yir::ConstantVector>(type, std::move(elements));
-        if (constant->type()->is_array())
+        if (constant->type()->is_array() || constant->type()->is_tensor())
             return std::make_shared<yir::ConstantArray>(type, std::move(elements));
         return nullptr;
     }
@@ -1241,7 +1478,7 @@ class Lowerer final : public ASTVisitor {
     }
 
     void define_variable(const std::string &name, yir::Value *value, yir::TypePtr type,
-                         bool is_const, bool is_array, bool is_global) {
+                         bool is_const, bool is_array, bool is_global, bool is_tensor = false) {
         Symbol symbol;
         symbol.kind = Symbol::Kind::Variable;
         symbol.name = name;
@@ -1249,6 +1486,7 @@ class Lowerer final : public ASTVisitor {
         symbol.type = std::move(type);
         symbol.is_const = is_const;
         symbol.is_array = is_array;
+        symbol.is_tensor = is_tensor;
         symbol.is_global = is_global;
         if (!symbols_.define(std::move(symbol))) {
             errors_.push_back("redefinition of symbol: " + name);
@@ -1256,7 +1494,8 @@ class Lowerer final : public ASTVisitor {
     }
 
     void define_function(const std::string &name, yir::Function *function, yir::TypePtr return_type,
-                         std::vector<yir::TypePtr> param_types, bool is_builtin, bool is_variadic) {
+                         std::vector<yir::TypePtr> param_types, bool is_builtin, bool is_variadic,
+                         bool has_sret = false, yir::TypePtr sret_storage_type = nullptr) {
         Symbol symbol;
         symbol.kind = Symbol::Kind::Function;
         symbol.name = name;
@@ -1266,6 +1505,8 @@ class Lowerer final : public ASTVisitor {
         symbol.param_types = std::move(param_types);
         symbol.is_builtin = is_builtin;
         symbol.is_variadic = is_variadic;
+        symbol.has_sret = has_sret;
+        symbol.sret_storage_type = std::move(sret_storage_type);
         if (!symbols_.define(std::move(symbol))) {
             errors_.push_back("redefinition of symbol: " + name);
         }
@@ -1306,6 +1547,8 @@ class Lowerer final : public ASTVisitor {
     yir::Function *current_function_ = nullptr;
     yir::Region *current_region_ = nullptr;
     yir::TypePtr current_return_type_;
+    yir::Value *current_sret_ = nullptr;
+    sema::SemanticTypeRef current_sret_semantic_type_ = nullptr;
     yir::Value *last_value_ = nullptr;
     int loop_depth_ = 0;
     unsigned temp_counter_ = 0;

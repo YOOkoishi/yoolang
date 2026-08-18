@@ -41,6 +41,13 @@ TypeSyntaxRef TypeSyntax::make_mask(ConstExprRef lane_expression, front::SourceR
         new TypeSyntax(Kind::Mask, BuiltinType::Int, std::move(lane_expression), range));
 }
 
+TypeSyntaxRef TypeSyntax::make_tensor(BuiltinType element_type, front::SourceRange range) {
+    if (element_type != BuiltinType::Int && element_type != BuiltinType::Float) {
+        throw std::invalid_argument("tensor type syntax element must be int or float");
+    }
+    return TypeSyntaxRef(new TypeSyntax(Kind::Tensor, element_type, nullptr, range));
+}
+
 BuiltinType TypeSyntax::legacy_builtin_type() const {
     if (kind_ == Kind::Mask) {
         return BuiltinType::Int;

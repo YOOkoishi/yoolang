@@ -28,7 +28,7 @@ SemanticType::SemanticType(SemanticTypeRef return_type,
 }
 
 SemanticTypeRef SemanticType::element_type() const {
-    return is_fixed_vector() || is_array() ? contained_type_ : nullptr;
+    return is_fixed_vector() || is_tensor() || is_array() ? contained_type_ : nullptr;
 }
 
 SemanticTypeRef SemanticType::pointee_type() const {
@@ -57,6 +57,13 @@ std::string SemanticType::str() const {
         return "vector<" + contained_type_->str() + ", " + std::to_string(count_) + ">";
     case Kind::Mask:
         return "mask<" + std::to_string(count_) + ">";
+    case Kind::Tensor: {
+        std::ostringstream out;
+        out << "tensor<" << contained_type_->str();
+        for (auto dimension : tensor_shape_) out << " x " << dimension;
+        out << ">";
+        return out.str();
+    }
     case Kind::Array:
         return "array<" + std::to_string(count_) + " x " + contained_type_->str() + ">";
     case Kind::Pointer:
@@ -140,6 +147,32 @@ SemanticTypeRef SemanticTypeContext::mask_type(std::uint64_t lane_count) {
     auto *type = own(std::unique_ptr<SemanticType>(
         new SemanticType(SemanticType::Kind::Mask, nullptr, lane_count)));
     mask_types_.emplace(lane_count, type);
+    return type;
+}
+
+SemanticTypeRef
+SemanticTypeContext::tensor_type(SemanticTypeRef element_type,
+                                 const std::vector<std::uint64_t> &shape) {
+    if (element_type == nullptr || !element_type->is_numeric_scalar()) {
+        throw std::invalid_argument("tensor element type must be int or float");
+    }
+    // 规范化（intern）后，符号表里两个同型 tensor 可以直接比较 type 指针。
+    // 空 shape 只作为 `tensor int f()` 在 return 推导完成前的占位类型；变量声明
+    // 仍由语义分析要求至少一维，ASTToYIR 也不会降低这个占位类型。
+    std::string key = element_type->is_integer() ? "i" : "f";
+    for (auto dimension : shape) {
+        if (dimension == 0) throw std::invalid_argument("tensor dimension must be positive");
+        key += ":" + std::to_string(dimension);
+    }
+    if (auto found = tensor_types_.find(key); found != tensor_types_.end()) {
+        return found->second;
+    }
+
+    auto owned = std::unique_ptr<SemanticType>(
+        new SemanticType(SemanticType::Kind::Tensor, element_type));
+    owned->tensor_shape_ = shape;
+    auto *type = own(std::move(owned));
+    tensor_types_.emplace(std::move(key), type);
     return type;
 }
 
