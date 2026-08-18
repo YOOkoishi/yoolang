@@ -156,11 +156,9 @@ SemanticTypeContext::tensor_type(SemanticTypeRef element_type,
     if (element_type == nullptr || !element_type->is_numeric_scalar()) {
         throw std::invalid_argument("tensor element type must be int or float");
     }
-    if (shape.empty()) {
-        throw std::invalid_argument("tensor must have at least one dimension");
-    }
-
     // 规范化（intern）后，符号表里两个同型 tensor 可以直接比较 type 指针。
+    // 空 shape 只作为 `tensor int f()` 在 return 推导完成前的占位类型；变量声明
+    // 仍由语义分析要求至少一维，ASTToYIR 也不会降低这个占位类型。
     std::string key = element_type->is_integer() ? "i" : "f";
     for (auto dimension : shape) {
         if (dimension == 0) throw std::invalid_argument("tensor dimension must be positive");

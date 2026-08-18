@@ -345,6 +345,15 @@ class Analyzer final : public ASTVisitor {
         }
 
         auto *function_type = symbol->type;
+        if (function_type->return_type()->is_tensor() &&
+            function_type->return_type()->tensor_shape().empty()) {
+            diagnose(front::DiagnosticCode::SemaInvalidType, node.source_range,
+                     "tensor return type of '" + node.func_name +
+                         "' is not inferred yet; define it before this call");
+            for (auto &argument : node.args) expr_type(*argument);
+            set_expr_type(node, types().error_type());
+            return;
+        }
         const auto &parameters = function_type->parameter_types();
         bool valid = true;
         if ((!function_type->is_variadic() && node.args.size() != parameters.size()) ||
@@ -545,6 +554,24 @@ class Analyzer final : public ASTVisitor {
             return;
         }
         auto *value_type = expr_type(*node.expr);
+        if (current_return_type_->is_tensor() &&
+            current_return_type_->tensor_shape().empty()) {
+            if (value_type->is_error()) return;
+            if (!value_type->is_tensor() ||
+                value_type->element_type() != current_return_type_->element_type()) {
+                diagnose(front::DiagnosticCode::SemaInvalidConversion, node.source_range,
+                         "return value of inferred tensor function must be " +
+                             current_return_type_->element_type()->str() + " tensor, not " +
+                             value_type->str());
+                return;
+            }
+            if (inferred_tensor_return_type_ == nullptr)
+                inferred_tensor_return_type_ = value_type;
+            else if (inferred_tensor_return_type_ != value_type)
+                diagnose(front::DiagnosticCode::SemaInvalidConversion, node.source_range,
+                         "all return values of a tensor function must have the same shape");
+            return;
+        }
         convert_context(*node.expr, value_type, current_return_type_, "return value");
     }
 
@@ -657,8 +684,10 @@ class Analyzer final : public ASTVisitor {
         auto *function_type = model_->function_type(node);
         if (!function_type) function_type = types().error_type();
         auto *previous_return_type = current_return_type_;
+        auto *previous_inferred_tensor_return_type = inferred_tensor_return_type_;
         current_return_type_ = function_type->is_function() ? function_type->return_type()
                                                             : types().error_type();
+        inferred_tensor_return_type_ = nullptr;
 
         symbols_.enter();
         for (auto &parameter : node.params) {
@@ -674,7 +703,24 @@ class Analyzer final : public ASTVisitor {
         }
         if (node.body) node.body->accept(*this);
         symbols_.leave();
+
+        if (current_return_type_->is_tensor() && current_return_type_->tensor_shape().empty()) {
+            if (!node.is_external && inferred_tensor_return_type_ == nullptr) {
+                diagnose(front::DiagnosticCode::SemaInvalidType, node.source_range,
+                         "tensor function has no inferable tensor return value");
+            } else if (!node.is_external) {
+                // 函数最初以无 shape 的 tensor 占位；函数体检查完后用所有 return
+                // 推导出的规范类型替换它，后续调用和 ASTToYIR 都只看到完整类型。
+                auto *inferred_function_type = types().function_type(
+                    inferred_tensor_return_type_, function_type->parameter_types(),
+                    function_type->is_variadic());
+                model_->set_function_type(node, inferred_function_type);
+                if (auto *symbol = symbols_.lookup_current(node.name))
+                    symbol->type = inferred_function_type;
+            }
+        }
         current_return_type_ = previous_return_type;
+        inferred_tensor_return_type_ = previous_inferred_tensor_return_type;
     }
 
     void visit(CompUnit &node) override {
@@ -685,6 +731,23 @@ class Analyzer final : public ASTVisitor {
         in_global_declarations_ = false;
         for (auto &function : node.functions) declare_function(*function);
         for (auto &function : node.functions) function->accept(*this);
+        // extern 声明自身没有 return；若同名定义已经完成推导，就把最终签名同步给
+        // 声明。只有 extern 而没有定义时无法确定 sret 存储大小，明确拒绝。
+        for (auto &function : node.functions) {
+            if (!function->is_external) continue;
+            auto *function_type = model_->function_type(*function);
+            if (!function_type || !function_type->return_type()->is_tensor() ||
+                !function_type->return_type()->tensor_shape().empty())
+                continue;
+            auto *symbol = symbols_.lookup_current(function->name);
+            if (symbol && symbol->type->is_function() &&
+                !symbol->type->return_type()->tensor_shape().empty()) {
+                model_->set_function_type(*function, symbol->type);
+            } else {
+                diagnose(front::DiagnosticCode::SemaInvalidType, function->source_range,
+                         "extern tensor return type cannot be inferred without a definition");
+            }
+        }
         symbols_.leave();
     }
 
@@ -1351,15 +1414,18 @@ class Analyzer final : public ASTVisitor {
         }
 
         if (tensor) {
-            if (parameter) {
-                diagnose(front::DiagnosticCode::SemaInvalidType, declaration_range,
-                         "tensor parameters are not supported; pass an ordinary array instead");
-                return types().error_type();
-            }
             std::vector<std::uint64_t> shape;
             shape.reserve(bounds.size());
             for (const auto &bound : bounds) {
-                if (!bound || base->is_error()) return types().error_type();
+                if (!bound) {
+                    // 普通数组形参允许省略第一维；tensor 的每一维都属于它的值类型，
+                    // 后续逐元素运算和 @ 都需要完整形状，因此 tensor 形参不能省略。
+                    if (parameter)
+                        diagnose(front::DiagnosticCode::SemaInvalidExtent, declaration_range,
+                                 "tensor parameter dimensions must all be specified");
+                    return types().error_type();
+                }
+                if (base->is_error()) return types().error_type();
                 shape.push_back(*bound);
             }
             return types().tensor_type(base, shape);
@@ -1378,11 +1444,11 @@ class Analyzer final : public ASTVisitor {
     void declare_function(FuncDef &function) {
         auto *return_base =
             resolve_type_syntax(function.return_type_syntax, true, "function return type");
-        // tensor 返回值的形状写在返回类型上，例如 tensor int[2][3] make()。
-        // 这里先形成完整语义类型；sret 只是后续 lowering 的实现细节。
-        auto *return_type = resolve_declarator_type(
-            return_base, function.return_dimensions, false, function.source_range,
-            function.return_type_syntax->kind() == TypeSyntax::Kind::Tensor);
+        // `tensor int f()` 只声明元素类型，shape 稍后由函数体中的 return 推导。
+        // 空 shape 仅是语义占位，绝不会直接进入 ASTToYIR。
+        auto *return_type = function.return_type_syntax->kind() == TypeSyntax::Kind::Tensor
+                                ? types().tensor_type(return_base, {})
+                                : return_base;
         std::vector<SemanticTypeRef> parameter_types;
         for (auto &parameter : function.params) {
             auto *base = resolve_type_syntax(parameter.type_syntax, false, "parameter");
@@ -1841,6 +1907,7 @@ class Analyzer final : public ASTVisitor {
     SemanticScopeStack symbols_;
     std::unordered_map<const TypeSyntax *, SemanticTypeRef> source_type_cache_;
     SemanticTypeRef current_return_type_ = nullptr;
+    SemanticTypeRef inferred_tensor_return_type_ = nullptr;
     unsigned loop_depth_ = 0;
     bool in_global_declarations_ = false;
 };

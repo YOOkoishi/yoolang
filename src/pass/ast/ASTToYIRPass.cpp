@@ -45,6 +45,8 @@ class Lowerer final : public ASTVisitor {
         yir::TypePtr type;
         bool is_const = false;
         bool is_array = false;
+        // tensor 形参在语义层仍是 Tensor，在 YIR 中是指向完整 array 对象的指针。
+        bool is_tensor = false;
         bool is_global = false;
         bool is_builtin = false;
         bool is_variadic = false;
@@ -276,8 +278,18 @@ class Lowerer final : public ASTVisitor {
                 yir::Type::get_ptr(callee->sret_storage_type), fresh_temp());
             args.push_back(address);
         }
-        for (auto &argument : node.args)
-            args.push_back(lower_expr(*argument));
+        for (auto &argument : node.args) {
+            auto *value = lower_expr(*argument);
+            if (require_expr_type(*argument)->is_tensor() && value->type()->is_array()) {
+                // 局部 tensor、运算临时值和 sret 返回槽都是 ArrayVar；传参时取整个
+                // array 对象的地址。若实参本身已是 tensor 形参/切片，它已经是指针。
+                auto storage_type = type_for_semantic(require_expr_type(*argument));
+                value = emit<yir::ElemAddrOp>(
+                    value, std::vector<yir::Value *>{}, yir::Type::get_ptr(storage_type),
+                    fresh_temp());
+            }
+            args.push_back(value);
+        }
 
         auto *op = emit<yir::CallOp>(node.func_name, std::move(args), callee->return_type,
                                      fresh_temp());
@@ -482,7 +494,7 @@ class Lowerer final : public ASTVisitor {
                 }
                 const std::string base =
                     param.name.empty() ? "arg" + std::to_string(i) : param.name + ".arg";
-                current_function_->add_param(type_for_semantic(parameter_semantic_type),
+                current_function_->add_param(lower_parameter_type(parameter_semantic_type),
                                              fresh_name(base));
             }
             current_function_ = nullptr;
@@ -508,10 +520,15 @@ class Lowerer final : public ASTVisitor {
                      "'");
                 continue;
             }
-            auto parameter_type = type_for_semantic(parameter_semantic_type);
+            auto parameter_type = lower_parameter_type(parameter_semantic_type);
             yir::Value *param_value =
                 current_function_->add_param(parameter_type, fresh_name(param.name + ".arg"));
-            if (!parameter_semantic_type->is_pointer()) {
+            if (parameter_semantic_type->is_tensor()) {
+                // 形参按普通数组传址，但符号仍标记为 tensor，使下标和整体运算按
+                // tensor 的完整形状解释。
+                define_variable(param.name, param_value, parameter_type, false, true, false,
+                                true);
+            } else if (!parameter_semantic_type->is_pointer()) {
                 auto *var = emit<yir::VarOp>(parameter_type, param_value, fresh_name(param.name));
                 define_variable(param.name, var, parameter_type, false, false, false);
             } else {
@@ -561,7 +578,7 @@ class Lowerer final : public ASTVisitor {
             }
             std::vector<yir::TypePtr> param_types;
             for (auto *parameter : semantic_function_type->parameter_types())
-                param_types.push_back(type_for_semantic(parameter));
+                param_types.push_back(lower_parameter_type(parameter));
             const bool has_sret = semantic_function_type->return_type()->is_tensor();
             auto sret_storage_type = has_sret
                                          ? type_for_semantic(semantic_function_type->return_type())
@@ -676,6 +693,13 @@ class Lowerer final : public ASTVisitor {
         }
         }
         return yir::Type::get_i32();
+    }
+
+    yir::TypePtr lower_parameter_type(sema::SemanticTypeRef type) {
+        auto lowered = type_for_semantic(type);
+        // 源语言保留 Tensor，YIR ABI 则与 array 一样传地址。这里指向完整
+        // array 对象，因而所有维度都保留下来，切片和 @ 不会丢失第一维。
+        return type->is_tensor() ? yir::Type::get_ptr(lowered) : lowered;
     }
 
     yir::Value *apply_semantic_conversions(Expr &expression, yir::Value *value) {
@@ -1031,6 +1055,12 @@ class Lowerer final : public ASTVisitor {
     IndexPath lower_index_path(const Symbol &symbol, LValExpr &lvalue) {
         IndexPath path;
         auto current = symbol.type;
+        if (symbol.is_tensor && current->is_ptr()) {
+            // tensor 形参是 ptr<完整 array>。先用 0 进入这个 array 对象，再让
+            // 源代码中的每个下标各剥离一维；普通 array 形参仍沿用原有 decay。
+            path.object_indices.push_back(emit<yir::ConstI32Op>(0, fresh_temp()));
+            current = current->pointee();
+        }
         for (auto &index_expression : lvalue.indices) {
             auto *index = lower_expr(*index_expression);
             if (current->is_vector() || current->is_mask()) {
@@ -1448,7 +1478,7 @@ class Lowerer final : public ASTVisitor {
     }
 
     void define_variable(const std::string &name, yir::Value *value, yir::TypePtr type,
-                         bool is_const, bool is_array, bool is_global) {
+                         bool is_const, bool is_array, bool is_global, bool is_tensor = false) {
         Symbol symbol;
         symbol.kind = Symbol::Kind::Variable;
         symbol.name = name;
@@ -1456,6 +1486,7 @@ class Lowerer final : public ASTVisitor {
         symbol.type = std::move(type);
         symbol.is_const = is_const;
         symbol.is_array = is_array;
+        symbol.is_tensor = is_tensor;
         symbol.is_global = is_global;
         if (!symbols_.define(std::move(symbol))) {
             errors_.push_back("redefinition of symbol: " + name);

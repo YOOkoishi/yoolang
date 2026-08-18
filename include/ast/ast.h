@@ -374,8 +374,6 @@ struct FuncParam {
 class FuncDef : public ASTNode {
   public:
     TypeSyntaxRef return_type_syntax;
-    // tensor int[2][3] f() 中的 [2][3]。普通返回类型保持为空。
-    std::vector<std::unique_ptr<Expr>> return_dimensions;
     // Scalar compatibility for legacy semantic/lowering passes.
     BuiltinType return_type;
     std::string name;

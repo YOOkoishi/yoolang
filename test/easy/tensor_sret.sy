@@ -1,9 +1,9 @@
-tensor int[2][2] add_bias(int bias) {
+tensor int add_bias(int bias) {
   tensor int base[2][2] = {{1, 2}, {3, 4}};
   return base + bias;
 }
 
-tensor int[2][2] make_product() {
+tensor int make_product() {
   tensor int left[2][2] = add_bias(0);
   tensor int right[2][2] = add_bias(1);
   return left @ right;

@@ -451,10 +451,6 @@ void ASTPrinter::visit(FuncDef &node) {
                    type_name(node.return_type_syntax));
     }
     with_indent([&] {
-        if (!node.return_dimensions.empty()) {
-            write_line("ReturnDimensions:");
-            with_indent([&] { print_dimensions(node.return_dimensions); });
-        }
         write_line("Params:");
         with_indent([&] {
             if (node.params.empty()) {

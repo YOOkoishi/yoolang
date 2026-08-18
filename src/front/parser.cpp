@@ -57,8 +57,7 @@ class Parser final {
                 std::string name;
                 front::SourceRange name_range;
                 if (return_type != nullptr && consume_identifier(name, &name_range) && check('(')) {
-                    auto function =
-                        parse_function(std::move(return_type), {}, std::move(name), false);
+                    auto function = parse_function(std::move(return_type), std::move(name), false);
                     if (function != nullptr) {
                         unit->functions.push_back(std::move(function));
                     } else {
@@ -72,16 +71,13 @@ class Parser final {
             } else if (is_basic_type_start(current().kind)) {
                 const std::size_t mark = position_;
                 auto possible_return_type = parse_basic_type();
-                auto return_dimensions =
-                    parse_tensor_return_dimensions(possible_return_type);
                 std::string name;
                 front::SourceRange name_range;
                 if (possible_return_type == nullptr || !consume_identifier(name, &name_range)) {
                     synchronize_declaration();
                 } else if (check('(')) {
-                    auto function =
-                        parse_function(std::move(possible_return_type),
-                                       std::move(return_dimensions), std::move(name), false);
+                    auto function = parse_function(std::move(possible_return_type),
+                                                   std::move(name), false);
                     if (function != nullptr) {
                         unit->functions.push_back(std::move(function));
                     } else {
@@ -308,20 +304,6 @@ class Parser final {
         return parse_basic_type();
     }
 
-    std::vector<std::unique_ptr<Expr>>
-    parse_tensor_return_dimensions(const TypeSyntaxRef &type) {
-        std::vector<std::unique_ptr<Expr>> dimensions;
-        if (!type || type->kind() != TypeSyntax::Kind::Tensor) return dimensions;
-        while (match('[')) {
-            auto dimension = parse_expression();
-            if (dimension == nullptr || !expect(']', "']' after tensor return dimension")) {
-                return {};
-            }
-            dimensions.push_back(std::move(dimension));
-        }
-        return dimensions;
-    }
-
     ConstExprRef parse_type_lane_expression() {
         const bool saved_stop = stop_at_type_greater_;
         stop_at_type_greater_ = true;
@@ -393,7 +375,6 @@ class Parser final {
             return nullptr;
         }
         auto return_type = parse_function_type();
-        auto return_dimensions = parse_tensor_return_dimensions(return_type);
         std::string name;
         front::SourceRange name_range;
         if (return_type == nullptr || !consume_identifier(name, &name_range)) {
@@ -404,20 +385,16 @@ class Parser final {
                          "extern is only permitted on a function declaration");
             return nullptr;
         }
-        auto function = parse_function(std::move(return_type), std::move(return_dimensions),
-                                       std::move(name), true);
+        auto function = parse_function(std::move(return_type), std::move(name), true);
         if (function != nullptr) {
             function->source_range = span(begin, function->source_range);
         }
         return function;
     }
 
-    std::unique_ptr<FuncDef>
-    parse_function(TypeSyntaxRef return_type,
-                   std::vector<std::unique_ptr<Expr>> return_dimensions, std::string name,
-                   bool is_external) {
+    std::unique_ptr<FuncDef> parse_function(TypeSyntaxRef return_type, std::string name,
+                                            bool is_external) {
         auto function = std::make_unique<FuncDef>(return_type, name);
-        function->return_dimensions = std::move(return_dimensions);
         function->is_external = is_external;
         if (!expect('(', "'('")) {
             return nullptr;

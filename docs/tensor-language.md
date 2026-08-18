@@ -12,17 +12,17 @@ tensor int a[2][2] = {{1, 2}, {3, 4}};
 tensor float b[2][3];
 ```
 
-函数返回类型必须在函数名前写出完整形状：
+函数返回类型只写元素类型，完整 tensor 形状由函数体中的 `return` 推导：
 
 ```c
-tensor int[2][2] make_tensor(int bias) {
+tensor int make_tensor(int bias) {
   tensor int value[2][2] = {{1, 2}, {3, 4}};
   return value + bias;
 }
 ```
 
-这里采用 `tensor int[2][2] make_tensor()`，而不是把维度写到函数名后。
-原因是这些维度描述的是“返回类型本身”，放在类型旁边最直观，也不会和函数参数列表混淆。
+上例的 `return` 表达式类型是 `tensor<int, [2,2]>`，因此函数最终返回类型也是这个类型。
+多个 `return` 必须具有相同元素类型和形状；`tensor int` 函数不能返回 `tensor float`。
 
 目前支持：
 
@@ -68,24 +68,23 @@ make_tensor  : (int) -> tensor<int, [2, 2]>
 `TypeSyntax` 增加 `Tensor`，它只保存 `tensor int` 或 `tensor float` 的元素类型。
 变量形状仍复用原有声明符的 `dimensions`。
 
-函数返回值没有变量声明符，因此 `FuncDef` 新增 `return_dimensions`，专门保存：
+函数返回值不解析维度，`FuncDef::return_type_syntax` 只保存 `tensor int` 或
+`tensor float`。因此 Parser 仍按普通的“返回类型、函数名、参数列表”顺序解析：
 
 ```c
-tensor int[2][3] f()
-          ^^^^^^
+tensor int f()
 ```
-
-中的两个维度表达式。Parser 只在基础类型为 tensor 时读取这里的方括号；普通函数和普通
-数组声明仍走原来的路径。
 
 ### 3.2 语义类型和符号表
 
 变量声明时，语义分析先解析元素类型，再检查所有维度是否为正的编译期整数，最后形成
 规范的 tensor 类型并写入 `SemanticModel` 和当前作用域的 `SemanticSymbol`。
 
-函数在分析任何函数体以前会先统一声明。对于 tensor 返回函数，返回形状也在这个阶段
-解析并写入函数类型。因此，即使被调函数的定义写在调用点后面，调用表达式仍能得到完整的
-tensor 返回类型。
+函数声明阶段先使用无 shape 的 tensor 占位类型。分析函数体时，第一个有效的
+`return tensor_expr` 确定返回形状，后续 `return` 必须同型；完成后用规范的完整 tensor
+类型替换函数符号和 `SemanticModel` 中的占位签名。因为调用 ABI 需要提前知道 sret 对象大小，
+tensor 返回函数必须先完成定义推导才能被调用；递归调用或定义前调用不能仅凭
+`tensor int f()` 得知形状，会给出明确诊断。
 
 需要特别区分两个符号表：
 
@@ -130,7 +129,10 @@ array 不能像一个 `i32` 一样直接放进单个返回寄存器，因此 ten
 源代码签名：
 
 ```c
-tensor int[2][2] make(int bias);
+tensor int make(int bias) {
+  tensor int value[2][2] = {{1, 2}, {3, 4}};
+  return value + bias;
+}
 ```
 
 概念上的 YIR 签名：
@@ -162,28 +164,50 @@ tensor int result[2][2] = make(0) @ make(1);
 
 每次调用各自拥有独立的调用者返回槽，不会互相覆盖。
 
-## 6. tensor 作为形式参数的现状
+## 6. tensor 作为形式参数
 
-tensor 作为函数返回值现在可以编译；tensor 作为形式参数目前仍明确拒绝。例如：
+tensor 可以作为形式参数，例如：
 
 ```c
-int sum(tensor int a[2][2]); // 当前不支持
+tensor int add(tensor int a[2][2], tensor int b[2][2]) {
+  return a + b;
+}
 ```
 
-原因不是符号表无法保存它，而是参数还需要单独确定值传递 ABI：是把整个 tensor 复制到
-形参私有空间，还是像数组一样传地址，以及调用者和被调者由谁负责复制。直接复用普通 array
-参数会让 tensor 悄悄发生 decay，破坏其值语义。为避免产生表面能编译、实际语义不确定的代码，
-当前语义分析给出错误，并建议临时使用普通数组参数。
+形参采用与普通数组一致的传址语义，不在函数入口复制。语义符号表仍保存完整的
+`tensor<int, [2,2]>`，使 `a + b`、`a @ b` 和形状检查继续按 tensor 规则工作；
+ASTToYIR 再把形参降为 `ptr<完整 array>`。调用者若传入局部 tensor、运算临时值或 sret
+返回槽，就取得整个 array 对象的地址；若传入的本身就是 tensor 形参或 tensor 切片，
+则直接转发已有指针。
 
-若后续要加入 tensor 形参，最直白且与当前 sret 对称的方案是：lowering 后使用隐藏/显式的
-`ptr<array<...>>` 参数，并在函数入口复制到局部 tensor，从而保持按值语义。这应作为独立修改完成。
+例如源语言签名：
+
+```text
+(tensor<int,[2,2]>, tensor<int,[2,2]>) -> tensor<int,[2,2]>
+```
+
+会降为：
+
+```text
+void add(ptr<array<2 x array<2 x i32>>> sret,
+         ptr<array<2 x array<2 x i32>>> a,
+         ptr<array<2 x array<2 x i32>>> b)
+```
+
+隐藏 sret 指针始终排在最前，随后才是源语言中的形参。因为 tensor 形参指向的是“完整
+array 对象”，对 `a[i][j]` 降级时会先补一个固定的 `0` 进入该对象，再依次使用 `i`、`j`；
+普通 array 形参原有的 decay 规则不受影响。
+
+这种传址语义也意味着，在函数内整体赋值或写元素会修改调用者的 tensor，与普通数组形参一致。
+所有维度都必须显式写出，不能像普通数组形参那样省略第一维，因为 tensor 运算需要完整形状。
 
 ## 7. 当前限制
 
 - 元素类型仅为 `int` 和 `float`。
 - 每一维都必须是正的编译期整数，至少有一维。
 - `@` 只接受二维 tensor。
-- 不支持 tensor 形式参数。
+- tensor 返回形状由函数体推导，因此递归或定义前调用无法确定 sret 大小；只有 extern
+  声明而没有同名定义的 tensor 返回函数也不支持。
 - 不支持比较、取模、逻辑和位运算等未定义的 tensor 运算。
 - sret 是 yoolang 当前内部约定；与外部 C/C++ 编译器链接 tensor 返回函数时，双方必须采用
   完全相同的隐藏指针签名，不能假设普通 C ABI 会自动匹配这个源语言扩展。
@@ -197,3 +221,4 @@ int sum(tensor int a[2][2]); // 当前不支持
 - `src/sema/ConstantEvaluator.cpp`：阻止未定义的 tensor 常量折叠路径。
 - `src/pass/ast/ASTToYIRPass.cpp`：array 展开、逐元素计算、矩阵乘法、整体拷贝和 sret。
 - `test/easy/tensor_sret.sy`：嵌套 sret 调用及返回结果参与矩阵乘法的端到端样例。
+- `test/easy/tensor_parameter.sy`：tensor 传址形参、下标读取、运算和 sret 组合样例。

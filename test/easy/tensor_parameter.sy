@@ -1,0 +1,15 @@
+tensor int multiply_with_bias(tensor int lhs[2][2],
+                              tensor int rhs[2][2], int bias) {
+  return (lhs + bias) @ rhs;
+}
+
+int diagonal_sum(tensor int value[2][2]) {
+  return value[0][0] + value[1][1];
+}
+
+int main() {
+  tensor int a[2][2] = {{1, 2}, {3, 4}};
+  tensor int b[2][2] = {{5, 6}, {7, 8}};
+  tensor int result[2][2] = multiply_with_bias(a, b, 1);
+  return diagonal_sum(result);
+}
