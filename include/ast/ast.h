@@ -33,6 +33,7 @@ enum class BinaryOp {
     Mul,
     Div,
     Mod, // 算术
+    MatMul, // tensor 矩阵乘法：a @ b
     Lt,
     Le,
     Gt,
@@ -166,7 +167,7 @@ using ConstExprRef = std::shared_ptr<const ConstExpr>;
 // their scalar, fixed-vector, or mask element type.
 class TypeSyntax final {
   public:
-    enum class Kind { Builtin, Vector, Mask };
+    enum class Kind { Builtin, Vector, Mask, Tensor };
 
     static std::shared_ptr<const TypeSyntax>
     make_builtin(BuiltinType type, front::SourceRange range = front::SourceRange{});
@@ -175,6 +176,8 @@ class TypeSyntax final {
                 front::SourceRange range = front::SourceRange{});
     static std::shared_ptr<const TypeSyntax>
     make_mask(ConstExprRef lane_expression, front::SourceRange range = front::SourceRange{});
+    static std::shared_ptr<const TypeSyntax>
+    make_tensor(BuiltinType element_type, front::SourceRange range = front::SourceRange{});
 
     Kind kind() const {
         return kind_;
@@ -187,6 +190,12 @@ class TypeSyntax final {
 
     BuiltinType vector_element_type() const {
         assert(kind_ == Kind::Vector);
+        return scalar_type_;
+    }
+
+    // tensor 和 vector 一样只允许 int/float 元素；tensor 的形状在声明符 [] 中。
+    BuiltinType tensor_element_type() const {
+        assert(kind_ == Kind::Tensor);
         return scalar_type_;
     }
 
@@ -365,6 +374,8 @@ struct FuncParam {
 class FuncDef : public ASTNode {
   public:
     TypeSyntaxRef return_type_syntax;
+    // tensor int[2][3] f() 中的 [2][3]。普通返回类型保持为空。
+    std::vector<std::unique_ptr<Expr>> return_dimensions;
     // Scalar compatibility for legacy semantic/lowering passes.
     BuiltinType return_type;
     std::string name;

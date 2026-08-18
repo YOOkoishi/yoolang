@@ -139,6 +139,9 @@ CheckedIntegerResult evaluate_impl(const Expr &expression,
             return checked_div(*lhs.value, *rhs.value);
         case BinaryOp::Mod:
             return checked_rem(*lhs.value, *rhs.value);
+        case BinaryOp::MatMul:
+            return failure(ConstantEvalError::NonConstant,
+                           "tensor matrix multiplication is not an integer constant expression");
         case BinaryOp::Lt:
         case BinaryOp::Le:
         case BinaryOp::Gt:
@@ -185,6 +188,7 @@ CheckedIntegerResult evaluate_impl(const Expr &expression,
         case BinaryOp::Mul:
         case BinaryOp::Div:
         case BinaryOp::Mod:
+        case BinaryOp::MatMul:
             break;
         }
     }

@@ -1,0 +1,15 @@
+tensor int global_tensor[2][2] = {{1, 2}, {3, 4}};
+
+int main() {
+  tensor int a[2][2] = {{1, 2}, {3, 4}};
+  tensor int b[2][2] = {{5, 6}, {7, 8}};
+  tensor int elementwise[2][2] = -a + b * 2 - 1;
+  tensor int product[2][2] = a @ b;
+  tensor int copied[2][2];
+  copied = elementwise;
+  tensor int row[2] = a[0] + b[1];
+  copied[1] = row;
+  tensor float f[2][2] = {{2.0, 4.0}, {6.0, 8.0}};
+  tensor float promoted[2][2] = 1 + f / 2;
+  return copied[1][1] + product[1][1] + promoted[1][1];
+}

@@ -1,0 +1,36 @@
+// RUN: %compiler --emit-yir %s | FileCheck %s --check-prefix=YIR
+// RUN: %compiler --emit-oir %s | FileCheck %s --check-prefix=OIR
+
+tensor int global_tensor[2][2] = {{1, 2}, {3, 4}};
+
+int main() {
+  tensor int a[2][2] = {{1, 2}, {3, 4}};
+  tensor int b[2][2] = {{5, 6}, {7, 8}};
+  tensor int elementwise[2][2] = -a + b * 2 - 1;
+  tensor int product[2][2] = a @ b;
+  tensor int copied[2][2];
+  copied = elementwise;
+  tensor int row[2] = a[0] + b[1];
+  copied[1] = row;
+
+  tensor float f[2][2] = {{2.0, 4.0}, {6.0, 8.0}};
+  tensor float promoted[2][2] = 1 + f / 2;
+  return copied[1][1] + product[1][1] + promoted[1][1];
+}
+
+// tensor 在 YIR 中只表现为 array，不引入任何 tensor 专用 IR。
+// YIR: yir.global @global_tensor : array<2 x array<2 x i32>>
+// YIR-LABEL: yir.func @main
+// YIR: yir.array_var
+// YIR: yir.array_load
+// YIR: yir.muli
+// YIR: yir.addi
+// YIR: yir.divf
+// YIR: yir.addf
+// YIR: yir.return
+
+// OIR: @global_tensor = global [2 x [2 x i32]]
+// OIR-LABEL: define i32 @main
+// OIR: mul i32
+// OIR: fdiv float
+// OIR: fadd float

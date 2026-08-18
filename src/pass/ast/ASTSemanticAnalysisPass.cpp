@@ -74,6 +74,7 @@ std::string binary_operator_name(BinaryOp op) {
     case BinaryOp::Mul: return "*";
     case BinaryOp::Div: return "/";
     case BinaryOp::Mod: return "%";
+    case BinaryOp::MatMul: return "@";
     case BinaryOp::Lt: return "<";
     case BinaryOp::Le: return "<=";
     case BinaryOp::Gt: return ">";
@@ -138,6 +139,16 @@ class Analyzer final : public ASTVisitor {
             }
             if (current->is_array()) current = current->element_type();
             else if (current->is_pointer()) current = current->pointee_type();
+            else if (current->is_tensor()) {
+                // tensor 不做 array decay。下标只是在它自己的形状上逐维剥离。
+                const auto &shape = current->tensor_shape();
+                if (shape.size() == 1) {
+                    current = current->element_type();
+                } else {
+                    std::vector<std::uint64_t> tail(shape.begin() + 1, shape.end());
+                    current = types().tensor_type(current->element_type(), tail);
+                }
+            }
             else if (current->is_fixed_vector()) {
                 check_constant_lane_index(*index, current->lane_count(), node.name);
                 current = current->element_type();
@@ -163,6 +174,37 @@ class Analyzer final : public ASTVisitor {
         auto *rhs = as_value(*node.rhs);
         if (lhs->is_error() || rhs->is_error()) {
             set_expr_type(node, types().error_type());
+            return;
+        }
+
+        // tensor 运算必须先于普通 scalar/vector 分支处理。tensor 在语义层不是 array，
+        // 所以这里不会误触发 array-to-pointer；这正是符号表保留 Tensor 类型的原因。
+        if (node.op == BinaryOp::MatMul) {
+            if (!lhs->is_tensor() || !rhs->is_tensor() ||
+                lhs->tensor_shape().size() != 2 || rhs->tensor_shape().size() != 2 ||
+                lhs->element_type() != rhs->element_type() ||
+                lhs->tensor_shape()[1] != rhs->tensor_shape()[0]) {
+                invalid_operands(node, lhs, rhs,
+                                 "operator @ requires two matrices with the same element type "
+                                 "and compatible inner dimensions");
+                return;
+            }
+            set_expr_type(node,
+                          types().tensor_type(lhs->element_type(),
+                                              {lhs->tensor_shape()[0], rhs->tensor_shape()[1]}));
+            return;
+        }
+
+        if (lhs->is_tensor() || rhs->is_tensor()) {
+            if (node.op != BinaryOp::Add && node.op != BinaryOp::Sub &&
+                node.op != BinaryOp::Mul && node.op != BinaryOp::Div) {
+                invalid_operands(node, lhs, rhs,
+                                 "tensor only supports +, -, *, / and @");
+                return;
+            }
+            SemanticTypeRef tensor_type = nullptr;
+            if (!coerce_tensor_operands(node, lhs, rhs, tensor_type)) return;
+            set_expr_type(node, tensor_type);
             return;
         }
 
@@ -250,7 +292,8 @@ class Analyzer final : public ASTVisitor {
         switch (node.op) {
         case UnaryOp::Pos:
         case UnaryOp::Neg:
-            if (!operand->is_numeric_scalar() && !operand->is_fixed_vector()) {
+            if (!operand->is_numeric_scalar() && !operand->is_fixed_vector() &&
+                !operand->is_tensor()) {
                 diagnose(front::DiagnosticCode::SemaInvalidOperand, node.source_range,
                          "unary arithmetic operator cannot be applied to " + operand->str());
                 set_expr_type(node, types().error_type());
@@ -533,7 +576,8 @@ class Analyzer final : public ASTVisitor {
     void visit(VarDecl &node) override {
         auto *base = resolve_type_syntax(node.type_syntax, false, "variable");
         auto *declaration_type =
-            resolve_declarator_type(base, node.dimensions, false, node.source_range);
+            resolve_declarator_type(base, node.dimensions, false, node.source_range,
+                                    node.type_syntax->kind() == TypeSyntax::Kind::Tensor);
         model_->set_declaration_type(node, declaration_type);
 
         SemanticSymbol symbol;
@@ -779,13 +823,18 @@ class Analyzer final : public ASTVisitor {
     sema::SemanticConstantRef zero_constant(SemanticTypeRef type) {
         if (type->is_integer()) return sema::SemanticConstant::integer(type, 0);
         if (type->is_float()) return sema::SemanticConstant::floating(type, 0.0F);
-        if (type->is_array() || type->is_fixed_vector() || type->is_mask())
+        if (type->is_array() || type->is_tensor() || type->is_fixed_vector() || type->is_mask())
             return sema::SemanticConstant::aggregate_zero(type);
         return nullptr;
     }
 
     void collect_array_shape(SemanticTypeRef type, std::vector<std::uint64_t> &dimensions,
                              SemanticTypeRef &leaf) {
+        if (type->is_tensor()) {
+            dimensions = type->tensor_shape();
+            leaf = type->element_type();
+            return;
+        }
         while (type->is_array()) {
             dimensions.push_back(type->array_bound());
             type = type->element_type();
@@ -862,6 +911,26 @@ class Analyzer final : public ASTVisitor {
         return sema::SemanticConstant::aggregate(type, std::move(elements));
     }
 
+    sema::SemanticConstantRef assemble_tensor_constant(
+        SemanticTypeRef element_type, const std::vector<std::uint64_t> &shape,
+        std::size_t dimension, const std::vector<sema::SemanticConstantRef> &flat,
+        std::size_t &cursor) {
+        if (dimension == shape.size()) {
+            return cursor < flat.size() ? flat[cursor++] : zero_constant(element_type);
+        }
+        std::vector<std::uint64_t> tail(shape.begin() + dimension, shape.end());
+        auto *this_type = types().tensor_type(element_type, tail);
+        std::vector<sema::SemanticConstantRef> elements;
+        elements.reserve(static_cast<std::size_t>(shape[dimension]));
+        for (std::uint64_t i = 0; i < shape[dimension]; ++i) {
+            auto element = assemble_tensor_constant(element_type, shape, dimension + 1,
+                                                    flat, cursor);
+            if (!element) return nullptr;
+            elements.push_back(std::move(element));
+        }
+        return sema::SemanticConstant::aggregate(this_type, std::move(elements));
+    }
+
     sema::SemanticConstantRef build_initializer_constant(InitVal &initializer,
                                                          SemanticTypeRef target) {
         if (target->is_integer() || target->is_float()) {
@@ -889,6 +958,21 @@ class Analyzer final : public ASTVisitor {
                 lanes.push_back(std::move(lane));
             }
             return sema::SemanticConstant::aggregate(target, std::move(lanes));
+        }
+        if (target->is_tensor()) {
+            if (initializer.expr) return constant_as(*initializer.expr, target);
+            if (initializer.elems.empty()) return zero_constant(target);
+            const auto &dimensions = target->tensor_shape();
+            const auto total = suffix_element_count(dimensions, 0);
+            auto *leaf = target->element_type();
+            std::vector<sema::SemanticConstantRef> flat(static_cast<std::size_t>(total),
+                                                        zero_constant(leaf));
+            std::uint64_t flat_cursor = 0;
+            if (!flatten_scalar_initializer(initializer, leaf, dimensions, 0, flat_cursor,
+                                            total, flat))
+                return nullptr;
+            std::size_t assemble_cursor = 0;
+            return assemble_tensor_constant(leaf, dimensions, 0, flat, assemble_cursor);
         }
         if (!target->is_array() || initializer.expr) return nullptr;
         if (initializer.elems.empty()) return zero_constant(target);
@@ -1092,6 +1176,40 @@ class Analyzer final : public ASTVisitor {
         return true;
     }
 
+    bool coerce_tensor_operands(BinaryExpr &node, SemanticTypeRef lhs, SemanticTypeRef rhs,
+                                SemanticTypeRef &result) {
+        auto *lhs_tensor = lhs->is_tensor() ? lhs : nullptr;
+        auto *rhs_tensor = rhs->is_tensor() ? rhs : nullptr;
+        if (lhs_tensor && rhs_tensor) {
+            if (lhs_tensor != rhs_tensor) {
+                invalid_operands(node, lhs, rhs,
+                                 "tensor operands must have identical element type and shape");
+                return false;
+            }
+            result = lhs_tensor;
+            return true;
+        }
+
+        auto *tensor = lhs_tensor ? lhs_tensor : rhs_tensor;
+        auto *scalar = lhs_tensor ? rhs : lhs;
+        auto &scalar_expression = lhs_tensor ? *node.rhs : *node.lhs;
+        if (!scalar->is_numeric_scalar()) {
+            invalid_operands(node, lhs, rhs,
+                             "tensor/scalar operation requires an int or float scalar");
+            return false;
+        }
+
+        // 标量提升不在语义层造一个假的 tensor 值，只把标量转换到元素类型；
+        // ASTToYIR 展开每个元素时会复用这个标量。
+        if (!convert_context(scalar_expression, scalar, tensor->element_type(),
+                             "tensor scalar promotion")) {
+            set_expr_type(node, types().error_type());
+            return false;
+        }
+        result = tensor;
+        return true;
+    }
+
     sema::CheckedIntegerResult evaluate_integer(const Expr &expression) {
         return sema::evaluate_integer_constant(
             expression, [this](std::string_view name) -> std::optional<sema::CheckedInteger> {
@@ -1172,6 +1290,12 @@ class Analyzer final : public ASTVisitor {
             case BuiltinType::Float: result = types().float_type(); break;
             }
             source_type_cache_.emplace(syntax.get(), result);
+        } else if (syntax->kind() == TypeSyntax::Kind::Tensor) {
+            // TypeSyntax 只表示 "tensor int/float"；真正形状来自变量后的 []，
+            // 因此这里先解析并缓存元素类型，resolve_declarator_type 再封装 Tensor。
+            result = syntax->tensor_element_type() == BuiltinType::Int ? types().int_type()
+                                                                       : types().float_type();
+            source_type_cache_.emplace(syntax.get(), result);
         } else {
             auto &lane_expression = const_cast<Expr &>(syntax->lane_expression()->expression());
             auto lane_count = resolve_extent(lane_expression, sema::ExtentKind::LaneCount);
@@ -1204,8 +1328,15 @@ class Analyzer final : public ASTVisitor {
 
     SemanticTypeRef resolve_declarator_type(
         SemanticTypeRef base, const std::vector<std::unique_ptr<Expr>> &dimensions,
-        bool parameter, front::SourceRange declaration_range) {
-        if (dimensions.empty()) return base;
+        bool parameter, front::SourceRange declaration_range, bool tensor = false) {
+        if (dimensions.empty()) {
+            if (tensor) {
+                diagnose(front::DiagnosticCode::SemaInvalidType, declaration_range,
+                         "tensor declaration requires at least one dimension");
+                return types().error_type();
+            }
+            return base;
+        }
         std::vector<std::optional<std::uint64_t>> bounds;
         bounds.reserve(dimensions.size());
         for (std::size_t i = 0; i < dimensions.size(); ++i) {
@@ -1219,6 +1350,21 @@ class Analyzer final : public ASTVisitor {
             }
         }
 
+        if (tensor) {
+            if (parameter) {
+                diagnose(front::DiagnosticCode::SemaInvalidType, declaration_range,
+                         "tensor parameters are not supported; pass an ordinary array instead");
+                return types().error_type();
+            }
+            std::vector<std::uint64_t> shape;
+            shape.reserve(bounds.size());
+            for (const auto &bound : bounds) {
+                if (!bound || base->is_error()) return types().error_type();
+                shape.push_back(*bound);
+            }
+            return types().tensor_type(base, shape);
+        }
+
         SemanticTypeRef result = base;
         const std::size_t first_nested = parameter ? 1 : 0;
         for (std::size_t i = bounds.size(); i-- > first_nested;) {
@@ -1230,13 +1376,19 @@ class Analyzer final : public ASTVisitor {
     }
 
     void declare_function(FuncDef &function) {
-        auto *return_type =
+        auto *return_base =
             resolve_type_syntax(function.return_type_syntax, true, "function return type");
+        // tensor 返回值的形状写在返回类型上，例如 tensor int[2][3] make()。
+        // 这里先形成完整语义类型；sret 只是后续 lowering 的实现细节。
+        auto *return_type = resolve_declarator_type(
+            return_base, function.return_dimensions, false, function.source_range,
+            function.return_type_syntax->kind() == TypeSyntax::Kind::Tensor);
         std::vector<SemanticTypeRef> parameter_types;
         for (auto &parameter : function.params) {
             auto *base = resolve_type_syntax(parameter.type_syntax, false, "parameter");
             auto *parameter_type =
-                resolve_declarator_type(base, parameter.dimensions, true, parameter.source_range);
+                resolve_declarator_type(base, parameter.dimensions, true, parameter.source_range,
+                                        parameter.type_syntax->kind() == TypeSyntax::Kind::Tensor);
             model_->set_parameter_type(parameter, parameter_type);
             parameter_types.push_back(parameter_type);
         }
@@ -1326,6 +1478,30 @@ class Analyzer final : public ASTVisitor {
                      context + " targets non-object type " + target->str());
             initializer.accept(*this);
             return false;
+        }
+        if (target->is_tensor()) {
+            // tensor 的花括号初始化完全复用数组的“按行展开”直觉；这里只做
+            // 元素总数和叶子类型检查，具体补零/坐标计算交给现有数组初始化代码。
+            if (initializer.expr) {
+                auto *source = expr_type(*initializer.expr);
+                return convert_context(*initializer.expr, source, target, context);
+            }
+            std::vector<Expr *> expressions;
+            collect_initializer_expressions(initializer, expressions);
+            const auto total = suffix_element_count(target->tensor_shape(), 0);
+            bool valid = true;
+            if (expressions.size() > total) {
+                diagnose(front::DiagnosticCode::SemaInvalidInitializer,
+                         initializer.source_range,
+                         context + " has too many scalar initializers for " + target->str());
+                valid = false;
+            }
+            for (auto *expression : expressions) {
+                auto *source = expr_type(*expression);
+                valid = convert_context(*expression, source, target->element_type(), context) &&
+                        valid;
+            }
+            return valid;
         }
         if (target->is_array()) {
             if (initializer.expr) {
